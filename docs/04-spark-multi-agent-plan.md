@@ -59,6 +59,8 @@ static_validation_status
 
 ## 4. 三个LLM角色
 
+**核心设计原则**：三个LLM角色的价值是加速开发——Developer生成草稿、Reviewer发现质量问题、Tester生成测试。但**真正保证产物可用的是它们身后每一步的确定性Validator和Executor**。LLM建议、机器裁决、人拍板——三者边界不可混淆。
+
 ### 4.1 SparkDeveloper
 
 输入：RequirementIR摘要、SubIntent、TransformationContract、源Schema、安全契约、上一轮OptimizationDirective。

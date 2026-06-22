@@ -43,12 +43,12 @@ snapshots/{snapshot_id}/
 
 ## 4. SemanticCompatibilityPolicy
 
-在实现某种操作前，必须声明DuckDB与Spark的等价策略：
+在实现某种操作前，必须声明DuckDB与Spark的等价策略。Spark与SQL对NULL等行为**存在明确语义差异**——不能直接比较原始结果，必须经Normalizer逐项处理。
 
 | 语义 | 必须明确的规则 |
 |------|----------------|
-| NULL | 比较、Join、聚合和排序中的NULL处理 |
-| NaN | 与NULL区分、排序和聚合处理 |
+| NULL | 比较、Join、聚合和排序中的NULL处理（详见下方 NULL 差异表） |
+| NaN | 与NULL区分、排序和聚合处理（详见下方 NaN 差异表） |
 | Decimal | 精度、scale、溢出和舍入 |
 | 时间 | 时区、日期截断、夏令时和边界包含性 |
 | 字符串 | 大小写、空白、编码和排序 |
@@ -57,7 +57,32 @@ snapshots/{snapshot_id}/
 | 聚合 | DISTINCT、空集合和近似函数 |
 | 行集合 | set、multiset或ordered sequence语义 |
 
-未进入兼容矩阵的函数和操作不得自动标记一致，必须返回`UNSUPPORTED_SEMANTICS`或`HUMAN_REVIEW`。
+### 4.1 DuckDB vs Spark NULL 语义差异（必须逐项归一化）
+
+两个引擎都遵循 SQL 标准的多数规则，但以下关键行为差异**不能**通过原始结果直接比较来消除：
+
+| 操作 | DuckDB 行为 | Spark 行为 | 归一化策略 |
+|------|------------|-----------|-----------|
+| **NULL 排序** | 默认 `NULLS FIRST`（升序） | 默认 `NULLS LAST`（升序） | Normalizer 必须显式指定 `NULLS LAST` 后再比较，或按业务键排序消除不确定性 |
+| **NULL = NULL** | 返回 `NULL`（非 TRUE） | 返回 `NULL`（非 TRUE） | 一致——但 `WHERE col = NULL` 在两个引擎中都不返回行。Comparator 不能使用等值比较来判断 NULL 匹配 |
+| **GROUP BY NULL** | NULL 归为一组 | NULL 归为一组 | 一致——但 Normalizer 必须用 `COALESCE` 或显式 NULL 标记统一两组输出的表示 |
+| **SUM(全NULL列)** | 返回 `NULL` | 返回 `NULL` | 一致——但 `SUM` + `COALESCE(0)` 在两个引擎中行为不同，因 COALESCE 评估时机取决于执行计划 |
+| **Window 分区中 NULL** | `PARTITION BY NULL` 将所有行归入同一分区 | 同 DuckDB | 一致——但 `ORDER BY NULL` 在不同分区中的排序不稳定性可能导致行顺序差异 |
+| **NULL 在 JOIN 键** | NULL 键不匹配任何行（含另一个 NULL） | 同 DuckDB | 一致——但 LEFT JOIN 保留左表 NULL 键行，右表列填 NULL；Comparator 必须用业务键 multiset 而非位置比较 |
+| **IS NULL vs = NULL** | `IS NULL` 检测 NULL，`= NULL` 返回 NULL | 同 DuckDB | 一致——但 Normalizer 必须在比较前将 NULL 标记为 `__NULL__` 哨兵值，禁止直接用 `=` 判断 |
+| **COALESCE 短路** | 从左到右返回第一个非 NULL | 同 DuckDB | 一致——但 `COALESCE(Spark_UDF(), default)` 这类场景不适用于纯转换函数契约 |
+
+**关键结论**：NULL 语义差异不能靠一句"声明等价策略"解决。Normalizer 必须在比较前完成：(1) 显式 NULL 排序方向、(2) NULL 哨兵值替换、(3) 排除基于 `=` 的 NULL 匹配。
+
+### 4.2 DuckDB vs Spark NaN 语义差异
+
+| 操作 | DuckDB 行为 | Spark 行为 | 归一化策略 |
+|------|------------|-----------|-----------|
+| **NaN 存在性** | DuckDB 不区分 NaN 和 NULL——所有特殊浮点值（NaN/+Inf/-Inf）在 DuckDB 中视为 NULL | Spark 区分 NaN、+Inf、-Inf 和 NULL，`isNaN()` 可单独检测 | Normalizer 必须在 Spark 侧将 NaN 显式替换为 `__NaN__` 哨兵值，DuckDB 侧 NaN 已是 NULL |
+| **NaN 聚合** | NaN 作为 NULL 被忽略 | `SUM` 包含 NaN 时结果可能是 NaN | 聚合前必须由 Normalizer 统一 NaN → NULL 映射 |
+| **NaN 排序** | NaN 作为 NULL 参与排序 | NaN 排序位置引擎特定（通常大于所有非 NULL 值） | Normalizer 必须将 NaN 归一化为统一哨兵后再排序 |
+
+**关键结论**：DuckDB 根本没有 NaN 概念。Spark 侧的 NaN 必须在进入 Comparator 之前显式替换——否则会因"DuckDB 报 NULL 计数、Spark 另有 NaN 计数"而反复产生 DIFFERENT。
 
 ## 5. ResultNormalizer
 
