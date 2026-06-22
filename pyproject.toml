@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tianshu-datadev"
+version = "0.1.0"
+description = "TianShu DataDev Agent v3 — AI 辅助数据开发工具"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "TianShu DataDev Team"}
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+# Phase 0 最小依赖声明——不在此阶段安装完整依赖链
+# 后续阶段按需激活（见各 phase roadmap 文档）
+dependencies = [
+    "duckdb>=0.10.0",
+    "pyyaml>=6.0",
+    "sqlglot>=20.0.0",
+]
+
+[project.optional-dependencies]
+# LangGraph——Phase 4 开始激活
+langgraph = ["langgraph>=0.2.0"]
+# PySpark——Phase 2 开始激活
+spark = ["pyspark>=3.5.0"]
+# 开发工具
+dev = ["pytest>=8.0", "pytest-cov>=4.0", "ruff>=0.3.0"]
+# 前端——Phase 5 开始激活
+frontend = ["fastapi>=0.100.0", "uvicorn>=0.20.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
