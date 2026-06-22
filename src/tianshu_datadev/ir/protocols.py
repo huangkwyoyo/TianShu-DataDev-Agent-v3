@@ -195,3 +195,63 @@ class MergedResult(Protocol):
     row_count: int  # 合并后的总行数
     source_summary_ids: list[str]  # 各子结果摘要 ID 列表
     status: str  # 合并状态（StepStatus 值）
+
+
+# =============================================================================
+# Spark 侧 Protocol 接口
+# =============================================================================
+
+
+@runtime_checkable
+class TransformationContract(Protocol):
+    """PySpark 转换的结构化契约——LLM 必须遵守的输入/输出/安全边界。
+
+    契约声明了 transform() 函数允许使用的表、字段、Join 路径、
+    指标定义和输出 Schema。Spark Static Validator 用此契约校验生成代码。
+    """
+
+    contract_id: str  # 契约唯一标识
+    sub_intent_id: str  # 关联的子意图 ID
+    declared_inputs: list[str]  # 允许从 inputs 读取的源表名列表——禁止读取列表外的表
+    field_schemas: dict[str, list[str]]  # 每个源表的字段白名单（表名→字段名列表）
+    join_paths: list[dict]  # 允许的 JOIN 路径（left_table/right_table/on/type）
+    metrics: list[dict]  # 指标定义列表（name/expr/output_alias）
+    output_schema: list[dict]  # 输出列定义（name/type/nullable/description）
+    grain: str | None  # 预期输出粒度（如 "daily"、"zone"）——禁止随意改变粒度
+    allowed_imports: list[str]  # 允许导入的模块白名单（如 "pyspark.sql.functions"）
+    params_schema: dict | None  # TransformParams 的 JSON Schema——约束 LLM 可用的参数
+
+
+@runtime_checkable
+class TransformParams(Protocol):
+    """传递给 transform() 的运行时参数。
+
+    参数必须来自 TransformationContract 中声明的 params_schema——
+    LLM 不能自行决定参数结构。参数值在编译/执行时由系统注入，不由 LLM 指定。
+    """
+
+    # Protocol 不约束具体字段——具体字段由 TransformationContract.params_schema 声明
+    # 此处只标记类型身份，实际校验由 JSON Schema 和 Static Validator 完成
+
+
+@runtime_checkable
+class SparkCodeArtifact(Protocol):
+    """PySpark 代码生成产物——SparkDeveloper 的输出。
+
+    包含经过静态验证和 Reviewer 检查的代码及其完整溯源信息。
+    代码正文落盘为独立文件，Graph State 只保存本 artifact 引用。
+    """
+
+    artifact_id: str  # 产物唯一标识
+    sub_intent_id: str  # 关联的子意图 ID
+    contract_ref: str  # 关联的 TransformationContract.contract_id
+    code_ref: str  # 代码文件路径（相对于 generated/ 目录）
+    code_sha256: str  # 代码正文的 SHA-256 哈希——用于完整性校验
+    entrypoint: str  # 入口函数名，固定为 "transform"
+    model_id: str  # 生成此代码的 LLM 模型标识
+    prompt_version: str  # 使用的 Prompt 模板版本
+    generation_round: int  # 生成轮次（首次=1，每轮返工递增）
+    allowed_imports: list[str]  # 实际允许的导入白名单
+    declared_inputs: list[str]  # 代码声明的输入表名——必须 ⊆ contract.declared_inputs
+    expected_output_schema: list[dict]  # 预期输出 Schema（从 contract 复制）
+    static_validation_status: str  # 静态验证状态（StepStatus 值）

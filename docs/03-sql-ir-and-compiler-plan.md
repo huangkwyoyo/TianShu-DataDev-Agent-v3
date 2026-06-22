@@ -1,175 +1,192 @@
 # SQL IR 和编译器计划 — TianShu DataDev Agent v3
 
-> 文档版本：Phase 0 初稿
+> 文档版本：Phase 0.5 架构契约校正版
 
 ## 1. 目标
 
-设计三层 IR 结构和 Python 确定性编译器，确保 SQL 由编译器生成而非 LLM 直接输出，杜绝非法 SQL 进入执行层。
+建立三层、可校验、可序列化的SQL IR。LLM只能选择经过事实源注册的类型化节点，Python编译器负责生成全部SQL语法。
 
-## 2. 三层 IR 结构
+## 2. 运行时模型选择
 
-### 2.1 RequirementIR（需求层）
+Phase 0中的`Protocol`只用于接口探索，不能作为LLM结构化输出和持久化契约。Phase 1必须使用Pydantic模型或等价的严格Schema，并满足：
 
-从项目书解析得到的结构化需求表示。
+- `extra="forbid"`，拒绝未知字段。
+- Enum限制操作符、Join类型、聚合函数和排序方向。
+- 字段引用使用注册ID或完全限定ColumnRef，不接受自由字符串表达式。
+- 可生成JSON Schema供LLM structured output使用。
+- 可序列化、反序列化并保持语义不变。
 
-```python
-@dataclass
-class RequirementIR:
-    """项目书解析后的结构化需求"""
-    raw_text: str                     # 原始项目书文本
-    data_source: list[str]            # 涉及的数据源（表名）
-    analysis_goals: list[str]         # 分析目标列表
-    output_requirements: dict         # 输出格式要求
-    constraints: list[str]            # 约束条件
-    business_context: str | None      # 业务上下文说明
+## 3. 三层IR
+
+### 3.1 RequirementIR
+
+业务需求层只描述“要什么”，不描述SQL实现：
+
+```text
+request_id
+metric_ids[]
+dimension_ids[]
+time_range
+filters[]
+output_grain
+expected_columns[]
+human_review_points[]
+project_spec_ref
 ```
 
-**不包含**：LLM 评分、Token 统计、模型版本等运行时元数据。
+`time_range`、`filters`必须是类型化对象。原始项目书通过artifact引用保存，不直接塞入IR或Graph State。
 
-### 2.2 SubIntent（子意图层）
+### 3.2 SubIntent / LogicalPlan
 
-原子可执行的子任务。
+SubIntent按planning_table、可用指标表达式和输出粒度拆分：
 
-```python
-@dataclass
-class SubIntent:
-    """原子可执行的子意图"""
-    id: str                           # 唯一标识
-    description: str                  # 自然语言描述
-    target_tables: list[str]          # 目标表
-    required_fields: list[str]        # 所需字段
-    filter_conditions: list[dict]     # 过滤条件
-    aggregation: dict | None          # 聚合定义
-    join_relations: list[dict] | None # Join 关系
-    ordering: list[dict] | None       # 排序要求
-    limit: int | None                 # 行数限制
+```text
+sub_intent_id
+request_id
+planning_table_id
+metric_ids[]
+dimension_ids[]
+filter_specs[]
+output_grain
+business_keys[]
+merge_group
+source_contract_refs[]
 ```
 
-**不包含**：执行计划、SQL 片段、LLM 中间产物。
+拆分前必须验证：
 
-### 2.3 SQLPlan（SQL 计划层）
+1. 指标存在于TianShu事实源。
+2. 每个指标有可用G3或G2绑定。
+3. 维度和日期字段可从规划表或白名单Join获得。
+4. 多SubIntent存在可证明的合并键和兼容粒度。
 
-编译器输入，包含生成 SQL 所需的所有结构化信息。
+### 3.3 SQLPlan / PhysicalPlan
 
-```python
-@dataclass
-class SQLPlan:
-    """SQL 编译器输入计划"""
-    sub_intent_id: str                # 对应的 SubIntent ID
-    source_tables: list[str]          # FROM 子句中的表
-    join_clauses: list[JoinClause]    # JOIN 定义
-    selected_columns: list[ColumnDef] # SELECT 列
-    where_conditions: list[Condition] # WHERE 条件
-    group_by: list[str] | None         # GROUP BY 字段
-    having: list[Condition] | None     # HAVING 条件
-    order_by: list[SortSpec] | None    # ORDER BY
-    limit: int | None                  # LIMIT
-    output_alias: str | None           # 输出别名
-```
+SQLPlan只包含封闭的类型化节点：
 
 ```python
-@dataclass
-class JoinClause:
-    """JOIN 子句定义"""
-    join_type: str                    # INNER / LEFT / RIGHT / FULL
-    left_table: str
-    right_table: str
-    left_key: str
-    right_key: str
+class ColumnRef:
+    table_id: str
+    column_id: str
 
-@dataclass
-class ColumnDef:
-    """列定义"""
-    table: str
-    column: str
-    alias: str | None
-    aggregation: str | None            # SUM / COUNT / AVG / MIN / MAX / None
+class Literal:
+    value: str | int | float | bool | date | datetime | None
+    data_type: str
 
-@dataclass
-class Condition:
-    """条件定义"""
-    field: str                         # table.column 格式
-    operator: str                      # =, !=, >, <, >=, <=, IN, LIKE, IS NULL, IS NOT NULL
-    value: Any | None                  # 值（可为 None）
-    logical_op: str = "AND"            # AND / OR
+class Predicate:
+    left: ColumnRef
+    operator: PredicateOperator
+    right: ColumnRef | Literal | list[Literal]
 
-@dataclass
+class JoinSpec:
+    right_table_id: str
+    join_type: JoinType
+    conditions: list[Predicate]
+    relationship_ref: str
+
+class AggregateSpec:
+    function: AggregateFunction
+    input: ColumnRef | None
+    alias: str
+    distinct: bool
+    metric_ref: str
+
 class SortSpec:
-    """排序定义"""
-    field: str
-    direction: str = "ASC"             # ASC / DESC
+    column: ColumnRef
+    direction: SortDirection
+    null_order: NullOrder
 ```
 
-**字段契约**：SQLPlan 仅包含生成 SQL 所需的结构化信息。不包含：
-- LLM 评分或置信度
-- 替代方案
-- Token 统计
-- 执行预估
-- 安全风险评估
+SQLPlan组合以上节点，并声明select、joins、predicates、grouping、aggregates、having、ordering和limit。
 
-## 3. Python 确定性编译器设计
+## 4. 明确禁止的IR形态
 
-### 3.1 编译器签名
+以下字段或同义字段不得出现：
 
-```python
-def compile_sql(sql_plan: SQLPlan) -> str:
-    """
-    将 SQLPlan 编译为 DuckDB 兼容的 SQL 字符串。
+- `where_clauses: list[str]`
+- `join_on: str`
+- `expression: str`
+- `aggregation_expr: str`
+- `having_sql: str`
+- `raw_sql`
+- 任意SQL函数调用字符串
 
-    输入：严格类型化的 SQLPlan
-    输出：有效的 DuckDB SQL 字符串
-    约束：同一输入始终产生同一输出（确定性）
-    """
+如果需求无法由当前表达式节点表示，Planner必须返回`UNSUPPORTED_PLAN`或`HUMAN_REVIEW`，不能退化为自由文本SQL。
+
+## 5. 事实源解析
+
+LLM输出的是逻辑ID，Fact Resolver确定性绑定到物理对象：
+
+```text
+metric_id → metric definition → G3物理列 / G2聚合表达式
+dimension_id → semantic dimension → 物理列
+relationship_ref → Join白名单 → 左右键和基数
+planning_table_id → Gold表
 ```
 
-### 3.2 编译器规则
+编译器不得接受未解析的表名、字段名、指标名和Join关系。
 
-1. 表名、字段名直接来自 TianShu `contracts/*.yml`，不修改、不猜测
-2. JOIN 条件中的左右键必须存在于对应表的 Contract 定义中
-3. 聚合函数只使用 DuckDB 支持的标准函数
-4. 不生成任何 DDL 语句
-5. 不生成 INSERT / UPDATE / DELETE
-6. 输出格式化为可读的 SQL（关键字大写、缩进一致）
-7. 编译器不执行任何安全检查——安全由输入契约保证
+## 6. SQL Compiler
 
-### 3.3 确定性保证
+编译流程：
 
-- 相同 SQLPlan → 相同 SQL 字符串（100% 确定）
-- 编译器是无状态的纯函数
-- 不使用随机数或当前时间等不确定因素
-- 输出不依赖 LLM
+```text
+SQLPlan Schema Validation
+→ Fact Resolution
+→ Semantic Validation
+→ SQL AST Construction
+→ sqlglot / 受控Renderer输出DuckDB SQL
+→ SQL AST Safety Validation
+→ Artifact写入与哈希
+```
 
-## 4. 硬约束
+同一个规范化SQLPlan和编译器版本必须产生字节一致的SQL。
 
-| 约束 | 说明 |
+## 7. 支持范围
+
+Phase 1只支持：
+
+- Gold层单表查询。
+- 白名单中的一个受控Join。
+- SELECT、WHERE、GROUP BY、HAVING、ORDER BY、LIMIT。
+- 已注册的COUNT、SUM、AVG、MIN、MAX和COUNT DISTINCT。
+- 明确类型的日期范围和比较谓词。
+
+窗口函数、子查询、多跳Join和复杂表达式在后续按黄金用例逐项开放，不能因为LLM能生成就默认支持。
+
+## 8. MergePlan
+
+跨表多指标拆分后，由确定性MergePlanner生成MergePlan。自动合并必须同时满足：
+
+- 输出粒度兼容。
+- 合并键在每个结果中存在。
+- 期望基数已声明。
+- 重复键策略明确。
+- 列冲突策略明确。
+
+不满足时进入`HUMAN_REVIEW`，不得由pandas默认merge推断。
+
+## 9. 错误与状态
+
+| 状态 | 含义 |
 |------|------|
-| LLM 不生成 SQL 字符串 | LLM 只输出结构化的 SQLPlan，SQL 由编译器生成 |
-| 表名来自事实源 | 所有表名必须存在于 TianShu 的 contracts 中 |
-| 字段名来自事实源 | 所有字段名必须在对应表的 contracts 中有定义 |
-| JOIN 关系来自事实源 | JOIN 条件中的字段必须在 contracts 中有关联关系 |
-| 不执行外部数据 | 编译器不读取外部文件、不调用网络 API |
+| `PLAN_VALIDATED` | 结构和事实源校验通过 |
+| `PLAN_REJECTED` | 非法字段、未注册引用或不支持表达式 |
+| `COMPILED` | SQL artifact已确定性生成 |
+| `RUNTIME_PASS` | DuckDB在冻结快照上执行成功 |
+| `HUMAN_REVIEW` | 无法确定规划、绑定或合并语义 |
 
-## 5. 不需要的旧项目安全检查
+LLM的`confidence`只能作为诊断元数据，不得参与安全判定、执行许可和自动通过。
 
-Legacy 项目有 6 层 SQL 安全检查：
-1. 关键字黑名单 → v3 编译器不会生成危险语句
-2. 正则表达式过滤 → v3 编译器生成的是结构化 SQL
-3. SQL 注入检测 → v3 SQL 中无用户输入拼接
-4. DDL 检测 → v3 编译器不生成 DDL
-5. 多语句检测 → v3 编译器生成单条 SELECT
-6. 权限评估 → v3 不涉及权限
+## 10. Phase 1验收标准
 
-**v3 方案**：编译器仅做输入验证（SQLPlan 字段合法性），不做运行时安全检查。
-
-## 6. 编译器测试边界
-
-| 测试类型 | 覆盖内容 |
-|----------|----------|
-| 正常路径 | 各种标准 SELECT、JOIN、GROUP BY、HAVING、ORDER BY、LIMIT |
-| 边界情况 | 空 SELECT、空 WHERE、NULL 条件、空 Join 列表 |
-| 异常输入 | 字段名不存在于 contracts、表名不存在、非法操作符 |
-| 确定性 | 两次相同输入 → 两次相同输出 |
+1. LLM输出Schema中不存在自由SQL片段字段。
+2. 非法表、列、指标、Join和操作符在编译前被拒绝。
+3. 相同SQLPlan重复编译产生相同SQL和哈希。
+4. 单表和一个白名单Join黄金用例可在DuckDB快照上运行。
+5. 不支持场景明确拒绝，不使用字符串逃生口。
+6. SQLPlan、SQL artifact和ExecutionTrace可追溯到事实源和版本。
 
 ---
 
-> Phase 0 初稿 | 2026-06-22 | 待后续阶段细化
+> Phase 0.5 校正 | 2026-06-22 | Phase 1 实施依据

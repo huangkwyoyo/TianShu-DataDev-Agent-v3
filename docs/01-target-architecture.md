@@ -1,139 +1,153 @@
 # 目标架构 — TianShu DataDev Agent v3
 
-> 文档版本：Phase 0 初稿
+> 文档版本：Phase 0.5 架构契约校正版
 
-## 1. 目标
+## 1. 架构原则
 
-定义 TianShu DataDev Agent v3 的系统架构。核心设计原则：**PySpark 代码是主产物，SQL 是验证手段**。
+1. PySpark是主要代码产物，SQL是独立参考实现和验证手段。
+2. SQL由类型化SQLPlan确定性编译，LLM不生成SQL文本或片段。
+3. PySpark由LLM生成，但必须满足纯转换函数、安全校验和真实执行契约。
+4. SQL与Spark共享TransformationContract和冻结快照，不共享实现代码。
+5. Comparator只证明样本一致性；人负责业务审查和上线决策。
+6. LangGraph是薄编排层，业务节点是普通Python函数。
 
-- SQL 分支：确定性生成 DuckDB SQL → 产生参考结果 → 用于交叉验证 PySpark 代码的正确性
-- PySpark 分支：三个 LLM 角色协作 → 生成达到"开发审查级"的 DataFrame DSL 代码 → 最终交付物
-- 双引擎交叉验证：同一快照上比较 SQL 和 PySpark 输出 → 确保 PySpark 逻辑正确
+## 2. 总体数据流
 
-## 2. 双分支架构总览
-
-```
-项目书
-  │
-  ▼
-RequirementIR
-  │
-  ▼
-SubIntent 列表
-  │
-  ├── SQL 分支 ────────────────────────────────┐
-  │   SubIntent → SQLPlan → Python 编译器     │
-  │   → DuckDB SQL → DuckDB 执行              │
-  │                                            │
-  ├── PySpark 分支 ────────────────────────────┤
-  │   SparkDeveloper → SparkReviewer          │
-  │   → SparkTester → PySpark 执行            │
-  │                                            │
-  ├── 同源 Parquet 快照 ───────────────────────┤
-  │   SQL 和 PySpark 使用同一快照              │
-  │                                            │
-  └── 交叉验证 ────────────────────────────────┘
-      9 个确定性维度比较 → LLM 差异诊断
-      → 返工 → Code Review Package
+```text
+ProjectSpec artifact
+  → RequirementIR
+  → Human confirmation gate
+  → SubIntent[]
+  → TransformationContract[]
+  → RelationalSnapshotManifest
+      ├─ SQLPlan → SQL Compiler → SQL Validator → DuckDB Executor
+      └─ SparkDeveloper → Spark Validator → SparkReviewer
+           → SparkDeveloper revision → SparkTester → Test Validator
+           → Spark Executor
+  → ResultNormalizer
+  → DeterministicComparator
+      ├─ CONSISTENT_SAMPLE → REVIEW_READY packaging
+      └─ DIFFERENT → DifferenceAnalyst → RepairPlanner
+           → retry (最多2轮) / HUMAN_REVIEW
 ```
 
-## 3. 五个 LLM 角色隔离
+Snapshot Builder必须在双引擎执行前完成。两个Executor只能读取同一个snapshot_id。
 
-| 角色 | 职责 | 输入 | 输出 |
-|------|------|------|------|
-| SparkDeveloper | 将 SubIntent 转为 PySpark DSL | SubIntent | PySpark 代码 |
-| SparkReviewer | 审查代码安全、性能、正确性 | PySpark 代码 | Review 意见 |
-| SparkTester | 为 PySpark 代码生成测试 | PySpark 代码 | 测试规格 + 测试代码 |
-| DifferenceAnalyst | 解释交叉验证差异（不判定） | 差异报告 | 诊断文本 |
-| RepairPlanner | 基于诊断制定修复方案 | 诊断文本 | RepairDirective |
+## 3. 三层SQL IR
 
-**隔离方式**：同一 LLM 模型，不同 Prompt + 不同输出 Schema，不共享上下文窗口。
+| 层 | 作用 | 是否允许自由表达式 |
+|----|------|--------------------|
+| RequirementIR | 表达业务目标、指标、维度、过滤、时间与粒度 | 否 |
+| SubIntent / LogicalPlan | 按planning_table和可合并粒度拆分业务任务 | 否 |
+| SQLPlan / PhysicalPlan | 绑定物理表列、Join、谓词、聚合与排序 | 否 |
 
-## 4. LangGraph 编排层
+SQLPlan使用`ColumnRef`、`Literal`、`Predicate`、`JoinSpec`、`AggregateSpec`、`SortSpec`等封闭类型。任何`where_sql`、`join_on: str`、`expression: str`都属于越界。
 
-### 4.1 使用边界
+## 4. TransformationContract
 
-LangGraph 仅用于**编排控制流**，包括：
+每个SubIntent在进入双分支前必须生成同一份TransformationContract：
 
-- 节点调度和状态传递
-- SQL / Spark 并行分支执行
-- 条件路由（PASS → Package / FAIL → Repair）
-- Checkpoint 持久化
-- retry_count 追踪
-- 最大返工次数控制
-- 人工中断信号侦听
-- 执行轨迹记录
+```text
+contract_id
+sub_intent_id
+input_tables[]
+input_columns[]
+metric_bindings[]
+join_paths[]
+filters[]
+grouping_keys[]
+output_columns[]
+output_types[]
+output_grain
+business_keys[]
+semantic_policy_ref
+source_contract_hashes[]
+```
 
-### 4.2 明确禁止 LangGraph 执行
+TransformationContract是两种实现的共同业务规格，不含SQL或Spark代码。
 
-1. 不得在 LangGraph 内拼接 SQL 字符串
-2. 不得在 LangGraph 内进行 SQL 安全判定
-3. 不得在 LangGraph 内进行 Spark 安全判定
-4. 不得在 LangGraph 内判断表和字段的真实性
-5. 不得在 LangGraph 内定义指标计算逻辑
-6. 不得在 LangGraph 内判定结果一致性最终结论
-7. 不得在 LangGraph 内自动批准代码
-8. 不得在 LangGraph 内触发自动上线
+## 5. 跨SubIntent合并
 
-### 4.3 Graph State 字段定义
+多SubIntent不得直接按一个字符串`merge_key`合并。必须存在MergePlan：
+
+```text
+merge_plan_id
+input_summary_refs[]
+join_keys[]
+expected_cardinality
+join_type
+grain_compatibility
+column_conflict_policy
+missing_key_policy
+output_schema
+```
+
+粒度不兼容、Join基数未知或业务键不唯一时，禁止自动合并并进入`HUMAN_REVIEW`。
+
+## 6. Artifact优先的Graph State
+
+LangGraph State只保存小型结构化字段：
 
 ```python
 class GraphState(TypedDict):
-    project_doc: str                    # 原始项目书文本
-    requirement_ir: dict                 # 结构化需求
-    sub_intents: list[dict]              # SubIntent 列表
-    sql_plan: dict | None                # SQL 分支的 SQLPlan
-    sql_code: str | None                 # 编译后的 SQL
-    sql_result: DataFrame | None         # SQL 执行结果
-    spark_code: str | None               # PySpark 代码
-    spark_review: list[str] | None       # Reviewer 意见
-    spark_test: str | None               # 测试代码
-    spark_result: DataFrame | None       # Spark 执行结果
-    comparison_result: dict | None       # 比较结果（9 个维度）
-    diagnosis: str | None                # LLM 差异诊断
-    retry_count: int                     # 当前已返工次数
-    max_retries: int                     # 最大返工次数
-    final_report: dict | None            # Code Review Package
+    request_id: str
+    project_spec_ref: str
+    requirement_ir_ref: str | None
+    sub_intent_refs: list[str]
+    transformation_contract_refs: list[str]
+    snapshot_manifest_ref: str | None
+    sql_plan_refs: list[str]
+    sql_artifact_refs: list[str]
+    spark_artifact_refs: list[str]
+    test_artifact_refs: list[str]
+    execution_trace_refs: list[str]
+    result_summary_refs: list[str]
+    comparison_report_ref: str | None
+    diagnosis_ref: str | None
+    repair_directive_ref: str | None
+    retry_count: int
+    assurance_level: str
+    final_status: str
 ```
 
-## 5. 同源 Parquet 快照机制
+禁止在State中保存DataFrame、完整结果集、完整代码、完整原始项目书或无限聊天历史。具体内容落盘后通过路径和SHA-256引用。
 
-1. **Snapshot Builder** 从 TianShu 数据源读取表数据
-2. 输出：Parquet 文件 + schema.json + manifest.yml + SHA-256 校验
-3. SQL 分支和 PySpark 分支都使用同一份快照
-4. 快照不可变，在同一推理周期内不重建
+## 7. 执行环境边界
 
-## 6. Code Review Package 输出目录
+- Snapshot Builder只读访问开发数据源。
+- DuckDB与Spark在隔离环境读取Parquet快照。
+- EnvironmentManifest固定引擎版本、时区、ANSI模式、大小写、Decimal和NaN策略。
+- SQL、Spark代码和LLM生成的测试代码必须先静态验证再执行。
+- 每次执行设置超时、内存、CPU、行数和输出大小限制。
+- Executor不拥有生产凭据和写入目标。
 
+## 8. Code Review Package
+
+```text
+generated/review_packages/{request_id}/
+├── requirement/
+├── contracts/
+├── plans/
+├── sql/
+├── spark/
+├── tests/
+├── snapshots/snapshot_manifest.yml
+├── traces/
+├── reports/
+├── lineage/source_refs.yml
+├── provenance.yml
+└── review.md
 ```
-code_review_package/
-├── 01_requirement/          # 项目书和 RequirementIR
-├── 02_sub_intent/           # SubIntent 列表
-├── 03_sql_plan/             # SQLPlan
-├── 04_sql_code/             # 编译后的 SQL
-├── 05_spark_code/           # PySpark 代码
-├── 06_execution_results/    # 双分支执行结果
-├── 07_comparison/           # 交叉验证报告
-├── 08_diagnosis/            # LLM 差异诊断
-└── 09_summary/              # 汇总报告和审批单
-```
 
-## 7. 非功能性目标
+`provenance.yml`至少记录：代码哈希、Prompt版本、模型标识、事实源哈希、快照哈希、执行环境指纹和返工轮次。
 
-| 维度 | 目标 |
-|------|------|
-| 容错 | 单个节点失败可重试，LangGraph 支持 checkpoint |
-| 可观测 | 每个节点有输入输出日志，执行轨迹可回放 |
-| 安全性 | Spark 代码通过 Static Validator 安全检查 |
-| 确定性 | SQL 编译器输入输出一一对应 |
-| 隔离性 | LLM 角色间上下文不共享 |
+## 9. 组件替换边界
 
-## 8. 架构边界约束
-
-- 所有模块是可脱离 LangGraph 单独调用的普通 Python 函数
-- LLM 调用必须通过统一 Gateway 层（支持 retry、fallback、token 计数）
-- 文件 I/O 统一通过 Storage 抽象层（支持本地 / S3 切换）
+- 所有业务节点接收结构化输入并返回结构化输出，可脱离LangGraph测试。
+- LLM调用统一通过Gateway，但Gateway不解析领域语义。
+- Storage只负责artifact持久化和哈希，不参与状态判定。
+- Validator和Comparator是确定性模块，不依赖LLM。
 
 ---
 
-> Phase 0 初稿 | 2026-06-22 | 待后续阶段细化
+> Phase 0.5 校正 | 2026-06-22 | Phase 1 前置事实源

@@ -13,9 +13,12 @@ from .protocols import (
     RequestStatus,
     RequirementIR,
     ResultSummary,
+    SparkCodeArtifact,
     SQLPlan,
     StepStatus,
     SubIntent,
+    TransformationContract,
+    TransformParams,
 )
 
 __all__ = [
@@ -27,7 +30,10 @@ __all__ = [
     "RequestStatus",
     "RequirementIR",
     "ResultSummary",
+    "SparkCodeArtifact",
     "SQLPlan",
     "StepStatus",
     "SubIntent",
+    "TransformationContract",
+    "TransformParams",
 ]

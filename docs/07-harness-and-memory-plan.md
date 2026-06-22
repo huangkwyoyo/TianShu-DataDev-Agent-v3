@@ -1,140 +1,115 @@
 # Harness 和 Memory 计划 — TianShu DataDev Agent v3
 
-> 文档版本：Phase 0 初稿
+> 文档版本：Phase 0.5 架构契约校正版
 
-## 1. 目标
+## 1. 原则
 
-定义 Harness 评测框架和 Memory 存储机制。Harness 负责离线质量评估，Memory 负责结构化信息存储。两者职责严格分离，不交叉。
+Harness是离线质量工程系统，应从早期记录基线，但不能成为产品运行时依赖。Memory不是越早越好；在积累真实失败样本和人工确认规则前，长期Memory不得参与自动路由或代码生成事实判断。
 
-## 2. Harness 职责
+## 2. Harness分层
 
-Harness 是一个独立于生产系统的评测框架，用于持续评估系统质量。
+### 2.1 Fast deterministic suite
 
-### 2.1 Harness 评测项
+进入普通CI，覆盖：IR Schema、SQL编译黄金用例、Validator、Normalizer、Comparator、状态路由和少量E2E。
 
-| # | 评测项 | 说明 | 评测方式 |
-|---|--------|------|----------|
-| 1 | Prompt 回归 | 各 LLM 角色 Prompt 变更后输出是否稳定 | 对比历史输出记录 |
-| 2 | IR 准确率 | RequirementIR 是否准确反映项目书 | 人工标注 + 自动化检查 |
-| 3 | SQL 编译黄金测试 | SQLPlan → 编译 → 执行 是否符合预期 | 预置黄金测试集 |
-| 4 | Spark 代码质量评测 | 生成的 PySpark 是否符合代码规范 | 静态分析 + 人工评分 |
-| 5 | SQL/Spark 一致率 | 双分支交叉验证通过率 | 多轮运行统计 |
-| 6 | 返工成功率 | 自动修复后通过交叉验证的比例 | 多轮运行统计 |
-| 7 | Token 和延迟统计 | 每轮推理的 Token 消耗和耗时 | 自动统计 |
-| 8 | 模型版本对比 | 不同模型或版本的效果对比 | A/B 测试 |
+### 2.2 Model evaluation suite
 
-### 2.2 Harness 测试数据
+独立运行，覆盖：
 
-- 测试用例保存在 `harness/evals/` 目录
-- 每个用例包含：项目书文本、预期输出、标注信息
-- 用例来源：真实历史项目、人工构造、边缘场景
+- RequirementIR和SubIntent人工标注准确率。
+- Spark语法、静态安全和真实运行成功率。
+- SQL/Spark `CONSISTENT_SAMPLE`比例。
+- 一轮、二轮返工成功率和错误修复率。
+- Human acceptance和`REVIEW_READY`接受率。
+- Unsupported/refusal准确率。
+- Prompt/模型版本、token、延迟和成本。
+- 相关错误率：两个分支结果一致但黄金答案错误的比例。
+- 测试变异检出率：生成测试能否发现故意植入的错误。
 
-### 2.3 Harness 不能成为生产运行时依赖
+### 2.3 Environment suite
 
-- Harness 不随产品部署
-- Harness 不参与生产推理流程
-- Harness 运行不影响生产状态
-- Harness 的数据不用于生产决策
+独立Spark/DuckDB环境运行，验证版本、时区、Decimal、NULL、NaN和执行隔离，不放入每次提交的快速CI。
 
-## 3. 三种 Memory 的严格分离
+## 3. EvalCase契约
 
-### 3.1 Run Memory（会话内存）
+每个评测用例至少包含：
 
-**用途**：记录单次推理运行期间的所有状态和数据。
-
-**内容**：
-- 原始项目书
-- RequirementIR
-- SubIntent 列表
-- SQLPlan
-- 编译后的 SQL
-- PySpark 代码
-- 执行结果
-- 交叉验证结果
-- 差异诊断
-- 修复记录
-- Code Review Package
-
-**生命周期**：单次推理开始创建，推理结束清除。
-
-**存储位置**：`memory/runs/{session_id}/`
-
-### 3.2 Engineering Memory（工程内存）
-
-**用途**：记录开发调试过程中累积的经验和模式。
-
-**内容**：
-- 常见失败模式记录
-- Prompt 调优历史
-- 编译器修复记录
-- 测试失败归因
-
-**生命周期**：长期存储，人工管理。
-
-**存储位置**：`memory/engineering/`
-
-### 3.3 Domain Memory（领域内存）
-
-**用途**：记录业务领域相关的知识。
-
-**内容**：
-- 指标定义
-- 常用的过滤条件
-- 业务规则
-- 表关系补充信息
-
-**生命周期**：长期存储，随 Contract 更新而更新。
-
-**存储位置**：`memory/domain/`
-
-### 3.4 三类 Memory 对比
-
-| 特性 | Run Memory | Engineering Memory | Domain Memory |
-|------|-----------|-------------------|---------------|
-| 自动写入 | 是 | 半自动（人工确认） | 半自动 |
-| 自动清除 | 推理结束即清除 | 否 | 否 |
-| 用于生产推理 | 是（当前会话） | 否 | 否 |
-| 用于 Harness | 可导出 | 可引用 | 可引用 |
-| 大小限制 | 严格限制 | 宽松 | 宽松 |
-
-## 4. Memory 的五条禁止事项
-
-| # | 禁止事项 | 原因 |
-|---|----------|------|
-| 1 | Memory 不得包含 LLM 原始响应 | 原始响应应保存到日志系统，不进入结构化 Memory |
-| 2 | Memory 不得包含 Token 统计 | Token 统计属于运行时监控，由 Harness 收集 |
-| 3 | Memory 不得用于一次性决策 | 每个推理周期的状态在 Run Memory 中独立存储 |
-| 4 | Engineering Memory 不得自动写入生产状态 | Engineering Memory 仅供参考，不直接影响推理 |
-| 5 | Domain Memory 不得替代 Contract 引用 | Domain Memory 仅是补充，表结构等事实以 Contract 为准 |
-
-## 5. Harness 输出格式
-
-```
-harness/reports/
-├── {eval_name}_{YYYYMMDD}_{HHmmss}/
-│   ├── report.json          # 结构化评测结果
-│   ├── report.md            # 可读报表
-│   └── artifacts/           # 附带产物（执行日志、失败案例等）
+```text
+case_id
+project_spec_ref
+fact_catalog_version
+expected_requirement_ir_ref
+expected_sub_intents_ref
+expected_invariants[]
+golden_result_ref
+supported_semantics[]
+expected_outcome
+human_labels
 ```
 
-## 6. 测试边界
+禁止只对比LLM全文快照。评测应比较结构化字段、可执行结果和人工标注。
 
-| 测试类型 | 覆盖内容 |
-|----------|----------|
-| Harness 独立 | Harness 不依赖生产代码运行 |
-| Run Memory 隔离 | 不同 session 互不干扰 |
-| Run Memory 清除 | 推理结束后目录被清除 |
-| Engineering Memory 写入 | 人工确认后才写入 |
-| Domain Memory 引用 | 不引用已删除的 Domain Memory |
+## 4. Run State不是长期Memory
 
-## 7. 风险
+单次运行状态由LangGraph checkpoint和artifact store管理，包含引用和状态，不称为“学习记忆”。运行完成后按保留策略归档或清理。
 
-| 风险 | 缓解 |
-|------|------|
-| Harness 误报 | 人工审核评测结果，允许调整标注 |
-| Memory 膨胀 | Run Memory 限制大小，Engineering/Domain Memory 人工管理 |
-| Harness 与生产耦合 | 严格的代码隔离，不共享运行时模块 |
+Run State不得保存完整DataFrame、生产数据、凭据和无限聊天记录。
+
+## 5. Engineering Memory
+
+只有满足以下条件的经验才能进入Engineering Memory：
+
+1. 来源于可复现失败案例。
+2. 有人工批准记录。
+3. 记录适用范围、反例、来源artifact和失效条件。
+4. 版本化并可撤销。
+
+Phase 6前，Engineering Memory只用于Harness分析，不自动注入运行时Prompt。Phase 7若启用检索，必须记录命中条目、版本和对输出的影响，并允许关闭。
+
+## 6. Domain Knowledge边界
+
+指标、表、字段、Join和业务口径不是可学习Memory，而是只读Fact Catalog：
+
+```text
+TianShu contracts/meta/database design
+→ Fact Catalog Adapter
+→ versioned catalog snapshot
+→ Requirement/Plan validators
+```
+
+禁止建立可半自动写入的`memory/domain`来补充或覆盖事实源。缺失知识必须走TianShu变更流程。
+
+## 7. Prompt与模型版本
+
+每个LLM artifact必须记录role、model_id、provider、prompt_version、schema_version、input artifact hashes、token与延迟。Harness基于这些字段进行可归因对比，不从自由日志猜测版本。
+
+## 8. 数据安全
+
+- Harness用例必须脱敏、版本化并声明来源许可。
+- DifferenceAnalyst只读取必要差异摘要和受限样本。
+- LLM原始响应进入受限日志，不进入Memory或Code Review Package正文。
+- Memory、Harness和日志均不得保存凭据和生产连接信息。
+
+## 9. 阶段安排
+
+| 阶段 | Harness | Memory |
+|------|---------|--------|
+| Phase 1 | SQL黄金用例与基线格式 | 仅Run State引用 |
+| Phase 2 | Spark生成、Validator和运行基线 | 不启用长期Memory |
+| Phase 3 | 双引擎一致率和语义矩阵 | 不启用长期Memory |
+| Phase 4 | 返工成功率、错误修复率 | 仅收集候选经验 |
+| Phase 6 | 扩充模型评测和报告 | 人工批准Engineering Memory |
+| Phase 7 | 模型A/B与稳定性门槛 | 可选、可审计检索 |
+
+## 10. 验收标准
+
+1. Harness不被产品运行时import。
+2. 模型输出评测不依赖全文快照。
+3. 能区分样本一致率、黄金正确率和人工接受率。
+4. Domain Knowledge只有一个TianShu事实源。
+5. Engineering Memory不能未经人工批准自动写入或影响运行时。
+6. 每次检索和Prompt/模型版本均可追溯。
 
 ---
 
-> Phase 0 初稿 | 2026-06-22 | 待后续阶段细化
+> Phase 0.5 校正 | 2026-06-22 | Phase 6/7 实施依据

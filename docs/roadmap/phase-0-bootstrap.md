@@ -1,71 +1,41 @@
-# Phase 0：项目启动与基础就绪记录
+# Phase 0 / 0.5：项目启动与架构契约校正
 
-## 目标
+## Phase 0已完成
 
-记录 TianShu DataDev Agent v3 项目启动阶段的已完成工作，作为后续所有阶段的基线。本阶段不新增功能，而是完成项目骨架搭建、复用审计、契约定义和基础测试，确保后续阶段有坚实可追溯的起点。
+- 创建项目骨架、核心文档、Protocol探索模型和22个基础测试。
+- 完成TianShu、Text2SQL Agent和legacy Data Dev Agent复用审计。
+- 明确新项目不复制旧项目实现，不继承发布和物化体系。
 
-## 输入
+Phase 0产物是探索基线，不是最终运行时契约。`src/tianshu_datadev/ir/protocols.py`中的自由字符串和宽泛Protocol不得直接进入Phase 1实现。
 
-- TianShu-Text2SQL-Agent 遗留项目的代码库和文档
-- 团队对 DataDev Agent v3 的产品需求备忘
-- Python 3.11+ 开发环境
+## Phase 0.5目标
 
-## 输出
+在进入Phase 1前统一以下架构事实：
 
-| 产出 | 说明 |
-|------|------|
-| 10个核心规划文档 | 架构设计、技术选型、数据流、安全策略等顶层文档 |
-| 8个路线图文档（本文件为其中之一） | 各阶段路线图，含目标、输入、输出、风险、验收标准 |
-| `contracts/` 目录 | 所有跨阶段数据结构 Schema 定义（Protocol + dataclass） |
-| 目录骨架 | 按阶段划分的包结构，各模块预留入口 |
-| Protocol 定义 | 核心接口类的抽象协议，供各阶段实现 |
-| 基础测试 22 passed | 协议一致性、目录完整性、导入可用性等测试 |
+1. SQLPlan必须使用类型化表达式AST，禁止LLM间接生成SQL片段。
+2. LLM结构化输出使用严格Pydantic/JSON Schema，而不是仅靠Protocol。
+3. PySpark固定为`transform(inputs, params) -> DataFrame`纯转换函数。
+4. 多表样本使用关系一致快照，不按表独立LIMIT。
+5. 验证采用精确状态，`CONSISTENT_SAMPLE`不等于生产正确。
+6. Graph State只保存artifact引用、哈希、状态和摘要。
+7. Domain Knowledge由TianShu Fact Catalog提供，不建设可写Domain Memory。
+8. Phase 1-7路线按SQL、Spark、验证、返工、前端、Harness、真实LLM依次推进。
 
-## 模块职责
+## 本阶段不做
 
-- **docs/planning/**：承载所有规划文档，供团队评审和追溯
-- **contracts/**：定义所有数据结构的 Protocol 和 dataclass，是跨阶段的唯一契约源
-- **tests/**：基础测试套件，验证项目骨架的正确性和契约的一致性
+- 不修改Python IR实现。
+- 不实现SQL编译、Spark生成、执行器或LangGraph。
+- 不接真实LLM、数据库或前端。
+- 不新增针对文档措辞的pytest。
 
-## 明确不做什么
+## 验收
 
-- 不实现任何业务逻辑（SQL 编译、Spark 生成、执行引擎等）
-- 不接入任何真实 LLM
-- 不涉及前端 UI 或 API 服务
-- 不处理数据源的连接或查询
+- 核心规划和Phase 1-7路线无相互冲突。
+- AGENTS和README与目标架构一致。
+- 现有22个测试保持通过。
+- ruff现有问题被明确记录并留给独立A类小修。
+- Phase 1能依据文档制定独立实现计划。
 
-## 契约
+---
 
-- 所有 Protocol 定义在 `contracts/` 中，各阶段通过 `Protocol` 或 `abc` 实现
-- 所有 dataclass 使用 `@dataclass(frozen=True)` 确保不可变
-- 基础测试套件在 CI 中必须全部通过
-
-## 风险
-
-| 风险 | 缓解措施 |
-|------|----------|
-| 契约设计不合理导致后续阶段返工 | 小型 POC 验证核心 Protocol 可行性 |
-| 复用审计遗漏关键遗留代码 | 交叉验证，多人参与审计 |
-| 目录骨架与后续阶段实际需求不匹配 | 保持轻量，阶段中可快速调整 |
-
-## 验收标准
-
-1. [x] `contracts/` 目录包含所有核心数据结构的 Protocol 定义
-2. [x] 目录骨架按阶段划分，各阶段有入口模块（`__init__.py`）
-3. [x] 22 个基础测试全部通过
-4. [x] 10 个核心规划文档完成并放于 `docs/planning/`
-5. [x] 8 个路线图文档完成并放于 `docs/roadmap/`
-6. [x] 分支 `feature/data-dev-agent-v3-bootstrap` 已合并
-
-## 测试边界
-
-- **测试范围**：仅覆盖协议一致性、目录完整性、导入可用性
-- **不测试**：任何业务逻辑、编译、执行、LLM 调用
-- **隔离要求**：不依赖任何外部服务或数据源
-
-## 与其他阶段的依赖
-
-- **作为所有阶段的前置依赖**：Phase 1-7 均依赖本阶段定义的契约和目录结构
-- **无后向依赖**：本阶段不依赖任何其他阶段
-
-> Phase 0 初稿 | 2026-06-22 | 待后续阶段细化
+> Phase 0完成；Phase 0.5文档校正 | 2026-06-22

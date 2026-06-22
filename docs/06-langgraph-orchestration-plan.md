@@ -1,163 +1,148 @@
 # LangGraph 编排计划 — TianShu DataDev Agent v3
 
-> 文档版本：Phase 0 初稿
+> 文档版本：Phase 0.5 架构契约校正版
 
-## 1. 目标
+## 1. 定位
 
-定义 LangGraph 在系统中的精确使用边界，明确其职责和禁止事项，确保编排层不越界执行业务逻辑。
+LangGraph只提供有状态编排、并行分支、条件路由、checkpoint、重试预算和人工中断。所有领域逻辑、编译、安全、执行和比较均由可独立调用的普通Python服务完成。
 
-## 2. LangGraph 的 12 项职责
+Phase 1-3先实现并验证普通Python节点；Phase 4才接入LangGraph图。不得为了框架提前改变领域接口。
 
-| # | 职责 | 说明 |
-|---|------|------|
-| 1 | 节点编排 | 定义节点执行顺序和依赖关系 |
-| 2 | 状态传递 | Graph State 在不同节点间传递 |
-| 3 | SQL/Spark 并行分支 | 同时调度 SQL 和 PySpark 执行 |
-| 4 | 条件路由 | 根据 PASS/FAIL 结果路由到不同路径 |
-| 5 | Checkpoint | 周期性保存状态，支持恢复 |
-| 6 | retry_count 追踪 | 记录当前重试次数 |
-| 7 | 最大返工次数控制 | retry_count >= max_retries 时终止返工 |
-| 8 | 人工中断信号 | 侦听外部中断信号 |
-| 9 | 执行轨迹记录 | 记录每个节点的输入输出 |
-| 10 | 超时控制 | 每个节点有独立超时限制 |
-| 11 | 失败处理 | 节点异常时的 Fallback 策略 |
-| 12 | 日志和可观测性 | 状态变更日志输出 |
+## 2. 图结构
 
-## 3. LangGraph 的 8 项禁止
+```text
+validate_project_spec
+→ analyze_requirement
+→ validate_requirement
+→ requirement_confirmation_gate
+→ decompose_sub_intents
+→ build_transformation_contracts
+→ build_relational_snapshot
+→ fan_out_sub_intents
+    ├─ plan_sql → compile_sql → validate_sql → execute_duckdb
+    └─ develop_spark → validate_spark → review_spark
+         → revise_spark → validate_spark → generate_tests
+         → validate_tests → run_tests → execute_spark
+→ normalize_results
+→ compare_results
+    ├─ CONSISTENT_SAMPLE → build_review_package
+    ├─ DIFFERENT → classify_difference → analyze_difference
+    │    → plan_repair → route_repair → retry / HUMAN_REVIEW
+    └─ NOT_EXECUTED / UNSUPPORTED → HUMAN_REVIEW
+```
 
-| # | 禁止事项 | 原因 |
-|---|----------|------|
-| 1 | 不得拼接 SQL 字符串 | 拼接 SQL 属于编译器职责，不应在编排层处理 |
-| 2 | 不得进行 SQL 安全判定 | 安全由 SQLPlan 契约保证，不需运行时判定 |
-| 3 | 不得进行 Spark 安全判定 | 安全由 Static Validator 负责 |
-| 4 | 不得判断表和字段真实性 | 真实性由 Contract 引用保证 |
-| 5 | 不得定义指标计算逻辑 | 指标计算是业务逻辑，不在编排层 |
-| 6 | 不得判定结果一致性最终结论 | 最终结论由 Comparator 决定 |
-| 7 | 不得自动批准代码 | 代码批准是人工审查环节 |
-| 8 | 不得触发自动上线 | 自动上线不在本系统范围 |
-
-## 4. Graph State 字段定义
+## 3. Artifact优先State
 
 ```python
-from typing import TypedDict, Any, Optional
-from pandas import DataFrame
-
 class GraphState(TypedDict):
-    """LangGraph 全局状态"""
-    # --- 输入 ---
-    project_doc: str                       # 原始项目书文本
-    session_id: str                        # 会话唯一标识
-
-    # --- 需求阶段 ---
-    requirement_ir: Optional[dict]         # 结构化需求（RequirementIR）
-    sub_intents: Optional[list[dict]]      # SubIntent 列表
-
-    # --- SQL 分支 ---
-    sql_plan: Optional[dict]               # SQLPlan
-    sql_code: Optional[str]                # 编译后的 SQL 字符串
-    sql_result: Optional[Any]              # DuckDB 执行结果（DataFrame）
-    sql_execution_success: Optional[bool]  # SQL 执行是否成功
-
-    # --- PySpark 分支 ---
-    spark_code: Optional[str]              # PySpark 代码
-    spark_review: Optional[list[dict]]     # Reviewer 审查意见
-    spark_test_code: Optional[str]         # 测试代码
-    spark_result: Optional[Any]            # PySpark 执行结果（DataFrame）
-    spark_execution_success: Optional[bool]  # Spark 执行是否成功
-
-    # --- 交叉验证 ---
-    comparison_result: Optional[dict]      # 9 个维度比较结果
-    comparison_pass: Optional[bool]        # 是否通过比较
-
-    # --- 差异诊断 ---
-    diagnosis: Optional[str]               # LLM 差异诊断文本
-
-    # --- 修复 ---
-    repair_directive: Optional[dict]       # RepairDirective
-    retry_count: int                       # 当前返工次数（从 0 开始）
-    max_retries: int                       # 最大返工次数（固定值 2）
-
-    # --- 输出 ---
-    final_report: Optional[dict]           # Code Review Package 索引
-    final_status: Optional[str]            # PASS / FAIL / HUMAN_REVIEW
+    request_id: str
+    run_id: str
+    project_spec_ref: str
+    requirement_ir_ref: str | None
+    requirement_confirmed: bool
+    sub_intent_refs: list[str]
+    transformation_contract_refs: list[str]
+    merge_plan_ref: str | None
+    snapshot_manifest_ref: str | None
+    sql_plan_refs: list[str]
+    sql_artifact_refs: list[str]
+    spark_artifact_refs: list[str]
+    test_artifact_refs: list[str]
+    execution_trace_refs: list[str]
+    result_summary_refs: list[str]
+    comparison_report_ref: str | None
+    diagnosis_ref: str | None
+    repair_directive_ref: str | None
+    repair_history_refs: list[str]
+    retry_count: int
+    max_retries: int
+    assurance_level: str
+    final_status: str
+    human_review_reasons: list[str]
 ```
 
-## 5. 节点定义与执行顺序
+State禁止包含：
 
-```
-input_validation → requirement_analysis → sub_intent_splitting
-    │
-    ├── sql_branch ───────────────────────┐
-    │   sql_plan_generation               │
-    │   → sql_compilation                 │
-    │   → sql_execution                   │
-    │                                     │
-    ├── spark_branch ─────────────────────┤
-    │   spark_development                 │
-    │   → spark_review                    │
-    │   → spark_test_generation           │
-    │   → spark_execution                 │
-    │                                     │
-    ├── snapshot_build ───────────────────┤
-    │   (在 sql 和 spark 执行前完成)      │
-    │                                     │
-    └── cross_validation ─────────────────┤
-        → comparison                      │
-        → (PASS) → report_packaging       │
-        → (FAIL) → difference_analysis    │
-        → repair_planning                 │
-        → (retry) → sql_branch + spark_branch  │
-        → (max retries) → human_review_marker  │
-```
+- pandas或Spark DataFrame。
+- 完整结果集、完整代码和完整项目书正文。
+- LLM原始响应或无限消息历史。
+- 生产数据、凭据和任意不可序列化对象。
 
-## 6. 所有业务节点是可脱离 LangGraph 单独测试的普通 Python 函数
+## 4. 节点接口
 
-每个节点的实现都遵循统一签名：
+业务服务不接收整个GraphState，只接收所需的明确输入：
 
 ```python
-# 所有节点函数的签名
-def node_function(state: GraphState) -> dict:
-    """
-    业务节点函数。
-    输入：当前 GraphState
-    输出：要更新的字段字典
-    """
-    # 这里是纯业务逻辑，不依赖 LangGraph
+def compile_sql(plan: SQLPlan, catalog: FactCatalog) -> SQLArtifact:
     ...
-    return {"field_name": new_value}
+
+def execute_spark(
+    code: SparkCodeArtifact,
+    snapshot: RelationalSnapshotManifest,
+    environment: EnvironmentManifest,
+) -> ExecutionTrace:
+    ...
 ```
 
-这意味着：
-- 每个节点可以在单元测试中独立测试
-- 不需要启动 LangGraph 即可测试业务逻辑
-- 节点可以轻松替换或重新排序
+LangGraph adapter负责从State解析引用、调用服务、持久化输出并返回最小State更新。这样业务模块可脱离LangGraph测试和复用。
 
-## 7. 检查点与恢复
+## 5. 路由事实源
 
-- LangGraph checkpoint 每执行一个节点后保存
-- 支持从上次 checkpoint 恢复执行
-- checkpoint 存储在本地文件系统（`./checkpoints/{session_id}/`）
+条件边只能读取确定性字段：
 
-## 8. 测试边界
+- Schema validation status。
+- Validator status。
+- Executor status。
+- Comparator verdict。
+- retry_count。
+- requirement_confirmed。
+- RepairDirective target。
 
-| 测试类型 | 覆盖内容 |
-|----------|----------|
-| 正常流水线 | 项目书 → Code Review Package 完整路径 |
-| 条件路由 | PASS → Package, FAIL → Repair |
-| 返工限制 | retry_count 达到 max_retries 后进入 HUMAN_REVIEW |
-| 人工中断 | 中断信号 → 当前节点完成后暂停 |
-| 节点独立测试 | 每个节点函数单独调用验证 |
-| 状态传递 | 验证 state 更新是否正确 |
-| 异常恢复 | 节点抛出异常 → Graph 捕获并处理 |
+禁止根据LLM自然语言、置信度或Reviewer评分直接决定执行、通过或上线。
 
-## 9. 风险
+## 6. 并发与SubIntent
 
-| 风险 | 缓解 |
-|------|------|
-| LangGraph 版本升级导致不兼容 | Lock 依赖版本，抽象接口层 |
-| Checkpoint 数据膨胀 | 限制 checkpoint 保留数量，设置大小上限 |
-| 状态字段污染 | 每个节点只返回需要更新的字段 |
+- SubIntent可并发处理，但每个SubIntent使用独立artifact命名空间。
+- Snapshot必须在分支执行前完成并冻结。
+- fan-in前验证所有必需SubIntent均产生结果。
+- MergePlan在合并前确定性校验粒度、键和基数。
+- 任一必需SubIntent失败时，不得把部分结果包装成完整成功。
+
+## 7. Checkpoint与恢复
+
+- checkpoint保存State和artifact索引，不复制artifact正文。
+- 每次LLM调用、编译、执行和比较前后记录幂等operation_id。
+- 恢复时先校验artifact哈希和EnvironmentManifest，失效则从最近安全节点重跑。
+- Executor、LLM调用和Storage写入必须设计为可重试或显式不可重试。
+- checkpoint设大小、数量和保留期限上限。
+
+## 8. 人工中断
+
+以下节点可触发interrupt：
+
+- RequirementIR确认。
+- 事实源或Join不完整。
+- 不支持语义。
+- 两轮返工仍不一致。
+- 测试代码或Spark代码被安全Validator拒绝。
+- Spark运行环境不可用。
+
+恢复后产生新的人工决策artifact，禁止直接修改历史State掩盖原结论。
+
+## 9. 可观测性
+
+每个节点记录：node_id、operation_id、输入artifact哈希、输出artifact哈希、开始/结束时间、模型和Prompt版本、token/延迟、状态与错误分类。日志不能替代ExecutionTrace或Harness评测数据。
+
+## 10. Phase 4验收标准
+
+1. 普通Python服务在不安装LangGraph时仍可独立测试。
+2. State序列化后不包含DataFrame、代码正文和结果集。
+3. SQL/Spark分支并行且使用同一snapshot manifest。
+4. 条件路由只依赖结构化确定性状态。
+5. retry_count最多2，UNKNOWN直接进入`HUMAN_REVIEW`。
+6. checkpoint恢复不重复提交已完成的副作用。
+7. 人工中断与恢复保留完整审计链。
 
 ---
 
-> Phase 0 初稿 | 2026-06-22 | 待后续阶段细化
+> Phase 0.5 校正 | 2026-06-22 | Phase 4 实施依据

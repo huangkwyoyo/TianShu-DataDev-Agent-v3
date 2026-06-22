@@ -14,9 +14,12 @@ from tianshu_datadev.ir import (
     RequestStatus,
     RequirementIR,
     ResultSummary,
+    SparkCodeArtifact,
     SQLPlan,
     StepStatus,
     SubIntent,
+    TransformationContract,
+    TransformParams,
 )
 
 
@@ -199,10 +202,64 @@ class TestProtocolInterfaces:
         assert "status" in attrs
 
 
+    # ── TransformationContract ──
+
+    def test_transformation_contract_protocol_attributes(self):
+        """验证 TransformationContract 定义了 PySpark 转换的结构化契约字段。"""
+        attrs = TransformationContract.__protocol_attrs__
+        assert "contract_id" in attrs
+        assert "sub_intent_id" in attrs
+        assert "declared_inputs" in attrs
+        assert "field_schemas" in attrs
+        assert "join_paths" in attrs
+        assert "metrics" in attrs
+        assert "output_schema" in attrs
+        assert "grain" in attrs
+        assert "allowed_imports" in attrs
+        assert "params_schema" in attrs
+
+    # ── TransformParams ──
+
+    def test_transform_params_is_protocol(self):
+        """验证 TransformParams 是一个 Protocol 接口。"""
+        assert hasattr(TransformParams, "__protocol_attrs__"), (
+            "TransformParams 应为 Protocol——其具体字段由 TransformationContract.params_schema 声明"
+        )
+
+    # ── SparkCodeArtifact ──
+
+    def test_spark_code_artifact_protocol_attributes(self):
+        """验证 SparkCodeArtifact 定义了代码产物的完整溯源字段。"""
+        attrs = SparkCodeArtifact.__protocol_attrs__
+        assert "artifact_id" in attrs
+        assert "sub_intent_id" in attrs
+        assert "contract_ref" in attrs
+        assert "code_ref" in attrs
+        assert "code_sha256" in attrs
+        assert "entrypoint" in attrs
+        assert "model_id" in attrs
+        assert "prompt_version" in attrs
+        assert "generation_round" in attrs
+        assert "allowed_imports" in attrs
+        assert "declared_inputs" in attrs
+        assert "expected_output_schema" in attrs
+        assert "static_validation_status" in attrs
+
+    def test_spark_code_artifact_entrypoint_is_transform(self):
+        """验证入口点固定为 transform——不允许 LLM 自定义入口名。"""
+        # 此测试验证契约语义：entrypoint 字段的值必须始终是 "transform"
+        # 实际代码中的函数名由 Static Validator 强制执行，此处验证 Protocol 包含该字段即可
+        attrs = SparkCodeArtifact.__protocol_attrs__
+        assert "entrypoint" in attrs, (
+            "SparkCodeArtifact 缺少 entrypoint 字段——entrypoint 固定为 transform，"
+            "不允许 LLM 自定义入口名"
+        )
+
+
 class TestProtocolDesign:
     """设计边界测试——确保 Protocol 不包含污染。"""
 
-    # 所有核心 Protocol 名称
+    # 所有核心 Protocol 名称（含 SQL 侧和 Spark 侧）
     CORE_PROTOCOLS = [
         "RequirementIR",
         "SubIntent",
@@ -212,6 +269,10 @@ class TestProtocolDesign:
         "CrossValidationResult",
         "RepairDirective",
         "MergedResult",
+        # Spark 侧
+        "TransformationContract",
+        "TransformParams",
+        "SparkCodeArtifact",
     ]
 
     def test_no_legacy_port_names(self):

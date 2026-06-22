@@ -1,146 +1,110 @@
 # 测试策略 — TianShu DataDev Agent v3
 
-> 文档版本：Phase 0 初稿
+> 文档版本：Phase 0.5 架构契约校正版
 
 ## 1. 目标
 
-定义分阶段测试策略，控制测试用例数量增长，避免重蹈 legacy 项目测试膨胀的覆辙。
+测试用于保护高风险契约和关键行为，不追求数量。pytest覆盖确定性逻辑和少量隔离集成；Prompt、模型、规模和性能评测进入Harness。
 
-## 2. 分阶段测试上限
+## 2. 当前基线
 
-| Phase | 测试用例上限 | 说明 |
-|-------|-------------|------|
-| Phase 0 | ≤ 10 | 核心模块单元测试 + 1 条端到端黄金路径 |
-| Phase 1 | ≤ 30 | 新增 SQL 分支和 Spark 分支测试 |
-| Phase 2 | ≤ 50 | 新增交叉验证和返工测试 |
-| Phase 3 | ≤ 80 | 新增 Harness 和 Memory 测试 |
-| v1.0 | 80-150 | 最终稳定版本 |
+Phase 0实际已有22个pytest用例，超过原定`≤10`预算。进入Phase 1前不继续为Protocol属性和枚举组合增加测试；在具体Pydantic模型落地后，合并或删除低价值反射测试。
 
-### 2.1 上限管理原则
+测试预算是评审阈值，不是为了达标而漏测安全边界。超过预算必须说明新增用例保护了哪项独立风险。
 
-- 每个阶段结束时评估测试用例数量
-- 超过上限需要评审：确认用例是否有必要，是否能合并
-- 低价值用例（测试 trivial 逻辑、重复覆盖）应删除而非保留
+## 3. 分阶段预算
 
-## 3. 测试范围
-
-### 3.1 使用 pytest 测试的领域
-
-| 领域 | 说明 | 用例占比 |
-|------|------|----------|
-| 确定性业务逻辑 | 编译器、Comparator、Validator、Snapshot Builder | 40% |
-| 契约 | 各 IR 类的字段约束、类型校验、序列化/反序列化 | 15% |
-| 安全边界 | Static Validator 规则、非法输入处理 | 15% |
-| 关键状态转换 | Graph State 更新、条件路由、返工计数 | 10% |
-| 端到端黄金路径 | 少量完整流水线测试 | 10% |
-| 其他 | 工具函数、异常处理 | 10% |
-
-### 3.2 不在 pytest 中测试的领域
-
-| 领域 | 测试方式 | 原因 |
+| 阶段 | 累计目标 | 重点 |
 |------|----------|------|
-| Prompt 质量 | Harness / evals | 大规模用例，不适合 CI 中的 pytest |
-| LLM 输出稳定性 | Harness / evals | 需要统计分析，不适合确定性断言 |
-| 性能 | 独立性能测试 | 需要专门工具和环境 |
-| 大规模数据 | 独立测试 | 不适用于单元测试 |
+| Phase 0.5 | 维持22，不新增文档措辞测试 | 契约校正，不改实现 |
+| Phase 1 | 30-40 | 类型化IR、事实解析、SQL编译和DuckDB黄金路径 |
+| Phase 2 | 50-65 | Spark纯函数契约、AST安全、测试代码隔离和真实Spark运行 |
+| Phase 3 | 70-90 | 关系快照、语义规范化、Comparator和MergePlan |
+| Phase 4 | 80-105 | LangGraph路由、checkpoint、两轮返工和人工中断 |
+| v1.0 | 100-150 | 前端/API边界和少量全链路黄金用例 |
 
-## 4. 大规模 Prompt 用例存放位置
+## 4. pytest覆盖范围
 
+- Pydantic/JSON Schema拒绝非法和额外字段。
+- SQLPlan无自由SQL逃生口。
+- SQL编译确定性和事实源拒绝。
+- Spark AST安全、入口契约和隔离Executor。
+- 测试代码安全校验。
+- 关系一致快照和哈希。
+- NULL、NaN、Decimal、时间、重复行和Join基数规范化。
+- Comparator精确状态与MergePlan。
+- LangGraph确定性路由、重试预算和恢复。
+- 3至8条高价值端到端黄金项目书。
+
+## 5. 不进入普通pytest的内容
+
+- LLM全文输出稳定性。
+- Prompt和模型版本排名。
+- 大规模项目书组合。
+- Spark全量性能和资源压测。
+- 人工代码质量评分。
+- 生产数据和生产连接测试。
+
+这些进入Harness或独立环境测试。
+
+## 6. 测试设计规则
+
+1. 一个测试保护一个独立风险，不为每个Enum值机械复制。
+2. 优先使用表驱动测试合并同类非法输入。
+3. 不测试Python标准库、dataclass/Enum自身行为和私有实现细节。
+4. 不对文档句子、完整LLM文本和大段生成代码做脆弱快照。
+5. 安全测试覆盖攻击类别和绕过路径，而不是只测关键词。
+6. 真实DuckDB/Spark集成测试使用小型版本化快照，不mock核心执行语义。
+7. LLM Gateway在单元测试中使用确定性Fake Adapter；真实模型放Harness。
+8. 每个E2E用例必须同时声明业务价值和它替代的低层重复测试。
+
+## 7. 各阶段测试重点
+
+### Phase 1
+
+- RequirementIR、SubIntent、SQLPlan严格Schema。
+- `where_sql`、`join_on`和自由表达式字段被拒绝。
+- 单表及一个白名单Join黄金编译与执行。
+- 未注册指标、列和Join拒绝。
+- MergePlan不兼容粒度进入人工审查。
+
+### Phase 2
+
+- `transform(inputs, params)`唯一入口。
+- 禁止`spark.table`、read、Action、Sink、UDF、网络、文件和动态执行。
+- Reviewer只输出Finding/Directive。
+- Developer修订后重新验证。
+- Tester代码也被拦截和隔离执行。
+- 真实本地Spark运行一条黄金路径。
+
+### Phase 3
+
+- 多表锚点键级联抽样。
+- Snapshot hash和EnvironmentManifest。
+- 类型、NULL、NaN、Decimal、时间、multiset和容差。
+- `NOT_EXECUTED`不能升级为一致。
+- `CONSISTENT_SAMPLE`不等于`REVIEW_READY`。
+
+### Phase 4
+
+- 条件边只读取确定性状态。
+- SQL修复只回到SQLPlan。
+- Spark修复回到Developer。
+- 0、1、2轮返工和超限人工审查。
+- checkpoint恢复不重复副作用。
+
+## 8. 质量门
+
+每个阶段至少运行：
+
+```powershell
+python -m pytest tests -q
+python -m ruff check .
+git diff --check
 ```
-harness/evals/
-├── prompt_regression/          # Prompt 回归测试用例
-├── ir_accuracy/                # IR 准确率评测用例
-├── sql_golden/                 # SQL 编译黄金测试用例
-├── spark_quality/              # Spark 代码质量评测用例
-├── cross_validation/           # 交叉验证一致率评测用例
-└── repair_success_rate/        # 返工成功率评测用例
-```
 
-每个 evals 目录下的用例是结构化 JSON/YAML 文件，不是 pytest 用例。
-
-## 5. 禁止事项
-
-| # | 禁止事项 | 原因 |
-|---|----------|------|
-| 1 | 禁止测试 LLM 调用的返回内容 | LLM 输出不确定，无法通过确定性断言验证 |
-| 2 | 禁止使用 LLM 作为测试 Orcale | 测试必须确定性，LLM 输出不能作为判断依据 |
-| 3 | 禁止测试外部依赖的不可控行为 | TianShu 表结构变更等外部因素不纳入 pytest |
-| 4 | 禁止为覆盖率工具写测试 | 覆盖率是参考指标，不追目标值 |
-| 5 | 禁止测试私有方法 | 只测试公有接口 |
-
-## 6. 与 Legacy 项目测试膨胀的对比
-
-| 指标 | Legacy (v2) | v3 目标 |
-|------|------------|---------|
-| 测试用例总数 | 200+ | 80-150 (v1.0) |
-| 端到端测试 | 30+ | 10-15 |
-| LLM 相关测试 | 40+ | 0（全部移入 Harness） |
-| 安全检查测试 | 50+ | 15-20（更精简） |
-| CI 运行时间 | 30+ 分钟 | ≤ 15 分钟 |
-
-## 7. 测试用例结构
-
-```python
-# 测试文件命名：test_{module_name}.py
-
-# 每个测试函数结构：
-def test_{scenario}():
-    """简短的中文描述测试场景"""
-    # Arrange：准备输入
-    # Act：执行被测函数
-    # Assert：验证输出
-
-    # 不使用 mock 覆盖 LLM 调用
-    # 不使用 mock 覆盖外部数据源（使用测试用 Contract）
-```
-
-## 8. 测试数据管理
-
-- 测试用的 Contract 文件存放在 `tests/fixtures/contracts/`
-- 测试用的 Parquet 文件存放在 `tests/fixtures/snapshots/`
-- 测试数据应该是静态的、版本化的
-
-## 9. 各阶段测试重点
-
-### Phase 0（≤10）
-
-| 模块 | 用例数 | 内容 |
-|------|--------|------|
-| SQLPlan 字段契约 | 2 | 合法/非法输入 |
-| SQL 编译器 | 3 | 基本 SELECT、JOIN、GROUP BY |
-| Graph State | 2 | 状态创建、更新 |
-| 端到端 | 1 | 完整流水线（使用小样本） |
-| 其他 | 2 | 工具函数 |
-
-### Phase 1（新增 ≤20）
-
-| 模块 | 新增用例 | 内容 |
-|------|----------|------|
-| SQLPlan 生成 | 3 | 各种 SubIntent 到 SQLPlan 的映射 |
-| SQL 编译器扩展 | 5 | HAVING、子查询、复杂 JOIN |
-| PySpark Static Validator | 5 | 安全规则全覆盖 |
-| SparkDeveloper | 2 | SubIntent 到 PySpark 的基本映射 |
-| 更多端到端 | 5 | SQL 分支和 Spark 分支独立端到端 |
-
-### Phase 2（新增 ≤20）
-
-| 模块 | 新增用例 | 内容 |
-|------|----------|------|
-| Comparator | 8 | 9 维度全覆盖 |
-| RepairDirective | 4 | 5 个目标的映射逻辑 |
-| 返工流程 | 5 | 0/1/2/3 轮逻辑 |
-| 条件路由 | 3 | PASS/FAIL/HUMAN_REVIEW |
-
-### Phase 3（新增 ≤30）
-
-| 模块 | 新增用例 | 内容 |
-|------|----------|------|
-| Code Review Package | 5 | 打包内容完整性 |
-| Harness 接口 | 5 | 各评测项接口测试 |
-| Memory 管理 | 5 | 读写清除逻辑 |
-| 更多端到端 | 10 | 覆盖更多场景 |
-| 安全边界 | 5 | 新增的边界 case |
+阶段报告同时记录Harness基线是否变化，但Harness失败不得被pytest数量掩盖。
 
 ---
 
-> Phase 0 初稿 | 2026-06-22 | 待后续阶段细化
+> Phase 0.5 校正 | 2026-06-22 | 全阶段测试事实源

@@ -1,117 +1,120 @@
 # 产品宪章 — TianShu DataDev Agent v3
 
-> 文档版本：Phase 0 初稿
+> 文档版本：Phase 0.5 架构契约校正版
 
-## 1. 目标
+## 1. 产品目标
 
-构建一个 **AI 辅助数据开发工具**，核心目标是生成达到 **"开发审查级"** 的 PySpark DataFrame DSL 代码。
+TianShu DataDev Agent v3 是 **AI 辅助数据开发工具**。它接收数据开发项目书，生成达到“开发审查级”的 SQL、PySpark DataFrame DSL、测试与验证材料，最终交付 Code Review Package。
 
-"开发审查级"意味着：生成的代码质量足以提交给程序员进行 code review 和上线决策——包含：
-- 结构清晰、遵循最佳实践的 PySpark 代码
-- 通过 SQL/Spark 双引擎交叉验证确保逻辑正确
-- 附带 Python 测试代码
-- 附带完整的执行追踪和验证报告
-- 附带供审查者阅读的 Code Review Package
+最终产物是代码，不是生产数据。系统不自动部署、不写生产库，也不替代程序员审批。
 
-**SQL 是验证手段，不是最终交付物**。DuckDB SQL 用于生成参考结果，与 PySpark 输出交叉验证——确保 PySpark 代码逻辑正确。最终交付的是 PySpark 代码 + 测试 + 审查材料。
+## 2. “开发审查级”的精确定义
 
-**最终产物是可交付的 Code Review Package**，而非直接上线执行。
+只有同时满足以下条件，产物才能标记为 `REVIEW_READY`：
 
-## 2. 核心流水线
+1. 项目书已转换为结构化 RequirementIR，并经事实源校验。
+2. SQL 由类型化 SQLPlan 经 Python 确定性编译生成。
+3. PySpark 代码满足受控纯转换函数契约。
+4. SQL 与 Spark 均在同一个冻结快照上真实执行。
+5. 确定性 Comparator 给出 `CONSISTENT_SAMPLE`。
+6. 所有 WARN、不支持语义和人工确认项已写入审查材料。
 
-项目书 → 需求分析 → SubIntent 拆分 → SQL / Spark 双分支 → 同源样本执行 → 确定性交叉验证 → LLM 差异诊断 → 返工 → Code Review Package → 人工审查
+`REVIEW_READY` 只表示可以进入代码审查，不表示业务绝对正确、全量性能合格或生产就绪。
 
-| 阶段 | 说明 |
-|------|------|
-| 项目书 | 用户以自然语言描述分析目标 |
-| 需求分析 | 将项目书解析为结构化 RequirementIR |
-| SubIntent 拆分 | 将需求分解为原子可执行的 SubIntent |
-| SQL / Spark 双分支 | 两条独立路径并行生成 SQL 和 PySpark 代码 |
-| 同源样本执行 | 基于同一份 Parquet 快照分别执行 |
-| 确定性交叉验证 | 比较两路执行结果，判定一致性 |
-| LLM 差异诊断 | LLM 仅解释差异原因，不判定 PASS/FAIL |
-| 返工 | 根据诊断结果自动修改 SQLPlan 或 Spark 代码 |
-| Code Review Package | 打包代码、执行结果、验证报告供人工审查 |
-| 人工审查 | 工程师确认后可选上线 |
+## 3. AssuranceLevel
 
-## 3. 核心约束
+| 等级 | 含义 | 不代表什么 |
+|------|------|------------|
+| `DRAFT` | 代码已生成，尚未验证 | 不代表可运行 |
+| `STATIC_VALIDATED` | 静态契约和安全检查通过 | 不代表运行成功 |
+| `RUNTIME_PASS` | 对应引擎在冻结样本上运行成功 | 不代表双引擎一致 |
+| `CONSISTENT_SAMPLE` | SQL/Spark 在样本和已比较维度上一致 | 不代表业务正确或全量一致 |
+| `REVIEW_READY` | 材料完整，可以进入人工代码审查 | 不代表获准上线 |
+| `HUMAN_REVIEW` | 自动化无法继续或存在不确定项 | 不代表失败代码可接受 |
 
-1. **LLM 不直接生成 SQL 字符串** — SQL 必须由 Python 确定性编译器从 SQLPlan 生成
-2. **LLM 不能决定 PASS** — 交叉验证 PASS 只能由确定性 Comparator 给出
-3. **SQL 必须由 Python 编译器确定性生成** — 同一 SQLPlan 始终生成同一 SQL
-4. **所有代码必须经过人工审查** 才能进入生产
-5. **表名、字段名、Join 关系必须来自 TianShu 事实源**，不允许 LLM 猜测
-6. **同源数据快照** — SQL 和 PySpark 使用同一份 Parquet 数据
+禁止使用一个通用 `PASS` 覆盖以上不同含义。
 
-## 4. 模块职责
+## 4. 核心流水线
+
+```text
+项目书
+→ Requirement Analyzer
+→ RequirementIR 人工确认点
+→ SubIntent 拆分
+→ TransformationContract
+→ 关系一致快照
+→ SQL / Spark 双分支
+→ 真实双引擎样本执行
+→ 确定性交叉验证
+→ LLM 差异诊断与有限返工
+→ Code Review Package
+→ 人工审查
+```
+
+## 5. 双分支独立性
+
+- SQL 分支读取 `SubIntent + TransformationContract + TianShu事实源`，LLM只生成类型化SQLPlan。
+- Spark 分支读取相同业务契约，但不得查看SQL文本或SQLPlan实现细节。
+- 两个分支共享业务目标和输入Schema，不共享彼此代码。
+- 两个分支结果一致只能证明样本实现一致，不能排除共同误解需求。
+
+因此，RequirementIR必须在高成本生成和执行之前设置人工确认点；Harness还必须维护人工标注的黄金需求和结果不变量。
+
+## 6. 模块职责
 
 | 模块 | 职责 |
 |------|------|
-| 需求分析器 | 解析项目书 → RequirementIR |
-| SubIntent 拆分器 | 拆分需求 → SubIntent 列表 |
-| SQLPlan 生成器 (LLM) | SubIntent → SQLPlan |
-| Python SQL 编译器 | SQLPlan → DuckDB SQL |
-| Spark Developer (LLM) | SubIntent → PySpark DSL |
-| Spark Reviewer (LLM) | 审查 PySpark 代码 |
-| Spark Tester (LLM) | 生成测试规格和测试代码 |
-| Snapshot Builder | 构建同源 Parquet 快照 |
-| SQL Executor | 在 DuckDB 上执行 SQL |
-| Spark Executor | 在 PySpark 上执行代码 |
-| Comparator | 确定性比较两路执行结果 |
-| Difference Analyst (LLM) | 解释差异原因（不判定 PASS） |
-| Repair Planner (LLM) | 根据诊断生成修复计划 |
-| Report Packager | 打包 Code Review Package |
-| LangGraph 编排层 | 编排上述所有模块 |
+| Requirement Analyzer | 项目书转为结构化RequirementIR |
+| Fact Validator | 校验指标、表、字段、Join和语义来源 |
+| SubIntent Decomposer | 按planning_table和可合并粒度拆分需求 |
+| TransformationContract Builder | 固定输入、输出Schema、粒度、指标和语义 |
+| SQL Planner | 只输出类型化SQLPlan |
+| SQL Compiler | 确定性编译DuckDB SQL |
+| SparkDeveloper | 生成受控PySpark纯转换函数 |
+| SparkReviewer | 输出ReviewFinding与OptimizationDirective |
+| SparkTester | 输出TestPlan和不可信测试代码 |
+| Snapshot Builder | 构建关系一致、不可变的Parquet快照 |
+| Executors | 在隔离环境真实执行SQL和Spark |
+| Normalizer / Comparator | 规范化并确定性判断结果一致性 |
+| DifferenceAnalyst | 解释差异，不决定验证结论 |
+| RepairPlanner | 输出结构化RepairDirective |
+| LangGraph | 编排节点、分支、重试、checkpoint和人工中断 |
+| Packager | 生成Code Review Package |
 
-## 5. 明确不做什么
+## 7. 明确不做什么
 
-- 不自动上线代码
-- 不直接写入生产数据库
-- 不生成生产级数据
-- 不替代人工代码审查
-- 不管理用户权限和认证
-- 不提供生产调度能力
-- 不覆盖数据质量监控
-- 不做数据血缘追踪
+- 不自动上线或自动批准代码。
+- 不写生产库，不生成生产数据。
+- 不把样本一致称为生产正确。
+- 不让LLM直接生成或修改SQL文本。
+- 不让LLM决定验证是否通过。
+- 不在小样本上宣称Spark全量性能合格。
+- 不让Memory覆盖TianShu contracts、meta或数据库设计事实源。
+- 不建设生产调度、生产写入和发布审批系统。
 
-## 6. 外部依赖
+## 8. 主要风险与控制
 
-- **TianShu 数据仓库**：表结构、字段定义、表关系等事实源信息
-- **Parquet 文件存储**：用于构建同源快照
-- **DuckDB**：本地 SQL 执行引擎
-- **PySpark (本地模式)**：本地 Spark 代码执行
+| 风险 | 控制 |
+|------|------|
+| LLM通过字符串字段间接写SQL | SQLPlan使用封闭的类型化表达式AST |
+| SQL和Spark一致地误解需求 | Requirement确认点、黄金用例和语义不变量 |
+| 跨表独立LIMIT破坏关联 | 锚点键驱动的关系一致快照 |
+| SQL/Spark语义差异造成误报 | EnvironmentManifest与SemanticCompatibilityPolicy |
+| Reviewer优化改变业务语义 | Reviewer只输出指令，Developer修订后重新验证 |
+| LLM测试代码执行任意操作 | 测试代码同样经过AST校验并隔离执行 |
+| Memory污染后续决策 | 初期不让长期Memory参与运行时路由 |
 
-## 7. 风险
+## 9. v1.0验收标准
 
-| 风险 | 缓解措施 |
-|------|----------|
-| LLM 生成不合规的 SQLPlan | SQLPlan 字段契约严格约束，编译器拒绝非法输入 |
-| 双分支执行结果不一致 | 确定性比较 + LLM 差异诊断 + 返工机制 |
-| 测试覆盖不足 | Harness 持续评估质量指标 |
-| 状态累积和 "遗忘" | Run Memory 结构化存储，每轮重置 |
-| 用户拒绝所有自动生成代码 | 系统保证人工审查是最终环节 |
-
-## 8. 验收标准
-
-1. Phase 0：流水线框架搭建完成，端到端核心路径走通
-2. Phase 1：SQL 分支可完整运行，PySpark 分支可完整运行
-3. Phase 2：交叉验证 + 返工机制可用
-4. Phase 3：Code Review Package 完整可用，Harness 体系就绪
-5. v1.0：全功能可用，覆盖 80-150 个测试用例
-
-## 9. 不支持的功能（Phases 之外）
-
-- Web UI 仪表盘（Phase 0 不实现）
-- 实时流数据处理
-- 多用户协作
-- 生产调度集成
-
-## 10. 与现有项目的边界
-
-- 本项目的 **Contract 目录** 可引用 TianShu 的 `contracts/*.yml`
-- 本项目的 **架构和设计** 吸取了三个 legacy 项目的经验教训
-- 本项目的 **代码** 不直接复用 legacy 项目，仅参考算法
+1. 至少覆盖单表、受控双表Join、聚合和窗口函数的黄金项目书。
+2. SQLPlan不包含任何自由SQL片段。
+3. PySpark只能通过受控`transform(inputs, params)`入口运行。
+4. SQL/Spark读取同一关系一致快照，并记录环境、代码和契约哈希。
+5. Comparator产生精确状态，LLM不能覆盖结论。
+6. 返工最多2轮，无法确定时进入`HUMAN_REVIEW`。
+7. Code Review Package可追溯到需求、事实源、模型、Prompt、快照和执行环境。
+8. 主pytest套件保持高价值、快速；Prompt与模型质量进入Harness。
 
 ---
 
-> Phase 0 初稿 | 2026-06-22 | 待后续阶段细化
+> Phase 0.5 校正 | 2026-06-22 | Phase 1 前置事实源
