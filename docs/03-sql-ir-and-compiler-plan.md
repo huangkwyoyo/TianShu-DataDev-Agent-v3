@@ -97,9 +97,71 @@ class SortSpec:
     column: ColumnRef
     direction: SortDirection
     null_order: NullOrder
+    # 优化元数据：无 LIMIT 且输入估算大时，Validator 可触发 PERF-005 WARN
+    estimated_input_rows: int | None = None
 ```
 
 Phase 1的SQLPlan组合以上节点，并声明select、joins、predicates、grouping、aggregates、having、ordering和limit。
+
+### 3.3.1 节点优化元数据字段
+
+为支撑确定性 PerfValidator 和 Compiler Pass 的优化决策，SQLPlan 各节点携带以下优化元数据。这些字段由 SQL Planner（LLM）填充初始估算值，由 Fact Resolver 补充事实源信息，最终由 PerfValidator 校验：
+
+**ScanNode 优化字段：**
+
+```python
+class ScanNode:
+    table_ref: str                          # 事实源注册表ID
+    required_columns: list[ColumnRef]       # 实际需要的列——不得为空或等于 SELECT *
+    predicates: list[Predicate]             # 扫描阶段可下推的过滤
+    partition_filters: list[Predicate]      # 可作用于 Parquet 分区的过滤（如日期分区键）
+    estimated_row_count: int | None         # 事实源提供的近似行数，用于基数判断
+```
+
+`partition_filters` 将时间范围过滤与 Parquet 分区裁剪直接关联——Compiler 可在渲染时生成分区感知 SQL，避免全表扫描。Fact Resolver 负责校验分区列是否真实存在。
+
+**JoinNode 优化字段：**
+
+```python
+class JoinNode:
+    left: QueryPlanNode
+    right: QueryPlanNode
+    right_table_ref: str
+    join_type: JoinType
+    join_keys: list[tuple[ColumnRef, ColumnRef]]
+    relationship_ref: str
+    cardinality_hint: str | None            # 事实源声明的基数关系："1:1" | "1:N" | "N:M" | None
+    pre_aggregation_allowed: bool = False   # 目标粒度允许在 Join 前先对大表聚合
+```
+
+`pre_aggregation_allowed` 直接支撑 PERF-008 规则——当目标粒度（如 zone/day）低于事实表明细粒度（如 trip_id），且业务语义允许时，Planner 可将此字段设为 True，Validator 据此判断是否需要 WARN。
+
+**SortNode 优化字段：**
+
+```python
+class SortNode:
+    order_by: list[SortSpec]
+    limit: int | None
+    requires_full_sort: bool = False        # True 表示无 LIMIT 或 LIMIT 极大，需全量排序
+    estimated_input_rows: int | None = None
+```
+
+`requires_full_sort` 由 Planner 根据是否有 LIMIT 及 LIMIT 大小设置。当 `requires_full_sort=True` 且 `estimated_input_rows` 超过阈值时，PerfValidator（PERF-005）发出 WARN。
+
+**WindowNode 优化字段（Phase 1.5 生效）：**
+
+```python
+class WindowNode:
+    partition_by: list[ColumnRef]
+    order_by: list[SortSpec]
+    frame: WindowFrame | None
+    window_exprs: list[WindowExpr]
+    estimated_partition_size: int | None    # 估算的每分区平均行数
+```
+
+`estimated_partition_size` 支撑 Phase 1.5 的窗口性能规则（PERF-009/010）——分区过大时触发 WARN 或 REJECT。
+
+以上优化字段均为可选（默认 None/False），不影响 Phase 1 功能正确性，但为 Phase 1.2 及后续阶段的性能门禁提供 IR 层可表达、可校验的结构化载体。Planner Prompt 要求 LLM 填充这些字段的初始值，Fact Resolver 和 PerfValidator 负责最终校验和决策。
 
 ### 3.4 多层SQL AST
 
@@ -203,6 +265,20 @@ SQLPlan Schema Validation
 ```
 
 同一个规范化SQLPlan和编译器版本必须产生字节一致的SQL。
+
+### 6.1 SQL 侧是否需要独立 LLM Performance Reviewer？
+
+本项目在 Spark 侧设有 `SparkReviewer`（LLM）输出结构化 `OptimizationDirective`，但 SQL 侧**不设独立的 LLM SQL Performance Reviewer 节点**。这不是遗漏，而是基于以下设计权衡：
+
+1. **SQL 语义空间比 PySpark 窄得多**。SQLPlan 是封闭类型化 AST——列裁剪、谓词规范化、无用排序消除和常量折叠这四类优化已被确定性 Compiler Pass 全覆盖。LLM 再审查同一份 SQLPlan，要么复读已有规则，要么引入不可证伪的"风格建议"。
+
+2. **LLM 不应做性能决策**（AGENTS.md §2）。如果让 LLM 审查 SQLPlan 并提出 `OptimizationDirective`，就赋予了它"判断什么是慢查询"的权力——这正是本项目刻意避免的。SparkReviewer 的存在是因为 PySpark 代码空间更广、静态规则覆盖不全，需要 LLM 辅助发现模式问题（如笛卡尔积、数据倾斜风险），但其 Directive 仍需经过确定性 Validator 才能落地。
+
+3. **SQL Planner 自身已承担"生成时即优化"的职责**。PerfRule 注册表的 `get_prompt_hints()` 将优化方向注入 Planner Prompt，Planner 在生成 SQLPlan 时就必须遵循这些原则——不需要事后由另一个 LLM 再审查一遍。
+
+4. **如果未来需要**（如 Phase 4+ 出现复杂 CTE/子查询场景），可以启用 LLM SQL Reviewer，但其输出仍限于 `OptimizationDirective`，落地必须回到 SQLPlan，且重新经过 Schema / Semantic / Perf / Safety 全套校验。届时只需在编译流程中 **Perf Validation 之后、Compiler Passes 之前** 增加一个可选节点即可——当前架构已为此预留空间。
+
+综上：**SQL 侧的优化走"Planner Prompt 软约束 + IR 元数据表达 + PerfValidator 硬门禁 + Compiler Pass 确定改写"四层闭环，不需要 LLM 中间审查**。这与 Codex 的 C 方案（IR 级优化规则体系为核心）完全一致——Codex 的 B 方案（LLM Reviewer）在 C 方案足够强时可以省略。
 
 ## 7. 支持范围
 
