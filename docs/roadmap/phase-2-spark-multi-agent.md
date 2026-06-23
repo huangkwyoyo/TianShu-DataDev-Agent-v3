@@ -10,6 +10,10 @@
 - 版本化快照fixture及源Schema。
 - 角色Prompt和输出JSON Schema。
 
+## 前置条件
+
+- Phase 1.2 的 PerfContract 和 `get_prompt_hints()` 机制已完成——Spark 分支的性能约束独立实现，不读取 SQL 侧的 PerfRule 列表。
+
 ## 交付物
 
 1. SparkCodeArtifact、ReviewResult、ReviewFinding、OptimizationDirective和TestPlan模型。

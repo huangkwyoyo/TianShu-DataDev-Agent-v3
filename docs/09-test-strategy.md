@@ -18,9 +18,11 @@ Phase 0实际已有22个pytest用例，超过原定`≤10`预算。进入Phase 1
 |------|----------|------|
 | Phase 0.5 | 维持22，不新增文档措辞测试 | 契约校正，不改实现 |
 | Phase 1 | 30-40 | 类型化IR、事实解析、SQL编译和DuckDB黄金路径 |
-| Phase 2 | 50-65 | Spark纯函数契约、AST安全、测试代码隔离和真实Spark运行 |
-| Phase 3 | 70-90 | 关系快照、语义规范化、Comparator和MergePlan |
-| Phase 4 | 80-105 | LangGraph路由、checkpoint、两轮返工和人工中断 |
+| Phase 1.2 | 45-55 | 性能契约注册表、REJECT/WARN 门禁规则、编译优化 pass 确定性 |
+| Phase 1.5 | 55-65 | WindowExpr、WindowFrame、TopN、累计、LAG/LEAD、窗口性能规则和拒绝路径 |
+| Phase 2 | 65-80 | Spark纯函数契约、AST安全、测试代码隔离和真实Spark运行 |
+| Phase 3 | 80-100 | 关系快照、语义规范化、Comparator和MergePlan |
+| Phase 4 | 90-115 | LangGraph路由、checkpoint、两轮返工和人工中断 |
 | v1.0 | 100-150 | 前端/API边界和少量全链路黄金用例 |
 
 ## 4. pytest覆盖范围
@@ -67,6 +69,25 @@ Phase 0实际已有22个pytest用例，超过原定`≤10`预算。进入Phase 1
 - 单表及一个白名单Join黄金编译与执行。
 - 未注册指标、列和Join拒绝。
 - MergePlan不兼容粒度进入人工审查。
+
+### Phase 1.2
+
+- PerfContract 注册表完整性：`rule_id` 唯一性、`get_prompt_hints()` 非空、`get_rules_by_severity()` 正确过滤。
+- REJECT 规则（PERF-001/002/004）通过和拒绝路径：fact 表时间过滤、Join key 类型、时间字段函数包裹。
+- WARN 规则（PERF-005/006/007/008）通过和警告路径：明细 LIMIT、GROUP BY 基数、汇总表优先、Join 前聚合。
+- PERF-003 注册但 no-op，测试推迟到 Phase 1.5。
+- Compiler Pass 确定性：相同 SQLPlan 两次编译产生相同 SQL 和 SHA-256。
+- 谓词规范化：`BETWEEN` / `DATE() =` / `strftime` 改写为标准 `>= AND <`。
+- 门禁集成：REJECT 阻断 Compiler，WARN 不阻断。
+
+### Phase 1.5
+
+- `WindowExpr`和`WindowFrame`严格Schema。
+- `over_sql`、`window_sql`、`expression: str`和额外字段被拒绝。
+- 未注册分区键、排序键、输入列和指标被拒绝。
+- `ROW_NUMBER`分区TopN、`SUM_OVER`日期累计、`LAG`或`LEAD`环比黄金路径。
+- 非法frame、缺失`order_by`和窗口函数非法位置进入拒绝状态。
+- 相同Window SQLPlan重复编译产生相同SQL和哈希。
 
 ### Phase 2
 

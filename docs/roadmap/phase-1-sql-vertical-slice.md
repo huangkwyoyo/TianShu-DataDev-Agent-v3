@@ -9,13 +9,14 @@
 - Phase 0.5文档校正已批准。
 - 明确TianShu Fact Catalog读取边界。
 - 选择Pydantic严格模型和SQL AST/Renderer方案。
+- `docs/10-performance-contract.md` 已定义，明确 REJECT/WARN 两级门禁策略和编译器优化 pass 清单——本阶段只预留接口，Phase 1.2 实现规则。
 
 ## 交付物
 
 1. 严格Pydantic模型：RequirementIR、SubIntent、TransformationContract、SQLPlan及表达式AST。
 2. Fact Catalog Adapter：读取TianShu指标、语义、表字段和Join白名单。
 3. Deterministic Fake Planner：不用真实LLM即可生成受控SQLPlan fixture。
-4. SQL Compiler与Validator。
+4. SQL Validator（含语义校验逻辑 + `register_perf_rules()` 性能门禁注册表接口）与 SQL Compiler（含 `register_passes()` 编译优化 pass 管道接口，Phase 1.2 注入具体规则和 pass）。
 5. 单表快照fixture、DuckDB Executor、ExecutionTrace和ResultSummary。
 6. MergePlan契约，但本阶段只验证不兼容场景，不实现任意多表合并。
 
@@ -31,8 +32,12 @@
 
 - 真实LLM调用。
 - 任意SQL字符串字段。
+- 开窗函数和`WindowExpr`。
 - 多跳Join、任意子查询和自由函数。
+- CTE、DDL、DML和多段SQL脚本。
 - Spark、LangGraph、Memory、前端和生产数据。
+
+开窗函数进入Phase 1.5。Phase 1遇到排名、累计、LAG/LEAD、分区TopN等窗口需求时，只能返回`UNSUPPORTED_PLAN`或`HUMAN_REVIEW`。
 
 ## 验收
 
@@ -44,7 +49,11 @@
 
 ## 下一阶段依赖
 
-Phase 2复用RequirementIR、SubIntent、TransformationContract和artifact模型，不读取SQL文本。
+Phase 1.2 使用本阶段的 Validator 注册表接口和 Compiler pass 管道接口，注入性能门禁规则和编译优化 pass。
+
+Phase 1.5 复用本阶段的 RequirementIR、SubIntent、TransformationContract、Fact Catalog Adapter 和 SQL Compiler 骨架，新增 `WindowExpr`、`WindowSpec` 和窗口拒绝路径。
+
+Phase 2 复用 RequirementIR、SubIntent、TransformationContract 和 artifact 模型，不读取 SQL 文本。
 
 ---
 

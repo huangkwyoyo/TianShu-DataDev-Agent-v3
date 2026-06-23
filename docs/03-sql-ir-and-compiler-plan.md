@@ -6,6 +6,8 @@
 
 建立三层、可校验、可序列化的SQL IR。LLM只能选择经过事实源注册的类型化节点，Python编译器负责生成全部SQL语法。
 
+SQLPlan不是“长SQL字符串拼接器”，而是按阶段开放的多层SQL AST。Phase 1只实现受控`QueryPlan + SelectNode`纵向切片；开窗函数进入Phase 1.5；CTE、子查询、DDL和DML在更后续阶段按黄金用例逐项开放。
+
 ## 2. 运行时模型选择
 
 Phase 0中的`Protocol`只用于接口探索，不能作为LLM结构化输出和持久化契约。Phase 1必须使用Pydantic模型或等价的严格Schema，并满足：
@@ -97,7 +99,65 @@ class SortSpec:
     null_order: NullOrder
 ```
 
-SQLPlan组合以上节点，并声明select、joins、predicates、grouping、aggregates、having、ordering和limit。
+Phase 1的SQLPlan组合以上节点，并声明select、joins、predicates、grouping、aggregates、having、ordering和limit。
+
+### 3.4 多层SQL AST
+
+后续复杂SQL能力必须通过多层AST表达，不得回退为SQL文本：
+
+```text
+SqlProgram
+├── QueryPlan
+│   ├── SelectNode
+│   ├── CTEPlan[]
+│   ├── Predicate / Expression AST
+│   ├── JoinSpec[]
+│   ├── AggregateSpec[]
+│   ├── WindowExpr[]
+│   └── SortSpec[]
+├── InsertPlan
+├── CreateTablePlan
+└── UnsupportedPlan / HumanReviewPlan
+```
+
+`SqlProgram`是可审查的SQL产物容器，不代表可以执行生产写入。Phase 1只允许`QueryPlan`中不含CTE、子查询和开窗函数的`SelectNode`子集。任何未开放节点必须在Schema或Validator阶段拒绝。
+
+### 3.5 WindowExpr / WindowSpec
+
+开窗函数在Phase 1.5开放，LLM只能输出结构化窗口AST，不能输出`OVER (...)`文本。
+
+```python
+class WindowExpr:
+    function: WindowFunction
+    input: ColumnRef | Literal | None
+    partition_by: list[ColumnRef]
+    order_by: list[SortSpec]
+    frame: WindowFrame | None
+    alias: str
+    metric_ref: str | None
+
+class WindowFrame:
+    frame_type: WindowFrameType  # ROWS | RANGE
+    start: FrameBoundary
+    end: FrameBoundary
+
+class FrameBoundary:
+    kind: FrameBoundaryKind
+    offset: int | None
+```
+
+Phase 1.5首批窗口函数白名单：
+
+- `ROW_NUMBER`
+- `RANK`
+- `DENSE_RANK`
+- `LAG`
+- `LEAD`
+- `SUM_OVER`
+- `AVG_OVER`
+- `COUNT_OVER`
+
+禁止任意窗口函数名、嵌套窗口函数、窗口函数出现在WHERE、窗口函数内自由表达式、窗口函数与任意子查询组合。无法表达的窗口需求必须进入`UNSUPPORTED_PLAN`或`HUMAN_REVIEW`。
 
 ## 4. 明确禁止的IR形态
 
@@ -134,7 +194,9 @@ planning_table_id → Gold表
 SQLPlan Schema Validation
 → Fact Resolution
 → Semantic Validation
+→ Perf Validation（Phase 1.2：REJECT 阻断 / WARN 记录）
 → SQL AST Construction
+→ Compiler Passes（Phase 1.2：列裁剪 / 谓词规范化 / 无用排序消除 / 常量折叠）
 → sqlglot / 受控Renderer输出DuckDB SQL
 → SQL AST Safety Validation
 → Artifact写入与哈希
@@ -144,6 +206,8 @@ SQLPlan Schema Validation
 
 ## 7. 支持范围
 
+### 7.1 Phase 1支持范围
+
 Phase 1只支持：
 
 - Gold层单表查询。
@@ -152,7 +216,31 @@ Phase 1只支持：
 - 已注册的COUNT、SUM、AVG、MIN、MAX和COUNT DISTINCT。
 - 明确类型的日期范围和比较谓词。
 
-窗口函数、子查询、多跳Join和复杂表达式在后续按黄金用例逐项开放，不能因为LLM能生成就默认支持。
+Phase 1禁止窗口函数、CTE、子查询、多跳Join、DDL、DML和复杂表达式。遇到窗口需求时返回`UNSUPPORTED_PLAN`或`HUMAN_REVIEW`。
+
+### 7.2 Phase 1.5开窗函数支持范围
+
+Phase 1.5支持通过`WindowExpr`表达以下黄金场景：
+
+- 分组内排序取TopN。
+- 按日期累计`SUM_OVER`。
+- 按业务键分区计算`ROW_NUMBER`。
+- 使用`LAG`或`LEAD`生成环比字段。
+- 分区内`AVG_OVER`和`COUNT_OVER`窗口指标。
+
+每个窗口能力必须同时交付Schema、Validator、Compiler、测试和拒绝路径。相同Window SQLPlan重复编译必须产生字节一致SQL和哈希。
+
+### 7.3 后续复杂SQL开放规则
+
+CTE、子查询、多跳Join、DDL和DML在Phase 4及以后按黄金用例逐项开放。每开放一种SQL能力，必须满足：
+
+1. 新增严格Pydantic模型或等价JSON Schema，并设置`extra="forbid"`。
+2. Validator校验事实源、类型、作用域、引用关系和禁止字段。
+3. Compiler确定性渲染SQL，不接受字符串片段。
+4. Safety Validation二次确认没有自由SQL逃生口。
+5. 测试覆盖合法黄金路径、非法字段、未注册引用、不支持语义和确定性哈希。
+6. 无法表达时返回`PLAN_REJECTED`、`UNSUPPORTED_PLAN`或`HUMAN_REVIEW`。
+7. Artifact记录AST、compiler version、fact catalog hash和schema version。
 
 ## 8. MergePlan
 

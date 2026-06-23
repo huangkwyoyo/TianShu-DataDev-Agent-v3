@@ -19,7 +19,7 @@ Phase 0产物是探索基线，不是最终运行时契约。`src/tianshu_datade
 5. 验证采用精确状态，`CONSISTENT_SAMPLE`不等于生产正确。
 6. Graph State只保存artifact引用、哈希、状态和摘要。
 7. Domain Knowledge由TianShu Fact Catalog提供，不建设可写Domain Memory。
-8. Phase 1-7路线按SQL、Spark、验证、返工、前端、Harness、真实LLM依次推进。
+8. Phase 1-7路线按类型化SQL、Phase 1.2性能契约、Phase 1.5开窗函数、Spark、验证、返工、前端、Harness、真实LLM依次推进。
 
 ## 本阶段不做
 
