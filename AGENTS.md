@@ -1,30 +1,32 @@
 # AGENTS.md — TianShu DataDev Agent v3
 
-> 项目宪法。所有Agent、LLM角色和自动化工具必须遵守本文件。
+> 项目宪法。所有 Agent、LLM 角色和自动化工具必须遵守本文件。
 
 ## 1. System Role
 
-TianShu DataDev Agent v3是AI辅助数据开发工具。它生成SQL、PySpark、测试和Code Review Package；最终产物是代码，不是生产数据。
+TianShu DataDev Agent v3 是 AI 辅助数据开发工具。它接收程序员编写的半自然语言 + 半结构化 DeveloperSpec 项目书，生成 SQL、PySpark、测试和 Code Review Package；最终产物是代码，不是生产数据。
 
 系统不自动上线、不写生产库、不生成生产数据。人是最终代码审查者和上线决策者。
 
-当前阶段：`Phase 0.5 — 架构契约校正`。本阶段只调整规划，不实现Phase 1代码。
+当前阶段：`Phase 0.5 — DeveloperSpec-first 架构校正`。本阶段只调整规划、边界和路线图，不实现 Phase 1 代码。
 
 ## 2. SQL Generation Boundary
 
-- LLM只输出严格的RequirementIR、SubIntent和SQLPlan。
-- SQLPlan必须使用封闭类型的ColumnRef、Literal、Predicate、JoinSpec、AggregateSpec和SortSpec。
-- 禁止`where_sql`、`join_on: str`、`expression: str`、`raw_sql`及其他自由SQL片段。
-- SQL只能由Python确定性编译器生成。
-- SQL修复只能生成新SQLPlan，禁止直接修改SQL文本。
-- 表、字段、指标和Join必须来自TianShu contracts、meta和数据库设计事实源。
-- 不支持的表达式必须拒绝或进入`HUMAN_REVIEW`，不能使用字符串逃生口。
+- 输入是 DeveloperSpec（Markdown 正文 + YAML-like metadata block），经 Parser 确定性解析为 ParsedDeveloperSpec。
+- LLM 只输出严格的 ParsedDeveloperSpec、RelationshipHypothesis、SqlBuildPlan 和 SqlProgram。
+- SqlBuildPlan 必须使用封闭类型的 ScanStep、FilterStep、JoinStep、AggregateStep、ProjectStep、CaseWhenStep、SortStep、LimitStep。
+- 禁止 `where_sql`、`join_on: str`、`expression: str`、`raw_sql` 及其他自由 SQL 片段。
+- SQL 只能由 Python 确定性编译器生成。
+- SQL 修复只能生成新 SqlBuildPlan，禁止直接修改 SQL 文本。
+- 表、字段和 Join 必须来自 SourceManifest；optional SchemaRegistry 只补充缺失信息，禁止静默覆盖 DeveloperSpec 中程序员已声明的值——冲突时输出 SOURCE_CONFLICT。
+- 不支持的表达式必须拒绝或进入 `HUMAN_REVIEW`，不能使用字符串逃生口。
+- Join 推理遵循三层分工：LLM 提候选 → Validator 确定性定级（STRONG/MEDIUM/WEAK/NONE）→ 人工确认中低置信。WEAK/NONE 硬门禁——不得进入 SqlBuildPlan 的 JoinSpec。
 - 性能门禁由确定性 PerfValidator 执行——硬规则（REJECT）阻断流水线，软规则（WARN）记录到 ExecutionTrace。LLM 不做性能决策。
-- SQL 编译器在渲染前运行轻量优化 pass（列裁剪、谓词规范化、无用排序消除、常量折叠），优化必须是幂等的——相同 SQLPlan 两次编译产生相同 SQL 和哈希。
+- SQL 编译器在渲染前运行轻量优化 pass（列裁剪、谓词规范化、无用排序消除、常量折叠），优化必须是幂等的——相同 SqlBuildPlan 两次编译产生相同 SQL 和哈希。
 
 ## 3. Spark Generation Boundary
 
-LLM可以生成PySpark，但只能生成以下纯转换入口：
+LLM 可以生成 PySpark，但只能生成以下纯转换入口：
 
 ```python
 def transform(
@@ -36,32 +38,33 @@ def transform(
 
 强制要求：
 
-- 只读取`inputs`中契约声明的数据源。
-- 禁止`spark.table`、`spark.read`和自行创建SparkSession。
-- 禁止Action、Sink、UDF、网络、文件系统、进程、线程、动态执行和任意模块导入。
-- 返回且仅返回一个DataFrame。
-- 不查看SQL文本或SQLPlan实现。
-- 所有代码和测试代码都是不可信artifact，必须先静态验证再隔离执行。
+- SparkDeveloper 读 DataTransformContract（从已验证 SqlBuildPlan 确定性抽取）作为权威规格输入，不从 DeveloperSpec 重新推理业务逻辑。
+- 只读取 `inputs` 中契约声明的数据源。
+- 禁止 `spark.table`、`spark.read` 和自行创建 SparkSession。
+- 禁止 Action、Sink、UDF、网络、文件系统、进程、线程、动态执行和任意模块导入。
+- 返回且仅返回一个 DataFrame。
+- 不查看 SQL 文本或 SqlBuildPlan 实现。
+- 所有代码和测试代码都是不可信 artifact，必须先静态验证再隔离执行。
 
 角色职责：
 
-- SparkDeveloper生成或修订代码。
-- SparkReviewer输出ReviewFinding和OptimizationDirective，不直接替换最终代码。
-- SparkTester输出TestPlan和测试代码，不参与业务实现，也不能宣布测试通过。
+- SparkDeveloper 生成或修订代码。
+- SparkReviewer 输出 ReviewFinding 和 OptimizationDirective，不直接替换最终代码。
+- SparkTester 输出 TestPlan 和测试代码，不参与业务实现，也不能宣布测试通过。
 
 ## 4. Execution Boundary
 
-- Snapshot Builder只读访问开发数据源。
-- SQL与Spark必须读取同一个关系一致、不可变的Parquet快照。
-- 多表快照使用锚点键和Join白名单级联抽取，禁止各表独立LIMIT。
-- Validator先于Executor。
-- Executor运行在隔离环境，受超时、CPU、内存、网络、工作目录和输出大小限制。
-- Agent环境不包含生产凭据和生产写权限。
-- EnvironmentManifest必须记录引擎版本、时区、ANSI、大小写、Decimal、NULL和NaN策略。
+- Snapshot Builder 只读访问开发数据源。
+- SQL 与 Spark 必须读取同一个关系一致、不可变的 Parquet 快照。
+- 多表快照使用锚点键和 Join 白名单级联抽取，禁止各表独立 LIMIT。
+- Validator 先于 Executor。
+- Executor 运行在隔离环境，受超时、CPU、内存、网络、工作目录和输出大小限制。
+- Agent 环境不包含生产凭据和生产写权限。
+- EnvironmentManifest 必须记录引擎版本、时区、ANSI、大小写、Decimal、NULL 和 NaN 策略。
 
 ## 5. Validation Boundary
 
-LLM不能决定验证通过。确定性Comparator产生以下精确状态：
+LLM 不能决定验证通过。确定性 Comparator 产生以下精确状态：
 
 | 状态 | 含义 |
 |------|------|
@@ -73,50 +76,50 @@ LLM不能决定验证通过。确定性Comparator产生以下精确状态：
 | `REVIEW_READY` | 材料完整，可进入人工代码审查 |
 | `HUMAN_REVIEW` | 自动化无法安全继续 |
 
-禁止使用泛化`PASS`表示业务正确、全量一致、生产性能或上线批准。
+禁止使用泛化 `PASS` 表示业务正确、全量一致、生产性能或上线批准。
 
 ## 6. Repair Boundary
 
-- DifferenceAnalyst只解释结构化差异，不修改Comparator结论。
-- RepairPlanner只能输出SQL_PLAN、SPARK_CODE、BOTH、REQUIREMENT或HUMAN_REVIEW。
-- SQL_PLAN返回SQL Planner；SPARK_CODE返回SparkDeveloper。
-- 每次修订必须重新经过Validator、Executor和Comparator。
-- 最多2轮自动返工；UNKNOWN、事实源缺失、需求变化或超限进入`HUMAN_REVIEW`。
+- DifferenceAnalyst 只解释结构化差异，不修改 Comparator 结论。
+- RepairPlanner 只能输出 SQL_PLAN、SPARK_CODE、BOTH、REQUIREMENT 或 HUMAN_REVIEW。
+- SQL_PLAN 返回 SQL Planner；SPARK_CODE 返回 SparkDeveloper。
+- 每次修订必须重新经过 Validator、Executor 和 Comparator。
+- 最多 2 轮自动返工；UNKNOWN、事实源缺失、需求变化或超限进入 `HUMAN_REVIEW`。
 
 ## 7. LangGraph Boundary
 
-- LangGraph只编排节点、分支、路由、checkpoint、retry_count和人工中断。
-- 业务节点必须是可脱离LangGraph调用的普通Python服务。
-- Graph State只保存artifact引用、哈希、状态和小型摘要。
-- 禁止在State中保存DataFrame、完整结果集、完整代码、项目书正文、凭据或无限聊天历史。
-- 条件路由只能读取结构化确定性状态，不能依赖LLM自由文本或置信度。
+- LangGraph 只编排节点、分支、路由、checkpoint、retry_count 和人工中断。
+- 业务节点必须是可脱离 LangGraph 调用的普通 Python 服务。
+- Graph State 只保存 artifact 引用、哈希、状态和小型摘要。
+- 禁止在 State 中保存 DataFrame、完整结果集、完整代码、项目书正文、凭据或无限聊天历史。
+- 条件路由只能读取结构化确定性状态，不能依赖 LLM 自由文本或置信度。
 
 ## 8. Data Contracts
 
-- Phase 1运行时契约使用严格Pydantic模型或等价JSON Schema，拒绝额外字段。
-- TransformationContract是SQL/Spark共同业务规格，不包含实现代码。
-- 多SubIntent合并必须使用MergePlan，明确键、粒度、基数、Join类型和冲突策略。
-- Code Review Package记录事实源、代码、Prompt、模型、快照、环境和Comparator版本哈希。
+- Phase 1 运行时契约使用严格 Pydantic 模型或等价 JSON Schema，拒绝额外字段。
+- DataTransformContract 是 SQL/Spark 共同业务规格，从已验证 SqlBuildPlan 确定性抽取，不包含实现代码。三级递进：lite（Phase 2 单语句）→ v1（Phase 3 Exit，+SqlProgram DAG +窗口 +CASE +受控写入）→ Phase 5 消费 v1。
+- SqlProgram 多语句合并使用 DAG 依赖和确定性拓扑排序，不引入 CTE 嵌套作用域。
+- Code Review Package 记录事实源、代码、Prompt、模型、快照、环境和 Comparator 版本哈希。
 
 ## 9. Harness and Memory
 
-- pytest覆盖确定性逻辑、安全边界和少量黄金路径。
-- Prompt、模型、规模、成本、人工接受率和返工效果进入独立Harness。
-- Harness不得成为产品运行时依赖。
-- Run State由checkpoint和artifact store管理，不是长期学习Memory。
-- Engineering Memory在Phase 6前不参与运行时；写入必须可复现且经人工批准。
-- 指标、表、字段、Join和业务口径属于TianShu Fact Catalog，不属于可写Domain Memory。
+- pytest 覆盖确定性逻辑、安全边界和少量黄金路径。
+- Prompt、模型、规模、成本、人工接受率和返工效果进入独立 Harness。
+- Harness 不得成为产品运行时依赖。
+- Run State 由 checkpoint 和 artifact store 管理，不是长期学习 Memory。
+- Engineering Memory 在 Phase 8 前不参与运行时；写入必须可复现且经人工批准。
+- 表、字段、Join 和业务口径的事实源是 SourceManifest / SchemaRegistry，不属于可写 Domain Memory。
 
 ## 10. Testing Policy
 
 - 测试保护独立风险，不追求数量或覆盖率目标。
 - 优先表驱动测试，禁止为枚举组合、标准库行为和文档措辞创建重复测试。
-- LLM真实调用进入Harness；pytest使用确定性Fake Adapter。
-- 每阶段运行`pytest`、`ruff`和`git diff --check`。
-- Phase 0已有22个测试，Phase 1前不得继续增加低价值Protocol反射测试。
+- LLM 真实调用进入 Harness；pytest 使用确定性 Fake Adapter。
+- 每阶段运行 `pytest`、`ruff` 和 `git diff --check`。
+- Phase 0 已有 22 个测试，Phase 1 前不得继续增加低价值 Protocol 反射测试。
 
 ## 11. Code Style
 
-- 所有代码注释和docstring使用中文。
-- 注释解释“为什么”，不复述代码。
+- 所有代码注释和 docstring 使用中文。
+- 注释解释"为什么"，不复述代码。
 - 文件按职责拆分，避免重新形成大型扁平模块。

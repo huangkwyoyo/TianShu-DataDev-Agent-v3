@@ -1,148 +1,81 @@
-# LangGraph 编排计划 — TianShu DataDev Agent v3
+# Phase 8 LangGraph 编排 — TianShu DataDev Agent v3
 
-> 文档版本：Phase 0.5 架构契约校正版
+> ⚠️ 本文为占位文档。Phase 4 退出后，必须基于 SQL-first v1.0 的真实 Harness 报告、人工接受率和试用反馈重写本文，才能启动本 Phase 的实施。
 
-## 1. 定位
+> 文档版本：Phase 0.5 DeveloperSpec-first 架构校正版（占位）
 
-LangGraph只提供有状态编排、并行分支、条件路由、checkpoint、重试预算和人工中断。所有领域逻辑、编译、安全、执行和比较均由可独立调用的普通Python服务完成。
+## 1. 当前状态
 
-Phase 1-3先实现并验证普通Python节点；Phase 4才接入LangGraph图。不得为了框架提前改变领域接口。
+**等待 Phase 4 退出。** Phase 8 的详细实施规格——包括具体节点实现、路由条件代码、checkpoint 恢复逻辑——必须在 Phase 5-7 各节点作为普通 Python 服务验证稳定后才能确定。
 
-## 2. 图结构
+## 2. 前置依赖
 
-```text
-validate_project_spec
-→ analyze_requirement
-→ validate_requirement
-→ requirement_confirmation_gate
-→ decompose_sub_intents
-→ build_transformation_contracts
-→ build_relational_snapshot
-→ fan_out_sub_intents
-    ├─ plan_sql → compile_sql → validate_sql → execute_duckdb
-    └─ develop_spark → validate_spark → review_spark
-         → revise_spark → validate_spark → generate_tests
-         → validate_tests → run_tests → execute_spark
-→ normalize_results
-→ compare_results
-    ├─ CONSISTENT_SAMPLE → build_review_package
-    ├─ DIFFERENT → classify_difference → analyze_difference
-    │    → plan_repair → route_repair → retry / HUMAN_REVIEW
-    └─ NOT_EXECUTED / UNSUPPORTED → HUMAN_REVIEW
-```
+- Phase 5-7 全部退出（SparkPlan IR、受控 PySpark DSL、双链验证）
+- 所有业务节点可作为普通 Python 函数独立调用和测试
 
-## 3. Artifact优先State
+## 3. 定位
 
-```python
-class GraphState(TypedDict):
-    request_id: str
-    run_id: str
-    project_spec_ref: str
-    requirement_ir_ref: str | None
-    requirement_confirmed: bool
-    sub_intent_refs: list[str]
-    transformation_contract_refs: list[str]
-    merge_plan_ref: str | None
-    snapshot_manifest_ref: str | None
-    sql_plan_refs: list[str]
-    sql_artifact_refs: list[str]
-    spark_artifact_refs: list[str]
-    test_artifact_refs: list[str]
-    execution_trace_refs: list[str]
-    result_summary_refs: list[str]
-    comparison_report_ref: str | None
-    diagnosis_ref: str | None
-    repair_directive_ref: str | None
-    repair_history_refs: list[str]
-    retry_count: int
-    max_retries: int
-    assurance_level: str
-    final_status: str
-    human_review_reasons: list[str]
-```
+LangGraph 只提供有状态编排、并行分支、条件路由、checkpoint、重试预算和人工中断。所有领域逻辑、编译、安全、执行和比较均由可独立调用的普通 Python 服务完成。
 
-State禁止包含：
+## 4. Graph State 最小约束
 
-- pandas或Spark DataFrame。
-- 完整结果集、完整代码和完整项目书正文。
-- LLM原始响应或无限消息历史。
-- 生产数据、凭据和任意不可序列化对象。
+Graph State 只保存：
+- artifact 引用（路径 + SHA-256）
+- 哈希值（developer_spec_hash、source_manifest_hash、sql_build_plan_hash 等）
+- 状态枚举（NOT_EXECUTED / RUNTIME_PASS / DIFFERENT / CONSISTENT_SAMPLE / REVIEW_READY / HUMAN_REVIEW）
+- retry_count、assurance_level、final_status
 
-## 4. 节点接口
+Graph State **禁止**保存：
+- pandas 或 Spark DataFrame
+- 完整结果集、完整代码、完整 DeveloperSpec 正文
+- LLM 原始响应或无限消息历史
+- 生产数据、凭据和任意不可序列化对象
 
-业务服务不接收整个GraphState，只接收所需的明确输入：
+## 5. 业务节点接口
+
+业务服务不接收整个 GraphState，只接收所需的明确输入：
 
 ```python
-def compile_sql(plan: SQLPlan, catalog: FactCatalog) -> SQLArtifact:
-    ...
+def compile_sql(plan: SqlBuildPlan, manifest: SourceManifest) -> CompilerOutput: ...
 
 def execute_spark(
     code: SparkCodeArtifact,
-    snapshot: RelationalSnapshotManifest,
+    snapshot: SnapshotManifest,
     environment: EnvironmentManifest,
-) -> ExecutionTrace:
-    ...
+) -> ExecutionTrace: ...
 ```
 
-LangGraph adapter负责从State解析引用、调用服务、持久化输出并返回最小State更新。这样业务模块可脱离LangGraph测试和复用。
+LangGraph adapter 负责从 State 解析引用、调用服务、持久化输出并返回最小 State 更新。
 
-## 5. 路由事实源
+## 6. checkpoint / retry / 人工中断
 
-条件边只能读取确定性字段：
+- checkpoint 保存 State 和 artifact 索引，不复制 artifact 正文
+- 恢复时先校验 artifact 哈希和 EnvironmentManifest，失效则从最近安全节点重跑
+- 每次 LLM 调用、编译、执行和比较前后记录幂等 operation_id
+- `retry_count` 最多 2，UNKNOWN 直接进入 `HUMAN_REVIEW`
+- 人工中断保留完整审计链——恢复后产生新的人工决策 artifact，不覆盖历史 State
 
-- Schema validation status。
-- Validator status。
-- Executor status。
-- Comparator verdict。
-- retry_count。
-- requirement_confirmed。
-- RepairDirective target。
+## 7. 条件路由
 
-禁止根据LLM自然语言、置信度或Reviewer评分直接决定执行、通过或上线。
+条件边只能读取确定性结构化字段：
+- Schema validation status
+- Validator status（含 WEAK/NONE 门禁判定）
+- Executor status
+- Comparator verdict
+- retry_count
 
-## 6. 并发与SubIntent
+禁止根据 LLM 自然语言、置信度或 Reviewer 评分直接决定执行、通过或上线。
 
-- SubIntent可并发处理，但每个SubIntent使用独立artifact命名空间。
-- Snapshot必须在分支执行前完成并冻结。
-- fan-in前验证所有必需SubIntent均产生结果。
-- MergePlan在合并前确定性校验粒度、键和基数。
-- 任一必需SubIntent失败时，不得把部分结果包装成完整成功。
+## 8. 验收标准骨架
 
-## 7. Checkpoint与恢复
-
-- checkpoint保存State和artifact索引，不复制artifact正文。
-- 每次LLM调用、编译、执行和比较前后记录幂等operation_id。
-- 恢复时先校验artifact哈希和EnvironmentManifest，失效则从最近安全节点重跑。
-- Executor、LLM调用和Storage写入必须设计为可重试或显式不可重试。
-- checkpoint设大小、数量和保留期限上限。
-
-## 8. 人工中断
-
-以下节点可触发interrupt：
-
-- RequirementIR确认。
-- 事实源或Join不完整。
-- 不支持语义。
-- 两轮返工仍不一致。
-- 测试代码或Spark代码被安全Validator拒绝。
-- Spark运行环境不可用。
-
-恢复后产生新的人工决策artifact，禁止直接修改历史State掩盖原结论。
-
-## 9. 可观测性
-
-每个节点记录：node_id、operation_id、输入artifact哈希、输出artifact哈希、开始/结束时间、模型和Prompt版本、token/延迟、状态与错误分类。日志不能替代ExecutionTrace或Harness评测数据。
-
-## 10. Phase 4验收标准
-
-1. 普通Python服务在不安装LangGraph时仍可独立测试。
-2. State序列化后不包含DataFrame、代码正文和结果集。
-3. SQL/Spark分支并行且使用同一snapshot manifest。
-4. 条件路由只依赖结构化确定性状态。
-5. retry_count最多2，UNKNOWN直接进入`HUMAN_REVIEW`。
-6. checkpoint恢复不重复提交已完成的副作用。
-7. 人工中断与恢复保留完整审计链。
+1. 普通 Python 服务在不安装 LangGraph 时仍可独立测试
+2. State 序列化后不包含 DataFrame、代码正文和结果集
+3. SQL/Spark 分支并行且使用同一 snapshot manifest
+4. 条件路由只依赖结构化确定性状态
+5. retry_count 最多 2，UNKNOWN 直接进入 `HUMAN_REVIEW`
+6. checkpoint 恢复不重复提交已完成的副作用
+7. 人工中断与恢复保留完整审计链
 
 ---
 
-> Phase 0.5 校正 | 2026-06-22 | Phase 4 实施依据
+> Phase 0.5 DeveloperSpec-first 校正 | 2026-06-26 | 占位——Phase 4 退出后重写

@@ -1,14 +1,14 @@
 # 测试策略 — TianShu DataDev Agent v3
 
-> 文档版本：Phase 0.5 架构契约校正版
+> 文档版本：Phase 0.5 DeveloperSpec-first 架构校正版
 
 ## 1. 目标
 
-测试用于保护高风险契约和关键行为，不追求数量。pytest覆盖确定性逻辑和少量隔离集成；Prompt、模型、规模和性能评测进入Harness。
+测试用于保护高风险契约和关键行为，不追求数量。pytest 覆盖确定性逻辑和少量隔离集成；Prompt、模型、规模和性能评测进入 Harness。
 
 ## 2. 当前基线
 
-Phase 0实际已有22个pytest用例，超过原定`≤10`预算。进入Phase 1前不继续为Protocol属性和枚举组合增加测试；在具体Pydantic模型落地后，合并或删除低价值反射测试。
+Phase 0 实际已有 22 个 pytest 用例，超过原定 `≤10` 预算。进入 Phase 1 前不继续为 Protocol 属性和枚举组合增加测试；在具体 Pydantic 模型落地后，合并或删除低价值反射测试。
 
 测试预算是评审阈值，不是为了达标而漏测安全边界。超过预算必须说明新增用例保护了哪项独立风险。
 
@@ -16,103 +16,141 @@ Phase 0实际已有22个pytest用例，超过原定`≤10`预算。进入Phase 1
 
 | 阶段 | 累计目标 | 重点 |
 |------|----------|------|
-| Phase 0.5 | 维持22，不新增文档措辞测试 | 契约校正，不改实现 |
-| Phase 1 | 30-40 | 类型化IR、事实解析、SQL编译和DuckDB黄金路径 |
-| Phase 1.2 | 45-55 | 性能契约注册表、REJECT/WARN 门禁规则、编译优化 pass 确定性 |
-| Phase 1.5 | 55-65 | WindowExpr、WindowFrame、TopN、累计、LAG/LEAD、窗口性能规则和拒绝路径 |
-| Phase 2 | 65-80 | Spark纯函数契约、AST安全、测试代码隔离和真实Spark运行 |
-| Phase 3 | 80-100 | 关系快照、语义规范化、Comparator和MergePlan |
-| Phase 4 | 90-115 | LangGraph路由、checkpoint、两轮返工和人工中断 |
-| v1.0 | 100-150 | 前端/API边界和少量全链路黄金用例 |
+| Phase 0.5 | 维持 22，不新增文档措辞测试 | 契约校正，不改实现 |
+| Phase 1A | 30-40 | DeveloperSpec Parser、ParsedDeveloperSpec Schema、SourceManifest、SOURCE_CONFLICT、golden/拒绝 fixture |
+| Phase 1B | 45-55 | RelationshipHypothesis 证据等级判定、字段名归一化、SqlBuildPlan 8 step Schema、WEAK/NONE 硬门禁 |
+| Phase 1C | 55-65 | SQL Validator、Compiler 确定性、PerfContract REJECT/WARN 门禁、Compiler Pass 幂等、DuckDB Executor |
+| Phase 2 | 65-80 | Code Review Package artifact schema、DataTransformContract-lite 抽取、provenance.yml、review.md 可读性 |
+| Phase 3A | 75-90 | SqlProgram 多语句 DAG、_temp 生命周期、拓扑排序、循环依赖拒绝 |
+| Phase 3B | 85-100 | CaseWhenStep、LabelRule 枚举覆盖、WindowExpr 白名单 8 种、窗口函数拒绝路径 |
+| Phase 3C | 90-105 | FinalWritePlan、分区 overwrite 审查材料、非分区覆盖拒绝、CompilerBackend 接口 |
+| Phase 4 | 100-130 | 真实 LLM 结构化输出、Harness 七维门禁、15 条 PERF 规则、安全评测六种攻击向量 |
+| Phase 4.5 | 110-140 | REST API 请求/响应 Schema、CLI 确定性、Web 前端输入校验 |
+| Phase 5 | 115-145 | SparkPlan IR Schema、DataTransformContract v1、SQL step 到 Spark step 映射、PlanEquivalence 规则 |
+| Phase 6 | 125-160 | SparkDeveloper 受控 DSL、Static Validator AST 白名单、Action/Sink/UDF 拒绝、SparkReviewer/Tester |
+| Phase 7 | 135-175 | PlanEquivalenceComparator、Snapshot Builder 关系一致抽取、ResultComparator 10 维度、差异诊断路由 |
+| Phase 8 | 140-190 | LangGraph 编排壳、Graph State 边界、返工上限、Spark Harness、前端 Spark-first 视图 |
 
-## 4. pytest覆盖范围
+## 4. pytest 覆盖范围
 
-- Pydantic/JSON Schema拒绝非法和额外字段。
-- SQLPlan无自由SQL逃生口。
-- SQL编译确定性和事实源拒绝。
-- Spark AST安全、入口契约和隔离Executor。
+- Pydantic/JSON Schema 拒绝非法和额外字段。
+- DeveloperSpec Parser 允许/禁止宽松封闭表（golden + rejection fixture）。
+- SqlBuildPlan / SqlProgram 无自由 SQL 逃生口。
+- RelationshipHypothesis 证据等级正确判定和分流。
+- SQL 编译确定性和 SourceManifest 事实源拒绝。
+- Spark AST 安全、入口契约和隔离 Executor。
 - 测试代码安全校验。
 - 关系一致快照和哈希。
-- NULL、NaN、Decimal、时间、重复行和Join基数规范化。
-- Comparator精确状态与MergePlan。
-- LangGraph确定性路由、重试预算和恢复。
-- 3至8条高价值端到端黄金项目书。
+- NULL、NaN、Decimal、时间、重复行和 Join 基数规范化。
+- Comparator 精确状态与 PlanEquivalence。
+- LangGraph 确定性路由、重试预算和恢复。
+- 3 至 8 条高价值端到端黄金 DeveloperSpec 用例。
 
-## 5. 不进入普通pytest的内容
+## 5. 不进入普通 pytest 的内容
 
-- LLM全文输出稳定性。
-- Prompt和模型版本排名。
-- 大规模项目书组合。
-- Spark全量性能和资源压测。
+- LLM 全文输出稳定性。
+- Prompt 和模型版本排名。
+- 大规模 DeveloperSpec 组合。
+- Spark 全量性能和资源压测。
 - 人工代码质量评分。
 - 生产数据和生产连接测试。
 
-这些进入Harness或独立环境测试。
+这些进入 Harness 或独立环境测试。
 
 ## 6. 测试设计规则
 
-1. 一个测试保护一个独立风险，不为每个Enum值机械复制。
+1. 一个测试保护一个独立风险，不为每个 Enum 值机械复制。
 2. 优先使用表驱动测试合并同类非法输入。
-3. 不测试Python标准库、dataclass/Enum自身行为和私有实现细节。
-4. 不对文档句子、完整LLM文本和大段生成代码做脆弱快照。
+3. 不测试 Python 标准库、dataclass/Enum 自身行为和私有实现细节。
+4. 不对文档句子、完整 LLM 文本和大段生成代码做脆弱快照。
 5. 安全测试覆盖攻击类别和绕过路径，而不是只测关键词。
-6. 真实DuckDB/Spark集成测试使用小型版本化快照，不mock核心执行语义。
-7. LLM Gateway在单元测试中使用确定性Fake Adapter；真实模型放Harness。
-8. 每个E2E用例必须同时声明业务价值和它替代的低层重复测试。
+6. 真实 DuckDB/Spark 集成测试使用小型版本化快照，不 mock 核心执行语义。
+7. LLM Gateway 在单元测试中使用确定性 Fake Adapter；真实模型放 Harness。
+8. 每个 E2E 用例必须同时声明业务价值和它替代的低层重复测试。
 
 ## 7. 各阶段测试重点
 
-### Phase 1
+### Phase 1A
 
-- RequirementIR、SubIntent、SQLPlan严格Schema。
-- `where_sql`、`join_on`和自由表达式字段被拒绝。
-- 单表及一个白名单Join黄金编译与执行。
-- 未注册指标、列和Join拒绝。
-- MergePlan不兼容粒度进入人工审查。
+- DeveloperSpec Parser golden fixture 全部通过（6 项允许宽松）。
+- DeveloperSpec Parser rejection fixture 全部正确拒绝（7 项禁止宽松）。
+- ParsedDeveloperSpec、OpenQuestion、ParseWarning、SourceConflict 严格 Schema——extra 字段拒绝。
+- `normalized_spec_hash` 确定性：相同输入两次解析 hash 一致。
+- SourceManifest 字段来源标记正确（developer_spec / schema_registry / snapshot_profile）。
+- SchemaRegistry 不可静默覆盖 DeveloperSpec 声明——SOURCE_CONFLICT 正确输出。
+- REQUIRED 字段缺失生成 OpenQuestion(blocking=true)。
 
-### Phase 1.2
+### Phase 1B
 
-- PerfContract 注册表完整性：`rule_id` 唯一性、`get_prompt_hints()` 非空、`get_rules_by_severity()` 正确过滤。
-- REJECT 规则（PERF-001/002/004）通过和拒绝路径：fact 表时间过滤、Join key 类型、时间字段函数包裹。
-- WARN 规则（PERF-005/006/007/008）通过和警告路径：明细 LIMIT、GROUP BY 基数、汇总表优先、Join 前聚合。
-- PERF-003 注册但 no-op，测试推迟到 Phase 1.5。
-- Compiler Pass 确定性：相同 SQLPlan 两次编译产生相同 SQL 和 SHA-256。
-- 谓词规范化：`BETWEEN` / `DATE() =` / `strftime` 改写为标准 `>= AND <`。
-- 门禁集成：REJECT 阻断 Compiler，WARN 不阻断。
+- RelationshipHypothesis 证据等级判定规则：STRONG/MEDIUM 自动采纳，WEAK/NONE 被拒绝。
+- WEAK/NONE Join 被 Validator 拦截，不得进入 SqlBuildPlan 的 JoinSpec。
+- 字段名归一化规则正确（大小写统一、驼峰转下划线、常见别名字典）。
+- 每个 Join 输出完整证据链模板。
+- SqlBuildPlan 8 step Schema（scan/filter/join/aggregate/project/case_when/sort/limit）——extra 字段拒绝。
+- `raw_sql`、`where_sql`、`join_on: str`、`expression: str` 字段不存在或被拒绝。
+- Fake Planner 确定性：相同 SourceManifest 两次生成相同 SqlBuildPlan。
 
-### Phase 1.5
+### Phase 1C
 
-- `WindowExpr`和`WindowFrame`严格Schema。
-- `over_sql`、`window_sql`、`expression: str`和额外字段被拒绝。
-- 未注册分区键、排序键、输入列和指标被拒绝。
-- `ROW_NUMBER`分区TopN、`SUM_OVER`日期累计、`LAG`或`LEAD`环比黄金路径。
-- 非法frame、缺失`order_by`和窗口函数非法位置进入拒绝状态。
-- 相同Window SQLPlan重复编译产生相同SQL和哈希。
+- SQL Validator 正确拒绝未声明表字段、Join key 类型不一致、时间字段无过滤。
+- Compiler 确定性：相同 SqlBuildPlan 两次编译产生相同 SQL 和 SHA-256。
+- PerfContract REJECT 规则（PERF-001/002/004）违反后阻断 Compiler。
+- PerfContract WARN 规则（PERF-005/006/007/008）违反后记录不阻断。
+- PERF-003 窗口函数规则注册但 no-op（Phase 3B 生效）。
+- Compiler Pass 幂等：列裁剪、谓词规范化（BETWEEN/DATE()=/strftime → >= AND <）、无用排序消除、常量折叠。
+- OptimizedSQLPlan 正确记录优化链和 rejected_directives。
+- DuckDB Executor 正确执行 Compiler 产物并输出 ExecutionTrace + ResultSummary。
 
 ### Phase 2
 
-- `transform(inputs, params)`唯一入口。
-- 禁止`spark.table`、read、Action、Sink、UDF、网络、文件和动态执行。
-- Reviewer只输出Finding/Directive。
-- Developer修订后重新验证。
-- Tester代码也被拦截和隔离执行。
-- 真实本地Spark运行一条黄金路径。
+- Code Review Package 目录结构完整，artifact hash 可复现。
+- DataTransformContract-lite 从 SqlBuildPlan 确定性抽取（不依赖 Phase 3A SqlProgram）。
+- provenance.yml 记录所有模型版本和输入 hash。
+- review.md 可被不熟悉系统的数据工程师读懂。
+- 非法输入生成拒绝报告，不生成不完整审查包。
 
-### Phase 3
+### Phase 3A
 
-- 多表锚点键级联抽样。
-- Snapshot hash和EnvironmentManifest。
-- 类型、NULL、NaN、Decimal、时间、multiset和容差。
-- `NOT_EXECUTED`不能升级为一致。
-- `CONSISTENT_SAMPLE`不等于`REVIEW_READY`。
+- SqlProgram 多语句 DAG 依赖正确——两步聚合、多表串联、扇出扇入。
+- 循环依赖被拒绝。
+- _temp 中间表生命周期：创建、使用、清理。
+- 拓扑排序确定性。
+- 多语句 Executor：失败语句阻断后续，cleanup 正确执行。
+
+### Phase 3B
+
+- CaseWhenStep 标签枚举覆盖检查——枚举值不在 DeveloperSpec 声明中被拒绝。
+- WindowExpr 白名单 8 种函数通过，非法函数被拒绝。
+- WindowFrame 非法参数和窗口函数嵌套被拒绝。
+- 窗口函数非法位置（WHERE 子句）被拒绝。
+
+### Phase 3C
+
+- FinalWritePlan 日期分区 overwrite 方案正确生成。
+- 全表 overwrite、无分区 overwrite、UPDATE/DELETE/MERGE 被拒绝。
+- CompilerBackend 抽象接口占位就绪。
 
 ### Phase 4
 
-- 条件边只读取确定性状态。
-- SQL修复只回到SQLPlan。
-- Spark修复回到Developer。
-- 0、1、2轮返工和超限人工审查。
-- checkpoint恢复不重复副作用。
+- 真实 LLM 结构化输出通过率可测量。
+- Harness 七维度门禁 REJECT 项全部通过。
+- 15 条 PERF 规则 REJECT/WARN/PERF_FEEDBACK 分流正确。
+- 六种攻击向量（Prompt 注入、SQL 注入、Schema extra 突破、未声明引用、Join 错误推理、写入越权）全部拦截。
+- Join 推理质量"零容忍"维度：高风险漏报率 = 0、WEAK/NONE 被采纳 = REJECT、缺证据链 = REJECT。
+
+### Phase 4.5
+
+- REST API 请求/响应 Schema 正确校验。
+- CLI 和 Web 同输入同输出。
+- 非法输入展示结构化拒绝原因，不崩溃。
+
+### Phase 5-8
+
+测试重点随 Phase 4 退出后重写的实施 Prompt 同步更新。当前占位：
+- Phase 5：PlanEquivalence 规则、DataTransformContract v1 覆盖完整。
+- Phase 6：受控 PySpark DSL 白名单、Static Validator 拒绝 Action/Sink/UDF。
+- Phase 7：PlanEquivalenceComparator、Snapshot Builder 一致性、ResultComparator 10 维度、故意注入差异全部被发现。
+- Phase 8：LangGraph interrupt/resume 可复现、Spark HarnessVerdict 正确。
 
 ## 8. 质量门
 
@@ -124,8 +162,8 @@ python -m ruff check .
 git diff --check
 ```
 
-阶段报告同时记录Harness基线是否变化，但Harness失败不得被pytest数量掩盖。
+阶段报告同时记录 Harness 基线是否变化，但 Harness 失败不得被 pytest 数量掩盖。
 
 ---
 
-> Phase 0.5 校正 | 2026-06-22 | 全阶段测试事实源
+> Phase 0.5 DeveloperSpec-first 校正 | 2026-06-26 | 全阶段测试事实源
