@@ -1,18 +1,31 @@
-"""TianShu DataDev Agent v3 — IR Protocol 接口定义
+"""DEPRECATED — Phase 1 及以后使用 strict Pydantic 模型（extra="forbid"）替代。
 
 Phase 0 只定义最基础的 Protocol 接口和状态枚举。
 这些接口规定了各模块之间的契约——不包含实现代码。
 
-设计原则：
-- Protocol 而非 dataclass——只定义契约，不约束实现
-- 每个 Protocol 只有核心链路必需的字段
-- 禁止将附加功能（chart、explanation、chinese_answer）塞进核心结构
+迁移规划：
+- ParsedDeveloperSpec → tianshu_datadev.developer_spec.models.ParsedDeveloperSpec
+- SourceManifest → tianshu_datadev.developer_spec.models.SourceManifest
+- 后续 Protocol 将在对应 Phase 中被严格 Pydantic 模型替换
+
+不要删除此文件——Phase 0 的 22 个测试依赖它。
 """
 
 from __future__ import annotations
 
-from enum import Enum
-from typing import Protocol, runtime_checkable
+import warnings
+
+warnings.warn(
+    "ir.protocols is deprecated. Use strict Pydantic models from developer_spec.models instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
+# ── 以下为 Phase 0 原始代码，未修改 ──
+
+# noqa: E402 — 以下导入在 DeprecationWarning 之后，因为 warning 必须在导入其他模块前执行
+from enum import Enum  # noqa: E402
+from typing import Protocol, runtime_checkable  # noqa: E402
 
 # =============================================================================
 # 状态枚举

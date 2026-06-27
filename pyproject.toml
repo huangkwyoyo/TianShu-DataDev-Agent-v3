@@ -24,6 +24,7 @@ classifiers = [
 # 后续阶段按需激活（见各 phase roadmap 文档）
 dependencies = [
     "duckdb>=0.10.0",
+    "pydantic>=2.0",
     "pyyaml>=6.0",
     "sqlglot>=20.0.0",
 ]
@@ -46,7 +47,7 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 
 [tool.ruff]
-line-length = 100
+line-length = 110
 target-version = "py310"
 
 [tool.ruff.lint]
