@@ -3,7 +3,6 @@
 所有 Protocol 只定义形状（属性），不包含实现代码。
 """
 
-import pytest
 
 from tianshu_datadev.ir import (
     CrossValidationResult,
@@ -321,10 +320,10 @@ class TestProtocolDesign:
 
         具体 dataclass 实现将在 Phase 1 添加到 ir/ 子包的独立模块中。
         """
-        from tianshu_datadev.ir import protocols as mod
-
         import dataclasses
         import inspect
+
+        from tianshu_datadev.ir import protocols as mod
 
         for name in dir(mod):
             obj = getattr(mod, name)
