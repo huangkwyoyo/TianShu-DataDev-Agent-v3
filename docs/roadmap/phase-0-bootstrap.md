@@ -21,7 +21,7 @@ Phase 0.5 已将项目从 Text2SQL-first / Fact Catalog-first 路线迁移为 De
 4. 多表样本使用关系一致快照，不按表独立 LIMIT。
 5. 验证采用精确状态，`CONSISTENT_SAMPLE` 不等于生产正确。
 6. Graph State 只保存 artifact 引用、哈希、状态和摘要。
-7. 表字段事实源是 SourceManifest / SchemaRegistry，不建设可写 Domain Memory。
+7. 表字段事实源是 SourceManifest / SchemaRegistry，不建设可写 Domain Memory 或独立 Engineering Memory。
 8. Phase 1A-8 路线按 DeveloperSpec → ParsedDeveloperSpec → SourceManifest → RelationshipHypothesis → SqlBuildPlan → SqlProgram → DataTransformContract → Spark-first 依次推进。
 
 ## Phase 0.5 交付物

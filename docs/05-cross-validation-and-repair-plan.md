@@ -67,6 +67,55 @@ DIFFERENT
 5. 差异诊断不改变确定性比较结果
 6. 两轮返工上限和 `HUMAN_REVIEW` 路由可确定性测试
 
+## 8. 人工 Review Feedback 返工入口
+
+> 本节定义人工 Review 不通过后的结构化反馈与返工路由边界。与 §5 RepairPlanner（自动 Comparator 差异修复）互补——§5 覆盖自动发现的双链不一致，本节覆盖人工发现的逻辑/事实/需求错误。两者共享同一 `retry_count` 上限和 `HUMAN_REVIEW` 退出路由。
+
+### 8.1 与自动返工的区别
+
+| 维度 | 自动返工（§5） | 人工 Review 返工（§8） |
+|------|---------------|---------------------|
+| 触发源 | Comparator 输出 `DIFFERENT` | 人工审查 Code Review Package 发现问题 |
+| 输入 artifact | DifferenceReport | ReviewFeedback |
+| 能发现的问题 | SQL/Spark 双链不一致 | 两个引擎一致地理解错了需求、事实源缺失、Join 逻辑错误、性能隐患 |
+| 路由依据 | DifferenceClassifier + RepairPlanner | `target`（机器路由主字段）+ `finding_type`（细分原因） |
+
+### 8.2 ReviewFeedback artifact 最小字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `request_id` | str | 本次返工请求唯一标识 |
+| `review_package_id` | str | 被审查的 Code Review Package ID |
+| `developer_spec_hash` | str | 审查时使用的 DeveloperSpec 版本 |
+| `source_manifest_hash` | str | 审查时使用的 SourceManifest 版本 |
+| `sql_build_plan_hash` | str | 被审查的 SqlBuildPlan 版本 |
+| `sql_artifact_hash` | str | 被审查的 SQL artifact 版本 |
+| `target` | enum | 机器路由主字段：`REQUIREMENT` / `SQL_PLAN` / `COMPILER_BUG` / `SOURCE_FACT` / `HUMAN_REVIEW` |
+| `finding_type` | str | 细分原因（如 `wrong_metric`、`missing_nullable`、`join_type_error`、`perf_missing_broadcast`） |
+| `comment` | str | 人工审查意见 |
+| `suggested_resolution` | str? | 可选，建议的修复方向 |
+
+`target` 是路由主字段，`finding_type` 不参与路由决策——避免自由文本型字段变成隐式路由条件。
+
+### 8.3 路由表
+
+| `target` | 返工入口 | 说明 |
+|----------|---------|------|
+| `REQUIREMENT` | DeveloperSpec / Parser / Planner | 需求理解错误，修改 DeveloperSpec 或补 HumanResolution，重新走全链路 |
+| `SOURCE_FACT` | SourceManifest / SchemaRegistry / open_questions | 表字段事实缺失或冲突，补全事实源后重新抽取 Contract |
+| `SQL_PLAN` | SqlBuildPlan 重新生成 | SQL 计划错误或 Join 关系错误；Join 问题进入 RelationshipHypothesis 重新定级，不靠 Memory；禁止直接改 SQL 文本 |
+| `COMPILER_BUG` | Compiler 修复 + 回归测试 | 确定性 Compiler 渲染错误，修 Compiler 并加 regression fixture |
+| `HUMAN_REVIEW` | **停止自动返工** | 反馈无法结构化、证据不足、需求变化不明确或目标无法归类 |
+
+性能问题不进入 ReviewFeedback 路由——经人工确认后直接补强 PerfValidator / Compiler Pass / Optimizer 确定性规则。
+
+### 8.4 核心约束
+
+- ReviewFeedback 是**版本化 artifact**，不是 Memory。通过 artifact 引用 + hash + checkpoint + retry_count 关联历史上下文。
+- Agent 读取上一版 DeveloperSpec、SourceManifest、SqlBuildPlan、ReviewFeedback，生成新版 artifact。"在原有基础上修改"不依赖长期学习 Memory。
+- 每次返工重新经过 Validator、Executor、Comparator，与自动返工共享同一 `retry_count` 上限（最多 2 轮）。
+- 可复现 Review 经验沉淀为 regression fixture、Validator/Compiler 规则、Schema/Contract 标注或 Prompt/Harness 回归样本，不进入运行时可检索 Memory。
+
 ---
 
 > Phase 0.5 DeveloperSpec-first 校正 | 2026-06-26 | 占位——Phase 4 退出后重写

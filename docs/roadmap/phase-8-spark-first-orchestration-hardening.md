@@ -12,7 +12,7 @@
 1. LangGraph 编排层接入完整 DeveloperSpec-first 链路
 2. Graph State 只存 artifact 引用、哈希、状态和摘要
 3. 业务节点是可脱离 LangGraph 调用的普通 Python 函数
-4. Memory 在 Phase 8 前不参与运行时路由
+4. 不做独立 Engineering Memory；失败沉淀走 Harness 回归 / 规则 / Schema 标注
 
 ### Graph State 约束
 
@@ -27,11 +27,11 @@
 - 返工上限 2 轮，超限进入 HUMAN_REVIEW
 - 人工中断保留完整审计链
 
-### Memory 禁令
+### Memory 边界
 
-- Engineering Memory 在 Phase 8 前不参与运行时
-- 写入必须可复现且经人工批准
-- 表、字段、Join 和业务口径的事实源是 SourceManifest / SchemaRegistry——不属于可写 Domain Memory
+- **本项目不建设独立 Engineering Memory。** Phase 8 不引入运行时长期学习组件。
+- 失败沉淀走 Harness 回归、确定性规则、Schema/Contract 标注和 Prompt/Harness 版本化评测记录。
+- 表、字段、Join 和业务口径的事实源是 SourceManifest / SchemaRegistry / Contract——禁止用 Memory 覆盖或补写事实源。
 
 ### 验收标准骨架
 

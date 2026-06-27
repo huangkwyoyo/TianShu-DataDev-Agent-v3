@@ -85,6 +85,21 @@ LLM 不能决定验证通过。确定性 Comparator 产生以下精确状态：
 - SQL_PLAN 返回 SQL Planner；SPARK_CODE 返回 SparkDeveloper。
 - 每次修订必须重新经过 Validator、Executor 和 Comparator。
 - 最多 2 轮自动返工；UNKNOWN、事实源缺失、需求变化或超限进入 `HUMAN_REVIEW`。
+- 人工 Review 不通过时，提交结构化 **ReviewFeedback** artifact（非 Memory），至少包含：
+  `request_id`、`review_package_id`、`developer_spec_hash`、`source_manifest_hash`、
+  `sql_build_plan_hash`、`sql_artifact_hash`、`target`、`finding_type`、`comment`、`suggested_resolution`。
+- `target` 是机器路由主字段（`REQUIREMENT` | `SQL_PLAN` | `COMPILER_BUG` | `SOURCE_FACT` | `HUMAN_REVIEW`），
+  `finding_type` 是细分原因。`target=HUMAN_REVIEW` 时停止自动返工。
+- 不同 `target` 的返工入口：
+  - `REQUIREMENT` → 修改 DeveloperSpec 或补 HumanResolution，重新从 Parser/Planner 走
+  - `SOURCE_FACT` → 更新 SourceManifest / SchemaRegistry / open_questions
+  - `SQL_PLAN` → 生成新 SqlBuildPlan（禁止直接改 SQL 文本）；Join 问题进入 RelationshipHypothesis 重新定级，不靠 Memory
+  - `COMPILER_BUG` → 修 Compiler，并加回归测试
+  - `HUMAN_REVIEW` → 反馈无法结构化、证据不足或需求变化不明确，停止自动返工
+- "在原有基础上修改"靠 artifact 引用 + hash + checkpoint + retry_count，不靠 Memory。
+  Agent 读取上一版 DeveloperSpec、SourceManifest、SqlBuildPlan、ReviewFeedback，生成新版 artifact。
+- 可复现 Review 经验沉淀为 regression fixture、Validator/Compiler 规则、
+  Schema/Contract 标注或 Prompt/Harness 回归样本，不进入运行时可检索 Memory。
 
 ## 7. LangGraph Boundary
 
@@ -107,8 +122,13 @@ LLM 不能决定验证通过。确定性 Comparator 产生以下精确状态：
 - Prompt、模型、规模、成本、人工接受率和返工效果进入独立 Harness。
 - Harness 不得成为产品运行时依赖。
 - Run State 由 checkpoint 和 artifact store 管理，不是长期学习 Memory。
-- Engineering Memory 在 Phase 8 前不参与运行时；写入必须可复现且经人工批准。
-- 表、字段、Join 和业务口径的事实源是 SourceManifest / SchemaRegistry，不属于可写 Domain Memory。
+- **本项目不建设独立 Engineering Memory。** 失败、经验与模型行为变化不进入运行时可检索 Memory。
+- 沉淀路径：
+  1. Harness 回归样本（`harness/datasets/regression/` + pytest）
+  2. Validator / Compiler / Optimizer 确定性规则
+  3. SchemaRegistry / Contract 显式标注（nullable、枚举、唯一性、时区策略等）
+  4. Prompt/Harness 版本化评测记录
+- 表、字段、Join 和业务口径的事实源是 SourceManifest / SchemaRegistry / Contract——禁止用 Memory 覆盖或补写事实源。
 
 ## 10. Testing Policy
 

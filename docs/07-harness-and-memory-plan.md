@@ -1,4 +1,4 @@
-# Phase 4 Harness + Phase 8 Memory — TianShu DataDev Agent v3
+# Phase 4 Harness + 回归 / 规则 / Schema 标注 — TianShu DataDev Agent v3
 
 > ⚠️ 本文为占位文档。Phase 4 退出后，必须基于 SQL-first v1.0 的真实 Harness 报告、人工接受率和试用反馈重写本文，才能启动本 Phase 的实施。
 
@@ -6,7 +6,7 @@
 
 ## 1. 当前状态
 
-**等待 Phase 4 退出。** 本文覆盖 Phase 4 的 Harness 评测系统和 Phase 8 的 Engineering Memory。具体的 Harness 实现代码、指标阈值、评测数据集——必须在 Phase 4 真实 LLM 硬化过程中校准后才能确定。
+**等待 Phase 4 退出。** 本文覆盖 Phase 4 的 Harness 评测系统与失败沉淀机制。具体的 Harness 实现代码、指标阈值、评测数据集——必须在 Phase 4 真实 LLM 硬化过程中校准后才能确定。**本项目不建设独立 Engineering Memory。**
 
 ## 2. Harness 七维门禁定义
 
@@ -37,16 +37,19 @@ harness/datasets/
 └── regression/                    # 回归用例
 ```
 
-## 4. Memory 禁令
+## 4. 失败沉淀：回归 / 规则 / Schema 标注（不做独立 Engineering Memory）
 
-- **Memory 不覆盖 DeveloperSpec / SourceManifest / SchemaRegistry**——表、字段、Join 和业务口径的事实源是 SourceManifest / SchemaRegistry，不属于可写 Domain Memory
-- Engineering Memory 在 Phase 8 前不参与运行时路由
-- 只有满足以下条件的经验才能进入 Engineering Memory：
-  1. 来源于可复现失败案例
-  2. 有人工批准记录
-  3. 记录适用范围、反例、来源 artifact 和失效条件
-  4. 版本化并可撤销
-- 禁止建立可半自动写入的 `memory/domain` 来补充或覆盖事实源
+**本项目不建设独立 Engineering Memory。** 失败、经验与模型行为变化不进入运行时可检索 Memory。可复现工程失败按以下路径沉淀：
+
+| 失败类型 | 落点 | 示例 |
+|---------|------|------|
+| LLM 对某类 DeveloperSpec 稳定产出错误 IR | `harness/datasets/regression/` + pytest | JOIN 类型、输出粒度、拒绝路径 |
+| 可自动检测的低效或危险执行模式 | Optimizer / Compiler / Validator 确定性规则 | broadcast、filter pushdown、全表排序 WARN |
+| 事实源缺失或语义标注不足 | SchemaRegistry / SourceManifest / DataTransformContract 字段 | nullable、枚举、唯一性、时区策略 |
+| Prompt 暗示不足导致结构化输出不稳定 | Prompt 回归样本 + Harness 指标 | structured output extra 字段、缺证据链 |
+
+- **事实源隔离**：表、字段、Join 和业务口径的事实源是 SourceManifest / SchemaRegistry / Contract——禁止用 Memory 覆盖或补写事实源。
+- **无自写入**：禁止建立可半自动写入的 `memory/domain` 来补充或覆盖事实源。
 
 ## 5. Harness 非运行时依赖
 
@@ -60,8 +63,8 @@ harness/datasets/
 2. 模型输出评测不依赖全文快照
 3. 能区分样本一致率（CONSISTENT_SAMPLE）、黄金正确率和人工接受率
 4. Domain Knowledge 只有一个事实源——SourceManifest / SchemaRegistry
-5. Engineering Memory 不能未经人工批准自动写入或影响运行时
-6. 每次检索和 Prompt/模型版本均可追溯
+5. 失败案例沉淀路径完整（回归 / 规则 / Schema 标注 / Prompt 回归），不存在独立 Memory 写入流程
+6. Harness case、Prompt 版本、模型版本和失败沉淀落点均可追溯
 
 ---
 

@@ -70,6 +70,10 @@ SQL 与 Spark 读取同一个关系一致冻结快照。确定性 Comparator 可
 
 LangGraph 只负责编排、分支、checkpoint、重试和人工中断。业务逻辑是普通 Python 服务；Graph State 只保存 artifact 引用、哈希、状态和摘要。
 
+### Memory 边界
+
+本项目不建设独立 Engineering Memory。失败案例沉淀进入 Harness 回归集、确定性 Validator / Compiler / Optimizer 规则、SchemaRegistry / Contract 显式标注和 Prompt/Harness 版本化评测记录。运行时路由、规划与生成不读取长期 Memory。事实源只有 SourceManifest / SchemaRegistry / Contract。
+
 ## 规划文档
 
 核心事实源：

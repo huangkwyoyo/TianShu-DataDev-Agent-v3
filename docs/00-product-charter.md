@@ -106,7 +106,7 @@ DeveloperSpec (.md 项目书)
 - 不让 LLM 决定验证是否通过。
 - 不在小样本上宣称 Spark 全量性能合格。
 - 不让 SchemaRegistry 静默覆盖 DeveloperSpec 中程序员已声明的字段类型、枚举值或唯一性——冲突输出 SOURCE_CONFLICT，由程序员裁决。
-- 不让 Memory 覆盖 SourceManifest 或 SchemaRegistry。
+- 不建设独立 Engineering Memory；不让 Memory 覆盖 SourceManifest 或 SchemaRegistry。
 - 不把业务人员自然语言问数作为产品主入口。
 - 不建设生产调度、生产写入和发布审批系统。
 
@@ -124,7 +124,7 @@ DeveloperSpec (.md 项目书)
 | SQL/Spark 语义差异造成误报 | EnvironmentManifest 与 SemanticCompatibilityPolicy |
 | Reviewer 优化改变业务语义 | Reviewer 只输出指令，Developer 修订后重新验证 |
 | LLM 测试代码执行任意操作 | 测试代码同样经过 AST 校验并隔离执行 |
-| Memory 污染后续决策 | 初期不让长期 Memory 参与运行时路由 |
+| Memory 污染后续决策 | 不建设独立 Engineering Memory；失败沉淀走回归 / 规则 / Schema / Prompt 回归 |
 | Spark 侧独立读取 DeveloperSpec 导致验证投入浪费 | SparkDeveloper 读 DataTransformContract（从已验证 SqlBuildPlan 确定性抽取），只做引擎翻译不做二次理解 |
 
 ## 9. v1.0 验收标准
