@@ -1,0 +1,19 @@
+[
+  {
+    "case_id": "golden_join_false_negative_001",
+    "category": "golden",
+    "description": "预期应被推理出的 Join 未被 Planner 输出——零容忍条件①：漏报率 > 0 = REJECT",
+    "developer_spec": {},
+    "expected": {
+      "must_accept": true,
+      "expect_false_negative": true,
+      "required_join_keys": [["orders.user_id", "users.user_id"]],
+      "required_output_columns": ["user_name", "total_amount"],
+      "forbidden_patterns": []
+    },
+    "human_review": {
+      "requires_review": true,
+      "review_focus": ["join_coverage", "false_negative"]
+    }
+  }
+]

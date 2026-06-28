@@ -1,0 +1,26 @@
+[
+  {
+    "case_id": "rej_missing_output_001",
+    "category": "rejection",
+    "description": "缺少 output_spec 的 DeveloperSpec——系统应拒绝生成 SqlBuildPlan，预期 Q-VAL-EMPTY- 拒绝码",
+    "developer_spec": {
+      "input_tables": [
+        {
+          "table_alias": "t1",
+          "source_table": "db.t1",
+          "columns": [
+            {"column_name": "id", "data_type": "int"}
+          ]
+        }
+      ],
+      "metrics": [],
+      "dimensions": [],
+      "output_spec": {"columns": [], "grain": []}
+    },
+    "expected": {
+      "must_accept": false,
+      "expected_rejection_code": "Q-VAL-EMPTY-",
+      "forbidden_patterns": []
+    }
+  }
+]

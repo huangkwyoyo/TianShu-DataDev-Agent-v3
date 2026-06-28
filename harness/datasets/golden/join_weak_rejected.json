@@ -1,0 +1,18 @@
+[
+  {
+    "case_id": "golden_join_weak_rejected_001",
+    "category": "golden",
+    "description": "WEAK 证据等级的 Join 必须被 Validator 拒绝——零容忍条件②：WEAK/NONE 被采纳 = REJECT",
+    "developer_spec": {},
+    "expected": {
+      "must_accept": false,
+      "expect_weak_rejection": true,
+      "expected_rejection_code": "Q-VAL-GATE-",
+      "forbidden_patterns": []
+    },
+    "human_review": {
+      "requires_review": true,
+      "review_focus": ["join_evidence_gate", "weak_rejection"]
+    }
+  }
+]

@@ -1,0 +1,18 @@
+[
+  {
+    "case_id": "golden_join_evidence_chain_001",
+    "category": "golden",
+    "description": "证据链不完整的 Join 必须被拒绝——零容忍条件③：缺证据链 = REJECT（evidence_checks 不足 3 项或 evidence_chain_yaml 为空）",
+    "developer_spec": {},
+    "expected": {
+      "must_accept": false,
+      "expect_evidence_chain_failure": true,
+      "expected_rejection_code": "Q-VAL-GATE-",
+      "forbidden_patterns": []
+    },
+    "human_review": {
+      "requires_review": true,
+      "review_focus": ["evidence_chain", "evidence_completeness"]
+    }
+  }
+]

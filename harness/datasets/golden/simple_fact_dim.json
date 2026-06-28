@@ -1,0 +1,50 @@
+[
+  {
+    "case_id": "golden_simple_fact_dim_001",
+    "category": "golden",
+    "description": "基础事实表聚合，含一个维度表 Join——验证 STRONG 证据的 Join 被正确采纳",
+    "developer_spec": {
+      "input_tables": [
+        {
+          "table_alias": "orders",
+          "source_table": "db.orders",
+          "columns": [
+            {"column_name": "user_id", "data_type": "int"},
+            {"column_name": "pay_amount", "data_type": "decimal"},
+            {"column_name": "dt", "data_type": "date"}
+          ],
+          "row_count": 5000000
+        },
+        {
+          "table_alias": "users",
+          "source_table": "db.users",
+          "columns": [
+            {"column_name": "user_id", "data_type": "int"},
+            {"column_name": "user_name", "data_type": "varchar"}
+          ]
+        }
+      ],
+      "metrics": [
+        {"aggregation": "SUM", "input_column": "pay_amount", "alias": "total_amount"}
+      ],
+      "dimensions": [
+        {"dimension_name": "user_name", "column_ref": "user_name"}
+      ],
+      "output_spec": {
+        "columns": ["user_name", "total_amount"],
+        "grain": ["user_name"]
+      }
+    },
+    "expected": {
+      "must_accept": true,
+      "required_output_columns": ["user_name", "total_amount"],
+      "required_join_keys": [["orders.user_id", "users.user_id"]],
+      "required_warnings": [],
+      "forbidden_patterns": ["SELECT *", "CROSS JOIN"]
+    },
+    "human_review": {
+      "requires_review": false,
+      "review_focus": []
+    }
+  }
+]

@@ -1,0 +1,13 @@
+[
+  {
+    "case_id": "reg_enum_undeclared_001",
+    "category": "regression",
+    "description": "错枚举回归——CaseWhenStep 输出未声明的枚举值'极高'必须被 LabelValidator 拒绝（Phase 4C SEM-WE-001 回归）",
+    "developer_spec": {},
+    "expected": {
+      "must_accept": false,
+      "expected_rejection_code": "label_enum_undeclared_",
+      "forbidden_patterns": []
+    }
+  }
+]

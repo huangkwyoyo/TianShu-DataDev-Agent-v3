@@ -1,0 +1,29 @@
+[
+  {
+    "case_id": "perf_count_distinct_no_group_001",
+    "category": "performance",
+    "description": "COUNT_DISTINCT 无 GROUP BY——应触发 PERF-009 WARN（全量去重扫描性能风险）",
+    "developer_spec": {
+      "input_tables": [
+        {
+          "table_alias": "t1",
+          "source_table": "db.t1",
+          "columns": [
+            {"column_name": "uid", "data_type": "int"},
+            {"column_name": "dt", "data_type": "date"}
+          ]
+        }
+      ],
+      "metrics": [
+        {"aggregation": "COUNT_DISTINCT", "input_column": "uid", "alias": "dau"}
+      ],
+      "dimensions": [],
+      "output_spec": {"columns": ["dau"], "grain": []}
+    },
+    "expected": {
+      "must_accept": true,
+      "required_perf_warns": ["PERF-009"],
+      "forbidden_patterns": []
+    }
+  }
+]

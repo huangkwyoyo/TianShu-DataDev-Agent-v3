@@ -139,3 +139,88 @@ class SemanticEvalReport(StrictModel):
         """生成确定性评测 ID——基于时间戳的 SHA-256 前 12 位。"""
         now = datetime.now(timezone.utc).isoformat()
         return f"sem_eval_{hashlib.sha256(now.encode()).hexdigest()[:12]}"
+
+
+# ════════════════════════════════════════════
+# Phase 4D——Harness 七维门禁模型
+# ════════════════════════════════════════════
+
+
+class DatasetCategory(str, Enum):
+    """五类 Harness 评测数据集——每个子目录对应一个类别。"""
+
+    GOLDEN = "golden"  # 黄金数据集——预期正确的 DeveloperSpec → SqlBuildPlan
+    REJECTION = "rejection"  # 拒绝数据集——应被拒绝的非法输入
+    ATTACK = "attack"  # 攻击数据集——六种攻击向量（Phase 4C 产出）
+    PERFORMANCE = "performance"  # 性能数据集——15 条 PERF 规则边界
+    REGRESSION = "regression"  # 回归数据集——Phase 3 Exit + 4A/4B/4C 已知错误
+
+
+class HarnessCase(StrictModel):
+    """统一的 Harness 评测用例——覆盖全部 5 类数据集。
+
+    category 鉴别器指示用例所属数据集分类。
+    expected 字典承载分类特定的预期结果形状，
+    由各分类的 fixture 验证测试校验结构完整性。
+    """
+
+    case_id: str  # 全局唯一标识，如 "golden_simple_001"
+    category: DatasetCategory  # 所属数据集分类
+    description: str  # 人类可读的用例描述
+
+    # 灵活字段——各分类承载不同的结构
+    developer_spec: dict = {}  # 内联 DeveloperSpec 内容
+    expected: dict = {}  # 分类特定的预期结果字典
+    attack: dict | None = None  # 攻击向量元数据（仅 attack 分类使用）
+    human_review: dict = {}  # 人工审查元数据
+
+
+class HarnessVerdict(str, Enum):
+    """Phase 4 退出门禁判决——GO 或 NO_GO。"""
+
+    GO = "GO"  # 全部 REJECT 项通过，可退出 Phase 4
+    NO_GO = "NO_GO"  # 存在 REJECT 项未通过，不得退出
+
+
+class DimensionResult(StrictModel):
+    """七维门禁的单维度结果——含判决、可测量指标、证据摘要。
+
+    verdict 取值："PASS" | "REJECT" | "WARN"
+    metrics 记录该维度所有可测量的量化指标。
+    details 记录人类可读的发现项列表（如具体的漏报项）。
+    """
+
+    dimension: int  # 1-7
+    name: str  # 维度名称
+    verdict: str  # PASS | REJECT | WARN
+    metrics: dict[str, float | int | str | bool] = {}  # 可测量指标
+    evidence: str = ""  # 证据文件引用或摘要
+    details: list[str] = []  # 详细发现项
+
+
+class HarnessReport(StrictModel):
+    """Phase 4D 七维门禁完整报告——退出决策的唯一依据。
+
+    含每个维度的逐项结果、总体判决、被 REJECT 的维度列表。
+    WARN 项进入审查包（review package），不阻断退出但必须记录。
+    """
+
+    report_id: str  # 确定性生成的报告唯一标识
+    phase: str = "phase-4-exit"  # 所属 Phase
+    dimensions: list[DimensionResult]  # 7 个维度结果
+    overall_verdict: HarnessVerdict  # GO | NO_GO
+    rejected_dimensions: list[int] = []  # 被 REJECT 的维度编号列表
+    warn_items: list[str] = []  # WARN 级别项列表（进入审查包）
+    evaluated_at: str  # ISO 时间戳
+    dataset_counts: dict[str, int] = {}  # 各数据集评测案例数
+
+    # 子报告引用——嵌入原始报告用于可追溯性
+    security_report: dict | None = None  # SecurityEvalReport 的 model_dump()
+    semantic_report: dict | None = None  # SemanticEvalReport 的 model_dump()
+    join_quality_report: dict | None = None  # Join 质量详细报告
+
+    @staticmethod
+    def generate_report_id() -> str:
+        """生成确定性报告 ID——基于时间戳的 SHA-256 前 12 位。"""
+        now = datetime.now(timezone.utc).isoformat()
+        return f"hr_{hashlib.sha256(now.encode()).hexdigest()[:12]}"
