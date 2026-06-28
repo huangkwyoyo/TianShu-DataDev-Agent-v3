@@ -112,6 +112,18 @@ def generate_review_md(
             lines.append("  - (未声明具体字段)")
         lines.append("")
 
+    # 过滤条件（从 Contract 结构化字段渲染人类可读表达式）
+    lines.append("### 2.3 过滤条件")
+    lines.append("")
+    filters = contract_dict.get("filters", [])
+    if filters:
+        for f in filters:
+            display = _render_predicate_display(f)
+            lines.append(f"- `{display}`")
+    else:
+        lines.append("(无显式过滤条件)")
+    lines.append("")
+
     # 3. Join 证据链
     lines.append("## 3. Join 证据链")
     lines.append("")
@@ -234,3 +246,23 @@ def generate_review_md(
     lines.append("")
 
     return "\n".join(lines)
+
+
+def _render_predicate_display(pred: dict) -> str:
+    """从 ContractPredicate 的结构化字段渲染人类可读的谓词表达式。
+
+    此函数仅用于 review.md 等显示层 artifact，
+    不得被 Phase 5 Spark 编译器直接消费——Spark 应使用 left/operator/right 结构化三元组。
+
+    Args:
+        pred: ContractPredicate 序列化 dict，含 left/operator/right 字段
+
+    Returns:
+        人类可读的表达式字符串，如 "tf.amount > 0" 或 "td.status = 'active'"
+    """
+    left = pred.get("left", "")
+    op = pred.get("operator", "")
+    right = pred.get("right", "")
+    if right:
+        return f"{left} {op} {right}"
+    return f"{left} {op}"

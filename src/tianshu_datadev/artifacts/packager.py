@@ -27,7 +27,7 @@ from .models import (
     PackageInputs,
     ReviewPackageManifest,
 )
-from .provenance import generate_provenance
+from .provenance import compute_json_hash, generate_provenance
 from .review_md import generate_review_md
 
 
@@ -315,6 +315,7 @@ class ReviewPackageBuilder:
     # ── 输入验证 ──
 
     @staticmethod
+    @staticmethod
     def _validate_inputs(inputs: PackageInputs) -> None:
         """验证输入 artifact 之间的 hash 一致性。
 
@@ -343,9 +344,40 @@ class ReviewPackageBuilder:
                 )
 
         # 验证 contract 的 source_sqlbuildplan_hash 与 plan 一致
-        # （contract 是在 packager 外部生成的，此处仅做一致性提醒）
+        # （contract 是在 packager 外部生成的，此处校验防止错配）
+        contract_source_hash = inputs.data_transform_contract.get(
+            "source_sqlbuildplan_hash", ""
+        )
+        plan_hash = ReviewPackageBuilder._compute_plan_hash_from_dict(
+            inputs.sql_build_plan
+        )
+        if contract_source_hash and plan_hash and contract_source_hash != plan_hash:
+            errors.append(
+                f"contract.source_sqlbuildplan_hash ({contract_source_hash}) != "
+                f"sql_build_plan hash ({plan_hash})"
+            )
+
         if errors:
             raise ValueError("输入 artifact hash 不一致:\n- " + "\n- ".join(errors))
+
+    @staticmethod
+    def _compute_plan_hash_from_dict(plan_dict: dict) -> str:
+        """从序列化 plan dict 计算 plan hash——与 SqlBuildPlan.generate_plan_hash 等价。
+
+        仅 hash steps 数组（排除 step_id 和 None 值），截取前 16 位。
+        用于 _validate_inputs 中 contract 与 plan 的一致性校验。
+        """
+        steps = plan_dict.get("steps", [])
+        steps_data: list[dict] = []
+        for step in steps:
+            # 排除 step_id 和 None 值——与 generate_plan_hash 的 exclude 参数一致
+            step_clean = {
+                k: v for k, v in step.items()
+                if k != "step_id" and v is not None
+            }
+            steps_data.append(step_clean)
+        content = json.dumps(steps_data, sort_keys=True, default=str)
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
 
     # ── 人工审查清单构建 ──
 
@@ -758,11 +790,11 @@ class ReviewPackageBuilder:
             created_at=now,
             artifacts=artifacts,
             spec_hash=inputs.parsed_spec.get("spec_hash", ""),
-            source_manifest_hash=inputs.source_manifest.get("manifest_id", ""),
-            sql_build_plan_hash=inputs.sql_build_plan.get("plan_id", ""),
-            sql_artifact_hash=inputs.sql_artifact.get("artifact_id", ""),
-            data_transform_contract_hash=inputs.data_transform_contract.get(
-                "contract_id", ""
+            source_manifest_hash=compute_json_hash(inputs.source_manifest),
+            sql_build_plan_hash=compute_json_hash(inputs.sql_build_plan),
+            sql_artifact_hash=compute_json_hash(inputs.sql_artifact),
+            data_transform_contract_hash=compute_json_hash(
+                inputs.data_transform_contract
             ),
             provenance_hash=provenance_sha256,
             retry_count=inputs.retry_count,

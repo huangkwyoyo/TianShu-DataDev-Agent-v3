@@ -48,14 +48,14 @@ def generate_provenance(
     trace_id = _safe_get(inputs.execution_trace, "trace_id", "") if inputs.execution_trace else ""
 
     # 计算各原始对象的 hash
-    parsed_spec_hash = _compute_json_hash(inputs.parsed_spec)
-    source_manifest_hash = _compute_json_hash(inputs.source_manifest)
-    hypothesis_hash = _compute_json_hash(inputs.hypothesis) if inputs.hypothesis else ""
-    sql_build_plan_hash = _compute_json_hash(inputs.sql_build_plan)
+    parsed_spec_hash = compute_json_hash(inputs.parsed_spec)
+    source_manifest_hash = compute_json_hash(inputs.source_manifest)
+    hypothesis_hash = compute_json_hash(inputs.hypothesis) if inputs.hypothesis else ""
+    sql_build_plan_hash = compute_json_hash(inputs.sql_build_plan)
     # sql_artifact 的完整性由 compiled_sql_sha256 保证——不需要额外 hash
-    data_transform_contract_hash = _compute_json_hash(inputs.data_transform_contract)
-    execution_trace_hash = _compute_json_hash(inputs.execution_trace) if inputs.execution_trace else ""
-    result_summary_hash = _compute_json_hash(inputs.result_summary) if inputs.result_summary else ""
+    data_transform_contract_hash = compute_json_hash(inputs.data_transform_contract)
+    execution_trace_hash = compute_json_hash(inputs.execution_trace) if inputs.execution_trace else ""
+    result_summary_hash = compute_json_hash(inputs.result_summary) if inputs.result_summary else ""
     snapshot_manifest_hash = ""  # Phase 2 无快照
 
     # 构建环境指纹
@@ -105,8 +105,12 @@ artifact_ids:
     return yml, provenance_sha256
 
 
-def _compute_json_hash(data: dict | None) -> str:
-    """计算 JSON 可序列化数据的 SHA-256。"""
+def compute_json_hash(data: dict | None) -> str:
+    """计算 JSON 可序列化数据的 SHA-256——canonical JSON 序列化后取 SHA-256。
+
+    公开函数，供 ReviewPackageManifest 和 provenance.yml 共同使用，
+    确保 manifest 与 provenance 的 hash 值一致。
+    """
     if data is None:
         return ""
     import json
@@ -120,7 +124,7 @@ def _safe_get(data: dict | None, key: str, default: str = "") -> str:
     if data is None:
         return default
     if not key:  # key 为空时返回整个 dict 的 hash
-        return _compute_json_hash(data)
+        return compute_json_hash(data)
     val = data.get(key, default)
     return str(val) if val is not None else default
 

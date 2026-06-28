@@ -7,8 +7,6 @@
 - Contract 不包含 SQL 代码字段
 """
 
-import hashlib
-import json
 import os
 
 from tianshu_datadev.artifacts.contract_extractor import DataTransformContractExtractor

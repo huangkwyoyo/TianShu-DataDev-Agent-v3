@@ -27,6 +27,7 @@ from .models import (
     PackageInputs,
     ReviewFeedback,
     ReviewPackageManifest,
+    ReviewTarget,
     ValidationSummaryArtifact,
 )
 
@@ -34,13 +35,14 @@ from .models import (
 from .packager import ReviewPackageBuilder
 
 # ── Provenance 生成器 ──
-from .provenance import generate_provenance
+from .provenance import compute_json_hash, generate_provenance
 
 # ── Review.md 生成器 ──
 from .review_md import generate_review_md
 
 __all__ = [
     # 数据模型
+    "ReviewTarget",
     "VALID_REVIEW_TARGETS",
     "REVIEW_ROUTING_TABLE",
     "ArtifactRef",
@@ -63,6 +65,7 @@ __all__ = [
     # Packager
     "ReviewPackageBuilder",
     # 生成器
+    "compute_json_hash",
     "generate_provenance",
     "generate_review_md",
 ]

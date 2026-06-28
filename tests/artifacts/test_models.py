@@ -10,8 +10,8 @@ import pytest
 from pydantic import ValidationError
 
 from tianshu_datadev.artifacts.models import (
-    VALID_REVIEW_TARGETS,
     REVIEW_ROUTING_TABLE,
+    VALID_REVIEW_TARGETS,
     ArtifactRef,
     DataTransformContractLite,
     HumanReviewItem,
@@ -42,28 +42,28 @@ class TestReviewFeedbackSchema:
             )
 
     def test_review_feedback_rejects_invalid_target(self):
-        """target 非法值应被拒绝——即便 Pydantic 不自动校验枚举，也应通过业务验证。"""
-        # 创建合法的 ReviewFeedback（Pydantic 层面通过）
-        feedback = ReviewFeedback(
-            request_id="req_001",
-            review_package_id="pkg_abc",
-            developer_spec_hash="abc123",
-            source_manifest_hash="def456",
-            sql_build_plan_hash="ghi789",
-            sql_artifact_hash="jkl012",
-            target="INVALID_TARGET",
-            finding_type="test",
-            comment="测试",
-            suggested_resolution="测试",
-        )
+        """target 非法值必须在 Pydantic 构造时直接抛出 ValidationError。
 
-        # 业务层验证：target 必须在 VALID_REVIEW_TARGETS 中
+        target 是 Literal 类型，非法值无法通过 Pydantic 校验，
+        不依赖业务层手动调用 validate_target()。
+        """
+        with pytest.raises(ValidationError):
+            ReviewFeedback(
+                request_id="req_001",
+                review_package_id="pkg_abc",
+                developer_spec_hash="abc123",
+                source_manifest_hash="def456",
+                sql_build_plan_hash="ghi789",
+                sql_artifact_hash="jkl012",
+                target="INVALID_TARGET",  # ← 非法路由值，Pydantic 直接拒绝
+                finding_type="test",
+                comment="测试",
+                suggested_resolution="测试",
+            )
+
+        # validate_target() 仍可用于提前检测（不构造对象时）
         assert ReviewFeedback.validate_target("INVALID_TARGET") is False
         assert ReviewFeedback.validate_target("SQL_PLAN") is True
-
-        # 非法 target 应被检测
-        is_valid = feedback.target in VALID_REVIEW_TARGETS
-        assert is_valid is False
 
     def test_review_feedback_valid_targets_accepted(self):
         """所有 5 个合法 target 值应被接受。"""

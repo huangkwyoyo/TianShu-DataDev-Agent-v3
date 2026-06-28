@@ -9,8 +9,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+from typing import Literal
 
 from tianshu_datadev.developer_spec.models import StrictModel
+
+# ── ReviewFeedback 路由 target 字面量类型 ──
+# Pydantic 在构造时强制校验，非法值直接 ValidationError
+ReviewTarget = Literal[
+    "REQUIREMENT",   # → 修改 DeveloperSpec，重新走 Parser/Planner
+    "SQL_PLAN",      # → 生成新 SqlBuildPlan（禁止直接改 SQL 文本）
+    "COMPILER_BUG",  # → 修 Compiler 并加回归测试
+    "SOURCE_FACT",   # → 更新 SourceManifest / SchemaRegistry / open_questions
+    "HUMAN_REVIEW",  # → 停止自动返工，需人工介入
+]
 
 # ════════════════════════════════════════════
 # DataTransformContract-lite
@@ -48,15 +59,16 @@ class ContractJoin(StrictModel):
 
 
 class ContractPredicate(StrictModel):
-    """Contract 中的过滤条件——人类可读的谓词描述。
+    """Contract 中的过滤条件——结构化谓词，不含自由文本。
 
-    不包含嵌套 AST，仅保留表达式的结构化摘要。
+    不包含嵌套 AST，仅保留表达式的结构化三元组。
+    人类可读的表达式渲染仅允许出现在 review.md 等显示层 artifact 中，
+    不得被 Phase 5 Spark 编译器直接消费。
     """
 
-    expression: str  # 人类可读的谓词描述，如 "tf.amount > 0"
-    operator: str  # 操作符，如 "GT" / "EQ" / "AND"
-    left: str  # 左操作数描述
-    right: str  # 右操作数描述
+    operator: str  # 操作符，如 "GT" / "EQ" / "AND" / "IN"
+    left: str  # 左操作数（列引用或嵌套谓词的规范化字符串表示）
+    right: str  # 右操作数（列引用、字面量或空字符串）
 
 
 class ContractAggregation(StrictModel):
@@ -239,6 +251,8 @@ class ReviewFeedback(StrictModel):
     target=HUMAN_REVIEW 时停止自动返工。
 
     返工不靠 Memory，靠 artifact 引用 + hash + checkpoint + retry_count。
+
+    target 由 Pydantic 在构造时强制校验（Literal 类型），非法值直接 ValidationError。
     """
 
     model_config = {"extra": "forbid"}  # type: ignore[assignment]
@@ -249,7 +263,7 @@ class ReviewFeedback(StrictModel):
     source_manifest_hash: str  # SourceManifest SHA-256
     sql_build_plan_hash: str  # SqlBuildPlan SHA-256
     sql_artifact_hash: str  # SqlArtifact SHA-256
-    target: str  # 机器路由主字段——必须是 VALID_REVIEW_TARGETS 之一
+    target: ReviewTarget  # 机器路由主字段——Literal 类型，Pydantic 构造时强制校验
     finding_type: str  # 细分原因——不参与路由
     comment: str  # 人类可读的审查意见
     suggested_resolution: str  # 建议的解决方案

@@ -176,20 +176,17 @@ class DataTransformContractExtractor:
 
     @staticmethod
     def _extract_filter(step: FilterStep) -> ContractPredicate:
-        """从 FilterStep 提取人类可读的过滤条件描述。"""
+        """从 FilterStep 提取结构化过滤条件——不含自由文本表达式。
+
+        人类可读的表达式渲染由 review.md 层负责，
+        Contract 仅保留 left/operator/right 结构化三元组。
+        """
         pred = step.predicate
         left_str = DataTransformContractExtractor._render_operand(pred.left)
-        right_str = DataTransformContractExtractor._render_operand(pred.right)
+        right_str = DataTransformContractExtractor._render_operand(pred.right) if pred.right else ""
         op_str = pred.operator.value if hasattr(pred.operator, "value") else str(pred.operator)
 
-        # 构建人类可读表达式
-        if right_str and right_str != "None":
-            expression = f"{left_str} {op_str} {right_str}"
-        else:
-            expression = f"{left_str} {op_str}"
-
         return ContractPredicate(
-            expression=expression,
             operator=op_str,
             left=left_str,
             right=right_str,

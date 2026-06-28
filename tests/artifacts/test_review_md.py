@@ -9,7 +9,7 @@
 import os
 
 from tianshu_datadev.artifacts.models import HumanReviewItem, PackageInputs
-from tianshu_datadev.artifacts.review_md import generate_review_md
+from tianshu_datadev.artifacts.review_md import _render_predicate_display, generate_review_md
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan, SqlBuildPlanBuilder
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
@@ -172,3 +172,59 @@ class TestReviewMd:
 
         md = generate_review_md(inputs)
         assert "未执行" in md
+
+    def test_review_md_renders_filters_from_structured_fields(self):
+        """过滤条件应从结构化 left/operator/right 字段渲染为人类可读表达式。"""
+        inputs = _build_minimal_inputs()
+        # 注入结构化过滤条件（不含 expression 字段）
+        inputs.data_transform_contract["filters"] = [
+            {"operator": "GT", "left": "tf.amount", "right": "0"},
+            {"operator": "EQ", "left": "td.status", "right": "'active'"},
+        ]
+        md = generate_review_md(inputs)
+
+        # 应包含过滤条件子章节
+        assert "### 2.3 过滤条件" in md
+        # 应从结构化字段渲染人类可读表达式
+        assert "tf.amount GT 0" in md
+        assert "td.status EQ 'active'" in md
+
+    def test_review_md_filters_empty_shows_placeholder(self):
+        """无过滤条件时应显示占位文本。"""
+        inputs = _build_minimal_inputs()
+        md = generate_review_md(inputs)
+
+        assert "### 2.3 过滤条件" in md
+        assert "(无显式过滤条件)" in md
+
+
+class TestRenderPredicateDisplay:
+    """_render_predicate_display 工具函数测试。"""
+
+    def test_binary_predicate(self):
+        """二元谓词——left operator right。"""
+        result = _render_predicate_display(
+            {"left": "tf.amount", "operator": "GT", "right": "0"}
+        )
+        assert result == "tf.amount GT 0"
+
+    def test_unary_predicate(self):
+        """一元谓词——无 right 值。"""
+        result = _render_predicate_display(
+            {"left": "td.deleted", "operator": "IS_NULL", "right": ""}
+        )
+        assert result == "td.deleted IS_NULL"
+
+    def test_in_predicate(self):
+        """IN 谓词——right 含多个值。"""
+        result = _render_predicate_display(
+            {"left": "td.zone", "operator": "IN", "right": "('A', 'B', 'C')"}
+        )
+        assert result == "td.zone IN ('A', 'B', 'C')"
+
+    def test_string_literal_right(self):
+        """right 为字符串字面量时保留引号。"""
+        result = _render_predicate_display(
+            {"left": "tf.status", "operator": "EQ", "right": "'active'"}
+        )
+        assert result == "tf.status EQ 'active'"
