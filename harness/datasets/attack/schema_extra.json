@@ -1,0 +1,35 @@
+[
+  {
+    "case_id": "SEC-SE-001",
+    "attack_vector": "SCHEMA_EXTRA",
+    "description": "SqlBuildPlan dict 含 sql 额外字段——LLM 试图绕过 Compiler 直接输出 SQL 文本",
+    "expected_protection_layer": "schema",
+    "expected_rejection_pattern": "sql",
+    "payload": {
+      "extra_field": "sql",
+      "injection_value": "SELECT * FROM users"
+    }
+  },
+  {
+    "case_id": "SEC-SE-002",
+    "attack_vector": "SCHEMA_EXTRA",
+    "description": "SqlBuildPlan dict 含 expression: str 额外字段——LLM 试图在 Step 中嵌入自由表达式",
+    "expected_protection_layer": "schema",
+    "expected_rejection_pattern": "expression",
+    "payload": {
+      "extra_field": "expression",
+      "injection_value": "x + 1"
+    }
+  },
+  {
+    "case_id": "SEC-SE-003",
+    "attack_vector": "SCHEMA_EXTRA",
+    "description": "SqlBuildPlan dict 含 raw_where 额外字段——LLM 试图绕过封闭 Predicate 类型直接注入 WHERE 子句",
+    "expected_protection_layer": "schema",
+    "expected_rejection_pattern": "raw_where",
+    "payload": {
+      "extra_field": "raw_where",
+      "injection_value": "1=1"
+    }
+  }
+]

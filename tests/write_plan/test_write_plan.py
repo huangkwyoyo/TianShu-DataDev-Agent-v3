@@ -848,9 +848,7 @@ class TestSecurityBypassRegression:
         )
         assert _INSERT_OVERWRITE_PARTITION_RE.match(
             spec.overwrite_dml.strip()
-        ), (
-            f"overwrite_dml 不匹配 WV-009 正则"
-        )
+        ), "overwrite_dml 不匹配 WV-009 正则"
 
     def test_bypass_3_temp_sql_semicolon_rejected(self):
         """问题 3 回归：_temp sql 含分号在 Schema 层被拒绝。
@@ -902,6 +900,70 @@ class TestSecurityBypassRegression:
                 sql="INSERT INTO _temp_x SELECT * FROM t",
                 order_index=0,
             )
+
+    # ── 问题 4：分区键注入（本次修复）──
+
+    def test_bypass_4_partition_value_key_injection_rejected(self):
+        """问题 4 回归：partition_values 的 key 注入被 Schema 层拒绝。
+
+        复现样本：
+        partition_values={
+            "dt) SELECT * FROM _temp_result; DROP TABLE prod; --": "20260101"
+        }
+        之前：WriteValidator.is_approved() == True，
+             生成的 SQL 含可执行注入。
+        修复后：PartitionOverwriteSpec 的 @model_validator 拒绝非标识符 key。
+        """
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            PartitionOverwriteSpec(
+                target_table="ads.result",
+                partition_keys=["dt"],
+                partition_values={
+                    "dt) SELECT * FROM _temp_result; DROP TABLE prod; --": "20260101"
+                },
+                partition_format="yyyyMMdd",
+                source_temp_table="_temp_result",
+            )
+
+    def test_bypass_4_partition_key_with_semicolon_rejected(self):
+        """问题 4 延伸：partition_keys 元素含分号被拒绝。"""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            PartitionOverwriteSpec(
+                target_table="ads.result",
+                partition_keys=["dt; DROP TABLE prod; --"],
+                partition_values={"dt; DROP TABLE prod; --": "20260101"},
+                partition_format="yyyyMMdd",
+                source_temp_table="_temp_result",
+            )
+
+    def test_bypass_4_partition_key_mismatch_rejected(self):
+        """问题 4 延伸：partition_values key 与 partition_keys 不一致被拒绝。"""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            PartitionOverwriteSpec(
+                target_table="ads.result",
+                partition_keys=["dt"],
+                partition_values={"wrong_key": "20260101"},
+                partition_format="yyyyMMdd",
+                source_temp_table="_temp_result",
+            )
+
+    def test_partition_keys_allow_valid_identifiers(self):
+        """合法的 SQL 标识符分区键正常通过。"""
+        spec = PartitionOverwriteSpec(
+            target_table="ads.result",
+            partition_keys=["dt", "country_code"],
+            partition_values={"dt": "20260101", "country_code": "CN"},
+            partition_format="yyyyMMdd",
+            source_temp_table="_temp_result",
+        )
+        assert "dt='20260101'" in spec.overwrite_dml
+        assert "country_code='CN'" in spec.overwrite_dml
 
 
 # ════════════════════════════════════════════

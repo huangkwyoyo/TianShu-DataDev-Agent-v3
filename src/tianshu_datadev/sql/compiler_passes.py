@@ -512,3 +512,142 @@ def _collect_from_object(obj, refs: set[str], visited: set[int]) -> None:
     elif hasattr(obj, "__dict__"):
         for val in obj.__dict__.values():
             _collect_from_object(val, refs, visited)
+
+
+# ════════════════════════════════════════════
+# Compiler Pass 幂等验证——Phase 4B 新增
+# ════════════════════════════════════════════
+
+
+def verify_column_pruning_idempotent(
+    plan: SqlBuildPlan,
+) -> tuple[bool, str]:
+    """验证列裁剪 Pass 的幂等性。
+
+    对同一 SqlBuildPlan 运行列裁剪两次，比较两次输出 hash。
+    相同 hash → 幂等成立。
+
+    Args:
+        plan: 待验证的 SqlBuildPlan
+
+    Returns:
+        (idempotent: bool, detail: str)
+    """
+    plan_a, _, _ = column_pruning(plan)
+    plan_b, _, _ = column_pruning(plan_a)
+
+    hash_a = SqlBuildPlan.generate_plan_hash(plan_a)
+    hash_b = SqlBuildPlan.generate_plan_hash(plan_b)
+
+    if hash_a == hash_b:
+        return True, f"列裁剪幂等验证通过——两次运行 hash 一致（{hash_a}）"
+    else:
+        return False, (
+            f"列裁剪幂等验证失败——首次 hash={hash_a}，二次 hash={hash_b}"
+        )
+
+
+def verify_predicate_normalization_idempotent(
+    plan: SqlBuildPlan,
+) -> tuple[bool, str]:
+    """验证谓词规范化 Pass 的幂等性。
+
+    对同一 SqlBuildPlan 运行谓词规范化两次，比较两次输出 hash。
+    相同 hash → 幂等成立。
+
+    Args:
+        plan: 待验证的 SqlBuildPlan
+
+    Returns:
+        (idempotent: bool, detail: str)
+    """
+    plan_a, _ = predicate_normalization(plan)
+    plan_b, _ = predicate_normalization(plan_a)
+
+    hash_a = SqlBuildPlan.generate_plan_hash(plan_a)
+    hash_b = SqlBuildPlan.generate_plan_hash(plan_b)
+
+    if hash_a == hash_b:
+        return True, f"谓词规范化幂等验证通过——两次运行 hash 一致（{hash_a}）"
+    else:
+        return False, (
+            f"谓词规范化幂等验证失败——首次 hash={hash_a}，二次 hash={hash_b}"
+        )
+
+
+def verify_sort_elimination_idempotent(
+    plan: SqlBuildPlan,
+) -> tuple[bool, str]:
+    """验证无用排序消除 Pass 的幂等性。
+
+    对同一 SqlBuildPlan 运行排序消除两次，比较两次输出 hash。
+    相同 hash → 幂等成立。
+
+    Args:
+        plan: 待验证的 SqlBuildPlan
+
+    Returns:
+        (idempotent: bool, detail: str)
+    """
+    plan_a, _, _ = sort_elimination(plan)
+    plan_b, _, _ = sort_elimination(plan_a)
+
+    hash_a = SqlBuildPlan.generate_plan_hash(plan_a)
+    hash_b = SqlBuildPlan.generate_plan_hash(plan_b)
+
+    if hash_a == hash_b:
+        return True, f"排序消除幂等验证通过——两次运行 hash 一致（{hash_a}）"
+    else:
+        return False, (
+            f"排序消除幂等验证失败——首次 hash={hash_a}，二次 hash={hash_b}"
+        )
+
+
+def verify_constant_folding_idempotent(
+    plan: SqlBuildPlan,
+) -> tuple[bool, str]:
+    """验证常量折叠 Pass 的幂等性。
+
+    对同一 SqlBuildPlan 运行常量折叠两次，比较两次输出 hash。
+    相同 hash → 幂等成立。
+
+    Args:
+        plan: 待验证的 SqlBuildPlan
+
+    Returns:
+        (idempotent: bool, detail: str)
+    """
+    plan_a, _ = constant_folding(plan)
+    plan_b, _ = constant_folding(plan_a)
+
+    hash_a = SqlBuildPlan.generate_plan_hash(plan_a)
+    hash_b = SqlBuildPlan.generate_plan_hash(plan_b)
+
+    if hash_a == hash_b:
+        return True, f"常量折叠幂等验证通过——两次运行 hash 一致（{hash_a}）"
+    else:
+        return False, (
+            f"常量折叠幂等验证失败——首次 hash={hash_a}，二次 hash={hash_b}"
+        )
+
+
+def verify_all_passes_idempotent(
+    plan: SqlBuildPlan,
+) -> list[tuple[str, bool, str]]:
+    """运行全部 4 个 Compiler Pass 的幂等验证。
+
+    对同一 SqlBuildPlan 分别运行每个 Pass 两次，
+    验证所有 Pass 的输出 hash 一致。
+
+    Args:
+        plan: 待验证的 SqlBuildPlan
+
+    Returns:
+        [(pass_name, idempotent, detail), ...]——4 个 Pass 的验证结果
+    """
+    return [
+        ("column_pruning", *verify_column_pruning_idempotent(plan)),
+        ("predicate_normalization", *verify_predicate_normalization_idempotent(plan)),
+        ("sort_elimination", *verify_sort_elimination_idempotent(plan)),
+        ("constant_folding", *verify_constant_folding_idempotent(plan)),
+    ]

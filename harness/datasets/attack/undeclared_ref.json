@@ -1,0 +1,24 @@
+[
+  {
+    "case_id": "SEC-UR-001",
+    "attack_vector": "UNDECLARED_REF",
+    "description": "ColumnRef.table_ref 指向 SourceManifest 未注册的表 nonexistent_table——指标引用未声明数据源",
+    "expected_protection_layer": "validator",
+    "expected_rejection_pattern": "Q-VAL-TABLE-",
+    "payload": {
+      "table_ref": "nonexistent_table",
+      "test_type": "column_ref"
+    }
+  },
+  {
+    "case_id": "SEC-UR-002",
+    "attack_vector": "UNDECLARED_REF",
+    "description": "ScanStep.table_ref 指向不在 InputTableDecl 中的表——表引用突破 Schema 白名单",
+    "expected_protection_layer": "validator",
+    "expected_rejection_pattern": "Q-VAL-TABLE-",
+    "payload": {
+      "table_ref": "undeclared_scan_table",
+      "test_type": "scan_step"
+    }
+  }
+]

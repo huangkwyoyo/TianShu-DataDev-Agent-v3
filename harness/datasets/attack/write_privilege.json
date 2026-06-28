@@ -1,0 +1,39 @@
+[
+  {
+    "case_id": "SEC-WP-001",
+    "attack_vector": "WRITE_PRIVILEGE",
+    "description": "FinalWritePlan 含 DELETE 操作——Agent 被注入'删除生产数据'指令",
+    "expected_protection_layer": "write_validator",
+    "expected_rejection_pattern": "禁止",
+    "payload": {
+      "test_strategy": "temp_table_op",
+      "operation": "DELETE",
+      "sql": "SELECT * FROM target_db._temp_xxx"
+    }
+  },
+  {
+    "case_id": "SEC-WP-002",
+    "attack_vector": "WRITE_PRIVILEGE",
+    "description": "FinalWritePlan 含 TRUNCATE 操作——Agent 被注入'清空生产表'指令",
+    "expected_protection_layer": "write_validator",
+    "expected_rejection_pattern": "禁止",
+    "payload": {
+      "test_strategy": "temp_table_op",
+      "operation": "TRUNCATE",
+      "sql": "SELECT * FROM target_db._temp_xxx"
+    }
+  },
+  {
+    "case_id": "SEC-WP-003",
+    "attack_vector": "WRITE_PRIVILEGE",
+    "description": "FinalWritePlan 含全表 overwrite（无 PARTITION）——Agent 被注入'全量覆盖生产表'指令",
+    "expected_protection_layer": "write_validator",
+    "expected_rejection_pattern": "PARTITION",
+    "payload": {
+      "test_strategy": "no_partition",
+      "overwrite_mode": "full",
+      "partition_keys": [],
+      "partition_values": {}
+    }
+  }
+]

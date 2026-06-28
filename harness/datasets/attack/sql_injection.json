@@ -1,0 +1,50 @@
+[
+  {
+    "case_id": "SEC-SQL-001",
+    "attack_vector": "SQL_INJECTION",
+    "description": "ColumnRef.column_name 含分号+DROP TABLE 注入——尝试通过字段名执行多语句攻击",
+    "expected_protection_layer": "schema",
+    "expected_rejection_pattern": "非法 SQL 标识符",
+    "payload": {
+      "malicious_value": "x'; DROP TABLE users; --",
+      "target_type": "ColumnRef",
+      "target_field": "column_name"
+    }
+  },
+  {
+    "case_id": "SEC-SQL-002",
+    "attack_vector": "SQL_INJECTION",
+    "description": "ColumnRef.table_ref 含布尔注入 '; OR '1'='1——尝试通过表引用名突破",
+    "expected_protection_layer": "schema",
+    "expected_rejection_pattern": "非法 SQL 标识符",
+    "payload": {
+      "malicious_value": "x' OR '1'='1",
+      "target_type": "ColumnRef",
+      "target_field": "table_ref"
+    }
+  },
+  {
+    "case_id": "SEC-SQL-003",
+    "attack_vector": "SQL_INJECTION",
+    "description": "ScanStep.table_ref 含 UNION SELECT 注入——尝试通过 FROM 子句注入子查询",
+    "expected_protection_layer": "schema",
+    "expected_rejection_pattern": "非法 SQL 标识符",
+    "payload": {
+      "malicious_value": "x UNION SELECT * FROM passwords",
+      "target_type": "ScanStep",
+      "target_field": "table_ref"
+    }
+  },
+  {
+    "case_id": "SEC-SQL-004",
+    "attack_vector": "SQL_INJECTION",
+    "description": "AggregateSpec.input_column 含注释逃逸 x--\\nDELETE FROM——尝试通过字段名绕过并执行 DML",
+    "expected_protection_layer": "schema",
+    "expected_rejection_pattern": "非法 SQL 标识符",
+    "payload": {
+      "malicious_value": "x--\nDELETE FROM users",
+      "target_type": "AggregateSpec",
+      "target_field": "input_column"
+    }
+  }
+]

@@ -30,6 +30,7 @@ from tianshu_datadev.developer_spec.models import (
     StrictModel,
     _render_sql_string_literal,
 )
+from tianshu_datadev.planning.models import _SQL_ID_RE
 
 # ════════════════════════════════════════════
 # 写入操作枚举
@@ -146,10 +147,59 @@ class PartitionOverwriteSpec(StrictModel):
     """
 
     target_table: SafePhysicalTableName  # 目标物理表名
-    partition_keys: list[str]  # 分区键列表（如 ["dt"]）——Validator 校验元素
-    partition_values: dict[str, str]  # 分区键 → 值（如 {"dt": "20260101"}）
+    partition_keys: list[str]  # 分区键列表（如 ["dt"]）——@model_validator 校验元素
+    partition_values: dict[str, str]  # 分区键 → 值——key 受 @model_validator 校验
     partition_format: str  # 分区格式："yyyyMMdd" | "yyyyMM"
     source_temp_table: SafePhysicalTableName  # 数据来源 _temp 表名
+
+    @model_validator(mode="after")
+    def _validate_partition_keys_safe(self) -> "PartitionOverwriteSpec":
+        """校验分区键和分区值的 key 均为合法 SQL 标识符。
+
+        分区键在渲染时作为 SQL 标识符原样嵌入 PARTITION (key=...) 子句——
+        若不校验，攻击者可通过 partition_values 的 key 注入 SQL 片段：
+
+            partition_values={
+                "dt) SELECT * FROM t; DROP TABLE prod; --": "20260101"
+            }
+            → PARTITION (dt) SELECT * FROM t; DROP TABLE prod; --='20260101')
+
+        此校验在 Schema 层拒绝所有非 SQL 标识符的键名。
+        """
+        # 1. 校验 partition_keys 每个元素为合法 SQL 标识符
+        for key in self.partition_keys:
+            if not _SQL_ID_RE.match(key):
+                raise ValueError(
+                    f"分区键 '{key}' 不是合法 SQL 标识符——"
+                    f"必须匹配 {_SQL_ID_RE.pattern}"
+                    f"（字母/下划线开头，仅含字母数字下划线）"
+                )
+
+        # 2. 校验 partition_values 每个 key 为合法 SQL 标识符
+        for key in self.partition_values:
+            if not _SQL_ID_RE.match(key):
+                raise ValueError(
+                    f"分区值键 '{key}' 不是合法 SQL 标识符——"
+                    f"必须匹配 {_SQL_ID_RE.pattern}"
+                    f"（字母/下划线开头，仅含字母数字下划线）"
+                )
+
+        # 3. 强制 partition_values 的 key 集合与 partition_keys 一致
+        values_keys = set(self.partition_values.keys())
+        declared_keys = set(self.partition_keys)
+        if values_keys != declared_keys:
+            missing = declared_keys - values_keys
+            extra = values_keys - declared_keys
+            msg_parts = []
+            if missing:
+                msg_parts.append(f"partition_values 缺少键：{sorted(missing)}")
+            if extra:
+                msg_parts.append(f"partition_values 含未声明的键：{sorted(extra)}")
+            raise ValueError(
+                f"分区键声明与分区值不一致——{'; '.join(msg_parts)}"
+            )
+
+        return self
 
     @computed_field
     @property

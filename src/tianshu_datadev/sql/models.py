@@ -172,28 +172,138 @@ class ResultSummary(StrictModel):
 
 
 class PerfRuleLevel(str, Enum):
-    """性能规则级别——REJECT 阻断编译，WARN 记录不阻断。"""
+    """性能规则级别——REJECT 阻断编译，WARN 记录不阻断。
+
+    Phase 4B：保留此枚举以兼容旧代码，新代码使用 PerfSeverity。
+    """
 
     REJECT = "REJECT"  # 硬门禁——违反后阻断编译
     WARN = "WARN"  # 软规则——记录到 ExecutionTrace，不阻断
 
 
-class PerfRule(StrictModel):
-    """单条性能契约规则——含触发条件的结构化描述。"""
+class PerfSeverity(str, Enum):
+    """性能规则严重级别——三分流：阻断 / 告警 / 反馈。
 
-    rule_id: str  # PERF-001 到 PERF-008
+    Phase 4B 新增 PERF_FEEDBACK 级别——慢 SQL 执行计划反馈
+    进入 artifact，不改变业务语义。
+    """
+
+    REJECT = "REJECT"  # 硬门禁——违反后阻断编译
+    WARN = "WARN"  # 软规则——记录到 ExecutionTrace，不阻断
+    PERF_FEEDBACK = "PERF_FEEDBACK"  # 执行计划反馈——不改变业务语义，进入 artifact
+
+
+class PerfRule(StrictModel):
+    """单条性能契约规则——含触发条件的结构化描述。
+
+    Phase 4B 扩展至 15 条规则（PERF-001 ~ PERF-015），
+    新增 check_category 分类字段。
+    """
+
+    rule_id: str  # PERF-001 ~ PERF-015
     description: str  # 规则中文描述
-    level: PerfRuleLevel  # REJECT 或 WARN
+    severity: PerfSeverity = PerfSeverity.WARN  # 规则严重级别（默认 WARN）
     condition: str  # 触发条件的人类可读描述
+    # 检查类别——column_selection / filtering / join
+    # / aggregation / sorting / optimization / execution
+    check_category: str = "general"
+
+
+class PerfCheckResult(StrictModel):
+    """单条 PERF 规则的检查结果——含具体被标记项。
+
+    Phase 4B 新增——替代旧 PerfValidationResult 的逐规则结果。
+    flagged_items 记录被标记的具体表名、列名等，便于下游定位问题。
+    """
+
+    rule_id: str  # PERF-001 ~ PERF-015
+    passed: bool  # True = 未违反此规则
+    severity: PerfSeverity  # 规则严重级别
+    message: str  # 人类可读的验证消息
+    flagged_items: list[str] = []  # 被标记的具体项（表名、列名等）
 
 
 class PerfValidationResult(StrictModel):
-    """单条性能规则的验证结果。"""
+    """性能验证聚合结果——Phase 4B 替代原有 tuple[bool, list] 返回值。
 
-    rule_id: str  # PERF-001 到 PERF-008
-    passed: bool  # True 表示未违反此规则
-    level: PerfRuleLevel  # 规则级别
-    message: str  # 人类可读的验证消息
+    聚合全部 15 条规则的检查结果，按严重级别分类：
+    - reject_violations：硬门禁违规——必须修复才能编译
+    - warnings：软规则违规——记录但不阻断
+    - feedbacks：执行计划反馈——进入 artifact，不改变语义
+    """
+
+    plan_id: str  # 被验证的 SqlBuildPlan.plan_id
+    all_reject_passed: bool  # 所有 REJECT 规则是否全部通过
+    check_results: list[PerfCheckResult] = []  # 所有规则的检查结果（15 条）
+    reject_violations: list[PerfCheckResult] = []  # REJECT 违规列表
+    warnings: list[PerfCheckResult] = []  # WARN 违规列表
+    feedbacks: list[PerfCheckResult] = []  # PERF_FEEDBACK 信息列表
+
+
+# ════════════════════════════════════════════
+# SOURCE_ANOMALY——数据源异常统一标记
+# ════════════════════════════════════════════
+
+
+class SourceAnomalyType(str, Enum):
+    """数据源异常类型——统一使用 SOURCE_ 前缀。
+
+    Phase 4B 规定：所有 SourceManifest / 快照异常统一输出为
+    SOURCE_ANOMALY，禁止使用 CATALOG_ANOMALY 或其他命名。
+    """
+
+    SOURCE_MISSING_COLUMN = "SOURCE_MISSING_COLUMN"  # SourceManifest 声明列在快照中不存在
+    SOURCE_TYPE_MISMATCH = "SOURCE_TYPE_MISMATCH"  # 列实际类型与 SourceManifest 声明不一致
+    SOURCE_NULL_SURPRISE = "SOURCE_NULL_SURPRISE"  # 声明为非空的列发现大量 NULL
+    SOURCE_PARTITION_GAP = "SOURCE_PARTITION_GAP"  # 快照分区不连续（日期缺失）
+    SOURCE_ROW_COUNT_DRIFT = "SOURCE_ROW_COUNT_DRIFT"  # 实际行数与 SourceManifest 预估偏差过大
+    SOURCE_VALUE_OUTLIER = "SOURCE_VALUE_OUTLIER"  # 列值分布异常（超出声明范围）
+
+
+class SourceAnomaly(StrictModel):
+    """SourceManifest / 快照数据源异常——统一使用 SOURCE_ANOMALY 标记。
+
+    所有数据源层面的异常（表结构、列类型、数据质量、分区完整性）
+    都通过此模型记录，可在审查包中引用。
+    """
+
+    anomaly_id: str  # 异常唯一标识
+    anomaly_type: SourceAnomalyType  # 异常类型
+    table_ref: str  # 涉及的表引用
+    column_name: str | None = None  # 涉及的列（表级异常时为空）
+    description: str  # 人类可读的异常描述
+    detected_at: str = ""  # 检测时间（ISO 格式）
+    snapshot_ref: str | None = None  # 快照引用
+    expected_value: str | None = None  # SourceManifest 声明的期望值
+    actual_value: str | None = None  # 实际观测值
+
+    @staticmethod
+    def generate_anomaly_id(table_ref: str, anomaly_type: str) -> str:
+        """基于表引用和异常类型的确定性 anomaly ID。"""
+        content = f"{table_ref}:{anomaly_type}"
+        hash_hex = hashlib.sha256(content.encode()).hexdigest()[:12]
+        return f"anomaly_{hash_hex}"
+
+
+# ════════════════════════════════════════════
+# EXPLAIN 反馈模型
+# ════════════════════════════════════════════
+
+
+class ExplainFeedback(StrictModel):
+    """DuckDB EXPLAIN 执行计划的结构化反馈——不改变业务语义。
+
+    Phase 4B 新增：PERF-015（慢 SQL 基于执行计划优化）的产物。
+    flagged_operations 记录被标记的危险操作（全表扫描、笛卡尔积等），
+    suggested_optimizations 提供建议的优化方向。
+    LLM 不参与性能决策——ExplainFeedback 是确定性解析的产物。
+    """
+
+    plan_hash: str  # 关联的 SqlBuildPlan hash
+    explain_output: str  # EXPLAIN / EXPLAIN ANALYZE 原始输出文本
+    flagged_operations: list[str] = []  # 被标记的危险操作
+    suggested_optimizations: list[str] = []  # 建议的优化方向
+    parser_version: str = "1.0.0"  # 解析器版本
 
 
 # ════════════════════════════════════════════

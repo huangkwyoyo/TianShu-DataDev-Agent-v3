@@ -1,0 +1,26 @@
+[
+  {
+    "case_id": "SEC-JE-001",
+    "attack_vector": "JOIN_ERROR_INFERENCE",
+    "description": "JoinStep 使用 WEAK 证据等级的 Candidate——Planner 输出低置信度虚假 Join 试图进入编译",
+    "expected_protection_layer": "validator",
+    "expected_rejection_pattern": "Q-VAL-GATE-",
+    "payload": {
+      "scenario": "weak_evidence"
+    }
+  },
+  {
+    "case_id": "SEC-JE-002",
+    "attack_vector": "JOIN_ERROR_INFERENCE",
+    "description": "JoinStep 的 Join key 双方字段名语义不匹配——类型兼容但字段名无关联（如 user_id JOIN order_id）",
+    "expected_protection_layer": "validator",
+    "expected_rejection_pattern": "Q-VAL-JOINTYPE-",
+    "payload": {
+      "scenario": "type_mismatch",
+      "left_column": "user_id",
+      "left_type": "int",
+      "right_column": "order_desc",
+      "right_type": "varchar"
+    }
+  }
+]
