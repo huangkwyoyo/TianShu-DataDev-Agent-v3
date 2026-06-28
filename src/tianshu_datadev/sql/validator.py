@@ -22,6 +22,7 @@ from tianshu_datadev.planning.relationship_hypothesis import (
 )
 from tianshu_datadev.planning.sql_build_plan import (
     AggregateStep,
+    CaseWhenStep,
     JoinStep,
     ScanStep,
     SqlBuildPlan,
@@ -39,6 +40,10 @@ class SqlBuildPlanValidator:
 
     Validator 是确定性的——相同输入 → 相同输出。
     所有检查结果记录为 OpenQuestion（blocking=True 时阻断编译）。
+
+    Phase 3B 新增：
+    - 窗口函数白名单 + Frame 合法性 + WHERE 拒绝检测
+    - CASE WHEN 标签枚举值校验
     """
 
     def validate(
@@ -46,6 +51,7 @@ class SqlBuildPlanValidator:
         plan: SqlBuildPlan,
         manifest: SourceManifest,
         hypothesis: RelationshipHypothesis | None = None,
+        spec: object | None = None,  # ParsedDeveloperSpec——Phase 3B 标签枚举校验
     ) -> tuple[bool, list[OpenQuestion]]:
         """验证 SqlBuildPlan 的正确性和安全性。
 
@@ -53,6 +59,7 @@ class SqlBuildPlanValidator:
             plan: 待验证的 SqlBuildPlan
             manifest: 事实源——含注册表、字段、类型信息
             hypothesis: Join 推测——用于 Join 证据等级门禁
+            spec: 已解析的 DeveloperSpec（Phase 3B 标签枚举校验）
 
         Returns:
             (all_passed, open_questions)
@@ -88,14 +95,20 @@ class SqlBuildPlanValidator:
         # ── 5. WEAK/NONE Join 门禁（二次确认） ──
         self._validate_join_evidence_gate(ctx, questions)
 
-        # ── 6. 枚举值校验（Phase 1C 占位） ──
-        self._validate_enum_values(ctx, questions)
+        # ── 6. 枚举值校验（Phase 3B 实现） ──
+        self._validate_enum_values(ctx, questions, spec)
 
         # ── 7. 时间过滤校验 ──
         self._validate_time_filter(ctx, questions)
 
         # ── 8. 明细查询 LIMIT 校验 ──
         self._validate_detail_limit(ctx, questions)
+
+        # ── 9. 窗口函数校验（Phase 3B 新增） ──
+        self._validate_window_functions(ctx, questions)
+
+        # ── 10. 窗口函数位置校验（Phase 3B 新增） ──
+        self._validate_window_position(ctx, questions)
 
         # 有 blocking 问题 → 不通过
         all_passed = not any(q.blocking for q in questions)
@@ -231,16 +244,62 @@ class SqlBuildPlanValidator:
                     )
                 )
 
-    def _validate_enum_values(self, ctx: _ValidationContext, questions: list[OpenQuestion]) -> None:
-        """检查 CaseWhenStep 的枚举值是否在 DeveloperSpec 中声明。
+    def _validate_enum_values(
+        self,
+        ctx: _ValidationContext,
+        questions: list[OpenQuestion],
+        spec: object | None = None,
+    ) -> None:
+        """检查 CaseWhenStep 的枚举值是否在 DeveloperSpec / SourceManifest 中声明。
 
-        Phase 1C 占位——当前 CaseWhenStep.cases 为空列表，
-        此检查在 Phase 3B 开放 CASE WHEN 后生效。
+        Phase 3B 实现——调用 LabelValidator 进行确定性的枚举值校验。
         """
-        # Phase 1C: CaseWhenStep.cases 始终为空，无需检查
-        # Phase 3B: 遍历 cases，检查每个 WhenBranch.result.value 是否在
-        #   对应字段的 enum_values 中
-        pass
+        from tianshu_datadev.validation.label_validator import validate_label_enums
+
+        # 收集所有 CaseWhenStep
+        has_case_when = any(
+            isinstance(step, CaseWhenStep) for step in ctx.plan.steps
+        )
+        if not has_case_when:
+            return
+
+        if spec is not None:
+            label_questions = validate_label_enums(
+                ctx.plan, spec=spec, manifest=ctx.manifest
+            )
+        else:
+            label_questions = validate_label_enums(
+                ctx.plan, spec=None, manifest=ctx.manifest
+            )
+        questions.extend(label_questions)
+
+    def _validate_window_functions(
+        self, ctx: _ValidationContext, questions: list[OpenQuestion]
+    ) -> None:
+        """校验窗口函数白名单、Frame 合法性和字段引用。
+
+        Phase 3B 新增——调用 WindowValidator 进行窗口函数安全校验。
+        """
+        from tianshu_datadev.validation.window_validator import (
+            validate_window_exprs,
+        )
+
+        window_questions = validate_window_exprs(ctx.plan, manifest=ctx.manifest)
+        questions.extend(window_questions)
+
+    def _validate_window_position(
+        self, ctx: _ValidationContext, questions: list[OpenQuestion]
+    ) -> None:
+        """检查窗口函数是否出现在 WHERE / HAVING 子句中。
+
+        Phase 3B 新增——窗口函数只能用于 SELECT 和 ORDER BY。
+        """
+        from tianshu_datadev.validation.window_validator import (
+            validate_window_not_in_where,
+        )
+
+        position_questions = validate_window_not_in_where(ctx.plan)
+        questions.extend(position_questions)
 
     def _validate_time_filter(self, ctx: _ValidationContext, questions: list[OpenQuestion]) -> None:
         """检查大事实表是否包含时间过滤条件。
@@ -398,6 +457,8 @@ def _classify_step(step: StepNode, ctx: _ValidationContext) -> None:
         ctx.sort_steps.append(step)
     elif isinstance(step, LimitStep):
         ctx.limit_steps.append(step)
+    # Phase 3B 新增步骤类型——不在旧版分类列表中，仅静默跳过
+    # CaseWhenStep 和 WindowStep 由专用 Validator 处理
 
 
 # ════════════════════════════════════════════

@@ -2,13 +2,19 @@
 
 所有运行时模型使用 extra="forbid"，拒绝未知字段。
 枚举类型使用 (str, Enum) 保证 JSON 序列化兼容。
+
+Phase 3B 安全加固：SafePhysicalTableName 类型——所有物理表名字段，
+在 Pydantic Schema 层即拒绝非法字符（仅允许字母、数字、下划线和可选的 schema 前缀），
+防止 SQL 注入通过 source_table / table_mapping 等字段绕过防线。
 """
 
 from __future__ import annotations
 
+import re
 from enum import Enum
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import AfterValidator, BaseModel, ConfigDict
 
 # ════════════════════════════════════════════
 # 基础
@@ -18,6 +24,147 @@ class StrictModel(BaseModel):
     """所有运行时模型的基类——统一 extra="forbid"，拒绝未知字段。"""
 
     model_config = ConfigDict(extra="forbid", frozen=False)
+
+
+# ════════════════════════════════════════════
+# SQL 物理表名安全约束——Schema 层防线
+# ════════════════════════════════════════════
+
+# 物理表名 allowlist 正则——支持 Unicode 字母 + schema.table 限定名格式
+# [^\W\d_] = Unicode 字母（任何书写系统），每个组件必须以字母开头
+# 拒绝：数字开头、双点号、点号起止、纯下划线开头
+# 注意：SQL 特殊字符（分号、引号、空白等）已被 _PHYSICAL_TABLE_NAME_FORBIDDEN 拦截
+_PHYSICAL_TABLE_NAME_RE = re.compile(
+    r"^[^\W\d][\w]*(?:\.[^\W\d][\w]*)*$", re.UNICODE
+)
+# [^\W\d] = 词字符且非数字 = Unicode 字母或下划线（允许 _private 等标识符）
+
+# 物理表名中明确拒绝的字符集合——用于生成清晰的错误消息
+_PHYSICAL_TABLE_NAME_FORBIDDEN = frozenset({
+    ";", "'", '"', "`", " ", "\t", "\n", "\r",
+    "(", ")", "[", "]", "{", "}", "<", ">",
+    ",", "=", "*", "/", "\\", "?", "!", "@", "#", "$", "%", "^", "&",
+    "+", "|", "~",
+})
+
+
+def _validate_physical_table_name(v: str) -> str:
+    """校验物理表名的合法性——三层防线拒绝 SQL 注入 + 结构非法。
+
+    三层防线设计：
+    1. 禁止字符检查——逐一扫描，清晰报错（分号、引号、空白等）
+    2. 结构合法性检查——拒绝点号起止、连续点号、数字开头
+    3. allowlist 正则——确保每个组件以 Unicode 字母开头
+
+    物理表名与 SafeIdentifier 的关键区别：
+    - 支持 schema.table 限定名格式（点号分隔，每个组件必须是合法标识符）
+    - 支持 Unicode 字母（中文、Cyrillic、Hangul 等）——适配中文数仓
+    - 不允许数字开头——未加引号 SQL 标识符不允许
+
+    这是 source_table / table_mapping / table_paths 的统一安全门禁。
+
+    Raises:
+        ValueError: 物理表名含非法字符或格式不正确
+    """
+    if not v:
+        raise ValueError("物理表名不能为空字符串")
+
+    # ── 第一道防线：禁止字符逐字检查（提供清晰的错误消息）──
+    for ch in v:
+        if ch in _PHYSICAL_TABLE_NAME_FORBIDDEN:
+            raise ValueError(
+                f"物理表名包含非法字符 {repr(ch)}：'{v}'——"
+                f"仅允许字母、数字、下划线，可选 schema.table 限定名格式"
+            )
+
+    # ── 第二道防线：结构合法性检查 ──
+    if v.startswith("."):
+        raise ValueError(f"物理表名不能以点号开头：'{v}'")
+    if v.endswith("."):
+        raise ValueError(f"物理表名不能以点号结尾：'{v}'")
+    if ".." in v:
+        raise ValueError(f"物理表名不能包含连续点号：'{v}'")
+    if v[0].isdigit():
+        raise ValueError(
+            f"物理表名不能以数字开头：'{v}'——"
+            f"未加引号 SQL 标识符必须以字母或下划线开头"
+        )
+
+    # ── 第三道防线：allowlist 正则校验 ──
+    if not _PHYSICAL_TABLE_NAME_RE.match(v):
+        raise ValueError(
+            f"物理表名格式不正确：'{v}'——"
+            f"每个点号分隔的组件必须以字母开头，仅含字母、数字、下划线"
+        )
+
+    return v
+
+
+# 安全物理表名约束类型——替代裸 str 用于 source_table / table_mapping 等字段
+SafePhysicalTableName = Annotated[str, AfterValidator(_validate_physical_table_name)]
+
+
+# ════════════════════════════════════════════
+# SQL CSV 路径安全约束——Schema 层防线
+# ════════════════════════════════════════════
+
+# CSV 路径中明确拒绝的字符——SQL 字符串终结符和控制字符
+# 允许 Windows 反斜杠 \（路径分隔符）和 Unix 正斜杠 /
+_CSV_PATH_FORBIDDEN = frozenset({
+    "'",      # SQL 字符串分隔符——可终结字符串字面量
+    "\n",     # 换行符
+    "\r",     # 回车符
+    "\x00",   # 空字节
+})
+
+
+def _validate_csv_path_literal(v: str) -> str:
+    """校验 CSV 路径不含 SQL 字符串终结符和控制字符。
+
+    CSV 路径作为 SQL 字符串字面量拼入 read_csv_auto('...')——
+    必须拒绝单引号（可终结字符串字面量并开启注入窗口）、
+    换行符、回车符和空字节。
+
+    注意：反斜杠（Windows 路径分隔符）是允许的，
+    攻击载荷中的反斜杠本身不会终结 SQL 字符串。
+
+    Raises:
+        ValueError: CSV 路径含 SQL 字符串终结符或控制字符
+    """
+    if not v:
+        raise ValueError("CSV 路径不能为空字符串")
+
+    for ch in v:
+        if ch in _CSV_PATH_FORBIDDEN:
+            raise ValueError(
+                f"CSV 路径包含非法字符 {repr(ch)}：'{v}'——"
+                f"不允许单引号、换行符、回车符、空字节"
+            )
+
+    return v
+
+
+# 安全 CSV 路径约束类型——替代裸 str 用于 table_paths 的 value
+SafeCsvPathLiteral = Annotated[str, AfterValidator(_validate_csv_path_literal)]
+
+
+def _render_sql_string_literal(value: str) -> str:
+    """将任意字符串渲染为安全的 SQL 字符串字面量。
+
+    使用 SQL 标准单引号转义规则：将字符串中的每个 ' 替换为 ''，
+    并用单引号包裹结果。
+
+    这是 SQL 渲染层纵深防线——即使 Schema 层校验被绕过，
+    此转义仍可阻止通过单引号终结字符串字面量的注入攻击。
+
+    Args:
+        value: 原始字符串值
+
+    Returns:
+        已转义并用单引号包裹的 SQL 字符串字面量
+    """
+    escaped = value.replace("'", "''")
+    return f"'{escaped}'"
 
 
 # ════════════════════════════════════════════
@@ -154,7 +301,7 @@ class InputTableDecl(StrictModel):
     """源表声明——包含别名、物理表名、列、过滤、角色等全部声明信息。"""
 
     table_alias: str
-    source_table: str
+    source_table: SafePhysicalTableName
     row_count: int | None = None  # 规范化后的数字（中文量级已转换）
     raw_row_count: str | None = None  # 原始字符串（如 "~5000万"），用于追溯
     role: str | None = None  # "fact" | "dim" | None
@@ -261,7 +408,7 @@ class ManifestTable(StrictModel):
     """SourceManifest 中的表条目。"""
 
     table_ref: str
-    source_table: str
+    source_table: SafePhysicalTableName
     columns: list[ManifestColumn] = []
     primary_key: list[str] | None = None
     foreign_keys: list[ForeignKeyRef] | None = None

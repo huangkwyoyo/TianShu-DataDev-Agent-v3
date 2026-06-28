@@ -2,6 +2,8 @@
 
 每个 step 使用 step_type: Literal["scan"|...] 作为 Pydantic discriminated union 的判别器。
 禁止任何自由 SQL 字段（raw_sql / where_sql / join_on: str / expression: str）。
+
+Phase 3B 新增 WindowStep（窗口函数步骤）和 CaseWhenStep 完善。
 """
 
 from __future__ import annotations
@@ -26,8 +28,11 @@ from .models import (
     JoinType,
     Predicate,
     PredicateOperator,
+    SafeIdentifier,
     SortSpec,
     SqlLiteral,
+    WhenBranch,
+    WindowExpr,
 )
 from .relationship_hypothesis import RelationshipHypothesis
 
@@ -45,7 +50,7 @@ class ScanStep(StrictModel):
 
     step_type: Literal["scan"] = "scan"
     step_id: str
-    table_ref: str  # SourceManifest 中注册的表引用
+    table_ref: SafeIdentifier  # SourceManifest 中注册的表引用——SafeIdentifier 防注入
     required_columns: list[ColumnRef]  # 实际需要的列——不得为空
     predicates: list[Predicate] = []  # 扫描阶段可下推的过滤
     partition_filters: list[Predicate] = []  # 分区裁剪过滤
@@ -69,7 +74,7 @@ class JoinStep(StrictModel):
 
     step_type: Literal["join"] = "join"
     step_id: str
-    right_table_ref: str  # 被 Join 的右表引用
+    right_table_ref: SafeIdentifier  # 被 Join 的右表引用——SafeIdentifier 防注入
     join_type: JoinType = JoinType.INNER
     join_keys: list[tuple[ColumnRef, ColumnRef]] = []  # (left_key, right_key) 对列表
     relationship_ref: str  # 对应 JoinCandidate.candidate_id
@@ -102,13 +107,26 @@ class CaseWhenStep(StrictModel):
     """CASE WHEN 条件标签步骤——Phase 3B 开放。
 
     枚举值必须在 DeveloperSpec 中声明，未声明枚举值被拒绝。
+    每个 WhenBranch 的 result 值必须来自声明枚举值列表。
     """
 
     step_type: Literal["case_when"] = "case_when"
     step_id: str
-    cases: list = []  # Phase 3B 填充 WhenBranch 列表
-    else_value: SqlLiteral | None = None
-    alias: str = ""
+    cases: list[WhenBranch] = []  # CASE WHEN 分支列表
+    else_value: SqlLiteral | None = None  # 默认值（ELSE 子句）
+    alias: SafeIdentifier = ""  # 输出列别名——SafeIdentifier 防注入（空字符串表示无别名）
+
+
+class WindowStep(StrictModel):
+    """窗口函数步骤——Phase 3B 新增。
+
+    对当前结果集计算窗口函数，每个 WindowExpr 产生一个带别名的输出列。
+    窗口函数白名单（8 种）由 Validator 强制校验。
+    """
+
+    step_type: Literal["window"] = "window"
+    step_id: str
+    window_exprs: list[WindowExpr] = []  # 窗口函数表达式列表
 
 
 class SortStep(StrictModel):
@@ -147,6 +165,7 @@ StepNode = Annotated[
         AggregateStep,
         ProjectStep,
         CaseWhenStep,
+        WindowStep,
         SortStep,
         LimitStep,
     ],
@@ -542,7 +561,7 @@ class SqlBuildPlanBuilder:
         for m in spec.metrics:
             agg_metrics.append(
                 AggregateSpec(
-                    aggregation=m.aggregation.value,
+                    aggregation=m.aggregation,  # 直接传递 AggregationType 枚举
                     input_column=m.input_column,
                     alias=m.alias,
                 )

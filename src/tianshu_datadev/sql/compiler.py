@@ -18,9 +18,11 @@ from tianshu_datadev.planning.models import (
     Predicate,
     PredicateOperator,
     SqlLiteral,
+    WindowExpr,
 )
 from tianshu_datadev.planning.sql_build_plan import (
     AggregateStep,
+    CaseWhenStep,
     FilterStep,
     JoinStep,
     LimitStep,
@@ -28,6 +30,7 @@ from tianshu_datadev.planning.sql_build_plan import (
     ScanStep,
     SortStep,
     SqlBuildPlan,
+    WindowStep,
 )
 from tianshu_datadev.planning.sql_program import (
     SqlProgram,
@@ -77,7 +80,12 @@ class DuckDbSqlCompiler:
         Args:
             table_mapping: table_ref（别名）→ source_table（物理表名）的映射。
                           如果为 None，则使用 table_ref 作为物理表名（用于单表/测试场景）。
+
+        Raises:
+            ValueError: table_mapping 的 key 或 value 包含非法 SQL 字符
         """
+        if table_mapping:
+            self._validate_table_mapping(table_mapping)
         self._table_mapping = table_mapping or {}
 
     def compile(self, plan: SqlBuildPlan) -> CompiledSql:
@@ -215,7 +223,7 @@ class DuckDbSqlCompiler:
         """将 SqlBuildPlan 渲染为完整的 DuckDB SQL 字符串。
 
         渲染顺序：
-        SELECT <project_cols>
+        SELECT <project_cols + case_when + window_exprs>
         FROM <scan_table>
         [JOIN <right_table> ON <keys>]
         [WHERE <filters>]
@@ -223,6 +231,8 @@ class DuckDbSqlCompiler:
         [HAVING <having>]
         [ORDER BY <sort>]
         [LIMIT <n>]
+
+        Phase 3B 新增：CaseWhenStep 和 WindowStep 渲染到 SELECT 子句。
         """
         # 收集各子句
         select_cols: list[str] = []
@@ -233,6 +243,10 @@ class DuckDbSqlCompiler:
         having_clause: str = ""
         order_by_parts: list[str] = []
         limit_clause: str = ""
+
+        # CASE WHEN 列和窗口函数列（Phase 3B）
+        case_when_cols: list[str] = []
+        window_cols: list[str] = []
 
         for step in plan.steps:
             if isinstance(step, ScanStep):
@@ -272,6 +286,19 @@ class DuckDbSqlCompiler:
                 if proj_cols:
                     select_cols = proj_cols
 
+            elif isinstance(step, CaseWhenStep):
+                # Phase 3B：渲染 CASE WHEN 表达式
+                case_sql = self._render_case_when(step)
+                if case_sql:
+                    case_when_cols.append(case_sql)
+
+            elif isinstance(step, WindowStep):
+                # Phase 3B：渲染窗口函数表达式
+                for wexpr in step.window_exprs:
+                    win_sql = self._render_window_expr(wexpr)
+                    if win_sql:
+                        window_cols.append(win_sql)
+
             elif isinstance(step, SortStep):
                 for s in step.order_by:
                     direction = s.direction.value if hasattr(s.direction, "value") else str(s.direction)
@@ -283,18 +310,21 @@ class DuckDbSqlCompiler:
                 else:
                     limit_clause = f"LIMIT {step.limit}"
 
+        # ── 合并 SELECT 列：基础列 + CASE WHEN + 窗口函数 ──
+        all_select_cols = select_cols + case_when_cols + window_cols
+
         # ── 组装 SQL ──
         sql_parts: list[str] = []
 
         # SELECT
-        if select_cols:
-            sql_parts.append(f"SELECT\n  {', '.join(select_cols)}")
+        if all_select_cols:
+            sql_parts.append(f"SELECT\n  {', '.join(all_select_cols)}")
         else:
             sql_parts.append("SELECT *")
 
         # FROM
         if from_parts:
-            sql_parts.append(f"FROM\n  {' , '.join(from_parts)}")  # 注意：DuckDB 支持逗号分隔多表
+            sql_parts.append(f"FROM\n  {' , '.join(from_parts)}")
         else:
             sql_parts.append("FROM (VALUES (1)) AS _empty")  # fallback
 
@@ -352,9 +382,9 @@ class DuckDbSqlCompiler:
 
         # 聚合指标
         for m in step.metrics:
-            # 处理聚合函数
-            agg_func = m.aggregation if isinstance(m.aggregation, str) else m.aggregation.value
-            if agg_func.upper() == "COUNT_DISTINCT":
+            # 处理聚合函数——aggregation 已是 AggregationType 枚举，直接使用
+            agg_func = m.aggregation
+            if agg_func == "COUNT_DISTINCT":
                 if m.input_column:
                     cols.append(f"COUNT(DISTINCT {m.input_column}) AS {m.alias}")
                 else:
@@ -369,20 +399,206 @@ class DuckDbSqlCompiler:
         return cols
 
     def _render_project(self, step: ProjectStep) -> list[str]:
-        """渲染投影步骤为 SELECT 列列表。"""
+        """渲染投影步骤为 SELECT 列列表。
+
+        Phase 3B 扩展：支持 WindowExpr 在 AliasExpr.expression 中。
+        """
         cols: list[str] = []
         for ae in step.columns:
-            # AliasExpr: expression(ColumnRef) + alias
-            col_expr = (
-                ae.expression.column_name
-                if hasattr(ae.expression, "column_name")
-                else str(ae.expression)
-            )
-            if ae.alias and ae.alias != col_expr:
-                cols.append(f"{col_expr} AS {ae.alias}")
+            expr = ae.expression
+            # Phase 3B：窗口表达式
+            if isinstance(expr, WindowExpr):
+                col_expr = self._render_window_expr(expr)
+                if col_expr:
+                    cols.append(col_expr)
+            elif hasattr(expr, "column_name"):
+                col_expr = expr.column_name
+                if ae.alias and ae.alias != col_expr:
+                    cols.append(f"{col_expr} AS {ae.alias}")
+                else:
+                    cols.append(col_expr)
             else:
-                cols.append(col_expr)
+                col_expr = str(expr)
+                if ae.alias and ae.alias != col_expr:
+                    cols.append(f"{col_expr} AS {ae.alias}")
+                else:
+                    cols.append(col_expr)
         return cols
+
+    # ── Phase 3B：CASE WHEN 渲染 ──
+
+    def _render_case_when(self, step: CaseWhenStep) -> str:
+        """渲染 CaseWhenStep 为 CASE WHEN SQL 表达式。
+
+        输出格式：
+            CASE
+              WHEN <condition> THEN <result>
+              [WHEN <condition> THEN <result> ...]
+              [ELSE <else_value>]
+            END AS <alias>
+
+        Args:
+            step: CASE WHEN 步骤
+
+        Returns:
+            完整的 CASE WHEN ... END AS alias SQL 表达式
+        """
+        if not step.cases:
+            return ""
+
+        parts: list[str] = ["CASE"]
+
+        for branch in step.cases:
+            cond_sql = self._render_predicate(branch.condition)
+            result_sql = self._render_literal(branch.result)
+            parts.append(f"  WHEN {cond_sql} THEN {result_sql}")
+
+        if step.else_value is not None:
+            else_sql = self._render_literal(step.else_value)
+            parts.append(f"  ELSE {else_sql}")
+
+        parts.append("END")
+
+        case_expr = "\n".join(parts)
+        if step.alias:
+            return f"{case_expr} AS {step.alias}"
+        return case_expr
+
+    # ── Phase 3B：窗口函数渲染 ──
+
+    def _render_window_expr(self, wexpr: WindowExpr) -> str:
+        """渲染 WindowExpr 为带 OVER 子句的窗口函数 SQL 表达式。
+
+        输出格式：
+            <FUNCTION>(<input>) OVER (
+              [PARTITION BY <cols>]
+              [ORDER BY <cols>]
+              [<frame>]
+            ) AS <alias>
+
+        支持 8 种白名单窗口函数：
+        - ROW_NUMBER / RANK / DENSE_RANK：无参数
+        - LAG / LEAD：单参数（列引用）
+        - SUM_OVER / AVG_OVER / COUNT_OVER：单参数（列引用）
+
+        Args:
+            wexpr: 窗口函数表达式
+
+        Returns:
+            完整的窗口函数 SQL 表达式（含 OVER 子句）
+        """
+        # 函数名映射：WindowFunction 枚举 → SQL 函数名
+        func_name_map = {
+            "ROW_NUMBER": "ROW_NUMBER()",
+            "RANK": "RANK()",
+            "DENSE_RANK": "DENSE_RANK()",
+            "LAG": "LAG",
+            "LEAD": "LEAD",
+            "SUM_OVER": "SUM",
+            "AVG_OVER": "AVG",
+            "COUNT_OVER": "COUNT",
+        }
+
+        func_value = wexpr.function.value if hasattr(wexpr.function, "value") else str(wexpr.function)
+        sql_func = func_name_map.get(func_value, func_value)
+
+        # 构建函数调用
+        if func_value in ("ROW_NUMBER", "RANK", "DENSE_RANK"):
+            func_call = sql_func  # 无参数
+        else:
+            # 有参数的窗口函数
+            if wexpr.input is not None:
+                input_str = self._render_window_input(wexpr.input)
+                func_call = f"{sql_func}({input_str})"
+            else:
+                func_call = f"{sql_func}()"
+
+        # OVER 子句
+        over_parts: list[str] = []
+
+        if wexpr.partition_by:
+            partition_cols = [
+                f"{c.table_ref}.{c.column_name}" if c.table_ref else c.column_name
+                for c in wexpr.partition_by
+            ]
+            over_parts.append(f"PARTITION BY {', '.join(partition_cols)}")
+
+        if wexpr.order_by:
+            order_cols = [
+                f"{s.column} {s.direction.value if hasattr(s.direction, 'value') else str(s.direction)}"
+                for s in wexpr.order_by
+            ]
+            over_parts.append(f"ORDER BY {', '.join(order_cols)}")
+
+        if wexpr.frame is not None:
+            frame_sql = self._render_window_frame(wexpr.frame)
+            if frame_sql:
+                over_parts.append(frame_sql)
+
+        if over_parts:
+            over_clause = "\n  ".join(over_parts)
+            result = f"{func_call} OVER (\n  {over_clause}\n)"
+        else:
+            result = f"{func_call} OVER ()"
+
+        if wexpr.alias:
+            return f"{result} AS {wexpr.alias}"
+        return result
+
+    def _render_window_input(self, win_input) -> str:
+        """渲染窗口函数的输入参数。
+
+        Args:
+            win_input: ColumnRef 或 SqlLiteral
+
+        Returns:
+            SQL 输入表达式
+        """
+        if hasattr(win_input, "table_ref") and hasattr(win_input, "column_name"):
+            # ColumnRef
+            if win_input.table_ref:
+                return f"{win_input.table_ref}.{win_input.column_name}"
+            return win_input.column_name
+        # SqlLiteral
+        return self._render_literal(win_input)
+
+    def _render_window_frame(self, frame) -> str:
+        """渲染 WindowFrame 为 SQL 窗口帧子句。
+
+        输出格式：ROWS BETWEEN <start> AND <end>
+                  RANGE BETWEEN <start> AND <end>
+
+        Args:
+            frame: WindowFrame 对象
+
+        Returns:
+            窗口帧 SQL 字符串
+        """
+        frame_type = frame.frame_type.value if hasattr(frame.frame_type, "value") else str(frame.frame_type)
+        start_str = self._render_frame_boundary(frame.start)
+        end_str = self._render_frame_boundary(frame.end)
+        return f"{frame_type} BETWEEN {start_str} AND {end_str}"
+
+    def _render_frame_boundary(self, boundary) -> str:
+        """渲染 FrameBoundary 为 SQL 边界表达式。
+
+        Args:
+            boundary: FrameBoundary 对象
+
+        Returns:
+            SQL 边界字符串（如 UNBOUNDED PRECEDING、CURRENT ROW、3 PRECEDING）
+        """
+        kind = boundary.kind
+        kind_value = kind.value if hasattr(kind, "value") else str(kind)
+
+        kind_map = {
+            "CURRENT_ROW": "CURRENT ROW",
+            "UNBOUNDED_PRECEDING": "UNBOUNDED PRECEDING",
+            "UNBOUNDED_FOLLOWING": "UNBOUNDED FOLLOWING",
+            "N_PRECEDING": f"{boundary.offset} PRECEDING",
+            "N_FOLLOWING": f"{boundary.offset} FOLLOWING",
+        }
+        return kind_map.get(kind_value, str(kind_value))
 
     # ── Predicate 渲染 ──
 
@@ -489,6 +705,42 @@ class DuckDbSqlCompiler:
         return mapping.get(op, str(op.value))
 
     # ── 表名解析 ──
+
+    @staticmethod
+    def _validate_table_mapping(mapping: dict[str, str]) -> None:
+        """校验 table_mapping 的 key 和 value 均不含 SQL 注入字符。
+
+        这是 Compiler 层防线——在 _resolve_table() 将物理表名拼入 SQL 之前，
+        确保 mapping 中的所有字符串均已通过 allowlist 校验。
+
+        校验规则（与 SafePhysicalTableName 保持一致）：
+        - key（table_ref 别名）：必须符合 SafeIdentifier 规范
+        - value（物理表名）：必须符合 SafePhysicalTableName 规范
+          （支持 schema.table 限定名格式）
+
+        Args:
+            mapping: table_ref → physical_table_name 映射
+
+        Raises:
+            ValueError: 任一 key 或 value 包含非法字符
+        """
+        from tianshu_datadev.developer_spec.models import (
+            _validate_physical_table_name,
+        )
+        from tianshu_datadev.planning.models import _SQL_ID_RE
+
+        for key, value in mapping.items():
+            # 校验 key（table_ref 别名）——必须符合 SQL 标识符规范
+            if not key:
+                raise ValueError("table_mapping 的 key 不能为空字符串")
+            if not _SQL_ID_RE.match(key):
+                raise ValueError(
+                    f"table_mapping 的 key（表别名）包含非法字符：'{key}'——"
+                    f"必须匹配 {_SQL_ID_RE.pattern}"
+                )
+
+            # 校验 value（物理表名）——必须符合物理表名 allowlist
+            _validate_physical_table_name(value)
 
     def _resolve_table(self, table_ref: str) -> str:
         """将 table_ref（别名）解析为物理表名。"""

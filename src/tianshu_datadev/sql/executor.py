@@ -43,7 +43,12 @@ class DuckDBExecutor:
         Args:
             table_paths: 物理表名 → CSV 文件路径的映射
             timeout_sec: 执行超时秒数
+
+        Raises:
+            ValueError: table_paths 的 key（物理表名）或 value（CSV 路径）包含非法 SQL 字符
         """
+        if table_paths:
+            self._validate_table_paths(table_paths)
         self._table_paths = table_paths or {}
         self._timeout_sec = timeout_sec
 
@@ -389,13 +394,53 @@ class DuckDBExecutor:
 
     # ── 内部方法 ──
 
+    @staticmethod
+    def _validate_table_paths(table_paths: dict[str, str]) -> None:
+        """校验 table_paths 的 key 和 value 均不含 SQL 注入字符。
+
+        双重防线（Schema 层）：
+        - key（物理表名）→ SafePhysicalTableName 三层防线
+        - value（CSV 路径）→ SafeCsvPathLiteral 拒绝单引号/控制字符
+
+        此方法在构造器 __init__ 中调用，构成入口门禁。
+
+        Args:
+            table_paths: 物理表名 → CSV 路径映射
+
+        Raises:
+            ValueError: 任一 key 或 value 包含非法 SQL 字符
+        """
+        from tianshu_datadev.developer_spec.models import (
+            _validate_csv_path_literal,
+            _validate_physical_table_name,
+        )
+
+        for table_name, csv_path in table_paths.items():
+            # 校验 key（物理表名）
+            if not table_name:
+                raise ValueError("table_paths 的 key（物理表名）不能为空字符串")
+            _validate_physical_table_name(table_name)
+
+            # 校验 value（CSV 路径）——Phase 3B 安全加固：关闭 csv_path 注入面
+            _validate_csv_path_literal(csv_path)
+
     def _load_tables(self, con) -> None:
-        """从 CSV fixture 文件加载只读表到 DuckDB 内存数据库。"""
+        """从 CSV fixture 文件加载只读表到 DuckDB 内存数据库。
+
+        使用 _render_sql_string_literal() 对 CSV 路径做 SQL 字符串字面量转义——
+        这是渲染层纵深防线：即使 Schema 层校验被绕过，
+        单引号转义仍可阻止通过路径值终结字符串字面量的注入攻击。
+        """
+        from tianshu_datadev.developer_spec.models import _render_sql_string_literal
+
         for table_name, csv_path in self._table_paths.items():
             try:
                 # 使用 DuckDB 的 read_csv_auto 加载 CSV
+                # csv_path 经 _render_sql_string_literal 转义后安全嵌入 SQL
+                safe_path = _render_sql_string_literal(csv_path)
                 con.execute(
-                    f"CREATE TABLE {table_name} AS SELECT * FROM read_csv_auto('{csv_path}')"
+                    f"CREATE TABLE {table_name} AS "
+                    f"SELECT * FROM read_csv_auto({safe_path})"
                 )
             except Exception:
                 # CSV 加载失败——跳过此表，让 SQL 执行时报错暴露

@@ -23,6 +23,8 @@ from .models import (
     OutputSpecDecl,
     ParsedDeveloperSpec,
     ParseWarning,
+    SafeCsvPathLiteral,
+    SafePhysicalTableName,
     SortDecl,
     SortDirection,
     SourceAnomaly,
@@ -31,6 +33,7 @@ from .models import (
     StrictModel,
     TimeRangeDecl,
     WarningSeverity,
+    _render_sql_string_literal,
 )
 from .parser import DeveloperSpecParser, ParseError, ParseErrorCode
 from .source_manifest import SchemaRegistry, SnapshotProfile, SourceManifestBuilder
@@ -38,6 +41,9 @@ from .source_manifest import SchemaRegistry, SnapshotProfile, SourceManifestBuil
 __all__ = [
     # 模型
     "StrictModel",
+    "SafeCsvPathLiteral",
+    "SafePhysicalTableName",
+    "_render_sql_string_literal",
     "ParsedDeveloperSpec",
     "OpenQuestion",
     "ParseWarning",

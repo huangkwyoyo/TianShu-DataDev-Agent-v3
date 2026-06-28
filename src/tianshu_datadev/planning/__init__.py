@@ -13,13 +13,20 @@ from .models import (
     AggregateSpec,
     AliasExpr,
     ColumnRef,
+    FrameBoundary,
+    FrameBoundaryKind,
     JoinType,
     NullOrder,
     Predicate,
     PredicateOperator,
+    SafeIdentifier,
     SortSpec,
     SqlLiteral,
     WhenBranch,
+    WindowExpr,
+    WindowFrame,
+    WindowFrameType,
+    WindowFunction,
 )
 
 # ── Join 推测模型 ──
@@ -49,6 +56,7 @@ from .sql_build_plan import (
     SortStep,
     SqlBuildPlan,
     SqlBuildPlanBuilder,
+    WindowStep,
 )
 
 # ── SqlProgram（Phase 3A） ──
@@ -74,13 +82,20 @@ __all__ = [
     "AggregateSpec",
     "AliasExpr",
     "ColumnRef",
+    "FrameBoundary",
+    "FrameBoundaryKind",
     "JoinType",
     "SqlLiteral",
     "NullOrder",
     "Predicate",
     "PredicateOperator",
+    "SafeIdentifier",
     "SortSpec",
     "WhenBranch",
+    "WindowExpr",
+    "WindowFrame",
+    "WindowFrameType",
+    "WindowFunction",
     # Join 推测
     "EvidenceAction",
     "JoinCandidate",
@@ -100,6 +115,7 @@ __all__ = [
     "ProjectStep",
     "ScanStep",
     "SortStep",
+    "WindowStep",
     "SqlBuildPlan",
     "SqlBuildPlanBuilder",
     # SqlProgram（Phase 3A）
