@@ -16,6 +16,8 @@ EXPECTED_SUBPACKAGES = [
     "tianshu_datadev.validation",
     "tianshu_datadev.artifacts",
     "tianshu_datadev.llm",
+    "tianshu_datadev.developer_spec",
+    "tianshu_datadev.planning",
 ]
 
 

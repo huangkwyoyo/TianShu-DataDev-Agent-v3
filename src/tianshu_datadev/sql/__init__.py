@@ -1,5 +1,74 @@
-"""SQL 确定性编译器。
+"""SQL 确定性编译器和执行器——Phase 1C。
 
-Phase 1 实现——将 SQLPlan 编译为 DuckDB SQL 字符串。
-LLM 不直接生成 SQL 字符串。
+SqlBuildPlan → Validator → PerfValidator → Compiler Passes
+→ Compiler → CompiledSql → Executor → ExecutionTrace + ResultSummary。
+
+LLM 不直接生成 SQL 字符串——SQL 只能由 Python 确定性编译器生成。
+Executor 只接受 Compiler 产物，拒绝外部 SQL 字符串。
 """
+
+# ── 数据模型 ──
+# ── Compiler ──
+from .compiler import DuckDbSqlCompiler
+
+# ── Compiler Passes ──
+from .compiler_passes import (
+    column_pruning,
+    constant_folding,
+    predicate_normalization,
+    sort_elimination,
+)
+
+# ── Executor ──
+from .executor import DuckDBExecutor
+from .models import (
+    CompiledSql,
+    CompilerPassRecord,
+    ConstantFoldRecord,
+    ExecutionStatus,
+    ExecutionTrace,
+    OptimizedSQLPlan,
+    PerfRule,
+    PerfRuleLevel,
+    PerfValidationResult,
+    PredicateNormRecord,
+    ResultSummary,
+    SqlArtifact,
+    types_are_compatible,
+)
+
+# ── PerfValidator ──
+from .perf_validator import PerfValidator
+
+# ── Validator ──
+from .validator import SqlBuildPlanValidator
+
+__all__ = [
+    # 数据模型
+    "CompiledSql",
+    "CompilerPassRecord",
+    "ConstantFoldRecord",
+    "ExecutionStatus",
+    "ExecutionTrace",
+    "OptimizedSQLPlan",
+    "PerfRule",
+    "PerfRuleLevel",
+    "PerfValidationResult",
+    "PredicateNormRecord",
+    "ResultSummary",
+    "SqlArtifact",
+    "types_are_compatible",
+    # Validator
+    "SqlBuildPlanValidator",
+    # PerfValidator
+    "PerfValidator",
+    # Compiler Passes
+    "column_pruning",
+    "constant_folding",
+    "predicate_normalization",
+    "sort_elimination",
+    # Compiler
+    "DuckDbSqlCompiler",
+    # Executor
+    "DuckDBExecutor",
+]

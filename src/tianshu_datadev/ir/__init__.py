@@ -2,17 +2,18 @@
 
 包含三层 IR 的 Protocol 接口和状态枚举。
 Phase 1 将添加具体 dataclass 实现。
+
+注意：ExecutionTrace 和 ResultSummary 已迁移至 tianshu_datadev.sql.models
+（严格 Pydantic 模型，替代旧 Protocol）。
 """
 
 from .protocols import (
     CrossValidationResult,
-    ExecutionTrace,
     MergedResult,
     RepairDirective,
     RepairTarget,
     RequestStatus,
     RequirementIR,
-    ResultSummary,
     SparkCodeArtifact,
     SQLPlan,
     StepStatus,
@@ -23,13 +24,11 @@ from .protocols import (
 
 __all__ = [
     "CrossValidationResult",
-    "ExecutionTrace",
     "MergedResult",
     "RepairDirective",
     "RepairTarget",
     "RequestStatus",
     "RequirementIR",
-    "ResultSummary",
     "SparkCodeArtifact",
     "SQLPlan",
     "StepStatus",

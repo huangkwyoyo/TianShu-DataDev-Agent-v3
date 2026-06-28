@@ -127,40 +127,8 @@ class SQLPlan(Protocol):
     confidence: float  # LLM 对计划的置信度（0.0–1.0）
 
 
-@runtime_checkable
-class ExecutionTrace(Protocol):
-    """单次执行的完整追踪记录。
-
-    记录 SQL 或 Spark 执行的全过程，用于交叉验证阶段的问题定位。
-    """
-
-    trace_id: str  # 追踪唯一标识
-    plan_id: str  # 关联的执行计划 ID
-    engine: str  # 执行引擎："duckdb" 或 "spark"
-    generated_code: str  # 实际执行的代码（SQL 字符串或 PySpark DSL）
-    status: str  # 执行状态（StepStatus 值）
-    row_count: int  # 返回行数
-    execution_time_ms: float  # 执行耗时（毫秒）
-    error_message: str | None  # 执行失败时的错误信息
-
-
-@runtime_checkable
-class ResultSummary(Protocol):
-    """结构化执行结果摘要——用于交叉验证比对的标准化格式。
-
-    将 DuckDB 和 Spark 的执行结果转换为统一格式后进行比较。
-    """
-
-    summary_id: str  # 摘要唯一标识
-    trace_id: str  # 关联的执行追踪 ID
-    engine: str  # 执行引擎
-    columns: list[str]  # 输出列名
-    column_types: list[str]  # 规范化后的列类型
-    row_count: int  # 行数
-    null_counts: dict[str, int]  # 逐列空值计数
-    numeric_sums: dict[str, float]  # 数值列合计
-    sample_rows: list[list]  # 前 N 行抽样数据
-
+# ExecutionTrace 和 ResultSummary 已迁移至 tianshu_datadev.sql.models
+# （严格 Pydantic 模型，替代旧 Protocol）
 
 @runtime_checkable
 class CrossValidationResult(Protocol):

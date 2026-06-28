@@ -4,15 +4,14 @@
 """
 
 
+# ExecutionTrace 和 ResultSummary 已迁移至 tianshu_datadev.sql.models（严格 Pydantic 模型）
 from tianshu_datadev.ir import (
     CrossValidationResult,
-    ExecutionTrace,
     MergedResult,
     RepairDirective,
     RepairTarget,
     RequestStatus,
     RequirementIR,
-    ResultSummary,
     SparkCodeArtifact,
     SQLPlan,
     StepStatus,
@@ -135,34 +134,7 @@ class TestProtocolInterfaces:
         assert "limit" in attrs
         assert "confidence" in attrs
 
-    # ── ExecutionTrace ──
-
-    def test_execution_trace_protocol_attributes(self):
-        """验证 ExecutionTrace Protocol 定义了核心追踪字段。"""
-        attrs = ExecutionTrace.__protocol_attrs__
-        assert "trace_id" in attrs
-        assert "plan_id" in attrs
-        assert "engine" in attrs
-        assert "generated_code" in attrs
-        assert "status" in attrs
-        assert "row_count" in attrs
-        assert "execution_time_ms" in attrs
-        assert "error_message" in attrs
-
-    # ── ResultSummary ──
-
-    def test_result_summary_protocol_attributes(self):
-        """验证 ResultSummary Protocol 定义了用于交叉验证比对的字段。"""
-        attrs = ResultSummary.__protocol_attrs__
-        assert "summary_id" in attrs
-        assert "trace_id" in attrs
-        assert "engine" in attrs
-        assert "columns" in attrs
-        assert "column_types" in attrs
-        assert "row_count" in attrs
-        assert "null_counts" in attrs
-        assert "numeric_sums" in attrs
-        assert "sample_rows" in attrs
+    # ExecutionTrace 和 ResultSummary 测试已迁移至 tests/sql/——使用严格 Pydantic 模型
 
     # ── CrossValidationResult ──
 
@@ -259,12 +231,11 @@ class TestProtocolDesign:
     """设计边界测试——确保 Protocol 不包含污染。"""
 
     # 所有核心 Protocol 名称（含 SQL 侧和 Spark 侧）
+    # 注意：ExecutionTrace 和 ResultSummary 已迁移至 tianshu_datadev.sql.models
     CORE_PROTOCOLS = [
         "RequirementIR",
         "SubIntent",
         "SQLPlan",
-        "ExecutionTrace",
-        "ResultSummary",
         "CrossValidationResult",
         "RepairDirective",
         "MergedResult",

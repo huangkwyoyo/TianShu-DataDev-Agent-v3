@@ -1,7 +1,7 @@
 """测试 FieldNormalizer 的归一化规则。"""
 
 
-from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer
+from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer, NormalizationConfig
 
 
 class TestLowercase:
@@ -94,3 +94,50 @@ class TestFullNormalization:
         assert result[0] == "user_id"
         assert result[1] == "order_amount"
         assert result[2] == "customer_id"
+
+
+# ════════════════════════════════════════════
+# Phase 1B 补充——别名扩展 + 前缀去除
+# ════════════════════════════════════════════
+
+
+class TestPhase1BAliases:
+    """Phase 1B 新增 Join 场景别名测试。"""
+
+    def test_ref_alias(self):
+        """ref → reference。"""
+        normalizer = FieldNormalizer()
+        assert normalizer.normalize("ref") == "reference"
+
+    def test_min_val_alias(self):
+        """min_val → minimum_value——逐段替换。"""
+        normalizer = FieldNormalizer()
+        assert normalizer.normalize("min_val") == "minimum_value"
+
+    def test_prev_curr_alias(self):
+        """prev_curr → previous_current——多段替换。"""
+        normalizer = FieldNormalizer()
+        assert normalizer.normalize("prev_curr") == "previous_current"
+
+
+class TestStripPrefixes:
+    """前缀去除测试——Phase 1B 新增，用于跨表 Join 匹配。"""
+
+    def test_strip_prefix_dw(self):
+        """dw_user_id → user_id——去除配置的 dw_ 前缀。"""
+        config = NormalizationConfig(strip_prefixes=("dw_", "f_"))
+        normalizer = FieldNormalizer(config=config)
+        assert normalizer.normalize("dw_user_id") == "user_id"
+
+    def test_strip_prefix_no_match(self):
+        """f_user_id → user_id（去除 f_ 后不匹配 dim_ 前缀，保持原样）。"""
+        config = NormalizationConfig(strip_prefixes=("dw_",))
+        normalizer = FieldNormalizer(config=config)
+        # f_ 前缀不在配置中，应保持原样
+        assert normalizer.normalize("f_user_id") == "f_user_id"
+
+    def test_compound_strip_and_alias(self):
+        """dw_cust_amt → customer_amount——前缀去除 + 别名替换组合。"""
+        config = NormalizationConfig(strip_prefixes=("dw_",))
+        normalizer = FieldNormalizer(config=config)
+        assert normalizer.normalize("dw_cust_amt") == "customer_amount"

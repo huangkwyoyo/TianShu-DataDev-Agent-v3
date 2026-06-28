@@ -18,23 +18,27 @@ class NormalizationConfig:
     camel_to_snake: bool = True  # 驼峰转下划线
     strip_special_chars: bool = True  # 去除非字母数字字符（保留 _）
     merge_underscores: bool = True  # 多个连续下划线合并为一个
+    strip_prefixes: tuple[str, ...] = ()  # 去除常见表名前缀（如 ("dw_", "f_")）
 
 
 class FieldNormalizer:
     """字段名归一化执行器。
 
-    五步归一化管道：
-    1. lowercase      —— 全部转为小写
-    2. camel_to_snake —— userId → user_id
-    3. alias_dict     —— 常见别名替换（如 cust → customer）
-    4. strip_special  —— 去除非字母数字字符
-    5. merge_underscores —— 合并连续下划线
+    六步归一化管道：
+    1. camel_to_snake —— userId → user_id（依赖大小写边界，必须在 lowercase 之前）
+    2. lowercase      —— 全部转为小写
+    3. alias_dict     —— 常见别名替换（如 cust → customer），先完整名匹配再逐段替换
+    4. strip_prefixes —— 去除配置的表名前缀（如 dw_user_id → user_id，用于跨表 Join 匹配）
+    5. strip_special  —— 去除非字母数字字符
+    6. merge_underscores —— 合并连续下划线
 
     默认别名字典覆盖数据仓库常见缩写，可根据项目扩展。
+    Phase 1B 补充 Join 场景常用缩写和前缀去除。
     """
 
     # 默认别名字典——数据仓库常见缩写
     DEFAULT_ALIASES: ClassVar[dict[str, str]] = {
+        # Phase 1A 基础别名
         "cust_id": "customer_id",
         "cust": "customer",
         "amt": "amount",
@@ -61,6 +65,22 @@ class FieldNormalizer:
         "statdate": "stat_date",
         "regioncode": "region_code",
         "ordercode": "order_code",
+        # Phase 1B 补充——Join 场景常用缩写
+        "ref": "reference",
+        "src": "source",
+        "dst": "destination",
+        "grp": "group",
+        "typ": "type",
+        "val": "value",
+        "min": "minimum",
+        "max": "maximum",
+        "avg": "average",
+        "tot": "total",
+        "attr": "attribute",
+        "init": "initial",
+        "prev": "previous",
+        "curr": "current",
+        "next": "next",
     }
 
     def __init__(
@@ -89,6 +109,7 @@ class FieldNormalizer:
         if self._config.lowercase:
             result = self._apply_lowercase(result)
         result = self._apply_alias_dict(result)
+        result = self._apply_strip_prefixes(result)
         if self._config.strip_special_chars:
             result = self._apply_strip_special_chars(result)
         if self._config.merge_underscores:
@@ -139,6 +160,18 @@ class FieldNormalizer:
         parts = name.split("_")
         replaced = [self._aliases.get(p, p) for p in parts]
         return "_".join(replaced)
+
+    def _apply_strip_prefixes(self, name: str) -> str:
+        """去除配置的表名前缀——用于跨表 Join 时忽略表前缀差异。
+
+        按配置顺序依次检查，匹配第一个前缀后立即返回，不重复去除。
+        例如：配置 ("dw_", "f_") 时，"dw_user_id" → "user_id"，
+        "f_cust_id" → "cust_id"，"dim_user_id" → 保持原样。
+        """
+        for prefix in self._config.strip_prefixes:
+            if name.startswith(prefix):
+                return name[len(prefix):]
+        return name
 
     def _apply_strip_special_chars(self, name: str) -> str:
         """去除非字母数字字符，仅保留字母、数字和下划线。"""
