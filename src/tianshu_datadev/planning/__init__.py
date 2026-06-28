@@ -51,6 +51,24 @@ from .sql_build_plan import (
     SqlBuildPlanBuilder,
 )
 
+# ── SqlProgram（Phase 3A） ──
+from .sql_program import (
+    SqlProgram,
+    SqlProgramBuilder,
+    SqlStatement,
+    StatementKind,
+    topological_sort,
+    validate_program_dag,
+)
+
+# ── TempTableSpec（Phase 3A） ──
+from .temp_table import (
+    TempTableSpec,
+    validate_consumer_is_declared,
+    validate_temp_table_naming,
+    validate_temp_table_refs,
+)
+
 __all__ = [
     # IR 基础类型
     "AggregateSpec",
@@ -84,4 +102,16 @@ __all__ = [
     "SortStep",
     "SqlBuildPlan",
     "SqlBuildPlanBuilder",
+    # SqlProgram（Phase 3A）
+    "SqlProgram",
+    "SqlProgramBuilder",
+    "SqlStatement",
+    "StatementKind",
+    "topological_sort",
+    "validate_program_dag",
+    # TempTableSpec（Phase 3A）
+    "TempTableSpec",
+    "validate_consumer_is_declared",
+    "validate_temp_table_naming",
+    "validate_temp_table_refs",
 ]

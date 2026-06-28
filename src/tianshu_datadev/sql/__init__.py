@@ -32,8 +32,12 @@ from .models import (
     PerfRuleLevel,
     PerfValidationResult,
     PredicateNormRecord,
+    ProgramCompiledSql,
+    ProgramExecutionResult,
     ResultSummary,
     SqlArtifact,
+    SqlProgramArtifact,
+    StatementExecutionResult,
     types_are_compatible,
 )
 
@@ -55,8 +59,12 @@ __all__ = [
     "PerfRuleLevel",
     "PerfValidationResult",
     "PredicateNormRecord",
+    "ProgramCompiledSql",
+    "ProgramExecutionResult",
     "ResultSummary",
     "SqlArtifact",
+    "SqlProgramArtifact",
+    "StatementExecutionResult",
     "types_are_compatible",
     # Validator
     "SqlBuildPlanValidator",

@@ -29,6 +29,11 @@ from tianshu_datadev.planning.sql_build_plan import (
     SortStep,
     SqlBuildPlan,
 )
+from tianshu_datadev.planning.sql_program import (
+    SqlProgram,
+    SqlStatement,
+    StatementKind,
+)
 
 from .compiler_passes import (
     column_pruning,
@@ -42,7 +47,9 @@ from .models import (
     ConstantFoldRecord,
     OptimizedSQLPlan,
     PredicateNormRecord,
+    ProgramCompiledSql,
     SqlArtifact,
+    SqlProgramArtifact,
 )
 
 COMPILER_VERSION = "1.0.0"
@@ -486,6 +493,140 @@ class DuckDbSqlCompiler:
     def _resolve_table(self, table_ref: str) -> str:
         """将 table_ref（别名）解析为物理表名。"""
         return self._table_mapping.get(table_ref, table_ref)
+
+    # ── 多语句编译（Phase 3A） ──
+
+    def compile_program(self, program: SqlProgram) -> SqlProgramArtifact:
+        """编译 SqlProgram 为多语句 SQL 产物。
+
+        流程：
+        1. 校验 DAG 合法性
+        2. 按 topological_order 依次编译每个语句
+        3. 为 PRODUCER 语句包装 CREATE TEMP TABLE
+        4. 为 CONSUMER 语句注入 _temp 表引用
+        5. 生成 cleanup DROP TABLE 语句列表
+        6. 组装 SqlProgramArtifact
+
+        Args:
+            program: 经过 DAG 校验的 SqlProgram
+
+        Returns:
+            SqlProgramArtifact——含每个语句的 CompiledSql + cleanup SQL
+
+        Raises:
+            ValueError: DAG 校验失败
+        """
+        from tianshu_datadev.planning.sql_program import validate_program_dag
+
+        # 1. DAG 校验
+        questions = validate_program_dag(program)
+        blocking = [q for q in questions if q.blocking]
+        if blocking:
+            error_msgs = "; ".join(q.description for q in blocking)
+            raise ValueError(f"SqlProgram DAG 校验失败：{error_msgs}")
+
+        if not program.topological_order:
+            raise ValueError("SqlProgram.topological_order 为空——无法确定编译顺序")
+
+        # 2. 构建 statement_id → SqlStatement 的索引
+        stmt_map: dict[str, SqlStatement] = {
+            s.statement_id: s for s in program.statements
+        }
+
+        # 3. 收集语句索引
+        compiled_statements: list[CompiledSql] = []
+        cleanup_sqls: list[str] = []
+
+        # 4. 按拓扑序编译每个语句
+        for stmt_id in program.topological_order:
+            stmt = stmt_map.get(stmt_id)
+            if stmt is None:
+                raise ValueError(
+                    f"topological_order 中引用了不存在的 statement_id：'{stmt_id}'"
+                )
+
+            # 构建此语句的 table_mapping
+            # 基础映射来自 compiler 实例的 _table_mapping
+            stmt_table_mapping: dict[str, str] = dict(self._table_mapping)
+
+            # 注入上游 _temp 表映射——CONSUMER 需要能引用上游 PRODUCER 创建的 _temp 表
+            # _temp 表在 DuckDB 中以 temp_id 自身作为物理表名（CREATE TEMP TABLE 时使用 temp_id）
+            for dep_id in stmt.depends_on:
+                dep_stmt = stmt_map.get(dep_id)
+                if dep_stmt and dep_stmt.produces:
+                    temp_id = dep_stmt.produces
+                    # _temp 表名直接作为物理引用（因为在 CREATE TEMP TABLE 时使用此名称）
+                    stmt_table_mapping[temp_id] = temp_id
+
+            # 如果当前语句自己产生 _temp 表，其自身 ScanStep 引用的数据源可能是 CSV 表
+            # 也可能是上游 _temp 表（已在上面处理）
+
+            # 创建临时编译器实例用于编译此语句
+            stmt_compiler = DuckDbSqlCompiler(table_mapping=stmt_table_mapping)
+            compiled = stmt_compiler.compile(stmt.plan)
+
+            # 根据语句类型包装 SQL
+            if stmt.kind == StatementKind.PRODUCER and stmt.produces:
+                # 生产者：CREATE TEMP TABLE {temp_id} AS {compiled_sql}
+                wrapped_sql = (
+                    f"CREATE TEMP TABLE {stmt.produces} AS\n{compiled.sql}"
+                )
+                # 重新计算 hash（SQL 内容已变）
+                wrapped_sql_sha256 = CompiledSql.compute_sql_hash(
+                    wrapped_sql, COMPILER_VERSION
+                )
+                compiled = CompiledSql(
+                    sql=wrapped_sql,
+                    sql_sha256=wrapped_sql_sha256,
+                    optimized_plan=compiled.optimized_plan,
+                    compiler_version=compiled.compiler_version,
+                    input_plan_hash=compiled.input_plan_hash,
+                )
+                # 记录需要清理的 _temp 表
+                cleanup_sqls.append(f"DROP TABLE IF EXISTS {stmt.produces}")
+
+            elif stmt.kind == StatementKind.CONSUMER:
+                # 消费者：直接使用编译结果（_temp 表引用已解析）
+                # 如果消费者也产生 _temp 表
+                if stmt.produces:
+                    wrapped_sql = (
+                        f"CREATE TEMP TABLE {stmt.produces} AS\n{compiled.sql}"
+                    )
+                    wrapped_sql_sha256 = CompiledSql.compute_sql_hash(
+                        wrapped_sql, COMPILER_VERSION
+                    )
+                    compiled = CompiledSql(
+                        sql=wrapped_sql,
+                        sql_sha256=wrapped_sql_sha256,
+                        optimized_plan=compiled.optimized_plan,
+                        compiler_version=compiled.compiler_version,
+                        input_plan_hash=compiled.input_plan_hash,
+                    )
+                    cleanup_sqls.append(f"DROP TABLE IF EXISTS {stmt.produces}")
+
+            # FINAL / STANDALONE：直接使用编译结果，无包装
+
+            compiled_statements.append(compiled)
+
+        # 5. 组装产物
+        program_compiled = ProgramCompiledSql(
+            program_id=program.program_id,
+            statements=compiled_statements,
+            cleanup_sql=cleanup_sqls,
+            statement_order=list(program.topological_order),
+        )
+
+        artifact_id = SqlProgramArtifact.generate_artifact_id(
+            program.program_id, COMPILER_VERSION
+        )
+
+        return SqlProgramArtifact(
+            artifact_id=artifact_id,
+            program_id=program.program_id,
+            compiled=program_compiled,
+            spec_id=program.spec_id,
+            compiler_version=COMPILER_VERSION,
+        )
 
 
 # ════════════════════════════════════════════

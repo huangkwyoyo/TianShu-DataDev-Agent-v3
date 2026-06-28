@@ -13,7 +13,10 @@ from .models import (
     CompiledSql,
     ExecutionStatus,
     ExecutionTrace,
+    ProgramCompiledSql,
+    ProgramExecutionResult,
     ResultSummary,
+    StatementExecutionResult,
 )
 
 # 默认执行超时（秒）
@@ -174,6 +177,215 @@ class DuckDBExecutor:
                 sample_rows=[],
             )
             return trace, summary
+
+    # ── 多语句执行（Phase 3A） ──
+
+    def execute_program(
+        self, compiled: ProgramCompiledSql
+    ) -> ProgramExecutionResult:
+        """执行多语句 SqlProgram——同一连接 + 失败阻断 + 总是清理。
+
+        流程：
+        1. 创建 DuckDB :memory: 连接（一次）
+        2. 加载 CSV 表（一次）
+        3. 按 statement_order 依次执行每条 SQL：
+           - 成功 → 记录 ExecutionTrace(RUNTIME_PASS) + ResultSummary
+           - 失败 → 记录 ExecutionTrace(RUNTIME_FAIL)，停止执行后续语句
+        4. 始终执行 cleanup（DROP temp tables）——finally 块保证
+        5. 关闭连接
+        6. 返回 ProgramExecutionResult
+
+        Args:
+            compiled: ProgramCompiledSql——编译产物
+
+        Returns:
+            ProgramExecutionResult——含每个语句的 trace + summary + cleanup 状态
+        """
+        results: list[StatementExecutionResult] = []
+        failed_at: str | None = None
+        cleanup_status = "success"
+        cleanup_error: str | None = None
+        con = None
+
+        try:
+            import duckdb
+        except ImportError:
+            # DuckDB 未安装——所有语句标记为 NOT_EXECUTED
+            for i, stmt_id in enumerate(compiled.statement_order):
+                cs = compiled.statements[i] if i < len(compiled.statements) else None
+                trace = ExecutionTrace(
+                    trace_id=ExecutionTrace.generate_trace_id(stmt_id),
+                    plan_id=stmt_id,
+                    engine="duckdb",
+                    generated_sql=cs.sql if cs else "",
+                    status=ExecutionStatus.NOT_EXECUTED,
+                    row_count=0,
+                    execution_time_ms=0.0,
+                    error_message="DuckDB 未安装——请运行 pip install duckdb",
+                )
+                summary = ResultSummary(
+                    summary_id=ResultSummary.generate_summary_id(
+                        ExecutionTrace.generate_trace_id(stmt_id)
+                    ),
+                    trace_id=ExecutionTrace.generate_trace_id(stmt_id),
+                    engine="duckdb",
+                    columns=[],
+                    column_types=[],
+                    row_count=0,
+                    null_counts={},
+                    numeric_sums={},
+                    sample_rows=[],
+                )
+                results.append(
+                    StatementExecutionResult(
+                        statement_id=stmt_id,
+                        trace=trace,
+                        summary=summary,
+                    )
+                )
+            return ProgramExecutionResult(
+                program_id=compiled.program_id,
+                results=results,
+                completed_count=0,
+                failed_at=None,
+                cleanup_status="success",
+            )
+
+        try:
+            # 1. 创建连接——整个 program 共享
+            con = duckdb.connect(":memory:")
+
+            # 2. 加载 CSV 表——只加载一次
+            self._load_tables(con)
+
+            # 3. 按顺序执行每条语句
+            for i, stmt_id in enumerate(compiled.statement_order):
+                if i >= len(compiled.statements):
+                    break
+
+                cs = compiled.statements[i]
+                start_time = time.perf_counter()
+
+                try:
+                    # 执行 SQL
+                    result = con.execute(cs.sql)
+
+                    # 收集结果
+                    columns = [desc[0] for desc in result.description]
+                    rows = result.fetchall()
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000
+                    row_count = len(rows)
+                    column_types = self._extract_column_types(result.description)
+                    null_counts = self._compute_null_counts(columns, rows)
+                    numeric_sums = self._compute_numeric_sums(
+                        columns, column_types, rows
+                    )
+                    sample_rows = self._sample_rows(rows, _MAX_SAMPLE_ROWS)
+
+                    trace_id = ExecutionTrace.generate_trace_id(stmt_id)
+                    trace = ExecutionTrace(
+                        trace_id=trace_id,
+                        plan_id=stmt_id,
+                        engine="duckdb",
+                        generated_sql=cs.sql,
+                        status=ExecutionStatus.RUNTIME_PASS,
+                        row_count=row_count,
+                        execution_time_ms=round(elapsed_ms, 2),
+                        error_message=None,
+                    )
+                    summary = ResultSummary(
+                        summary_id=ResultSummary.generate_summary_id(trace_id),
+                        trace_id=trace_id,
+                        engine="duckdb",
+                        columns=columns,
+                        column_types=column_types,
+                        row_count=row_count,
+                        null_counts=null_counts,
+                        numeric_sums=numeric_sums,
+                        sample_rows=sample_rows,
+                    )
+                    results.append(
+                        StatementExecutionResult(
+                            statement_id=stmt_id,
+                            trace=trace,
+                            summary=summary,
+                        )
+                    )
+
+                except Exception as exec_err:
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000
+                    trace_id = ExecutionTrace.generate_trace_id(stmt_id)
+                    trace = ExecutionTrace(
+                        trace_id=trace_id,
+                        plan_id=stmt_id,
+                        engine="duckdb",
+                        generated_sql=cs.sql,
+                        status=ExecutionStatus.RUNTIME_FAIL,
+                        row_count=0,
+                        execution_time_ms=round(elapsed_ms, 2),
+                        error_message=str(exec_err),
+                    )
+                    summary = ResultSummary(
+                        summary_id=ResultSummary.generate_summary_id(trace_id),
+                        trace_id=trace_id,
+                        engine="duckdb",
+                        columns=[],
+                        column_types=[],
+                        row_count=0,
+                        null_counts={},
+                        numeric_sums={},
+                        sample_rows=[],
+                    )
+                    results.append(
+                        StatementExecutionResult(
+                            statement_id=stmt_id,
+                            trace=trace,
+                            summary=summary,
+                        )
+                    )
+
+                    # 记录失败位置并停止执行后续语句
+                    failed_at = stmt_id
+                    break
+
+        except Exception as outer_err:
+            # 连接创建或 CSV 加载失败
+            cleanup_status = "partial_failure"
+            cleanup_error = str(outer_err)
+
+        finally:
+            # 4. 始终执行 cleanup——DROP 所有 _temp 表
+            if con is not None:
+                try:
+                    for drop_sql in compiled.cleanup_sql:
+                        try:
+                            con.execute(drop_sql)
+                        except Exception:
+                            # 单个 DROP 失败不阻断其他 DROP
+                            pass
+                except Exception as drop_err:
+                    cleanup_status = "partial_failure"
+                    cleanup_error = str(drop_err)
+                finally:
+                    try:
+                        con.close()
+                    except Exception:
+                        pass
+
+        completed_count = sum(
+            1
+            for r in results
+            if r.trace.status == ExecutionStatus.RUNTIME_PASS
+        )
+
+        return ProgramExecutionResult(
+            program_id=compiled.program_id,
+            results=results,
+            completed_count=completed_count,
+            failed_at=failed_at,
+            cleanup_status=cleanup_status,
+            cleanup_error=cleanup_error,
+        )
 
     # ── 内部方法 ──
 

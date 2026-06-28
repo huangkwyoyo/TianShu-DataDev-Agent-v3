@@ -274,3 +274,67 @@ def find_column_type(
         if hasattr(col, "normalized_name") and col.normalized_name == normalized_name:
             return col.data_type
     return None
+
+
+# ════════════════════════════════════════════
+# Phase 3A 多语句编译/执行产物
+# ════════════════════════════════════════════
+
+
+class ProgramCompiledSql(StrictModel):
+    """多语句编译产物——按拓扑序排列的 CompiledSql + cleanup 语句。
+
+    编译 SqlProgram 的输出，每条 SqlStatement 对应一个 CompiledSql。
+    cleanup_sql 包含所有 _temp 表的 DROP TABLE 语句。
+    """
+
+    program_id: str
+    statements: list[CompiledSql]  # 按 statement_order 排列的编译产物
+    cleanup_sql: list[str] = []  # DROP TABLE IF EXISTS _temp_* 语句列表
+    statement_order: list[str] = []  # 对应的 statement_id 顺序
+
+
+class SqlProgramArtifact(StrictModel):
+    """SqlProgram 的完整编译产物——含溯源链。
+
+    与 SqlArtifact（单语句）对应，绑定 spec_id + compiler_version 溯源。
+    """
+
+    artifact_id: str  # artifact_prog_{program_id[:8]}_{compiler_version}
+    program_id: str
+    compiled: ProgramCompiledSql
+    spec_id: str
+    compiler_version: str
+
+    @staticmethod
+    def generate_artifact_id(program_id: str, compiler_version: str) -> str:
+        """基于 program_id 和 compiler_version 的确定性 artifact ID。"""
+        import hashlib
+
+        key = f"{program_id}:{compiler_version}"
+        hash_hex = hashlib.sha256(key.encode()).hexdigest()[:12]
+        return f"artifact_prog_{hash_hex}"
+
+
+class StatementExecutionResult(StrictModel):
+    """单个语句的执行结果——绑定 trace + summary。"""
+
+    statement_id: str
+    trace: ExecutionTrace
+    summary: ResultSummary
+
+
+class ProgramExecutionResult(StrictModel):
+    """多语句 SqlProgram 的执行结果汇总。
+
+    记录每个语句的执行状态、失败位置和 cleanup 结果。
+    cleanup_status 为 "success" 表示所有 _temp 表成功清理，
+    "partial_failure" 表示部分 DROP 失败。
+    """
+
+    program_id: str
+    results: list[StatementExecutionResult] = []  # 按执行顺序排列
+    completed_count: int = 0  # 成功执行的语句数
+    failed_at: str | None = None  # 首个失败的 statement_id（全部成功时为空）
+    cleanup_status: str = "success"  # "success" | "partial_failure"
+    cleanup_error: str | None = None  # cleanup 阶段的错误信息（成功时为空）
