@@ -219,55 +219,19 @@ class FinalWritePlanBuilder:
     ) -> PartitionOverwriteSpec:
         """构建分区 overwrite 审查材料。
 
-        生成 INSERT OVERWRITE TABLE ... PARTITION (...) SELECT ...
-        的完整 SQL 文本——仅作为审查材料，不实际执行。
+        SQL 文本（overwrite_dml / pre_check_sql / rollback_note）由
+        PartitionOverwriteSpec 的 @computed_field 确定性渲染——
+        Builder 仅传入结构化字段，不拼接任何 SQL 字符串。
+
+        这确保即使 Builder 被绕过，恶意 SQL 也无法通过
+        直接构造 Pydantic 对象进入审查材料。
         """
-        # 分区子句
-        partition_clause = ", ".join(
-            f"{k}='{v}'" for k, v in partition_values.items()
-        )
-
-        # INSERT OVERWRITE DML
-        overwrite_dml = (
-            f"INSERT OVERWRITE TABLE {target_table}\n"
-            f"  PARTITION ({partition_clause})\n"
-            f"SELECT *\n"
-            f"FROM {source_temp_table}"
-        )
-
-        # 执行前检查 SQL
-        q = "'"  # 单引号常量——避免 f-string 内转义
-        where_conditions = " AND ".join(
-            f"{k} = {q}{v}{q}" for k, v in partition_values.items()
-        )
-        pre_check_sql = (
-            f"-- 执行前检查：确认目标分区数据量\n"
-            f"SELECT COUNT(*) AS row_count\n"
-            f"FROM {target_table}\n"
-            f"WHERE {where_conditions}"
-        )
-
-        # 回滚注意事项
-        backup_suffix = partition_values.get(partition_keys[0], "backup")
-        rollback_note = (
-            f"如需回滚：\n"
-            f"1. 确认上游数据源可重放（{source_temp_table} 的源数据未变更）\n"
-            f"2. 备份当前分区数据：\n"
-            f"   CREATE TABLE {target_table}_{backup_suffix}_bak "
-            f"AS SELECT * FROM {target_table} "
-            f"WHERE {where_conditions};\n"
-            f"3. 重跑 SqlProgram 并重新执行 INSERT OVERWRITE"
-        )
-
         return PartitionOverwriteSpec(
             target_table=target_table,
             partition_keys=partition_keys,
             partition_values=partition_values,
             partition_format=partition_format,
             source_temp_table=source_temp_table,
-            overwrite_dml=overwrite_dml,
-            pre_check_sql=pre_check_sql,
-            rollback_note=rollback_note,
         )
 
     @staticmethod

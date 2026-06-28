@@ -304,7 +304,13 @@ class TestWriteValidator:
     """写入方案校验器。"""
 
     def test_approves_valid_partition_write(self):
-        """合法日期分区 overwrite 方案通过校验。"""
+        """合法日期分区 overwrite 方案通过校验。
+
+        Phase 3C 安全加固后，PartitionOverwriteSpec 仅接受结构化字段——
+        overwrite_dml / pre_check_sql / rollback_note 均为 @computed_field，
+        由 SafePhysicalTableName 约束的表名 + _render_sql_string_literal()
+        转义的分区值确定性渲染。
+        """
         plan = FinalWritePlan(
             write_plan_id="wp_test",
             program_id="prog_test",
@@ -319,16 +325,17 @@ class TestWriteValidator:
                 partition_values={"dt": "20260101"},
                 partition_format="yyyyMMdd",
                 source_temp_table="_temp_result",
-                overwrite_dml=(
-                    "INSERT OVERWRITE TABLE ads.result\n"
-                    "  PARTITION (dt='20260101')\n"
-                    "SELECT *\n"
-                    "FROM _temp_result"
-                ),
-                pre_check_sql="SELECT COUNT(*) FROM ads.result WHERE dt='20260101'",
-                rollback_note="回滚说明",
             ),
         )
+
+        # 验证 computed fields 正确生成
+        spec = plan.partition_overwrite
+        assert spec is not None
+        assert "INSERT OVERWRITE" in spec.overwrite_dml
+        assert "PARTITION (dt='20260101')" in spec.overwrite_dml
+        assert "FROM _temp_result" in spec.overwrite_dml
+        assert "SELECT COUNT(*)" in spec.pre_check_sql
+        assert "回滚" in spec.rollback_note
 
         validator = WriteValidator()
         validated = validator.validate(plan)
@@ -392,82 +399,44 @@ class TestWriteValidator:
         assert any("full_table" in f for f in validated.forbidden_operations)
 
     def test_rejects_update_in_temp_ops(self):
-        """_temp 表中的 UPDATE 操作被拒绝。"""
-        plan = FinalWritePlan(
-            write_plan_id="wp_test",
-            program_id="prog_test",
-            target_table="ads.result",
-            partition_keys=["dt"],
-            overwrite_mode="partition",
-            partition_values={"dt": "20260101"},
-            partition_format="yyyyMMdd",
-            temp_table_ops=[
-                TempTableStatement(
-                    temp_id="_temp_x",
-                    operation="UPDATE",  # 禁止
-                    sql="UPDATE _temp_x SET ...",
-                    order_index=0,
-                ),
-            ],
-        )
+        """_temp 表中的 UPDATE 操作在 Schema 层即被拒绝。
 
-        validator = WriteValidator()
-        validated = validator.validate(plan)
+        Phase 3C 安全加固：TempTableStatement 的 @model_validator
+        扫描 sql 文本中的禁止操作词——包含 UPDATE 的 SQL 无法通过构造。
+        """
+        from pydantic import ValidationError
 
-        assert not WriteValidator.is_approved(validated)
-        assert any("UPDATE" in f for f in validated.forbidden_operations)
+        with pytest.raises(ValidationError):
+            TempTableStatement(
+                temp_id="_temp_x",
+                operation="UPDATE",
+                sql="UPDATE _temp_x SET col=1",
+                order_index=0,
+            )
 
     def test_rejects_delete_in_temp_ops(self):
-        """_temp 表中的 DELETE 操作被拒绝。"""
-        plan = FinalWritePlan(
-            write_plan_id="wp_test",
-            program_id="prog_test",
-            target_table="ads.result",
-            partition_keys=["dt"],
-            overwrite_mode="partition",
-            partition_values={"dt": "20260101"},
-            partition_format="yyyyMMdd",
-            temp_table_ops=[
-                TempTableStatement(
-                    temp_id="_temp_x",
-                    operation="DELETE",  # 禁止
-                    sql="DELETE FROM _temp_x WHERE ...",
-                    order_index=0,
-                ),
-            ],
-        )
+        """_temp 表中的 DELETE 操作在 Schema 层即被拒绝。"""
+        from pydantic import ValidationError
 
-        validator = WriteValidator()
-        validated = validator.validate(plan)
-
-        assert not WriteValidator.is_approved(validated)
-        assert any("DELETE" in f for f in validated.forbidden_operations)
+        with pytest.raises(ValidationError):
+            TempTableStatement(
+                temp_id="_temp_x",
+                operation="DELETE",
+                sql="DELETE FROM _temp_x WHERE col=1",
+                order_index=0,
+            )
 
     def test_rejects_merge_in_temp_ops(self):
-        """_temp 表中的 MERGE 操作被拒绝。"""
-        plan = FinalWritePlan(
-            write_plan_id="wp_test",
-            program_id="prog_test",
-            target_table="ads.result",
-            partition_keys=["dt"],
-            overwrite_mode="partition",
-            partition_values={"dt": "20260101"},
-            partition_format="yyyyMMdd",
-            temp_table_ops=[
-                TempTableStatement(
-                    temp_id="_temp_x",
-                    operation="MERGE",  # 禁止
-                    sql="MERGE INTO _temp_x ...",
-                    order_index=0,
-                ),
-            ],
-        )
+        """_temp 表中的 MERGE 操作在 Schema 层即被拒绝。"""
+        from pydantic import ValidationError
 
-        validator = WriteValidator()
-        validated = validator.validate(plan)
-
-        assert not WriteValidator.is_approved(validated)
-        assert any("MERGE" in f for f in validated.forbidden_operations)
+        with pytest.raises(ValidationError):
+            TempTableStatement(
+                temp_id="_temp_x",
+                operation="MERGE",
+                sql="MERGE INTO _temp_x USING src ON _temp_x.id=src.id WHEN MATCHED THEN UPDATE SET col=1",
+                order_index=0,
+            )
 
     def test_rejects_invalid_temp_op(self):
         """非法 _temp 操作被拒绝。"""
@@ -495,70 +464,42 @@ class TestWriteValidator:
         assert not WriteValidator.is_approved(validated)
         assert any("ALTER" in f for f in validated.forbidden_operations)
 
-    def test_rejects_full_table_overwrite_in_partition_dml(self):
-        """分区 DML 中缺少 PARTITION 子句被拒绝。"""
-        plan = FinalWritePlan(
-            write_plan_id="wp_test",
-            program_id="prog_test",
+    def test_overwrite_dml_always_has_partition(self):
+        """computed overwrite_dml 始终包含 PARTITION 子句——无法构造无分区的 DML。
+
+        Phase 3C 安全加固后，overwrite_dml 是 @computed_field——
+        任何人无法通过构造函数注入缺少 PARTITION 的 DML 文本。
+        此测试验证 computed 输出始终符合安全形状。
+        """
+        spec = PartitionOverwriteSpec(
             target_table="ads.result",
             partition_keys=["dt"],
-            overwrite_mode="partition",
             partition_values={"dt": "20260101"},
             partition_format="yyyyMMdd",
-            partition_overwrite=PartitionOverwriteSpec(
-                target_table="ads.result",
-                partition_keys=["dt"],
-                partition_values={"dt": "20260101"},
-                partition_format="yyyyMMdd",
-                source_temp_table="_temp_result",
-                overwrite_dml=(
-                    "INSERT OVERWRITE TABLE ads.result\n"  # 缺少 PARTITION
-                    "SELECT *\n"
-                    "FROM _temp_result"
-                ),
-                pre_check_sql="",
-                rollback_note="",
-            ),
+            source_temp_table="_temp_result",
         )
+        assert "PARTITION" in spec.overwrite_dml
+        assert "INSERT OVERWRITE TABLE ads.result" in spec.overwrite_dml
 
-        validator = WriteValidator()
-        validated = validator.validate(plan)
+    def test_overwrite_dml_never_contains_forbidden_ops(self):
+        """computed overwrite_dml 永不包含禁止操作词。
 
-        assert not WriteValidator.is_approved(validated)
-        assert any("全表 overwrite" in f for f in validated.forbidden_operations)
-
-    def test_rejects_forbidden_dml_in_partition_spec(self):
-        """分区 DML 中包含 DELETE 被拒绝。"""
-        plan = FinalWritePlan(
-            write_plan_id="wp_test",
-            program_id="prog_test",
+        Schema 层保证——恶意 DML 无法通过结构化字段进入审查材料。
+        此测试作为回归验证：即使未来 computed 逻辑变更，
+        也不应意外引入 UPDATE/DELETE/MERGE/TRUNCATE。
+        """
+        spec = PartitionOverwriteSpec(
             target_table="ads.result",
             partition_keys=["dt"],
-            overwrite_mode="partition",
             partition_values={"dt": "20260101"},
             partition_format="yyyyMMdd",
-            partition_overwrite=PartitionOverwriteSpec(
-                target_table="ads.result",
-                partition_keys=["dt"],
-                partition_values={"dt": "20260101"},
-                partition_format="yyyyMMdd",
-                source_temp_table="_temp_result",
-                overwrite_dml=(
-                    "INSERT OVERWRITE TABLE ads.result\n"
-                    "  PARTITION (dt='20260101')\n"
-                    "SELECT * FROM _temp_result;\n"
-                    "DELETE FROM ads.result WHERE dt='20260101'"  # 禁止
-                ),
-                pre_check_sql="",
-                rollback_note="",
-            ),
+            source_temp_table="_temp_result",
         )
-
-        validator = WriteValidator()
-        validated = validator.validate(plan)
-
-        assert not WriteValidator.is_approved(validated)
-        assert any("DELETE" in f for f in validated.forbidden_operations)
+        dml_upper = spec.overwrite_dml.upper()
+        for forbidden_op in FORBIDDEN_PRODUCTION_OPS:
+            assert forbidden_op not in dml_upper, (
+                f"overwrite_dml 包含禁止操作 '{forbidden_op}'"
+            )
 
 
 # ════════════════════════════════════════════
@@ -818,6 +759,149 @@ class TestBuildThenValidate:
 
         # Validator 应拒绝无分区键的方案
         assert not WriteValidator.is_approved(validated)
+
+
+# ════════════════════════════════════════════
+# Phase 3C 安全链路回归——问题 1~3 绕过样本
+# ════════════════════════════════════════════
+
+class TestSecurityBypassRegression:
+    """C 类安全链路回归——验证问题 1~3 的绕过路径已被关闭。
+
+    每条测试对应一个已验证的可复现绕过：
+    1. target_table 注入 → SafePhysicalTableName 拒绝
+    2. INSERT INTO 替代 INSERT OVERWRITE → @computed_field 保证
+    3. _temp sql 文本含分号/禁止操作 → @model_validator 拒绝
+    """
+
+    def test_bypass_1_target_table_injection_rejected(self):
+        """问题 1 回归：target_table 注入在 Schema 层被拒绝。
+
+        复现样本：
+        target_table = "ads.result; DROP TABLE prod; --"
+        之前：WriteValidator.is_approved() == True（全线绕过）
+        修复后：FinalWritePlan 构造时 SafePhysicalTableName 拒绝分号
+        """
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            FinalWritePlan(
+                write_plan_id="wp_test",
+                program_id="prog_test",
+                target_table="ads.result; DROP TABLE prod; --",
+                partition_keys=["dt"],
+                overwrite_mode="partition",
+                partition_values={"dt": "20260101"},
+                partition_format="yyyyMMdd",
+            )
+
+    def test_bypass_1_partition_spec_target_table_injection_rejected(self):
+        """问题 1 延伸：PartitionOverwriteSpec.target_table 注入同样被拒绝。"""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            PartitionOverwriteSpec(
+                target_table="ads.result; DROP TABLE prod; --",
+                partition_keys=["dt"],
+                partition_values={"dt": "20260101"},
+                partition_format="yyyyMMdd",
+                source_temp_table="_temp_result",
+            )
+
+    def test_bypass_1_source_temp_table_injection_rejected(self):
+        """问题 1 延伸：source_temp_table 受 SafePhysicalTableName 约束。"""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            PartitionOverwriteSpec(
+                target_table="ads.result",
+                partition_keys=["dt"],
+                partition_values={"dt": "20260101"},
+                partition_format="yyyyMMdd",
+                source_temp_table="_temp_x; DROP TABLE prod; --",
+            )
+
+    def test_bypass_2_insert_overwrite_guaranteed_by_computed_field(self):
+        """问题 2 回归：overwrite_dml 始终以 INSERT OVERWRITE 开头。
+
+        复现样本：
+        overwrite_dml = "INSERT INTO ads.result PARTITION (dt='20260101') SELECT ..."
+        之前：WriteValidator.is_approved() == True（INSERT INTO 穿透）
+        修复后：overwrite_dml 是 @computed_field——由结构化字段确定性渲染，
+        必然以 INSERT OVERWRITE 开头，无法构造 INSERT INTO 的 DML。
+        同时 WV-009 正则形状校验作为纵深防线。
+        """
+        spec = PartitionOverwriteSpec(
+            target_table="ads.result",
+            partition_keys=["dt"],
+            partition_values={"dt": "20260101"},
+            partition_format="yyyyMMdd",
+            source_temp_table="_temp_result",
+        )
+        # computed 输出必然以 INSERT OVERWRITE 开头
+        assert spec.overwrite_dml.strip().upper().startswith("INSERT OVERWRITE"), (
+            f"overwrite_dml 不以 INSERT OVERWRITE 开头：{spec.overwrite_dml}"
+        )
+        # WV-009 正则作为纵深——必须匹配
+        from tianshu_datadev.sql.write_validator import (
+            _INSERT_OVERWRITE_PARTITION_RE,
+        )
+        assert _INSERT_OVERWRITE_PARTITION_RE.match(
+            spec.overwrite_dml.strip()
+        ), (
+            f"overwrite_dml 不匹配 WV-009 正则"
+        )
+
+    def test_bypass_3_temp_sql_semicolon_rejected(self):
+        """问题 3 回归：_temp sql 含分号在 Schema 层被拒绝。
+
+        复现样本：
+        operation = "CREATE"
+        sql = "CREATE TABLE _temp_x AS SELECT 1; DELETE FROM ads.result"
+        之前：WriteValidator.is_approved() == True（sql 文本不受校验）
+        修复后：TempTableStatement 的 @model_validator 拒绝任何分号
+        """
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            TempTableStatement(
+                temp_id="_temp_x",
+                operation="CREATE",
+                sql="CREATE TABLE _temp_x AS SELECT 1; DELETE FROM ads.result",
+                order_index=0,
+            )
+
+    def test_bypass_3_temp_sql_forbidden_op_rejected(self):
+        """问题 3 延伸：_temp sql 含禁止操作词被拒绝——即使 operation 标签合法。
+
+        operation="CREATE" 但 sql 文本内嵌 DELETE——之前可绕过，
+        现在 @model_validator 扫描 sql 文本中的禁止操作词。
+        """
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            TempTableStatement(
+                temp_id="_temp_x",
+                operation="CREATE",
+                sql="CREATE TABLE _temp_x AS SELECT * FROM t; DROP TABLE important",
+                order_index=0,
+            )
+
+    def test_bypass_3_temp_sql_operation_mismatch_rejected(self):
+        """问题 3 延伸：sql 文本与 operation 标签不一致被拒绝。
+
+        operation="CREATE" 但 sql 以 INSERT INTO 开头——
+        @model_validator 校验关键词一致性。
+        """
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            TempTableStatement(
+                temp_id="_temp_x",
+                operation="CREATE",
+                sql="INSERT INTO _temp_x SELECT * FROM t",
+                order_index=0,
+            )
 
 
 # ════════════════════════════════════════════
