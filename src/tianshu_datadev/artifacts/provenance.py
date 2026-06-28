@@ -8,7 +8,6 @@ from __future__ import annotations
 import hashlib
 import platform
 import sys
-from datetime import datetime, timezone
 
 from .models import PackageInputs
 
@@ -26,12 +25,13 @@ def generate_provenance(
 
     Args:
         inputs: 组装 Code Review Package 所需的全部输入
-        timestamp: 可选——覆盖自动生成的时间戳（用于确定性测试）
+        timestamp: ISO 时间戳字符串——为 None 时使用空字符串（确定性默认值），
+                  调用方应显式传入 datetime.now(timezone.utc).isoformat() 以获取真实时间戳
 
     Returns:
         (provenance_yml_content, provenance_sha256)
     """
-    now = timestamp if timestamp else datetime.now(timezone.utc).isoformat()
+    now = timestamp if timestamp is not None else ""
 
     # 从序列化 dict 中提取 hash 值
     spec_hash = _safe_get(inputs.parsed_spec, "spec_hash", "")

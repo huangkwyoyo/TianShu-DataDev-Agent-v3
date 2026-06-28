@@ -20,6 +20,8 @@ import json
 import os
 from datetime import datetime, timezone
 
+from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan
+
 from .models import (
     VALID_REVIEW_TARGETS,
     ArtifactRef,
@@ -109,10 +111,11 @@ class ReviewPackageBuilder:
         # 5.6 feedback/
         artifacts.extend(self._write_feedback_schema(package_dir))
 
-        # 5.7 provenance.yml
+        # 5.7 provenance.yml（生产模式显式传入当前时间戳，测试模式用固定值）
         provenance_path = os.path.join(package_dir, "provenance.yml")
+        ts = self._fixed_timestamp or datetime.now(timezone.utc).isoformat()
         provenance_yml, provenance_sha256 = generate_provenance(
-            inputs, timestamp=self._fixed_timestamp
+            inputs, timestamp=ts
         )
         self._write_file(provenance_path, provenance_yml)
         artifacts.append(
@@ -315,7 +318,6 @@ class ReviewPackageBuilder:
     # ── 输入验证 ──
 
     @staticmethod
-    @staticmethod
     def _validate_inputs(inputs: PackageInputs) -> None:
         """验证输入 artifact 之间的 hash 一致性。
 
@@ -348,9 +350,9 @@ class ReviewPackageBuilder:
         contract_source_hash = inputs.data_transform_contract.get(
             "source_sqlbuildplan_hash", ""
         )
-        plan_hash = ReviewPackageBuilder._compute_plan_hash_from_dict(
-            inputs.sql_build_plan
-        )
+        # 反序列化为 SqlBuildPlan 后调用权威 hash 函数——避免手写 hash 逻辑漂移
+        plan = SqlBuildPlan.model_validate(inputs.sql_build_plan)
+        plan_hash = SqlBuildPlan.generate_plan_hash(plan)
         if contract_source_hash and plan_hash and contract_source_hash != plan_hash:
             errors.append(
                 f"contract.source_sqlbuildplan_hash ({contract_source_hash}) != "
@@ -359,25 +361,6 @@ class ReviewPackageBuilder:
 
         if errors:
             raise ValueError("输入 artifact hash 不一致:\n- " + "\n- ".join(errors))
-
-    @staticmethod
-    def _compute_plan_hash_from_dict(plan_dict: dict) -> str:
-        """从序列化 plan dict 计算 plan hash——与 SqlBuildPlan.generate_plan_hash 等价。
-
-        仅 hash steps 数组（排除 step_id 和 None 值），截取前 16 位。
-        用于 _validate_inputs 中 contract 与 plan 的一致性校验。
-        """
-        steps = plan_dict.get("steps", [])
-        steps_data: list[dict] = []
-        for step in steps:
-            # 排除 step_id 和 None 值——与 generate_plan_hash 的 exclude 参数一致
-            step_clean = {
-                k: v for k, v in step.items()
-                if k != "step_id" and v is not None
-            }
-            steps_data.append(step_clean)
-        content = json.dumps(steps_data, sort_keys=True, default=str)
-        return hashlib.sha256(content.encode()).hexdigest()[:16]
 
     # ── 人工审查清单构建 ──
 
