@@ -410,7 +410,10 @@ class SemanticEvaluator:
             description="声明 (date, region) 两个维度",
             input_tables=[],
             metrics=[
-                MetricDecl(metric_name="total_amt", aggregation="SUM", input_column="amount", alias="total_amt"),
+                MetricDecl(
+                    metric_name="total_amt", aggregation="SUM",
+                    input_column="amount", alias="total_amt",
+                ),
             ],
             dimensions=[
                 DimensionDecl(dimension_name="date", column_ref="date"),
@@ -528,7 +531,10 @@ class SemanticEvaluator:
             description="声明 COUNT_DISTINCT(user_id) as dau",
             input_tables=[],
             metrics=[
-                MetricDecl(metric_name="dau", aggregation="COUNT_DISTINCT", input_column="user_id", alias="dau"),
+                MetricDecl(
+                    metric_name="dau", aggregation="COUNT_DISTINCT",
+                    input_column="user_id", alias="dau",
+                ),
             ],
             dimensions=[
                 DimensionDecl(dimension_name="dt", column_ref="dt"),
@@ -572,7 +578,10 @@ class SemanticEvaluator:
                 case_id=case.case_id,
                 error_type=case.error_type,
                 passed=False,
-                rejection_detail="Validator 未检测到聚合类型不匹配——_validate_aggregation_declaration 可能未生效",
+                rejection_detail=(
+                    "Validator 未检测到聚合类型不匹配——"
+                    "_validate_aggregation_declaration 可能未生效"
+                ),
                 trace="plan 使用 COUNT 而非 COUNT_DISTINCT，但 Validator 返回 passed=True",
             )
 

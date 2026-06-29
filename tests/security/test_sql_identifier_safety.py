@@ -203,9 +203,14 @@ VALID_FIELD_TARGETS: list[tuple[str, callable, callable]] = [
 class TestAllSafeIdentifierFieldsRejectMalicious:
     """所有 SafeIdentifier 字段统一拒绝恶意输入——跨 11 个模型字段、18 种注入模式。"""
 
-    @pytest.mark.parametrize("label,factory,_field", MALICIOUS_FIELD_TARGETS, ids=lambda x: x if isinstance(x, str) else "")
+    @pytest.mark.parametrize(
+        "label,factory,_field", MALICIOUS_FIELD_TARGETS,
+        ids=lambda x: x if isinstance(x, str) else "",
+    )
     @pytest.mark.parametrize("malicious,desc", MALICIOUS_SAMPLES)
-    def test_field_rejects_malicious(self, label: str, factory, _field: str, malicious: str, desc: str):
+    def test_field_rejects_malicious(
+        self, label: str, factory, _field: str, malicious: str, desc: str,
+    ):
         """任一 SafeIdentifier 字段拒绝任一恶意值——抛出 ValidationError。"""
         with pytest.raises(ValidationError, match="非法 SQL 标识符"):
             factory(malicious)
@@ -214,9 +219,14 @@ class TestAllSafeIdentifierFieldsRejectMalicious:
 class TestAllSafeIdentifierFieldsAcceptValid:
     """所有 SafeIdentifier 字段统一接受合法值——跨 10 个模型字段、21 种合法值。"""
 
-    @pytest.mark.parametrize("label,factory,getter", VALID_FIELD_TARGETS, ids=lambda x: x if isinstance(x, str) else "")
+    @pytest.mark.parametrize(
+        "label,factory,getter", VALID_FIELD_TARGETS,
+        ids=lambda x: x if isinstance(x, str) else "",
+    )
     @pytest.mark.parametrize("valid", VALID_SAMPLES)
-    def test_field_accepts_valid(self, label: str, factory, getter, valid: str):
+    def test_field_accepts_valid(
+        self, label: str, factory, getter, valid: str,
+    ):
         """任一 SafeIdentifier 字段接受合法值——构造成功且值正确存回。"""
         model = factory(valid)
         assert getter(model) == valid
@@ -245,7 +255,12 @@ class TestWindowExprEdgeCases:
         wexpr = WindowExpr(
             function=WindowFunction.SUM_OVER,
             input=ColumnRef(table_ref="tf", column_name="amt", normalized_name="amt"),
-            partition_by=[ColumnRef(table_ref="tf", column_name="dept", normalized_name="dept")],
+            partition_by=[
+                            ColumnRef(
+                                table_ref="tf", column_name="dept",
+                                normalized_name="dept",
+                            ),
+                        ],
             order_by=[SortSpec(column="salary", direction="DESC")],
             frame=WindowFrame(
                 frame_type=WindowFrameType.ROWS,
@@ -367,14 +382,24 @@ class TestSafeIdentifierIntegration:
                     window_exprs=[
                         WindowExpr(
                             function=WindowFunction.ROW_NUMBER,
-                            partition_by=[ColumnRef(table_ref="tf", column_name="dept", normalized_name="dept")],
+                            partition_by=[
+                            ColumnRef(
+                                table_ref="tf", column_name="dept",
+                                normalized_name="dept",
+                            ),
+                        ],
                             order_by=[SortSpec(column="salary", direction="DESC")],
                             alias="rn",
                         ),
                         WindowExpr(
                             function=WindowFunction.SUM_OVER,
                             input=ColumnRef(table_ref="tf", column_name="salary", normalized_name="salary"),
-                            partition_by=[ColumnRef(table_ref="tf", column_name="dept", normalized_name="dept")],
+                            partition_by=[
+                            ColumnRef(
+                                table_ref="tf", column_name="dept",
+                                normalized_name="dept",
+                            ),
+                        ],
                             alias="dept_total",
                         ),
                     ],
@@ -479,7 +504,10 @@ class TestSafeIdentifierIntegration:
                         AggregateSpec(aggregation="AVG", input_column="amt", alias="avg_amt"),
                         AggregateSpec(aggregation="MAX", input_column="amt", alias="max_amt"),
                         AggregateSpec(aggregation="MIN", input_column="amt", alias="min_amt"),
-                        AggregateSpec(aggregation="COUNT_DISTINCT", input_column="dept", alias="distinct_dept"),
+                        AggregateSpec(
+                            aggregation="COUNT_DISTINCT",
+                            input_column="dept", alias="distinct_dept",
+                        ),
                     ],
                 ),
             ],

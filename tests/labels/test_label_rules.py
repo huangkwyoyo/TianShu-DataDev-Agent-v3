@@ -335,6 +335,7 @@ class TestLabelEnumEdgeCases:
 
 
 import pytest
+
 from tianshu_datadev.profiling.enum_profiler import ColumnSample, EnumProfiler
 from tianshu_datadev.profiling.models import (
     EnumConfidenceTier,
@@ -376,7 +377,10 @@ class TestEnumProfilerStatus:
         "values,field_name,expected_tier,expected_class",
         [
             (["Approved", "Pending"], "order_status", EnumConfidenceTier.HIGH, EnumFieldClass.STATUS),
-            (["Pending", "In Progress", "In-Progress"], "task_state", EnumConfidenceTier.HIGH, EnumFieldClass.STATUS),
+            (
+                ["Pending", "In Progress", "In-Progress"], "task_state",
+                EnumConfidenceTier.HIGH, EnumFieldClass.STATUS,
+            ),
             # distinct > 30 → 跳过
             ([f"S{i}" for i in range(35)], "status_field", EnumConfidenceTier.NOT_ENUM, None),
         ],

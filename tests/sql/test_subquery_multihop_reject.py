@@ -46,17 +46,32 @@ def _make_manifest() -> SourceManifest:
                 table_ref="o",
                 source_table="dwd.order_detail",
                 columns=[
-                    ManifestColumn(column_name="user_id", normalized_name="user_id", data_type="bigint"),
-                    ManifestColumn(column_name="product_id", normalized_name="product_id", data_type="bigint"),
-                    ManifestColumn(column_name="amount", normalized_name="amount", data_type="decimal"),
+                    ManifestColumn(
+                        column_name="user_id", normalized_name="user_id",
+                        data_type="bigint",
+                    ),
+                    ManifestColumn(
+                        column_name="product_id", normalized_name="product_id",
+                        data_type="bigint",
+                    ),
+                    ManifestColumn(
+                        column_name="amount", normalized_name="amount",
+                        data_type="decimal",
+                    ),
                 ],
             ),
             ManifestTable(
                 table_ref="p",
                 source_table="dim.product_info",
                 columns=[
-                    ManifestColumn(column_name="product_id", normalized_name="product_id", data_type="bigint"),
-                    ManifestColumn(column_name="product_name", normalized_name="product_name", data_type="varchar"),
+                    ManifestColumn(
+                        column_name="product_id", normalized_name="product_id",
+                        data_type="bigint",
+                    ),
+                    ManifestColumn(
+                        column_name="product_name",
+                        normalized_name="product_name", data_type="varchar",
+                    ),
                 ],
             ),
         ],
@@ -205,15 +220,30 @@ class TestMultiHopJoinReject:
             steps=[
                 ScanStep(
                     step_id="scan_a", table_ref="u",
-                    required_columns=[ColumnRef(table_ref="u", column_name="user_id", normalized_name="user_id")],
+                    required_columns=[
+                        ColumnRef(
+                            table_ref="u", column_name="user_id",
+                            normalized_name="user_id",
+                        ),
+                    ],
                 ),
                 ScanStep(
                     step_id="scan_b", table_ref="o",
-                    required_columns=[ColumnRef(table_ref="o", column_name="user_id", normalized_name="user_id")],
+                    required_columns=[
+                        ColumnRef(
+                            table_ref="o", column_name="user_id",
+                            normalized_name="user_id",
+                        ),
+                    ],
                 ),
                 ScanStep(
                     step_id="scan_c", table_ref="p",
-                    required_columns=[ColumnRef(table_ref="p", column_name="product_id", normalized_name="product_id")],
+                    required_columns=[
+                        ColumnRef(
+                            table_ref="p", column_name="product_id",
+                            normalized_name="product_id",
+                        ),
+                    ],
                 ),
                 JoinStep(
                     step_id="join_1", right_table_ref="o", join_type=JoinType.INNER,
@@ -320,11 +350,21 @@ class TestCombinedRejection:
             steps=[
                 ScanStep(
                     step_id="scan_u", table_ref="u",
-                    required_columns=[ColumnRef(table_ref="u", column_name="user_id", normalized_name="user_id")],
+                    required_columns=[
+                        ColumnRef(
+                            table_ref="u", column_name="user_id",
+                            normalized_name="user_id",
+                        ),
+                    ],
                 ),
                 ScanStep(
                     step_id="scan_o", table_ref="o",
-                    required_columns=[ColumnRef(table_ref="o", column_name="user_id", normalized_name="user_id")],
+                    required_columns=[
+                        ColumnRef(
+                            table_ref="o", column_name="user_id",
+                            normalized_name="user_id",
+                        ),
+                    ],
                 ),
                 JoinStep(
                     step_id="join_1", right_table_ref="o", join_type=JoinType.INNER,
@@ -338,8 +378,16 @@ class TestCombinedRejection:
                     step_id="join_2", right_table_ref="p", join_type=JoinType.LEFT,
                     join_keys=[
                         # user_id (bigint) ↔ product_name (varchar)——类型不兼容
-                        (ColumnRef(table_ref="u", column_name="user_id", normalized_name="user_id"),
-                         ColumnRef(table_ref="p", column_name="product_name", normalized_name="product_name")),
+                        (
+                            ColumnRef(
+                                table_ref="u", column_name="user_id",
+                                normalized_name="user_id",
+                            ),
+                            ColumnRef(
+                                table_ref="p", column_name="product_name",
+                                normalized_name="product_name",
+                            ),
+                        ),
                     ],
                     relationship_ref="rel_2",
                 ),

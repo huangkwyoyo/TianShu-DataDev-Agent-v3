@@ -427,7 +427,8 @@ REGRESSION_CASES: dict[str, list[dict]] = {
             "description": "真实 LLM 解析 DAU DeveloperSpec YAML",
             "system_message_override": None,  # 使用 Prompt 模板的 body
             "user_message": (
-                "请解析以下 DeveloperSpec YAML 声明和 SourceManifest，输出严格的 ParsedDeveloperSpec JSON。\n\n"
+                "请解析以下 DeveloperSpec YAML 声明和 SourceManifest，"
+                "输出严格的 ParsedDeveloperSpec JSON。\n\n"
                 "## DeveloperSpec YAML\n\n```yaml\n"
                 + DEV_SPEC_DAU_YAML
                 + "\n```\n\n"
@@ -441,7 +442,8 @@ REGRESSION_CASES: dict[str, list[dict]] = {
             "description": "真实 LLM 解析销售汇总 DeveloperSpec YAML（含 Join 声明）",
             "system_message_override": None,
             "user_message": (
-                "请解析以下 DeveloperSpec YAML 声明和 SourceManifest，输出严格的 ParsedDeveloperSpec JSON。\n\n"
+                "请解析以下 DeveloperSpec YAML 声明和 SourceManifest，"
+                "输出严格的 ParsedDeveloperSpec JSON。\n\n"
                 "## DeveloperSpec YAML\n\n```yaml\n"
                 + DEV_SPEC_SALES_YAML
                 + "\n```\n\n"
@@ -627,7 +629,11 @@ def run_real_llm_regression(
                 latency_ms = int((time.time() - case_start) * 1000)
 
                 if validated is not None and not errors:
-                    _log(f"    [PASS] ({latency_ms}ms, {token_usage.get('total_tokens', '?')} tokens)", verbose)
+                    tokens_str = token_usage.get('total_tokens', '?')
+                    _log(
+                        f"    [PASS] ({latency_ms}ms, {tokens_str} tokens)",
+                        verbose,
+                    )
                     results.append({
                         "case_id": case["case_id"],
                         "task": task_name,
@@ -679,7 +685,7 @@ def run_real_llm_regression(
     }
 
     _log(f"\n{'='*60}", verbose)
-    _log(f"  回归汇总", verbose)
+    _log("  回归汇总", verbose)
     _log(f"{'='*60}", verbose)
     _log(f"  总计: {total} 用例", verbose)
     _log(f"  通过: {passed} [PASS]", verbose)

@@ -202,7 +202,10 @@ class TestSemanticWrongGrain:
             description="声明 (date, region) 两个维度",
             input_tables=[],
             metrics=[
-                MetricDecl(metric_name="total_amt", aggregation="SUM", input_column="amount", alias="total_amt"),
+                MetricDecl(
+                    metric_name="total_amt", aggregation="SUM",
+                    input_column="amount", alias="total_amt",
+                ),
             ],
             dimensions=[
                 DimensionDecl(dimension_name="date", column_ref="date"),
@@ -329,7 +332,10 @@ class TestSemanticWrongAggregation:
             description="声明 COUNT_DISTINCT(user_id) as dau",
             input_tables=[],
             metrics=[
-                MetricDecl(metric_name="dau", aggregation="COUNT_DISTINCT", input_column="user_id", alias="dau"),
+                MetricDecl(
+                    metric_name="dau", aggregation="COUNT_DISTINCT",
+                    input_column="user_id", alias="dau",
+                ),
             ],
             dimensions=[
                 DimensionDecl(dimension_name="dt", column_ref="dt"),
