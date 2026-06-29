@@ -327,3 +327,171 @@ class TestLabelEnumEdgeCases:
         assert len(questions) == 1
         assert "Z" in questions[0].description
         assert questions[0].blocking is True
+
+
+# ════════════════════════════════════════════
+# Phase 3B.1：EnumProfiler 测试
+# ════════════════════════════════════════════
+
+
+import pytest
+from tianshu_datadev.profiling.enum_profiler import ColumnSample, EnumProfiler
+from tianshu_datadev.profiling.models import (
+    EnumConfidenceTier,
+    EnumFieldClass,
+    EnumProfile,
+)
+
+
+class TestEnumProfilerFlag:
+    """Flag（标志位）检测——二值判定 + 字段名信号。"""
+
+    @pytest.mark.parametrize(
+        "values,field_name,expected_tier,expected_class",
+        [
+            (["0", "1", "1", "0"], "is_valid", EnumConfidenceTier.CERTAIN, EnumFieldClass.FLAG),
+            (["Y", "N", "Y"], "pass_yn", EnumConfidenceTier.CERTAIN, EnumFieldClass.FLAG),
+            (["是", "否", "是"], "是否有效", EnumConfidenceTier.CERTAIN, EnumFieldClass.FLAG),
+            # 字段名无信号 → 降级
+            (["0", "1", "0", "1"], "score", EnumConfidenceTier.LOW, EnumFieldClass.FLAG),
+            # distinct=3 → 跳过
+            (["0", "1", "2"], "is_valid", EnumConfidenceTier.NOT_ENUM, None),
+        ],
+    )
+    def test_flag_detection(self, values, field_name, expected_tier, expected_class):
+        """Flag 检测覆盖：CERTAIN/LOW/NOT_ENUM 三层。"""
+        sample = ColumnSample(
+            table_ref="tf", column_name=field_name,
+            normalized_name=field_name, values=values,
+        )
+        profile = EnumProfiler().profile([sample]).profiles[0]
+        assert profile.tier == expected_tier
+        assert profile.field_class == expected_class
+
+
+class TestEnumProfilerStatus:
+    """Status（状态码）检测——模式匹配 + 字段名 + 词典。"""
+
+    @pytest.mark.parametrize(
+        "values,field_name,expected_tier,expected_class",
+        [
+            (["Approved", "Pending"], "order_status", EnumConfidenceTier.HIGH, EnumFieldClass.STATUS),
+            (["Pending", "In Progress", "In-Progress"], "task_state", EnumConfidenceTier.HIGH, EnumFieldClass.STATUS),
+            # distinct > 30 → 跳过
+            ([f"S{i}" for i in range(35)], "status_field", EnumConfidenceTier.NOT_ENUM, None),
+        ],
+    )
+    def test_status_detection(self, values, field_name, expected_tier, expected_class):
+        sample = ColumnSample(
+            table_ref="tf", column_name=field_name,
+            normalized_name=field_name, values=values,
+        )
+        profile = EnumProfiler().profile([sample]).profiles[0]
+        assert profile.tier == expected_tier
+        assert profile.field_class == expected_class
+
+
+class TestEnumProfilerCodeAndExclusions:
+    """Code 检测 + 特殊排除（年份/月份/金额）。"""
+
+    @pytest.mark.parametrize(
+        "values,field_name,expected_tier,expected_class",
+        [
+            (["1", "2", "3"], "payment_type", EnumConfidenceTier.HIGH, EnumFieldClass.CODE),
+            (["PDR", "ADR", "OTH"], "fee_code", EnumConfidenceTier.HIGH, EnumFieldClass.CODE),
+            # 年份/月份/金额 → 排除
+            (["2020", "2021", "2022"], "fiscal_year", EnumConfidenceTier.NOT_ENUM, None),
+            (["1", "6", "12"], "birth_month", EnumConfidenceTier.NOT_ENUM, None),
+            (["100", "200", "500"], "item_amount", EnumConfidenceTier.NOT_ENUM, None),
+            # 无字段名信号 → LOW
+            (["10", "20", "30"], "unknown_field", EnumConfidenceTier.LOW, EnumFieldClass.CODE),
+        ],
+    )
+    def test_code_and_exclusions(self, values, field_name, expected_tier, expected_class):
+        sample = ColumnSample(
+            table_ref="tf", column_name=field_name,
+            normalized_name=field_name, values=values,
+        )
+        profile = EnumProfiler().profile([sample]).profiles[0]
+        assert profile.tier == expected_tier
+        assert profile.field_class == expected_class
+
+
+class TestLabelEnumWithAutoDetect:
+    """LabelValidator 集成自动检测——分层行为。"""
+
+    def test_certain_blocks_undeclared(self):
+        """CERTAIN 自动检测——值不在检测集中仍 blocking。"""
+        from tianshu_datadev.validation.label_validator import validate_label_enums
+
+        spec = _make_spec_with_enums(["A"])
+        plan = _make_case_when_plan(["Z"])
+        profiles = [
+            EnumProfile(
+                table_ref="tf", column_name="score", normalized_name="score",
+                field_class=EnumFieldClass.FLAG,
+                detected_values=["0", "1"], distinct_count=2, total_sampled=100,
+                tier=EnumConfidenceTier.CERTAIN, pattern_match_ratio=1.0,
+                signals=["field_name:flag"],
+            )
+        ]
+        questions = validate_label_enums(plan, spec=spec, profiles=profiles)
+        # Z 不在声明的 [A] 也不在检测的 [0, 1] → blocking
+        assert len(questions) == 1
+        assert questions[0].blocking is True
+
+    def test_high_tier_warns_non_blocking(self):
+        """HIGH 自动检测——值在检测集中但未声明 → WARN。"""
+        from tianshu_datadev.validation.label_validator import validate_label_enums
+
+        spec = _make_spec_with_enums(["A"], field_name="status")
+        plan = _make_case_when_plan(["Approved"], field_name="status")
+        profiles = [
+            EnumProfile(
+                table_ref="tf", column_name="status", normalized_name="status",
+                field_class=EnumFieldClass.STATUS,
+                detected_values=["Approved", "Pending"], distinct_count=2, total_sampled=200,
+                tier=EnumConfidenceTier.HIGH, pattern_match_ratio=0.95,
+                signals=["field_name:status"],
+            )
+        ]
+        questions = validate_label_enums(plan, spec=spec, profiles=profiles)
+        warn_qs = [q for q in questions if not q.blocking]
+        assert len(warn_qs) >= 1, f"应产生 WARN: {questions}"
+
+    def test_medium_tier_info_only(self):
+        """MEDIUM 自动检测 → info 不阻断。"""
+        from tianshu_datadev.validation.label_validator import validate_label_enums
+
+        spec = _make_spec_with_enums(["A"], field_name="status")
+        plan = _make_case_when_plan(["Approved"], field_name="status")
+        profiles = [
+            EnumProfile(
+                table_ref="tf", column_name="status", normalized_name="status",
+                field_class=EnumFieldClass.STATUS,
+                detected_values=["Approved", "Pending"], distinct_count=2, total_sampled=200,
+                tier=EnumConfidenceTier.MEDIUM, pattern_match_ratio=0.85,
+                signals=[],
+            )
+        ]
+        questions = validate_label_enums(plan, spec=spec, profiles=profiles)
+        assert all(not q.blocking for q in questions)
+
+    def test_low_tier_skipped_blocks_undeclared(self):
+        """LOW 自动检测被跳过 → 值不在声明中 → blocking。"""
+        from tianshu_datadev.validation.label_validator import validate_label_enums
+
+        spec = _make_spec_with_enums(["A"], field_name="status")
+        plan = _make_case_when_plan(["Approved"], field_name="status")
+        profiles = [
+            EnumProfile(
+                table_ref="tf", column_name="status", normalized_name="status",
+                field_class=EnumFieldClass.STATUS,
+                detected_values=["Approved", "Pending"], distinct_count=2, total_sampled=200,
+                tier=EnumConfidenceTier.LOW, pattern_match_ratio=0.7,
+                signals=[],
+            )
+        ]
+        questions = validate_label_enums(plan, spec=spec, profiles=profiles)
+        assert len(questions) == 1
+        assert questions[0].blocking is True  # LOW → 跳过 → 回退到 blocking

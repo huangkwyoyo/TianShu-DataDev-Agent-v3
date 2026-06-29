@@ -1,8 +1,8 @@
 """LabelValidator——CASE WHEN 标签枚举值校验。
 
 Phase 3B 标签门禁——在 CASE WHEN 表达式进入 Compiler 之前执行：
-1. 标签枚举值必须来自 DeveloperSpec / SourceManifest 声明
-2. 未声明的枚举值被拒绝
+1. 标签枚举值必须来自 DeveloperSpec / SourceManifest 声明（blocking）
+2. Phase 3B.1 升级：支持 EnumProfiler 自动检测值（按 tier 分层行为）
 3. else_value 不校验（默认值可以是未声明值）
 """
 
@@ -17,25 +17,34 @@ from tianshu_datadev.planning.sql_build_plan import (
     CaseWhenStep,
     SqlBuildPlan,
 )
+from tianshu_datadev.profiling.models import (
+    EnumConfidenceTier,
+    EnumProfile,
+)
 
 
 def validate_label_enums(
     plan: SqlBuildPlan,
     spec: ParsedDeveloperSpec | None = None,
     manifest: SourceManifest | None = None,
+    profiles: list[EnumProfile] | None = None,
 ) -> list[OpenQuestion]:
     """校验 CaseWhenStep 的所有标签枚举值是否在声明范围内。
 
-    查找策略：
-    1. 从 spec.input_tables → columns → enum_values 收集所有声明枚举值
-    2. 从 manifest.tables → columns → enum_values 收集补充枚举值
-    3. 将 CaseWhenStep 中每个 WhenBranch.result.value 与声明值比对
-    4. 未声明的值生成 blocking OpenQuestion
+    查找策略（优先级递减）：
+    1. 从 spec.input_tables → columns → enum_values 收集声明枚举值（等效 CERTAIN）
+    2. 从 manifest.tables → columns → enum_values 收集补充枚举值（等效 CERTAIN）
+    3. 从 profiles（EnumProfiler 输出）收集自动检测值——按 tier 分层行为：
+       - CERTAIN → blocking（Flag 必达条件，与手动声明等效）
+       - HIGH    → 非 blocking（WARN——不阻断流水线）
+       - MEDIUM  → 非 blocking（info——供人工审查参考）
+       - LOW     → 跳过
 
     Args:
         plan: 待校验的 SqlBuildPlan
         spec: 已解析的 DeveloperSpec（提供枚举值声明）
         manifest: 事实源（提供补充枚举值）
+        profiles: EnumProfiler 检测结果（Phase 3B.1——可选，提供自动检测值）
 
     Returns:
         OpenQuestion 列表——空列表表示全部通过
@@ -51,11 +60,19 @@ def validate_label_enums(
     if not case_steps:
         return questions
 
-    # 收集所有已声明的枚举值（按字段名索引）
+    # 收集已声明的枚举值（按字段名索引）
     declared_enums: dict[str, set[str]] = _collect_declared_enums(spec, manifest)
 
-    # 无任何声明枚举值——无法校验，静默通过
-    if not declared_enums:
+    # 收集自动检测的枚举值（按字段名索引，含 tier）
+    detected_enums: dict[str, tuple[set[str], EnumConfidenceTier]] = {}
+    if profiles:
+        detected_enums = _collect_detected_enums(profiles)
+
+    # 合并所有可用的枚举值源
+    merged_enums = _merge_enum_sources(declared_enums, detected_enums)
+
+    # 无任何声明且无自动检测值——无法校验，静默通过
+    if not merged_enums:
         return questions
 
     for cstep in case_steps:
@@ -64,13 +81,63 @@ def validate_label_enums(
             if result_value is None:
                 continue  # NULL 字面量不校验
 
-            # 将值转为字符串进行比较
             result_str = str(result_value)
+            field_hint = _extract_field_from_predicate(branch.condition)
 
-            # 在所有声明的枚举值中搜索
-            if not _is_enum_declared(result_str, declared_enums):
-                # 尝试找到最相关的字段名（从 condition 中推断）
-                field_hint = _extract_field_from_predicate(branch.condition)
+            # 在声明的枚举值中搜索
+            if _is_enum_declared(result_str, declared_enums):
+                continue  # 已声明——通过
+
+            # 在自动检测的枚举值中搜索
+            detected_info = _find_in_detected(result_str, detected_enums)
+            if detected_info is not None:
+                detected_tier = detected_info
+                if detected_tier == EnumConfidenceTier.CERTAIN:
+                    continue  # CERTAIN 级别自动检测——通过（等效声明）
+                elif detected_tier == EnumConfidenceTier.HIGH:
+                    questions.append(
+                        OpenQuestion(
+                            question_id=(
+                                f"label_enum_autodetect_warn_"
+                                f"{cstep.step_id}_{i}"
+                            ),
+                            source="LabelValidator",
+                            field_ref=field_hint,
+                            description=(
+                                f"CASE WHEN 分支 {i}（别名 '{cstep.alias}'）的 "
+                                f"结果值 '{result_str}' 未在 DeveloperSpec 中声明，"
+                                f"但被 EnumProfiler 检测到（置信度: HIGH）。"
+                                f"推断字段: {field_hint or '未知'}。"
+                                f"检测到的枚举值: "
+                                f"{_format_detected_values(detected_enums, field_hint)}"
+                            ),
+                            blocking=False,  # WARN——不阻断流水线
+                        )
+                    )
+                elif detected_tier == EnumConfidenceTier.MEDIUM:
+                    questions.append(
+                        OpenQuestion(
+                            question_id=(
+                                f"label_enum_autodetect_info_"
+                                f"{cstep.step_id}_{i}"
+                            ),
+                            source="LabelValidator",
+                            field_ref=field_hint,
+                            description=(
+                                f"CASE WHEN 分支 {i}（别名 '{cstep.alias}'）的 "
+                                f"结果值 '{result_str}' 未在 DeveloperSpec 中声明，"
+                                f"EnumProfiler 检测到但置信度较低（MEDIUM），"
+                                f"建议人工审查。"
+                                f"推断字段: {field_hint or '未知'}。"
+                            ),
+                            blocking=False,  # info——仅提示
+                        )
+                    )
+                else:
+                    # LOW tier——静默跳过
+                    continue
+            else:
+                # 既不在声明中也不在自动检测中——blocking
                 questions.append(
                     OpenQuestion(
                         question_id=(
@@ -167,6 +234,130 @@ def _extract_field_from_predicate(pred) -> str | None:
     if hasattr(left, "operator"):
         return _extract_field_from_predicate(left)
     return None
+
+
+def _collect_detected_enums(
+    profiles: list[EnumProfile],
+) -> dict[str, tuple[set[str], EnumConfidenceTier]]:
+    """从 EnumProfiler 输出中提取枚举值映射。
+
+    仅提取 tier ≥ MEDIUM 的 profile——LOW 和 NOT_ENUM 不参与校验。
+    按 normalized_name 索引——多个 profile 可能指向同一字段的不同表引用，
+    取 tier 最高的那个。
+
+    Args:
+        profiles: EnumProfiler.profile() 返回的 profiles 列表
+
+    Returns:
+        {normalized_name: (detected_values_set, tier)} 的映射
+    """
+    detected: dict[str, tuple[set[str], EnumConfidenceTier]] = {}
+
+    for p in profiles:
+        if p.tier in (EnumConfidenceTier.LOW, EnumConfidenceTier.NOT_ENUM):
+            continue  # 低置信度和非枚举不参与
+
+        key = p.normalized_name
+
+        # 同一字段取 tier 更高的
+        if key in detected:
+            existing_tier = detected[key][1]
+            if _tier_rank(p.tier) <= _tier_rank(existing_tier):
+                continue
+
+        detected[key] = (set(p.detected_values), p.tier)
+
+    return detected
+
+
+def _tier_rank(tier: EnumConfidenceTier) -> int:
+    """返回 tier 的数值排序——数字越小越可信。"""
+    _rank = {
+        EnumConfidenceTier.CERTAIN: 0,
+        EnumConfidenceTier.HIGH: 1,
+        EnumConfidenceTier.MEDIUM: 2,
+        EnumConfidenceTier.LOW: 3,
+        EnumConfidenceTier.NOT_ENUM: 4,
+    }
+    return _rank.get(tier, 99)
+
+
+def _merge_enum_sources(
+    declared: dict[str, set[str]],
+    detected: dict[str, tuple[set[str], EnumConfidenceTier]],
+) -> dict[str, set[str]]:
+    """合并手动声明和自动检测的枚举值。
+
+    自动检测值不覆盖手动声明——手动声明始终优先。
+    合并后的集合用于唯一查找——tier 信息保留在 detected 中。
+
+    Args:
+        declared: 手动声明的枚举值 {normalized_name: {values}}
+        detected: 自动检测的枚举值 {normalized_name: ({values}, tier)}
+
+    Returns:
+        合并后的 {normalized_name: {all_values}}
+    """
+    merged: dict[str, set[str]] = {}
+
+    # 手动声明优先
+    for name, values in declared.items():
+        merged[name] = set(values)
+
+    # 自动检测补充（不覆盖）
+    for name, (values, _tier) in detected.items():
+        if name not in merged:
+            merged[name] = set(values)
+
+    return merged
+
+
+def _find_in_detected(
+    value: str,
+    detected_enums: dict[str, tuple[set[str], EnumConfidenceTier]],
+) -> EnumConfidenceTier | None:
+    """在自动检测的枚举值中查找指定值。
+
+    Args:
+        value: 待查找的 CASE WHEN 结果值
+        detected_enums: 自动检测枚举值映射
+
+    Returns:
+        值所属的最高 tier，未找到返回 None
+    """
+    best_tier: EnumConfidenceTier | None = None
+
+    for _name, (values, tier) in detected_enums.items():
+        if value in values:
+            if best_tier is None or _tier_rank(tier) < _tier_rank(best_tier):
+                best_tier = tier
+
+    return best_tier
+
+
+def _format_detected_values(
+    detected_enums: dict[str, tuple[set[str], EnumConfidenceTier]],
+    field_hint: str | None,
+) -> str:
+    """格式化自动检测的枚举值——用于 OpenQuestion 描述。
+
+    Args:
+        detected_enums: 自动检测枚举值映射
+        field_hint: 推断字段名（用于精确匹配）
+
+    Returns:
+        可读的枚举值描述字符串
+    """
+    if field_hint and field_hint in detected_enums:
+        values, tier = detected_enums[field_hint]
+        return f"[{', '.join(sorted(values))}] (tier={tier.value})"
+
+    # 无精确匹配——汇总所有检测值
+    parts: list[str] = []
+    for name, (values, tier) in sorted(detected_enums.items()):
+        vals_str = ", ".join(sorted(values))
+        parts.append(f"{name}: [{vals_str}] (tier={tier.value})")
+    return "; ".join(parts[:3])
 
 
 def _format_declared_enums(declared_enums: dict[str, set[str]]) -> str:

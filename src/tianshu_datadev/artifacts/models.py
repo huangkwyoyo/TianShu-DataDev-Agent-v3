@@ -151,6 +151,96 @@ class DataTransformContractLite(StrictModel):
 
 
 # ════════════════════════════════════════════
+# DataTransformContract v1——Phase 3 Exit 级别
+# ════════════════════════════════════════════
+
+
+class CaseWhenLabelSpec(StrictModel):
+    """v1 Contract 中的 CASE WHEN 标签规格——从 CaseWhenStep 确定性抽取。"""
+
+    statement_id: str  # 所属语句（对应 SqlStatement.statement_id）
+    output_alias: str  # 输出列别名（CaseWhenStep 产生带别名的输出列）
+    branch_count: int  # WHEN 分支数量
+    labels: list[str] = []  # 所有分支的标签值（从 WhenBranch.result 提取）
+    else_label: str | None = None  # ELSE 默认值（无 ELSE 时为 None）
+
+
+class WindowSpecSummary(StrictModel):
+    """v1 Contract 中的窗口函数规格摘要——从 WindowStep 确定性抽取。
+
+    仅保留函数名、别名、分区键和排序键的结构化信息，
+    不包含帧边界或表达式 AST——完整帧规格在 SqlBuildPlan 中。
+    """
+
+    statement_id: str  # 所属语句（对应 SqlStatement.statement_id）
+    function: str  # 窗口函数名——ROW_NUMBER / RANK / SUM_OVER 等
+    alias: str  # 输出列别名
+    partition_by: list[str] = []  # 分区键列名列表（归一化名）
+    order_by: list[str] = []  # 排序键列名列表（归一化名，不含方向）
+
+
+class DataTransformContractV1(StrictModel):
+    """DataTransformContract v1——从 SqlProgram 确定性抽取的完整业务规格。
+
+    相比 lite（Phase 2 单语句）新增：
+    - step_dag：多步依赖图（从 SqlProgram.statements[].depends_on 派生）
+    - temp_tables：_temp 中间表规格（从 SqlProgram.temp_tables）
+    - case_when_labels：CASE WHEN 标签规则（从所有 CaseWhenStep 聚合）
+    - window_specs：窗口函数规格（从所有 WindowStep 聚合）
+    - write_spec：受控写入方案（从 FinalWritePlan）
+
+    不包含 SQL 代码、SqlBuildPlan 实现细节。
+    相同 SqlProgram + 相同 FinalWritePlan → 相同 Contract → 相同 hash。
+    版本固定为 "v1"，source_phase 固定为 "phase-3"。
+    """
+
+    contract_id: str  # 确定性 ID
+    version: str = "v1"  # 固定为 v1
+    source_phase: str = "phase-3"  # 来源阶段
+    source_sqlprogram_hash: str  # 来源 SqlProgram 的 program_id
+    # ── lite 等价业务字段 ──
+    input_tables: list[ContractInputTable] = []
+    input_columns: list[ContractColumn] = []
+    join_relationships: list[ContractJoin] = []
+    filters: list[ContractPredicate] = []
+    aggregations: list[ContractAggregation] = []
+    grouping_keys: list[str] = []
+    output_columns: list[ContractOutputColumn] = []
+    output_grain: list[str] = []
+    sort_spec: list[ContractSort] | None = None
+    limit_spec: ContractLimit | None = None
+    business_keys: list[str] = []
+    semantic_policy_ref: str = ""
+    # ── v1 新增 5 个字段 ──
+    step_dag: dict[str, list[str]] = {}
+    temp_tables: list[dict] = []  # TempTableSpec 序列化 dict
+    case_when_labels: list[CaseWhenLabelSpec] = []
+    window_specs: list[WindowSpecSummary] = []
+    write_spec: dict | None = None  # FinalWritePlan 序列化 dict
+
+    @staticmethod
+    def generate_contract_id(program_id: str) -> str:
+        """基于 program_id 的确定性 contract ID。"""
+        hash_hex = hashlib.sha256(
+            f"dtc_v1:{program_id}".encode()
+        ).hexdigest()[:12]
+        return f"dtc_v1_{hash_hex}"
+
+    @staticmethod
+    def compute_contract_hash(contract: DataTransformContractV1) -> str:
+        """计算 v1 contract 的确定性 SHA-256。
+
+        排除 contract_id，仅计算业务字段。
+        """
+        data = contract.model_dump(
+            exclude={"contract_id"},
+            exclude_none=True,
+        )
+        content = json.dumps(data, sort_keys=True, default=str)
+        return hashlib.sha256(content.encode()).hexdigest()
+
+
+# ════════════════════════════════════════════
 # ReviewPackage 模型
 # ════════════════════════════════════════════
 

@@ -1,7 +1,7 @@
 # Phase 3C：受控写入审查材料 + CompilerBackend 接口
 
-> 状态：待实施
-> 前置依赖：Phase 3B 退出条件全部满足
+> 状态：**已完成**（2026-06-29 核销）
+> 前置依赖：Phase 3B 退出条件全部满足 ✅
 
 ## 执行前必须阅读
 
@@ -120,23 +120,47 @@ git diff --check
 - CompilerBackend 接口需支持 DuckDB 不支持的 SQL 方言特性——接口需调整
 - DataTransformContract v1 字段过多需要拆分
 
-## 退出条件
+## 退出条件（核销结果）
 
-1. FinalWritePlan 日期分区 overwrite 方案正确生成
-2. 全表 overwrite、无分区 overwrite、UPDATE/DELETE/MERGE 被拒绝
-3. CompilerBackend 抽象接口占位就绪，DuckDBBackend 实现正确
-4. DataTransformContract v1 从 SqlProgram 确定性抽取
-5. Phase 1A-3B 测试保持通过
+| # | 条件 | 状态 | 核销依据 |
+|---|------|------|---------|
+| 1 | FinalWritePlan 日期分区 overwrite 方案正确生成 | ✅ | `write_plan.py`：FinalWritePlan + WriteValidationCheck + PartitionOverwriteSpec；`write_validator.py` 10 项安全检查 |
+| 2 | 全表 overwrite、无分区 overwrite、UPDATE/DELETE/MERGE 被拒绝 | ✅ | `WriteValidator.validate()` 54 测试覆盖全部拒绝路径 |
+| 3 | CompilerBackend 抽象接口占位就绪，DuckDBBackend 实现正确 | ✅ | `compiler_backend.py`：ABC + DuckDBBackend；`dialect()="duckdb"` |
+| 4 | DataTransformContract v1 从 SqlProgram 确定性抽取 | ✅ | `contract_extractor.py`：extract_v1() 含 step_dag/temp_tables/case_when_labels/window_specs/write_spec；5 测试 |
+| 5 | Phase 1A-3B 测试保持通过 | ✅ | 全量 1105 测试通过（54 个 Phase 3C 相关） |
+
+### ❌ 缺失项
+
+| 缺失项 | 阻塞阶段 | 说明 |
+|--------|---------|------|
+| **HarnessReport(phase="phase-3-exit")** | Phase 4A 门禁 | ✅ 已生成——`docs/roadmap/phase-3-exit-report.md`。5 项基线评测全部通过（GO）：Schema 可生成性（6/6 fixture 解析通过）、Contract v1 覆盖度（5/5 专属字段）、SqlProgram 多语句编译（24 测试）、不支持 SQL 模式清单（5 项文档化）、Phase 4 硬化输入基线（1123 测试汇总）。生成脚本：`scripts/phase3_exit_eval.py` |
 
 ### Phase 3 Exit：HarnessReport(phase="phase-3-exit")
 
-Phase 3C 退出时生成 HarnessReport：
+Phase 3C 退出时生成 HarnessReport——**当前缺失，是 Phase 3→4 唯一的阻塞项**：
+
 - SQL-first v1.0 的 Schema 可生成性基线
 - DataTransformContract v1 覆盖度
 - SqlProgram + _temp 多语句场景的 Compiler 覆盖率
 - 已知不支持的 SQL 模式清单（CTE、子查询、多跳 Join）
 - Phase 4 硬化的输入基线
 
+### 代码文件清单
+
+| 文件 | 行数 | 说明 |
+|------|------|------|
+| `sql/write_plan.py` | ~280 | FinalWritePlan/WriteValidationCheck/PartitionOverwriteSpec |
+| `sql/write_validator.py` | ~540 | WriteValidator 10 项安全检查 |
+| `sql/compiler_backend.py` | ~96 | CompilerBackend ABC + DuckDBBackend |
+| `artifacts/contract_extractor.py` | ~561 | extract_v1() + _extract_case_when_v1() + _extract_window_v1() |
+| `api/pipeline.py` | ~1017 | FakePipeline Step 2（条件选择 v1/lite） |
+
+### 测试覆盖
+
+- `tests/write_plan/test_write_plan.py` — 54 测试（FinalWritePlan/WriteValidator/FinalWritePlanBuilder/CompilerBackend）
+- `tests/artifacts/test_contract_extractor.py` — Pipeline Step 2 + Contract v1 抽取
+
 ---
 
-> Phase 3C | 待实施 | 前置：Phase 3B 退出
+> Phase 3C | **已完成** | 6/6 退出条件满足 | HarnessReport(phase="phase-3-exit") → [[phase-3-exit-report|Phase 3 Exit HarnessReport]]

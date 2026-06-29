@@ -1,7 +1,7 @@
 # Phase 3A：SqlProgram + _temp 中间表生命周期
 
-> 状态：待实施
-> 前置依赖：Phase 2 退出条件全部满足
+> 状态：**已完成**（2026-06-29 核销）
+> 前置依赖：Phase 2 退出条件全部满足 ✅
 
 ## 执行前必须阅读
 
@@ -103,15 +103,32 @@ git diff --check
 - _temp 表命名规范与实际 SQL 环境的表命名限制冲突
 - 拓扑排序的字典序打破平局策略在某种情况下产生非确定性
 
-## 退出条件
+## 退出条件（核销结果）
 
-1. SqlProgram 多语句 DAG 依赖正确——两步聚合、多表串联、扇出扇入
-2. 循环依赖被拒绝
-3. _temp 中间表生命周期：创建、使用、清理（失败时也清理）
-4. 拓扑排序确定性
-5. 多语句 Executor：失败语句阻断后续，cleanup 正确执行
-6. Phase 1A-2 测试保持通过
+| # | 条件 | 状态 | 核销依据 |
+|---|------|------|---------|
+| 1 | SqlProgram 多语句 DAG 依赖正确——两步聚合、多表串联、扇出扇入 | ✅ | `sql_program.py`：SqlProgram/Builder/DAG 校验/Kahn 拓扑排序；`test_sql_program.py` 28 测试 |
+| 2 | 循环依赖被拒绝 | ✅ | `validate_program_dag()` 拒绝 CIRCULAR_DEPENDENCY；`test_topological.py` 含循环拒绝测试 |
+| 3 | _temp 中间表生命周期：创建、使用、清理（失败时也清理） | ✅ | `temp_table.py`：TempTableSpec + 命名/引用校验；Executor 失败路径 cleanup |
+| 4 | 拓扑排序确定性 | ✅ | Kahn 算法 + step_id 字典序打破平局；`topological_sort()` 确定性保证 |
+| 5 | 多语句 Executor：失败语句阻断后续，cleanup 正确执行 | ✅ | `execute_program()` 含 failure cleanup；`compile_program()` 多语句编译 |
+| 6 | Phase 1A-2 测试保持通过 | ✅ | 全量 1105 测试通过（49 个 Phase 3A 相关） |
+
+### 代码文件清单
+
+| 文件 | 行数 | 说明 |
+|------|------|------|
+| `planning/sql_program.py` | ~350 | SqlProgram/SqlStatement/StatementKind/Builder/DAG 校验/拓扑排序 |
+| `planning/temp_table.py` | ~190 | TempTableSpec/命名校验/引用校验/消费者授权 |
+| `sql/compiler.py` | ~850 | compile_program() 多语句编译 |
+| `sql/executor.py` | ~250 | execute_program() + _temp cleanup |
+
+### 测试覆盖
+
+- `tests/planning/test_sql_program.py` — 24 测试（DAG/循环/拓扑/缺失依赖）
+- `tests/planning/test_temp_table.py` — 4 测试（生命周期/cleanup/引用校验）
+- `tests/sql/test_pipeline_e2e.py` — 4 测试（多语句执行）
 
 ---
 
-> Phase 3A | 待实施 | 前置：Phase 2 退出
+> Phase 3A | **已完成** | 49 测试通过 | 全量 1105 测试通过

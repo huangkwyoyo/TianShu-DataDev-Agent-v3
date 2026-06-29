@@ -1,0 +1,195 @@
+"""Phase 4.5A — REST API 路由处理器。
+
+5 个端点，全部通过 FakePipeline 编排：
+  POST /api/spec/parse      — 解析 DeveloperSpec
+  POST /api/plan             — 解析 + 构建 SqlBuildPlan + 验证
+  POST /api/execute          — 全流程编译+执行（dry_run）
+  GET  /api/package/{id}     — 获取 ReviewPackage manifest
+  POST /api/run-all          — 全流程+打包
+
+Phase 4.5B 新增前端 SPA 专用端点：
+  GET  /api/templates        — 获取模板列表
+  GET  /api/templates/{id}   — 获取指定模板详情
+  GET  /api/health           — 健康检查
+  POST /api/spec/parse-rich  — 富解析（含完整结构化结果）
+  POST /api/plan-rich        — 富 Plan（含步骤详情+Join 证据）
+  POST /api/execute-rich     — 富 Execute（含 SQL 文本）
+  GET  /api/package-rich/{id}— 富 Package（含文件树）
+"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+
+from .models import (
+    ExecuteRequest,
+    ParseSpecRequest,
+    PlanRequest,
+    RunAllRequest,
+)
+
+api_router = APIRouter(prefix="/api")
+
+
+@api_router.post("/spec/parse")
+async def parse_spec(request: Request, body: ParseSpecRequest):
+    """解析 DeveloperSpec——返回结构化摘要。
+
+    不返回完整 ParsedDeveloperSpec 对象，仅返回 table_count、
+    metric_count 等元信息和 OpenQuestion/Warning 摘要。
+    """
+    pipeline = request.app.state.pipeline
+    result = pipeline.parse_only(body.markdown_text)
+    return result
+
+
+@api_router.post("/plan")
+async def build_plan(request: Request, body: PlanRequest):
+    """解析 + 构建 SqlBuildPlan + Validator 验证——返回 Plan 摘要。
+
+    返回 plan_id、step 类型列表、验证结果和 OpenQuestion 摘要。
+    """
+    pipeline = request.app.state.pipeline
+    result = pipeline.build_plan(body.markdown_text, body.table_mapping)
+    return result
+
+
+@api_router.post("/execute")
+async def execute_pipeline(request: Request, body: ExecuteRequest):
+    """全流程编译+执行（dry_run）——返回执行摘要。
+
+    dry_run 始终为 true——不提供生产执行入口。
+    返回 execution_trace 摘要和 result_summary（不含 sample_rows）。
+    """
+    pipeline = request.app.state.pipeline
+    result = pipeline.execute(body.markdown_text, body.table_mapping, body.table_paths)
+    return result
+
+
+@api_router.get("/package/{request_id}")
+async def get_package(request: Request, request_id: str):
+    """获取 ReviewPackage manifest——返回 artifact 引用列表。
+
+    仅返回文件路径和 SHA-256 引用，不返回文件内容。
+    """
+    pipeline = request.app.state.pipeline
+    result = pipeline.get_package(request_id)
+    if result is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error_code": "NOT_FOUND",
+                "message": f"request_id '{request_id}' 对应的 package 不存在",
+                "field_ref": "request_id",
+            },
+        )
+    return result
+
+
+@api_router.post("/run-all")
+async def run_all(request: Request, body: RunAllRequest):
+    """全流程一键执行 + ReviewPackage 打包——返回完整摘要。
+
+    串联 Parser → Builder → Validator → Compiler → Executor → Contract → Packager。
+    dry_run 始终为 true——不提供生产写入开关。
+    """
+    pipeline = request.app.state.pipeline
+    result = pipeline.run_all(body.markdown_text, body.table_mapping, body.table_paths)
+    return result
+
+
+# ════════════════════════════════════════════
+# Phase 4.5B — 前端 SPA 专用端点
+# ════════════════════════════════════════════
+
+
+@api_router.get("/templates")
+async def list_templates(request: Request):
+    """获取 DeveloperSpec 模板列表——返回模板元信息（不含 markdown_template）。"""
+    pipeline = request.app.state.pipeline
+    templates = pipeline.get_templates()
+    return {"templates": templates, "count": len(templates)}
+
+
+@api_router.get("/templates/{template_id}")
+async def get_template(request: Request, template_id: str):
+    """获取指定模板的完整定义——含 markdown_template 正文。"""
+    pipeline = request.app.state.pipeline
+    template = pipeline.get_template(template_id)
+    if template is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error_code": "NOT_FOUND",
+                "message": f"模板 '{template_id}' 不存在",
+                "field_ref": "template_id",
+            },
+        )
+    return template
+
+
+@api_router.get("/health")
+async def health_check(request: Request):
+    """API 健康检查——返回服务状态和版本信息。"""
+    return {
+        "status": "ok",
+        "version": "0.1.0",
+        "pipeline_ready": request.app.state.pipeline is not None,
+    }
+
+
+@api_router.post("/spec/parse-rich")
+async def parse_spec_rich(request: Request, body: ParseSpecRequest):
+    """前端专用：完整解析 DeveloperSpec——返回 SpecRichResponse。
+
+    包含全部结构化解析结果：表、字段、指标、维度、Join、时间范围等，
+    供前端渲染结构化预览面板和 OpenQuestion 面板。
+    """
+    pipeline = request.app.state.pipeline
+    result = pipeline.parse_rich(body.markdown_text)
+    return result
+
+
+@api_router.post("/plan-rich")
+async def build_plan_rich(request: Request, body: PlanRequest):
+    """前端专用：构建 Plan + 提取 Join 证据——返回 PlanRichResponse。
+
+    包含步骤详情列表和 Join 推理证据链（STRONG/MEDIUM/WEAK/NONE），
+    供前端渲染 SqlBuildPlan 步骤面板和 Join 证据面板。
+    """
+    pipeline = request.app.state.pipeline
+    result = pipeline.build_plan_rich(body.markdown_text, body.table_mapping)
+    return result
+
+
+@api_router.post("/execute-rich")
+async def execute_pipeline_rich(request: Request, body: ExecuteRequest):
+    """前端专用：全流程编译+执行——返回 ExecuteRichResponse（含 SQL 文本）。
+
+    返回生成的 SQL 全文和执行结果，供前端渲染 SQL 展示面板。
+    dry_run 始终为 true——不提供生产执行入口。
+    """
+    pipeline = request.app.state.pipeline
+    result = pipeline.execute_rich(body.markdown_text, body.table_mapping, body.table_paths)
+    return result
+
+
+@api_router.get("/package-rich/{request_id}")
+async def get_package_rich(request: Request, request_id: str):
+    """前端专用：获取 ReviewPackage 文件树——返回 PackageRichResponse。
+
+    返回文件树结构供前端渲染 Review Package 文件浏览器。
+    """
+    pipeline = request.app.state.pipeline
+    result = pipeline.get_package_rich(request_id)
+    if result is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error_code": "NOT_FOUND",
+                "message": f"request_id '{request_id}' 对应的 package 不存在",
+                "field_ref": "request_id",
+            },
+        )
+    return result

@@ -9,6 +9,7 @@ from __future__ import annotations
 from tianshu_datadev.planning.relationship_hypothesis import RelationshipEvidence
 from tianshu_datadev.planning.sql_build_plan import (
     AggregateStep,
+    CaseWhenStep,
     FilterStep,
     JoinStep,
     LimitStep,
@@ -16,9 +17,13 @@ from tianshu_datadev.planning.sql_build_plan import (
     ScanStep,
     SortStep,
     SqlBuildPlan,
+    WindowStep,
 )
+from tianshu_datadev.planning.sql_program import SqlProgram
+from tianshu_datadev.sql.write_plan import FinalWritePlan
 
 from .models import (
+    CaseWhenLabelSpec,
     ContractAggregation,
     ContractColumn,
     ContractInputTable,
@@ -28,13 +33,18 @@ from .models import (
     ContractPredicate,
     ContractSort,
     DataTransformContractLite,
+    DataTransformContractV1,
+    WindowSpecSummary,
 )
 
 
 class DataTransformContractExtractor:
-    """从 SqlBuildPlan 确定性抽取 DataTransformContract-lite。
+    """从 SqlBuildPlan/SqlProgram 确定性抽取 DataTransformContract。
 
-    抽取策略：
+    extract():    SqlBuildPlan → DataTransformContractLite（Phase 2）
+    extract_v1(): SqlProgram  → DataTransformContractV1（Phase 3 Exit）
+
+    lite 抽取策略：
     - 输入表/列 → 从 ScanStep 提取
     - 过滤条件 → 从 FilterStep 提取（Predicate → 人类可读描述）
     - Join 关系 → 从 JoinStep 提取（含 evidence_chain）
@@ -42,7 +52,14 @@ class DataTransformContractExtractor:
     - 输出列 → 从 ProjectStep 提取
     - 排序/行限制 → 从 SortStep/LimitStep 提取
 
-    相同 SqlBuildPlan → 相同 DataTransformContractLite → 相同 hash。
+    v1 在 lite 基础上聚合 SqlProgram 全部 statements：
+    - step_dag → 从 SqlProgram.statements[].depends_on 派生
+    - temp_tables → 从 SqlProgram.temp_tables
+    - case_when_labels → 从所有 CaseWhenStep 聚合
+    - window_specs → 从所有 WindowStep 聚合
+    - write_spec → 可选 FinalWritePlan
+
+    相同输入 → 相同 Contract → 相同 hash。
     """
 
     def extract(
@@ -328,6 +345,212 @@ class DataTransformContractExtractor:
         if hasattr(operand, "left") and hasattr(operand, "operator"):
             return DataTransformContractExtractor._render_operand(operand)
         return str(operand)
+
+    # ── v1 抽取：SqlProgram → DataTransformContractV1 ──
+
+    def extract_v1(
+        self,
+        sql_program: SqlProgram,
+        write_plan: FinalWritePlan | None = None,
+    ) -> DataTransformContractV1:
+        """从 SqlProgram 确定性抽取 DataTransformContract v1。
+
+        聚合 SqlProgram 中全部 statement 的 lite 字段，
+        并新增 step_dag、temp_tables、case_when_labels、window_specs、write_spec。
+
+        Args:
+            sql_program: 经过 DAG 校验的 SqlProgram
+            write_plan: 可选的 FinalWritePlan——若提供则写入 write_spec 字段
+
+        Returns:
+            DataTransformContractV1——不包含 SQL 代码字段
+
+        Raises:
+            ValueError: SqlProgram 不含任何 statement
+        """
+        if not sql_program.statements:
+            raise ValueError("SqlProgram 不含任何 statement，无法抽取 Contract v1")
+
+        program_id = sql_program.program_id
+
+        # ── 聚合所有 statement 的 lite 等价字段 ──
+        input_tables: list[ContractInputTable] = []
+        input_columns: list[ContractColumn] = []
+        join_relationships: list[ContractJoin] = []
+        filters: list[ContractPredicate] = []
+        aggregations: list[ContractAggregation] = []
+        grouping_keys: list[str] = []
+        output_columns: list[ContractOutputColumn] = []
+        sort_spec: list[ContractSort] | None = None
+        limit_spec: ContractLimit | None = None
+        business_keys: list[str] = []
+
+        seen_tables: set[str] = set()
+        seen_columns: set[tuple[str, str]] = set()
+
+        # ── v1 新增字段收集 ──
+        step_dag: dict[str, list[str]] = {}
+        case_when_labels: list[CaseWhenLabelSpec] = []
+        window_specs: list[WindowSpecSummary] = []
+
+        # 遍历所有 statement，按优先级聚合：
+        # - 最终 statement（FINAL/STANDALONE）的 sort/limit 优先
+        # - 聚合时 group_keys 取并集
+        for stmt in sql_program.statements:
+            plan = stmt.plan
+            sid = stmt.statement_id
+
+            # step_dag 条目
+            step_dag[sid] = list(stmt.depends_on)
+
+            # 遍历 plan 的所有 step
+            for step in plan.steps:
+                if isinstance(step, ScanStep):
+                    self._extract_scan(
+                        step, input_tables, input_columns, seen_tables, seen_columns,
+                    )
+                elif isinstance(step, FilterStep):
+                    filters.append(self._extract_filter(step))
+                elif isinstance(step, JoinStep):
+                    join_rel = self._extract_join(step, {})
+                    if join_rel:
+                        join_relationships.append(join_rel)
+                elif isinstance(step, AggregateStep):
+                    aggs, groups, biz_keys = self._extract_aggregate(step)
+                    aggregations.extend(aggs)
+                    grouping_keys.extend(groups)
+                    business_keys.extend(biz_keys)
+                elif isinstance(step, ProjectStep):
+                    output_columns = self._extract_project(step)
+                elif isinstance(step, SortStep):
+                    sort_spec = self._extract_sort(step)
+                elif isinstance(step, LimitStep):
+                    limit_spec = self._extract_limit(step)
+                elif isinstance(step, CaseWhenStep):
+                    case_when_labels.extend(
+                        self._extract_case_when_v1(step, sid)
+                    )
+                elif isinstance(step, WindowStep):
+                    window_specs.extend(
+                        self._extract_window_v1(step, sid)
+                    )
+
+        # ── temp_tables 序列化 ──
+        temp_tables: list[dict] = [
+            tt.model_dump() for tt in sql_program.temp_tables
+        ]
+
+        # ── 生成确定性 contract ID ──
+        contract_id = DataTransformContractV1.generate_contract_id(program_id)
+
+        contract = DataTransformContractV1(
+            contract_id=contract_id,
+            version="v1",
+            source_phase="phase-3",
+            source_sqlprogram_hash=program_id,
+            input_tables=input_tables,
+            input_columns=input_columns,
+            join_relationships=join_relationships,
+            filters=filters,
+            aggregations=aggregations,
+            grouping_keys=grouping_keys,
+            output_columns=output_columns,
+            output_grain=grouping_keys,
+            sort_spec=sort_spec,
+            limit_spec=limit_spec,
+            business_keys=business_keys,
+            semantic_policy_ref="",
+            step_dag=step_dag,
+            temp_tables=temp_tables,
+            case_when_labels=case_when_labels,
+            window_specs=window_specs,
+            write_spec=write_plan.model_dump() if write_plan else None,
+        )
+
+        return contract
+
+    # ── v1 专用 Step 抽取辅助 ──
+
+    @staticmethod
+    def _extract_case_when_v1(
+        step: CaseWhenStep, statement_id: str,
+    ) -> list[CaseWhenLabelSpec]:
+        """从 CaseWhenStep 提取 CASE WHEN 标签规格。
+
+        一个 CaseWhenStep 产生一个标签列，提取所有分支的 label 值。
+
+        Args:
+            step: CaseWhenStep 实例
+            statement_id: 所属语句 ID
+
+        Returns:
+            CaseWhenLabelSpec 列表（当前每个 step 对应一个 spec）
+        """
+        labels: list[str] = []
+        else_label: str | None = None
+
+        for branch in step.cases:
+            result = branch.result
+            if hasattr(result, "value"):
+                labels.append(str(result.value))
+
+        if step.else_value is not None and hasattr(step.else_value, "value"):
+            else_label = str(step.else_value.value)
+
+        return [
+            CaseWhenLabelSpec(
+                statement_id=statement_id,
+                output_alias=step.step_id,
+                branch_count=len(step.cases),
+                labels=labels,
+                else_label=else_label,
+            )
+        ]
+
+    @staticmethod
+    def _extract_window_v1(
+        step: WindowStep, statement_id: str,
+    ) -> list[WindowSpecSummary]:
+        """从 WindowStep 提取窗口函数规格摘要。
+
+        每个 WindowExpr 生成一个 WindowSpecSummary。
+
+        Args:
+            step: WindowStep 实例
+            statement_id: 所属语句 ID
+
+        Returns:
+            WindowSpecSummary 列表
+        """
+        specs: list[WindowSpecSummary] = []
+        for wexpr in step.window_exprs:
+            func = wexpr.function.value if hasattr(wexpr.function, "value") else str(wexpr.function)
+            alias = wexpr.alias
+
+            # 分区键——归一化名
+            partition_by = [
+                cr.normalized_name
+                if hasattr(cr, "normalized_name")
+                else str(cr)
+                for cr in wexpr.partition_by
+            ]
+
+            # 排序键——归一化名（不含方向）
+            order_by = [
+                s.column if hasattr(s, "column") else str(s)
+                for s in wexpr.order_by
+            ]
+
+            specs.append(
+                WindowSpecSummary(
+                    statement_id=statement_id,
+                    function=func,
+                    alias=alias,
+                    partition_by=partition_by,
+                    order_by=order_by,
+                )
+            )
+        return specs
 
     # ── 静态工具方法 ──
 

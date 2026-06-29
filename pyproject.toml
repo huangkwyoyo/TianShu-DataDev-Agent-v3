@@ -24,9 +24,11 @@ classifiers = [
 # 后续阶段按需激活（见各 phase roadmap 文档）
 dependencies = [
     "duckdb>=0.10.0",
+    "fastapi>=0.100.0",
     "pydantic>=2.0",
     "pyyaml>=6.0",
     "sqlglot>=20.0.0",
+    "uvicorn>=0.20.0",
 ]
 
 [project.optional-dependencies]
@@ -35,9 +37,8 @@ langgraph = ["langgraph>=0.2.0"]
 # PySpark——Phase 2 开始激活
 spark = ["pyspark>=3.5.0"]
 # 开发工具
-dev = ["pytest>=8.0", "pytest-cov>=4.0", "ruff>=0.3.0"]
-# 前端——Phase 5 开始激活
-frontend = ["fastapi>=0.100.0", "uvicorn>=0.20.0"]
+dev = ["pytest>=8.0", "pytest-cov>=4.0", "ruff>=0.3.0", "httpx>=0.24.0"]
+# 前端——Phase 5 开始激活（fastapi/uvicorn 已移入核心依赖）
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -8,11 +8,12 @@
 
 ## 外接知识文档路径
 
-项目的外部知识积累存放在 Obsidian Vault 中，路径为：
+项目的外部知识积累存放在 Obsidian Vault 中，按优先级依次尝试以下路径：
 
-```
-C:\Users\62414\Nutstore\1\Obsidian Vault\Ai Learning\Data Dev Agent知识积累
-```
+1. `C:\Users\62414\Nutstore\1\Obsidian Vault\Ai Learning\Data Dev Agent知识积累`（主路径）
+2. `C:\Users\Karvi_h\Nutstore\1\Obsidian Vault\Ai Learning\Data Dev Agent知识积累`（备用路径）
+
+> 使用规则：按上述顺序尝试，第一个存在且可读的路径即为当前会话的有效外接知识路径。
 
 ### 使用规则
 

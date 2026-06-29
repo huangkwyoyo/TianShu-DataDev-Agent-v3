@@ -1,0 +1,39 @@
+"""API 测试共享 fixtures——TestClient + FakePipeline + golden_spec。"""
+
+import os
+import tempfile
+
+import pytest
+from fastapi.testclient import TestClient
+
+from tianshu_datadev.api.app import create_app
+from tianshu_datadev.api.pipeline import FakePipeline
+
+# 项目根目录（相对于本文件）
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+
+def _read_fixture(filename: str) -> str:
+    """读取测试 fixture 文件。"""
+    path = os.path.join(_ROOT, "tests", "fixtures", "golden", filename)
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+@pytest.fixture
+def pipeline():
+    """创建真实 FakePipeline 实例——使用临时目录避免污染。"""
+    return FakePipeline(base_output_dir=tempfile.mkdtemp())
+
+
+@pytest.fixture
+def client(pipeline):
+    """创建 FastAPI TestClient——注入 FakePipeline。"""
+    app = create_app(pipeline=pipeline)
+    return TestClient(app)
+
+
+@pytest.fixture
+def golden_spec():
+    """读取 golden fixture——golden_no_time_range.md。"""
+    return _read_fixture("golden_no_time_range.md")
