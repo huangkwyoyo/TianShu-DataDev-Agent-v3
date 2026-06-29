@@ -29,6 +29,9 @@ export function TemplateSelector({ onSelect }: Props) {
     aggregation: '汇总表',
     label: '标签表',
     multi_step: '多步骤',
+    join: '关联宽表',
+    window: '窗口排名',
+    empty: '空白模板',
   };
 
   return (

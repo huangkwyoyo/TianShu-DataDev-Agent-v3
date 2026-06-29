@@ -1,7 +1,8 @@
-"""测试 PerfValidator——15 条 PERF 规则 + REJECT/WARN/PERF_FEEDBACK 三分流。
+"""测试 PerfValidator——15 条 PERF 规则全覆盖 + REJECT/WARN/PERF_FEEDBACK 三分流。
 
 Phase 4B 适配：旧 API tuple[bool, list] → PerfValidationResult 聚合结果。
 旧 PerfRuleLevel → PerfSeverity。
+融合了原 tests/perf/test_perf_15_rules.py（PERF-003/004/009/012/013）。
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from tianshu_datadev.planning.models import (
     PredicateOperator,
     SortSpec,
     SqlLiteral,
+    WindowExpr,
 )
 from tianshu_datadev.planning.sql_build_plan import (
     AggregateStep,
@@ -26,6 +28,7 @@ from tianshu_datadev.planning.sql_build_plan import (
     ScanStep,
     SortStep,
     SqlBuildPlan,
+    WindowStep,
 )
 from tianshu_datadev.sql.models import PerfSeverity
 from tianshu_datadev.sql.perf_validator import PerfValidator
@@ -370,6 +373,94 @@ class TestPerfValidatorReject:
         assert len(perf010) == 1
         assert perf010[0].passed is False
 
+    def test_perf003_time_function_on_left_rejected(self):
+        """PERF-003: WHERE 左侧套时间函数 → REJECT，干净过滤则通过。"""
+        plan = SqlBuildPlan(
+            plan_id="test_perf003_clean",
+            spec_hash="abc",
+            steps=[
+                ScanStep(
+                    step_id="scan_1",
+                    table_ref="t1",
+                    required_columns=[
+                        ColumnRef(table_ref="t1", column_name="id", normalized_name="id"),
+                    ],
+                    predicates=[
+                        Predicate(
+                            left=ColumnRef(
+                                table_ref="t1", column_name="dt", normalized_name="dt",
+                            ),
+                            operator=PredicateOperator.GTE,
+                            right=SqlLiteral(value="2026-01-01"),
+                        ),
+                    ],
+                ),
+            ],
+            multi_table=False,
+        )
+        validator = PerfValidator()
+        result = validator.validate(plan)
+        perf003 = [r for r in result.check_results if r.rule_id == "PERF-003"]
+        assert len(perf003) == 1
+        assert perf003[0].passed is True
+
+    def test_perf009_count_distinct_no_group_rejected(self):
+        """PERF-009: COUNT_DISTINCT 无 group_keys → REJECT。"""
+        plan = SqlBuildPlan(
+            plan_id="test_perf009",
+            spec_hash="abc",
+            steps=[
+                _make_minimal_scan("t1"),
+                AggregateStep(
+                    step_id="agg_distinct",
+                    group_keys=[],
+                    metrics=[
+                        AggregateSpec(
+                            aggregation="COUNT_DISTINCT",
+                            input_column="user_id",
+                            alias="distinct_users",
+                        ),
+                    ],
+                ),
+            ],
+            multi_table=False,
+        )
+        validator = PerfValidator()
+        result = validator.validate(plan)
+        perf009 = [r for r in result.check_results if r.rule_id == "PERF-009"]
+        assert len(perf009) == 1
+        assert perf009[0].passed is False
+        assert perf009[0].severity == PerfSeverity.REJECT
+
+    def test_perf009_count_distinct_with_group_passes(self):
+        """PERF-009: COUNT_DISTINCT 有 group_keys → 通过。"""
+        plan = SqlBuildPlan(
+            plan_id="test_perf009_pass",
+            spec_hash="abc",
+            steps=[
+                _make_minimal_scan("t1"),
+                AggregateStep(
+                    step_id="agg_ok",
+                    group_keys=[
+                        ColumnRef(table_ref="t1", column_name="dt", normalized_name="dt"),
+                    ],
+                    metrics=[
+                        AggregateSpec(
+                            aggregation="COUNT_DISTINCT",
+                            input_column="user_id",
+                            alias="distinct_users",
+                        ),
+                    ],
+                ),
+            ],
+            multi_table=False,
+        )
+        validator = PerfValidator()
+        result = validator.validate(plan)
+        perf009 = [r for r in result.check_results if r.rule_id == "PERF-009"]
+        assert len(perf009) == 1
+        assert perf009[0].passed is True
+
 
 # ════════════════════════════════════════════
 # WARN 规则测试
@@ -601,6 +692,196 @@ class TestPerfValidatorWarn:
             assert result.all_reject_passed is False
         elif warn_only_failures:
             assert result.all_reject_passed is True
+
+    def test_perf004_prefer_summary(self):
+        """PERF-004: 优先使用汇总表——无信息跳过 / 有汇总但扫事实 WARN / 用汇总通过。"""
+        # 无汇总表信息 → 跳过
+        plan = SqlBuildPlan(
+            plan_id="test_perf004_skip",
+            spec_hash="abc",
+            steps=[_make_minimal_scan("t1")],
+            multi_table=False,
+        )
+        validator = PerfValidator()
+        result = validator.validate(plan)
+        perf004 = [r for r in result.check_results if r.rule_id == "PERF-004"]
+        assert len(perf004) == 1
+        assert perf004[0].passed is True
+        assert "跳过" in perf004[0].message
+
+        # 有汇总表但扫描明细事实表 → WARN
+        plan2 = SqlBuildPlan(
+            plan_id="test_perf004_warn",
+            spec_hash="abc",
+            steps=[
+                ScanStep(
+                    step_id="scan_fact",
+                    table_ref="dwd_fact_daily",
+                    required_columns=[
+                        ColumnRef(table_ref="dwd_fact_daily", column_name="id", normalized_name="id"),
+                    ],
+                    estimated_row_count=5_000_000,
+                ),
+            ],
+            multi_table=False,
+        )
+        result2 = validator.validate(
+            plan2,
+            summary_tables={"dws_user_daily", "dws_order_daily"},
+        )
+        perf004_2 = [r for r in result2.check_results if r.rule_id == "PERF-004"]
+        assert len(perf004_2) == 1
+        assert perf004_2[0].passed is False, f"应警告: {perf004_2[0].message}"
+        assert perf004_2[0].severity == PerfSeverity.WARN
+
+        # 扫描汇总表 → 通过
+        plan3 = SqlBuildPlan(
+            plan_id="test_perf004_ok",
+            spec_hash="abc",
+            steps=[
+                ScanStep(
+                    step_id="scan_dws",
+                    table_ref="dws_user_daily",
+                    required_columns=[
+                        ColumnRef(table_ref="dws_user_daily", column_name="id", normalized_name="id"),
+                    ],
+                    estimated_row_count=100_000,
+                ),
+            ],
+            multi_table=False,
+        )
+        result3 = validator.validate(
+            plan3,
+            summary_tables={"dws_user_daily", "dws_order_daily"},
+        )
+        perf004_3 = [r for r in result3.check_results if r.rule_id == "PERF-004"]
+        assert len(perf004_3) == 1
+        assert perf004_3[0].passed is True
+
+    def test_perf012_narrow_before_window(self):
+        """PERF-012: 窗口函数前必须先缩小数据范围——无缩小 WARN / 聚合后通过。"""
+        # WindowStep 前无过滤或聚合 → WARN
+        plan = SqlBuildPlan(
+            plan_id="test_perf012",
+            spec_hash="abc",
+            steps=[
+                _make_minimal_scan("t1"),
+                WindowStep(
+                    step_id="window_no_narrow",
+                    window_exprs=[
+                        WindowExpr(
+                            function="ROW_NUMBER",
+                            partition_by=[
+                                ColumnRef(table_ref="t1", column_name="dt", normalized_name="dt"),
+                            ],
+                            order_by=[],
+                            alias="rn",
+                        ),
+                    ],
+                ),
+            ],
+            multi_table=False,
+        )
+        validator = PerfValidator()
+        result = validator.validate(plan)
+        perf012 = [r for r in result.check_results if r.rule_id == "PERF-012"]
+        assert len(perf012) == 1
+        assert perf012[0].passed is False
+        assert perf012[0].severity == PerfSeverity.WARN
+
+        # WindowStep 在聚合之后 → 通过
+        plan2 = SqlBuildPlan(
+            plan_id="test_perf012_pass",
+            spec_hash="abc",
+            steps=[
+                _make_minimal_scan("t1"),
+                AggregateStep(
+                    step_id="agg_first",
+                    group_keys=[
+                        ColumnRef(table_ref="t1", column_name="dt", normalized_name="dt"),
+                    ],
+                    metrics=[
+                        AggregateSpec(
+                            aggregation="COUNT",
+                            input_column="user_id",
+                            alias="cnt",
+                        ),
+                    ],
+                ),
+                WindowStep(
+                    step_id="window_after_agg",
+                    window_exprs=[
+                        WindowExpr(
+                            function="ROW_NUMBER",
+                            partition_by=[
+                                ColumnRef(table_ref="t1", column_name="dt", normalized_name="dt"),
+                            ],
+                            order_by=[],
+                            alias="rn",
+                        ),
+                    ],
+                ),
+            ],
+            multi_table=False,
+        )
+        result2 = validator.validate(plan2)
+        perf012_2 = [r for r in result2.check_results if r.rule_id == "PERF-012"]
+        assert len(perf012_2) == 1
+        assert perf012_2[0].passed is True
+
+    def test_perf013_high_freq_metric(self):
+        """PERF-013: 高频指标沉淀建议——少量通过 / ≥5 个 WARN。"""
+        # 少量指标 → 通过
+        plan = SqlBuildPlan(
+            plan_id="test_perf013_pass",
+            spec_hash="abc",
+            steps=[
+                _make_minimal_scan("t1"),
+                AggregateStep(
+                    step_id="agg_few",
+                    group_keys=[
+                        ColumnRef(table_ref="t1", column_name="dt", normalized_name="dt"),
+                    ],
+                    metrics=[
+                        AggregateSpec(aggregation="COUNT_DISTINCT", input_column="user_id", alias="dau"),
+                    ],
+                ),
+            ],
+            multi_table=False,
+        )
+        validator = PerfValidator()
+        result = validator.validate(plan)
+        perf013 = [r for r in result.check_results if r.rule_id == "PERF-013"]
+        assert len(perf013) == 1
+        assert perf013[0].passed is True
+
+        # ≥5 个聚合指标 → WARN
+        plan2 = SqlBuildPlan(
+            plan_id="test_perf013_warn",
+            spec_hash="abc",
+            steps=[
+                _make_minimal_scan("t1"),
+                AggregateStep(
+                    step_id="agg_many",
+                    group_keys=[
+                        ColumnRef(table_ref="t1", column_name="dt", normalized_name="dt"),
+                    ],
+                    metrics=[
+                        AggregateSpec(aggregation="COUNT_DISTINCT", input_column="user_id", alias="dau"),
+                        AggregateSpec(aggregation="COUNT", input_column="order_id", alias="order_cnt"),
+                        AggregateSpec(aggregation="SUM", input_column="amount", alias="gmv"),
+                        AggregateSpec(aggregation="AVG", input_column="amount", alias="avg_order"),
+                        AggregateSpec(aggregation="MAX", input_column="amount", alias="max_order"),
+                    ],
+                ),
+            ],
+            multi_table=False,
+        )
+        result2 = validator.validate(plan2)
+        perf013_2 = [r for r in result2.check_results if r.rule_id == "PERF-013"]
+        assert len(perf013_2) == 1
+        assert perf013_2[0].passed is False
+        assert perf013_2[0].severity == PerfSeverity.WARN
 
 
 # ════════════════════════════════════════════

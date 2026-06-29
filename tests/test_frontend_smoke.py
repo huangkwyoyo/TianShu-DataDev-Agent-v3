@@ -150,18 +150,33 @@ class TestTemplateButtons:
         assert not missing, f"JS bundle 中未找到模板关键词: {missing}"
 
     def test_template_ids_in_pipeline(self):
-        """验证模板 ID 存在于流水线定义中（模板由 API 端提供，非前端硬编码）。"""
+        """验证模板 ID 存在于流水线定义中（模板由 API 端提供，非前端硬编码）。
+
+        Phase 4.5 要求至少 5 个模板（退出条件 #4）。
+        """
         pipeline_path = os.path.join(
             _ROOT, "src", "tianshu_datadev", "api", "pipeline.py"
         )
         with open(pipeline_path, "r", encoding="utf-8") as f:
             pipeline_src = f.read()
 
-        template_ids = ["tpl_aggregation", "tpl_label_table", "tpl_multi_step"]
+        template_ids = [
+            "tpl_aggregation",
+            "tpl_label_table",
+            "tpl_multi_step",
+            "tpl_two_table_join",     # Phase 4.5 补全
+            "tpl_window_topn",        # Phase 4.5 补全
+            "tpl_empty",              # Phase 4.5 补全
+        ]
         for tid in template_ids:
             assert tid in pipeline_src, (
                 f"模板 ID '{tid}' 未在 pipeline.py 的 TEMPLATES 中找到"
             )
+        # 验证模板数量 >= 5（Phase 4.5 退出条件 #4）
+        template_count = pipeline_src.count('"template_id":')
+        assert template_count >= 5, (
+            f"模板数量 {template_count} < 5——不满足 Phase 4.5 退出条件 #4"
+        )
 
     def test_frontend_fetches_templates(self):
         """验证前端包含模板获取逻辑（fetchTemplates / fetchTemplate）。"""

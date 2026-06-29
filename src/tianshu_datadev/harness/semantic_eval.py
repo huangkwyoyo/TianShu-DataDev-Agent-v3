@@ -117,23 +117,19 @@ def _make_semantic_fixtures() -> list[SemanticCase]:
     ]
 
 
-# ── 已知能力缺口——系统当前无对应 Validator 规则的语义错误类型 ──
-# 这些错误类型的 _eval_* 方法会诚实返回 passed=False，
-# 因为它们依赖的 Validator/PerfValidator 规则尚未实现。
-# 缺口应在后续 Phase 中通过确定性规则补充（非临时 fixture 逻辑）。
-_KNOWN_GAP_ERROR_TYPES: set[SemanticErrorType] = {
-    SemanticErrorType.WRONG_GRAIN,       # 缺少 _validate_grain_completeness 规则
-    SemanticErrorType.WRONG_AGGREGATION,  # 缺少 _validate_aggregation_declaration 规则
-}
+# 已知能力缺口——Phase 4C 补全后，所有 5 类语义错误均已有对应 Validator 规则。
+# 此集合保留为空——若未来新增语义错误类型暂时无对应规则，
+# 可临时加入此集合以标记为 known_gap。
+_KNOWN_GAP_ERROR_TYPES: set[SemanticErrorType] = set()
 
 
 class SemanticEvaluator:
     """语义评测器——确定性评估 5 类语义错误的检测能力。
 
-    当前可检测 3/5：
+    全部 5/5 可检测（Phase 4C 补全）：
     - ✅ WRONG_FIELD（字段引用校验——Q-VAL-COL-）
-    - ❌ WRONG_GRAIN（已知缺口——Validator 无粒度完整性规则）
-    - ❌ WRONG_AGGREGATION（已知缺口——Validator 无聚合类型声明对比）
+    - ✅ WRONG_GRAIN（粒度完整性校验——Q-VAL-GRAIN-）
+    - ✅ WRONG_AGGREGATION（聚合类型声明对比——Q-VAL-AGG-）
     - ✅ WRONG_ENUM（LabelValidator 枚举值校验）
     - ✅ WRONG_JOIN（Join key 类型兼容校验——Q-VAL-JOINTYPE-）
 
@@ -347,11 +343,17 @@ class SemanticEvaluator:
     def _eval_wrong_grain(self, case: SemanticCase) -> SemanticCaseResult:
         """评测语义错误：错粒度。
 
-        策略：构造 group_keys 仅含 date 的 plan，
-        但 required_columns 中包含 region 字段却未被使用。
-        Validator 可能通过字段引用检查检测到 region 被扫描但未输出。
-        或者通过 group_keys 与维度声明的不一致检测。
+        策略：构造 ParsedDeveloperSpec 声明 (date, region) 两个维度，
+        但 SqlBuildPlan 的 group_keys 仅含 date——缺失 region。
+        Validator._validate_grain_completeness() 应产生 Q-VAL-GRAIN- 拒绝码。
         """
+        from tianshu_datadev.developer_spec.models import (
+            DimensionDecl,
+            MetricDecl,
+            OutputSpecDecl,
+            ParsedDeveloperSpec,
+        )
+
         manifest = SourceManifest(
             manifest_id="test_manifest_wg",
             spec_hash="abc123",
@@ -368,7 +370,7 @@ class SemanticEvaluator:
             ],
         )
 
-        # 错误 plan——扫描了 region 但在 group_keys 中缺失
+        # 错误 plan——group_keys 仅含 date，缺少 region
         plan = SqlBuildPlan(
             plan_id="test_wrong_grain",
             spec_hash="abc123",
@@ -400,19 +402,30 @@ class SemanticEvaluator:
             multi_table=False,
         )
 
-        validator = SqlBuildPlanValidator()
-        passed, questions = validator.validate(plan, manifest)
+        # 构造 ParsedDeveloperSpec——声明两个维度
+        spec = ParsedDeveloperSpec(
+            spec_id="spec_wg",
+            spec_hash="abc123",
+            title="粒度测试",
+            description="声明 (date, region) 两个维度",
+            input_tables=[],
+            metrics=[
+                MetricDecl(metric_name="total_amt", aggregation="SUM", input_column="amount", alias="total_amt"),
+            ],
+            dimensions=[
+                DimensionDecl(dimension_name="date", column_ref="date"),
+                DimensionDecl(dimension_name="region", column_ref="region"),
+            ],
+            output_spec=OutputSpecDecl(columns=["date", "region", "total_amt"], grain=["date", "region"]),
+        )
 
-        # 错粒度——仅当 Validator 返回与粒度/分组键直接相关的拒绝时才视为"已识别"
+        validator = SqlBuildPlanValidator()
+        passed, questions = validator.validate(plan, manifest, spec=spec)
+
         if not passed:
-            # 窄关键词匹配——避免将无关拒绝误判为粒度检测成功
-            grain_keywords = ("Q-VAL-GRAIN-", "粒度", "分组键缺少", "分组键不完整")
             grain_issues = [
                 q for q in questions
-                if q.blocking and any(
-                    kw in q.question_id or kw in q.description
-                    for kw in grain_keywords
-                )
+                if q.blocking and "Q-VAL-GRAIN-" in q.question_id
             ]
             if grain_issues:
                 return SemanticCaseResult(
@@ -421,55 +434,29 @@ class SemanticEvaluator:
                     passed=True,
                     detection_layer="validator",
                     rejection_detail=(
-                        f"Validator 检测到粒度相关错误："
+                        f"Validator 检测到粒度错误："
                         f"{grain_issues[0].question_id}"
                     ),
                     trace=f"question_id={grain_issues[0].question_id}, "
                           f"description={grain_issues[0].description[:200]}",
                 )
-            # Validator 拒绝了但与粒度无关——不能算"错粒度已识别"
             return SemanticCaseResult(
                 case_id=case.case_id,
                 error_type=case.error_type,
                 passed=False,
                 rejection_detail=(
-                    f"Validator 拒绝但原因与粒度无关——"
-                    f"预期因分组键不完整而拒绝，"
-                    f"实际: {questions[0].question_id}"
+                    f"Validator 拒绝但未命中 Q-VAL-GRAIN-——"
+                    f"实际: {questions[0].question_id if questions else '无'}"
                 ),
-                trace=f"question_id={questions[0].question_id}, "
-                      f"description={questions[0].description[:200]}",
+                trace=f"questions={[q.question_id for q in questions]}",
             )
         else:
-            # Validator 通过了，但我们可以通过 PerfValidator 做二次检查
-            from tianshu_datadev.sql.perf_validator import PerfValidator
-
-            perf = PerfValidator()
-            perf_result = perf.validate(plan)
-
-            # 查找列使用相关的 PERF 问题
-            col_perf = [
-                r for r in perf_result.check_results
-                if not r.passed and r.severity in ("REJECT", "WARN")
-                   and ("column" in r.rule_id.lower() or "列" in r.message)
-            ]
-            if col_perf:
-                return SemanticCaseResult(
-                    case_id=case.case_id,
-                    error_type=case.error_type,
-                    passed=True,
-                    detection_layer="perf_validator",
-                    rejection_detail=f"PerfValidator 检测到列使用问题：{col_perf[0].rule_id}",
-                    trace=f"rule_id={col_perf[0].rule_id}, "
-                          f"message={col_perf[0].message[:200]}",
-                )
-
             return SemanticCaseResult(
                 case_id=case.case_id,
                 error_type=case.error_type,
                 passed=False,
-                rejection_detail="未检测到粒度错误——当前 Validator/PerfValidator 可能不直接覆盖此语义维度",
-                trace="plan 的 group_keys 缺少 region，但所有 Validator 返回通过。粒度检查需后续阶段加入。",
+                rejection_detail="Validator 未检测到粒度不完整——_validate_grain_completeness 可能未生效",
+                trace="plan 的 group_keys 缺少 region，但 Validator 返回 passed=True",
             )
 
     # ── 错误3：错聚合 ──
@@ -477,11 +464,17 @@ class SemanticEvaluator:
     def _eval_wrong_aggregation(self, case: SemanticCase) -> SemanticCaseResult:
         """评测语义错误：错聚合。
 
-        策略：构造 aggregation='COUNT' 的 AggregateSpec，
-        但 input_column 引用了一个 Validator 认识的字段。
-        检测方式：如果 input_column 存在但 aggregation 类型不匹配声明，
-        Validator 可能通过 PERF 规则检测，或通过 Contract 对比发现。
+        策略：构造 ParsedDeveloperSpec 声明 COUNT_DISTINCT(user_id)->dau，
+        但 SqlBuildPlan 使用 COUNT(user_id)->dau。
+        Validator._validate_aggregation_declaration() 应产生 Q-VAL-AGG- 拒绝码。
         """
+        from tianshu_datadev.developer_spec.models import (
+            DimensionDecl,
+            MetricDecl,
+            OutputSpecDecl,
+            ParsedDeveloperSpec,
+        )
+
         manifest = SourceManifest(
             manifest_id="test_manifest_wa",
             spec_hash="abc123",
@@ -517,7 +510,7 @@ class SemanticEvaluator:
                     ],
                     metrics=[
                         AggregateSpec(
-                            aggregation="COUNT",  # 错误：应该是 COUNT_DISTINCT
+                            aggregation="COUNT",  # 错误：声明应为 COUNT_DISTINCT
                             input_column="user_id",
                             alias="dau",
                         ),
@@ -527,19 +520,29 @@ class SemanticEvaluator:
             multi_table=False,
         )
 
-        validator = SqlBuildPlanValidator()
-        passed, questions = validator.validate(plan, manifest)
+        # 构造 ParsedDeveloperSpec——声明 COUNT_DISTINCT
+        spec = ParsedDeveloperSpec(
+            spec_id="spec_wa",
+            spec_hash="abc123",
+            title="聚合测试",
+            description="声明 COUNT_DISTINCT(user_id) as dau",
+            input_tables=[],
+            metrics=[
+                MetricDecl(metric_name="dau", aggregation="COUNT_DISTINCT", input_column="user_id", alias="dau"),
+            ],
+            dimensions=[
+                DimensionDecl(dimension_name="dt", column_ref="dt"),
+            ],
+            output_spec=OutputSpecDecl(columns=["dt", "dau"], grain=["dt"]),
+        )
 
-        # 错聚合——仅当 Validator 返回与聚合函数直接相关的拒绝时才视为"已识别"
+        validator = SqlBuildPlanValidator()
+        passed, questions = validator.validate(plan, manifest, spec=spec)
+
         if not passed:
-            # 窄关键词匹配——避免将无关拒绝误判为聚合检测成功
-            agg_keywords = ("PERF-009", "Q-VAL-AGG-", "聚合函数", "aggregation type")
             agg_issues = [
                 q for q in questions
-                if q.blocking and any(
-                    kw in q.question_id or kw in q.description
-                    for kw in agg_keywords
-                )
+                if q.blocking and "Q-VAL-AGG-" in q.question_id
             ]
             if agg_issues:
                 return SemanticCaseResult(
@@ -548,57 +551,28 @@ class SemanticEvaluator:
                     passed=True,
                     detection_layer="validator",
                     rejection_detail=(
-                        f"Validator 检测到聚合相关错误："
+                        f"Validator 检测到聚合错误："
                         f"{agg_issues[0].question_id}"
                     ),
                     trace=f"question_id={agg_issues[0].question_id}, "
                           f"description={agg_issues[0].description[:200]}",
                 )
-            # Validator 拒绝了但与聚合无关——不能算"错聚合已识别"
             return SemanticCaseResult(
                 case_id=case.case_id,
                 error_type=case.error_type,
                 passed=False,
                 rejection_detail=(
-                    f"Validator 拒绝但原因与聚合无关——"
-                    f"预期因聚合函数不匹配而拒绝，"
-                    f"实际: {questions[0].question_id}"
+                    f"Validator 拒绝但未命中 Q-VAL-AGG-——"
+                    f"实际: {questions[0].question_id if questions else '无'}"
                 ),
-                trace=f"question_id={questions[0].question_id}, "
-                      f"description={questions[0].description[:200]}",
+                trace=f"questions={[q.question_id for q in questions]}",
             )
         else:
-            # 尝试 PerfValidator
-            from tianshu_datadev.sql.perf_validator import PerfValidator
-
-            perf = PerfValidator()
-            perf_result = perf.validate(plan)
-
-            agg_perf = [
-                r for r in perf_result.check_results
-                if not r.passed and (
-                    "PERF-009" in r.rule_id
-                    or "DISTINCT" in r.message
-                    or "聚合" in r.message
-                    or "COUNT_DISTINCT" in r.message
-                )
-            ]
-            if agg_perf:
-                return SemanticCaseResult(
-                    case_id=case.case_id,
-                    error_type=case.error_type,
-                    passed=True,
-                    detection_layer="perf_validator",
-                    rejection_detail=f"PerfValidator 检测到聚合问题：{agg_perf[0].rule_id}",
-                    trace=f"rule_id={agg_perf[0].rule_id}, "
-                          f"message={agg_perf[0].message[:200]}",
-                )
-
             return SemanticCaseResult(
                 case_id=case.case_id,
                 error_type=case.error_type,
                 passed=False,
-                rejection_detail="未检测到聚合错误——当前 Validator 不直接比对 aggregation 类型与声明",
+                rejection_detail="Validator 未检测到聚合类型不匹配——_validate_aggregation_declaration 可能未生效",
                 trace="plan 使用 COUNT 而非 COUNT_DISTINCT，但 Validator 返回 passed=True",
             )
 

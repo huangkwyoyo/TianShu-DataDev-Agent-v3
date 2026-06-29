@@ -24,8 +24,9 @@ class HarnessMetricsEngine:
     """指标计算引擎——确定性的七维门禁判决。
 
     每个维度独立计算，判决结果汇总为 HarnessReport。
-    占位维度（D4/D5/D7）返回 WARN 并标记 [stub]，
-    遵循 SemanticEvaluator 的 known_gap 诚实报告原则。
+    无数据时返回 WARN 并标记 [stub]（诚实报告原则），
+    有数据时执行真实阈值判决（REJECT/PASS）。
+    D4/D5/D7 已从占位 stub 补全为真实指标计算（Phase 4D 补全）。
     """
 
     def compute_all(
@@ -353,70 +354,229 @@ class HarnessMetricsEngine:
 
     # ── 维度 4：编译与执行 ──
 
+    # D4 门禁阈值（来自 Phase 4D 规划文档）
+    _D4_COMPILE_SUCCESS_MIN: float = 99.0       # 编译成功率最低阈值（%）
+    _D4_EXECUTE_SUCCESS_MIN: float = 95.0       # 执行成功率最低阈值（%）
+    _D4_DETERMINISM_MIN: float = 100.0          # 编译确定性最低阈值（%）
+
     def compute_dimension_4(
-        self, compile_results: list | None = None,
+        self, compile_results: dict | None = None,
     ) -> DimensionResult:
         """维度 4：编译与执行——确定性、成功率。
 
-        占位实现——真实数据需要完整的 Compiler + Executor 集成。
+        测量指标（来自 Compiler + Executor 集成）：
+        - compile_success_rate: SqlBuildPlan → CompiledSql 成功率（%）
+        - execute_success_rate: CompiledSql → ExecutionTrace 成功率（%）
+        - compile_determinism: 同一 SqlBuildPlan 两次编译 hash 一致率（%）
 
-        REJECT：compile_success_rate < 99% 或 execute_success_rate < 95%
-        当前阶段所有指标为 [stub]，返回 WARN（不阻断退出）。
+        REJECT 条件：
+        - compile_success_rate < 99%
+        - execute_success_rate < 95%
+        - compile_determinism < 100%
+
+        无 compile_results 时返回 WARN（占位——不阻断退出）。
         """
+        # 无数据 → WARN：不能因缺少 Compiler 集成而静默放行
+        if compile_results is None:
+            return DimensionResult(
+                dimension=4,
+                name="编译与执行",
+                verdict="WARN",
+                metrics={
+                    "compile_success_rate": -1.0,
+                    "execute_success_rate": -1.0,
+                    "compile_determinism": -1.0,
+                    "total_plans": 0,
+                    "compiled_count": 0,
+                    "executed_count": 0,
+                },
+                evidence="Compiler 集成待接入——使用 HarnessRunner.run_compiler_checks() 填充数据",
+                details=[
+                    "[stub] 编译与执行指标需要真实 Compiler + Executor 集成——当前为占位值",
+                    "[stub] 接入 DuckDbSqlCompiler + DuckDBExecutor 后自动进入真实评测模式",
+                ],
+            )
+
+        # 从 compile_results 提取指标
+        total = compile_results.get("total_plans", 0)
+        compiled = compile_results.get("compiled_count", 0)
+        executed = compile_results.get("executed_count", 0)
+        deterministic = compile_results.get("deterministic_count", 0)
+
+        compile_rate = round(compiled / total * 100, 1) if total > 0 else 0.0
+        execute_rate = round(executed / compiled * 100, 1) if compiled > 0 else 0.0
+        determinism_rate = round(deterministic / total * 100, 1) if total > 0 else 0.0
+
         metrics: dict[str, float | int | str | bool] = {
-            "compile_success_rate": -1.0,
-            "execute_success_rate": -1.0,
-            "compile_determinism": -1.0,
+            "compile_success_rate": compile_rate,
+            "execute_success_rate": execute_rate,
+            "compile_determinism": determinism_rate,
+            "total_plans": total,
+            "compiled_count": compiled,
+            "executed_count": executed,
+            "deterministic_count": deterministic,
         }
-        details: list[str] = [
-            "[stub] 编译与执行指标需要真实 Compiler + Executor 集成——当前为占位值",
-            "[stub] compile_determinism 可使用 SqlBuildPlan.generate_plan_hash() 验证",
-        ]
+
+        failures = compile_results.get("failures", [])
+        details: list[str] = []
+
+        # 逐条件检查——任一不达标即 REJECT
+        reject_reasons: list[str] = []
+
+        if compile_rate < self._D4_COMPILE_SUCCESS_MIN:
+            reject_reasons.append(
+                f"编译成功率 {compile_rate}% < {self._D4_COMPILE_SUCCESS_MIN}%——"
+                f"{total - compiled} 个 plan 编译失败"
+            )
+        if execute_rate < self._D4_EXECUTE_SUCCESS_MIN:
+            reject_reasons.append(
+                f"执行成功率 {execute_rate}% < {self._D4_EXECUTE_SUCCESS_MIN}%——"
+                f"{compiled - executed} 个 SQL 执行失败"
+            )
+        if determinism_rate < self._D4_DETERMINISM_MIN:
+            reject_reasons.append(
+                f"编译确定性 {determinism_rate}% < {self._D4_DETERMINISM_MIN}%——"
+                f"{total - deterministic} 个 plan 两次编译 hash 不一致"
+            )
+
+        if reject_reasons:
+            details.extend(reject_reasons)
+            # 附加失败详情（最多 10 条，避免报告过长）
+            for f in failures[:10]:
+                details.append(
+                    f"  {f.get('plan_id', '?')}: {f.get('error', '未知错误')}"
+                )
+            if len(failures) > 10:
+                details.append(f"  ... 及其他 {len(failures) - 10} 条失败记录")
+
+        verdict = "REJECT" if reject_reasons else "PASS"
 
         return DimensionResult(
             dimension=4,
             name="编译与执行",
-            verdict="WARN",  # 占位阶段不阻断，但提醒
+            verdict=verdict,
             metrics=metrics,
-            evidence="Compiler 确定性验证占位；真实数据需 Phase 2 Compiler 集成",
-            details=details,
+            evidence=compile_results.get(
+                "evidence",
+                "Compiler + Executor 集成运行结果",
+            ),
+            details=details or [
+                f"全部 {total} 个 plan 编译/执行通过，确定性 100%——D4 门禁 PASS"
+            ],
         )
 
     # ── 维度 5：产品可用性 ──
+
+    # D5 门禁阈值（来自 Phase 4D 规划文档——需 30-50 个真实样本后校准）
+    _D5_ACCEPTANCE_MIN: float = 70.0            # 人工接受率最低阈值（%）
+    _D5_MIN_REVIEWERS: int = 3                  # 最少审查人数
 
     def compute_dimension_5(
         self, review_results: dict | None = None,
     ) -> DimensionResult:
         """维度 5：产品可用性——review.md 人工接受率。
 
-        占位实现——需要至少 3 名数据工程师参与审查。
-        阈值将在 30-50 个真实 LLM 样本后校准。
-        """
-        metrics: dict[str, float | int | str | bool] = {
-            "human_acceptance_rate": -1.0,
-            "total_reviews": 0,
-            "accepted_reviews": 0,
-        }
-        details: list[str] = [
-            "[stub] 人工接受率需要至少 3 名数据工程师参与审查——当前为占位值",
-            "[stub] 阈值将在 30-50 个真实 LLM 样本后校准",
-        ]
+        测量指标：
+        - human_acceptance_rate: 人工审查接受率（%）
+        - total_reviews / accepted_reviews: 审查总数与接受数
+        - reviewer_count: 参与审查的人数
 
-        if review_results:
-            total = review_results.get("total_reviews", 0)
-            accepted = review_results.get("accepted_reviews", 0)
-            metrics["total_reviews"] = total
-            metrics["accepted_reviews"] = accepted
-            if total > 0:
-                metrics["human_acceptance_rate"] = round(accepted / total * 100, 1)
+        REJECT 条件：
+        - human_acceptance_rate < 70%（阈值待 30-50 样本后校准）
+        - reviewer_count < 3（审查人数不足——样本偏差风险）
+
+        无 review_results 或 total_reviews == 0 时返回 WARN（占位——不阻断退出）。
+        """
+        # 无数据 → WARN：不能因缺少人工审查而静默放行
+        if review_results is None:
+            return DimensionResult(
+                dimension=5,
+                name="产品可用性",
+                verdict="WARN",
+                metrics={
+                    "human_acceptance_rate": -1.0,
+                    "total_reviews": 0,
+                    "accepted_reviews": 0,
+                    "reviewer_count": 0,
+                },
+                evidence="人工审查流程待集成——需至少 3 名数据工程师参与",
+                details=[
+                    "[stub] 人工接受率需要至少 3 名数据工程师参与审查——当前为占位值",
+                    "[stub] 阈值将在 30-50 个真实 LLM 样本后校准",
+                ],
+            )
+
+        total = review_results.get("total_reviews", 0)
+        accepted = review_results.get("accepted_reviews", 0)
+        reviewer_count = review_results.get("reviewer_count", 0)
+
+        # 无有效审查数据 → WARN
+        if total == 0:
+            return DimensionResult(
+                dimension=5,
+                name="产品可用性",
+                verdict="WARN",
+                metrics={
+                    "human_acceptance_rate": -1.0,
+                    "total_reviews": 0,
+                    "accepted_reviews": 0,
+                    "reviewer_count": reviewer_count,
+                },
+                evidence="审查数据为空——total_reviews == 0",
+                details=[
+                    "[stub] 审查数据为空——需填充真实人工审查结果",
+                ],
+            )
+
+        acceptance_rate = round(accepted / total * 100, 1)
+        metrics: dict[str, float | int | str | bool] = {
+            "human_acceptance_rate": acceptance_rate,
+            "total_reviews": total,
+            "accepted_reviews": accepted,
+            "reviewer_count": reviewer_count,
+        }
+
+        details: list[str] = []
+        reject_reasons: list[str] = []
+
+        # 条件 1：审查人数不足 → 样本偏差风险（REJECT）
+        if reviewer_count < self._D5_MIN_REVIEWERS:
+            reject_reasons.append(
+                f"审查人数 {reviewer_count} < {self._D5_MIN_REVIEWERS}——"
+                f"样本偏差风险，审查结果不可靠"
+            )
+
+        # 条件 2：接受率低于阈值 → REJECT
+        if acceptance_rate < self._D5_ACCEPTANCE_MIN:
+            reject_reasons.append(
+                f"人工接受率 {acceptance_rate}% < {self._D5_ACCEPTANCE_MIN}%——"
+                f"{total - accepted}/{total} 个审查被拒绝"
+            )
+
+        if reject_reasons:
+            details.extend(reject_reasons)
+            # 附加拒绝明细（如有）
+            rejected_items = review_results.get("rejected_items", [])
+            for item in rejected_items[:10]:
+                details.append(
+                    f"  {item.get('case_id', '?')}: {item.get('reason', '未说明')}"
+                )
+
+        verdict = "REJECT" if reject_reasons else "PASS"
 
         return DimensionResult(
             dimension=5,
             name="产品可用性",
-            verdict="WARN",  # 占位阶段不阻断
+            verdict=verdict,
             metrics=metrics,
-            evidence="review.md 人工审查流程（待集成）",
-            details=details,
+            evidence=review_results.get(
+                "evidence",
+                "review.md 人工审查流程",
+            ),
+            details=details or [
+                f"人工接受率 {acceptance_rate}%（{accepted}/{total}），"
+                f"{reviewer_count} 人参与审查——D5 门禁 PASS"
+            ],
         )
 
     # ── 维度 6：安全边界 ──
@@ -467,43 +627,149 @@ class HarnessMetricsEngine:
 
     # ── 维度 7：运行稳健性 ──
 
+    # D7 门禁阈值
+    _D7_TOKEN_DRIFT_MAX: float = 50.0           # token 消耗漂移上限（%——相对首次运行）
+    _D7_LATENCY_DRIFT_MAX: float = 100.0        # 延迟漂移上限（%——相对首次运行，即 2x）
+    _D7_MIN_RUNS_FOR_TREND: int = 3             # 趋势分析最少运行次数
+
     def compute_dimension_7(
         self, run_history: list | None = None,
     ) -> DimensionResult:
         """维度 7：运行稳健性——连续运行无显著衰减。
 
-        占位实现——需要多次完整 HarnessRunner 执行数据。
-        当前返回 PASS（无运行数据时默认通过）。
+        测量指标（来自多次完整 HarnessRunner 执行）：
+        - run_count: 运行次数
+        - token_usage 趋势：token 消耗是否持续增长（>50% 漂移 = 异常）
+        - latency 趋势：延迟是否持续增长（>2x 漂移 = 异常）
+        - exception_count: 异常运行次数
+        - has_degradation: 是否存在显著退化
+
+        REJECT 条件：
+        - exception_count > 0（任何异常运行）
+        - token 漂移 > 50%（相对首次运行的平均值）
+        - 延迟漂移 > 100%（相对首次运行的平均值，即 2x）
+
+        无 run_history 时返回 WARN（占位——不阻断退出）。
         """
-        metrics: dict[str, float | int | str | bool] = {
-            "run_count": 0,
-            "token_usage": 0,
-            "latency_ms": 0,
-            "exception_count": 0,
-            "has_degradation": False,
-        }
-        details: list[str] = [
-            "[stub] 运行稳健性需要多次完整 HarnessRunner 执行数据——当前为占位值",
+        # 无数据 → WARN：不能因缺少运行历史而静默放行
+        if run_history is None or len(run_history) == 0:
+            return DimensionResult(
+                dimension=7,
+                name="运行稳健性",
+                verdict="WARN",
+                metrics={
+                    "run_count": 0,
+                    "avg_token_usage": -1,
+                    "avg_latency_ms": -1,
+                    "token_drift_pct": 0.0,
+                    "latency_drift_pct": 0.0,
+                    "exception_count": 0,
+                    "has_degradation": False,
+                },
+                evidence="运行历史待收集——需多次完整 HarnessRunner 执行数据",
+                details=[
+                    "[stub] 运行稳健性需要多次完整 HarnessRunner 执行数据——当前为占位值",
+                ],
+            )
+
+        run_count = len(run_history)
+        exceptions = sum(
+            1 for run in run_history if run.get("exception")
+        )
+
+        # 提取每轮的 token 和延迟数据
+        tokens = [
+            run.get("token_usage", 0)
+            for run in run_history
+            if not run.get("exception")  # 排除异常运行
+        ]
+        latencies = [
+            run.get("latency_ms", 0)
+            for run in run_history
+            if not run.get("exception")
         ]
 
-        if run_history:
-            metrics["run_count"] = len(run_history)
-            exceptions = sum(
-                1 for run in run_history if run.get("exception")
+        avg_tokens = round(sum(tokens) / len(tokens)) if tokens else 0
+        avg_latency = round(sum(latencies) / len(latencies)) if latencies else 0
+
+        details: list[str] = []
+        reject_reasons: list[str] = []
+
+        # 条件 1：异常运行 → REJECT
+        if exceptions > 0:
+            reject_reasons.append(
+                f"检测到 {exceptions}/{run_count} 次运行异常——"
+                f"异常率 {round(exceptions / run_count * 100, 1)}%"
             )
-            metrics["exception_count"] = exceptions
-            metrics["has_degradation"] = exceptions > 0
-            if exceptions > 0:
-                details.append(
-                    f"检测到 {exceptions} 次运行异常——需人工审查"
+            # 列出异常详情
+            for i, run in enumerate(run_history):
+                if run.get("exception"):
+                    details.append(
+                        f"  运行 #{i + 1}: {run.get('exception')}"
+                    )
+
+        # 条件 2：token 漂移检测（需至少 _D7_MIN_RUNS_FOR_TREND 次运行）
+        token_drift_pct = 0.0
+        if len(tokens) >= self._D7_MIN_RUNS_FOR_TREND and tokens[0] > 0:
+            # 比较后半段与前半段的平均值——检测持续增长趋势
+            mid = len(tokens) // 2
+            first_half_avg = sum(tokens[:mid]) / mid
+            second_half_avg = sum(tokens[mid:]) / (len(tokens) - mid)
+            if first_half_avg > 0:
+                token_drift_pct = round(
+                    (second_half_avg - first_half_avg) / first_half_avg * 100, 1
                 )
+            if token_drift_pct > self._D7_TOKEN_DRIFT_MAX:
+                reject_reasons.append(
+                    f"Token 消耗漂移 {token_drift_pct}% > {self._D7_TOKEN_DRIFT_MAX}%——"
+                    f"前半段均值 {round(first_half_avg)} → 后半段均值 {round(second_half_avg)}"
+                )
+
+        # 条件 3：延迟漂移检测
+        latency_drift_pct = 0.0
+        if len(latencies) >= self._D7_MIN_RUNS_FOR_TREND and latencies[0] > 0:
+            mid = len(latencies) // 2
+            first_half_avg = sum(latencies[:mid]) / mid
+            second_half_avg = sum(latencies[mid:]) / (len(latencies) - mid)
+            if first_half_avg > 0:
+                latency_drift_pct = round(
+                    (second_half_avg - first_half_avg) / first_half_avg * 100, 1
+                )
+            if latency_drift_pct > self._D7_LATENCY_DRIFT_MAX:
+                reject_reasons.append(
+                    f"延迟漂移 {latency_drift_pct}% > {self._D7_LATENCY_DRIFT_MAX}%——"
+                    f"前半段均值 {round(first_half_avg)}ms → 后半段均值 {round(second_half_avg)}ms"
+                )
+
+        has_degradation = len(reject_reasons) > 0
+
+        if not reject_reasons and run_count > 0:
+            details.append(
+                f"{run_count} 次运行均无异常——"
+                f"平均 token {avg_tokens}，平均延迟 {avg_latency}ms"
+            )
+            if len(tokens) >= self._D7_MIN_RUNS_FOR_TREND:
+                details.append(
+                    f"Token 漂移 {token_drift_pct}%（阈值 {self._D7_TOKEN_DRIFT_MAX}%），"
+                    f"延迟漂移 {latency_drift_pct}%（阈值 {self._D7_LATENCY_DRIFT_MAX}%）"
+                )
+
+        verdict = "REJECT" if reject_reasons else "PASS"
 
         return DimensionResult(
             dimension=7,
             name="运行稳健性",
-            verdict="PASS" if metrics["exception_count"] == 0 else "REJECT",
-            metrics=metrics,
-            evidence="连续运行记录（真实数据需多次运行）",
+            verdict=verdict,
+            metrics={
+                "run_count": run_count,
+                "avg_token_usage": avg_tokens,
+                "avg_latency_ms": avg_latency,
+                "token_drift_pct": token_drift_pct,
+                "latency_drift_pct": latency_drift_pct,
+                "exception_count": exceptions,
+                "has_degradation": has_degradation,
+            },
+            evidence=f"连续 {run_count} 次运行记录",
             details=details,
         )
 

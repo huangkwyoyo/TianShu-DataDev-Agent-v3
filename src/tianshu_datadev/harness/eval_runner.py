@@ -4,10 +4,10 @@
 - 维 1（结构化约束力）：加载 golden/rejection 数据集 → 通过 fake Planner 运行
 - 维 2（Join 质量）：使用 golden join fixture → 测量 3 个零容忍指标
 - 维 3（语义正确性）：直接调用 SemanticEvaluator
-- 维 4（编译与执行）：占位——需 Compiler 集成
-- 维 5（产品可用性）：占位——需人工审查
+- 维 4（编译与执行）：集成 DuckDbSqlCompiler + DuckDBExecutor（Phase 4D 补全）
+- 维 5（产品可用性）：人工接受率阈值判决（Phase 4D 补全）
 - 维 6（安全边界）：直接调用 SecurityEvaluator
-- 维 7（运行稳健性）：占位——需多次运行历史
+- 维 7（运行稳健性）：多运行退化检测（Phase 4D 补全）
 
 不修改被测系统——只读取、验证、报告。
 """
@@ -211,18 +211,126 @@ class HarnessRunner:
 
         return result
 
+    def run_compiler_checks(
+        self,
+        plans: list,
+        table_mapping: dict[str, str] | None = None,
+        table_paths: dict[str, str] | None = None,
+    ) -> dict:
+        """维度 4：运行 Compiler + Executor 集成检查。
+
+        对给定的 SqlBuildPlan 列表依次执行：编译 → 执行 → 确定性验证。
+        使用 DuckDbSqlCompiler + DuckDBExecutor（Phase 4B 已就绪）。
+
+        Args:
+            plans: SqlBuildPlan 实例列表。
+            table_mapping: 逻辑表名 → 物理表名映射（传给 Compiler）。
+            table_paths: 物理表名 → CSV 文件路径映射（传给 Executor）。
+
+        Returns:
+            dict——compile_results，含 total_plans、compiled_count、
+            executed_count、deterministic_count、failures 等字段，
+            可直接传给 HarnessMetricsEngine.compute_dimension_4()。
+        """
+        # 延迟导入——避免 Compiler/Executor 成为 Harness 的硬依赖
+        try:
+            from tianshu_datadev.sql.compiler import DuckDbSqlCompiler  # noqa: F811
+            from tianshu_datadev.sql.executor import DuckDBExecutor  # noqa: F811
+        except ImportError as e:
+            return {
+                "total_plans": len(plans),
+                "compiled_count": 0,
+                "executed_count": 0,
+                "deterministic_count": 0,
+                "failures": [{"plan_id": "import", "error": str(e)}],
+                "evidence": "Compiler/Executor 导入失败",
+            }
+
+        compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
+        executor = DuckDBExecutor(table_paths=table_paths or {})
+
+        total = len(plans)
+        compiled = 0
+        executed = 0
+        deterministic = 0
+        failures: list[dict] = []
+
+        for i, plan in enumerate(plans):
+            plan_id = getattr(plan, "plan_id", f"plan_{i}")
+
+            try:
+                # 步骤 1：编译
+                compiled_sql = compiler.compile(plan)
+                compiled += 1
+
+                # 步骤 2：确定性验证——同一 plan 两次编译 hash 必须一致
+                try:
+                    compiled_sql_2 = compiler.compile(plan)
+                    if compiled_sql.sql_sha256 == compiled_sql_2.sql_sha256:
+                        deterministic += 1
+                    else:
+                        failures.append({
+                            "plan_id": plan_id,
+                            "error": (
+                                f"编译非确定性：两次编译 hash 不一致 "
+                                f"({compiled_sql.sql_sha256} vs "
+                                f"{compiled_sql_2.sql_sha256})"
+                            ),
+                        })
+                except Exception as e2:
+                    failures.append({
+                        "plan_id": plan_id,
+                        "error": f"确定性验证第二次编译失败: {e2}",
+                    })
+
+                # 步骤 3：执行
+                try:
+                    executor.execute(compiled_sql)
+                    executed += 1
+                except Exception as e3:
+                    failures.append({
+                        "plan_id": plan_id,
+                        "error": f"执行失败: {e3}",
+                    })
+
+            except Exception as e1:
+                failures.append({
+                    "plan_id": plan_id,
+                    "error": f"编译失败: {e1}",
+                })
+
+        return {
+            "total_plans": total,
+            "compiled_count": compiled,
+            "executed_count": executed,
+            "deterministic_count": deterministic,
+            "failures": failures,
+            "evidence": (
+                f"DuckDbSqlCompiler + DuckDBExecutor 集成运行——"
+                f"{compiled}/{total} 编译通过，"
+                f"{executed}/{compiled} 执行通过，"
+                f"{deterministic}/{total} 确定性验证通过"
+            ),
+        }
+
     def run_all(
         self,
         run_compiler: bool = False,
         run_history: list | None = None,
         review_results: dict | None = None,
+        compiler_plans: list | None = None,
+        compiler_table_mapping: dict[str, str] | None = None,
+        compiler_table_paths: dict[str, str] | None = None,
     ) -> HarnessReport:
         """运行全量 7 维评测，产生 HarnessReport。
 
         Args:
-            run_compiler: 是否运行编译器检查（默认 False——占位）。
-            run_history: 多次运行历史记录（默认 None——占位）。
-            review_results: 人工审查结果（默认 None——占位）。
+            run_compiler: 是否运行编译器检查（默认 False）。
+            run_history: 多次运行历史记录（默认 None——D7 占位）。
+            review_results: 人工审查结果（默认 None——D5 占位）。
+            compiler_plans: 用于 D4 编译器检查的 SqlBuildPlan 列表。
+            compiler_table_mapping: Compiler 表名映射。
+            compiler_table_paths: Executor 表路径映射。
 
         Returns:
             HarnessReport——含全部 7 维度结果 + HarnessVerdict。
@@ -243,22 +351,34 @@ class HarnessRunner:
         golden_cases = datasets.get(DatasetCategory.GOLDEN, [])
         join_quality_data = self.evaluate_join_quality(golden_cases)
 
-        # 步骤 5：计算全部 7 个维度
+        # 步骤 5：收集编译器检查数据（维度 4）
+        compile_results = None
+        if run_compiler and compiler_plans:
+            compile_results = self.run_compiler_checks(
+                plans=compiler_plans,
+                table_mapping=compiler_table_mapping,
+                table_paths=compiler_table_paths,
+            )
+
+        # 步骤 6：计算全部 7 个维度
         dimensions = self._metrics_engine.compute_all(
             datasets=datasets,
             security_report=security_report,
             semantic_report=semantic_report,
             join_quality_data=join_quality_data,
+            compile_results=compile_results,
             review_results=review_results,
             run_history=run_history,
         )
 
-        # 步骤 6：生成 HarnessReport
+        # 步骤 7：生成 HarnessReport
         extra_reports = {
             "security": security_report.model_dump(),
             "semantic": semantic_report.model_dump(),
             "join_quality": join_quality_data,
         }
+        if compile_results:
+            extra_reports["compile"] = compile_results
 
         report = self._metrics_engine.produce_report(
             dimensions=dimensions,

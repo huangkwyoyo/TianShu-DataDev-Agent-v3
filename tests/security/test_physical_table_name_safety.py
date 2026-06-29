@@ -87,62 +87,37 @@ VALID_SIMPLE_AND_QUALIFIED: list[str] = [
 
 
 # ════════════════════════════════════════════
-# InputTableDecl.source_table 字段测试
+# source_table 字段统一测试（InputTableDecl + ManifestTable）
 # ════════════════════════════════════════════
 
-class TestInputTableDeclSourceTable:
-    """InputTableDecl.source_table 使用 SafePhysicalTableName 约束。"""
+_SOURCE_TABLE_MODELS = [
+    ("InputTableDecl", InputTableDecl, lambda v: {"table_alias": "t", "source_table": v}),
+    ("ManifestTable", ManifestTable, lambda v: {"table_ref": "t", "source_table": v}),
+]
 
-    def _make_minimal_table(self, source_table: str) -> InputTableDecl:
-        """创建最小合法 InputTableDecl——仅 source_table 变参。"""
-        return InputTableDecl(
-            table_alias="t",
-            source_table=source_table,
-        )
 
+class TestSourceTableField:
+    """InputTableDecl 和 ManifestTable 的 source_table 字段使用相同的 SafePhysicalTableName 约束。"""
+
+    @pytest.mark.parametrize("label,model_cls,kwargs_fn", _SOURCE_TABLE_MODELS)
     @pytest.mark.parametrize("malicious,desc", MALICIOUS_SAMPLES)
-    def test_reject_malicious_source_table(self, malicious: str, desc: str):
-        """恶意物理表名在 InputTableDecl 构造时被拒绝。"""
+    def test_reject_malicious_source_table(self, label: str, model_cls, kwargs_fn, malicious: str, desc: str):
+        """恶意物理表名在 {InputTableDecl|ManifestTable} 构造时被拒绝。"""
         with pytest.raises(ValidationError, match="source_table"):
-            self._make_minimal_table(malicious)
+            model_cls(**kwargs_fn(malicious))
 
+    @pytest.mark.parametrize("label,model_cls,kwargs_fn", _SOURCE_TABLE_MODELS)
     @pytest.mark.parametrize("valid", VALID_SIMPLE_AND_QUALIFIED)
-    def test_accept_valid_source_table(self, valid: str):
-        """合法物理表名在 InputTableDecl 构造时通过。"""
-        table = self._make_minimal_table(valid)
+    def test_accept_valid_source_table(self, label: str, model_cls, kwargs_fn, valid: str):
+        """合法物理表名在 {InputTableDecl|ManifestTable} 构造时通过。"""
+        table = model_cls(**kwargs_fn(valid))
         assert table.source_table == valid
 
     def test_reject_empty_source_table(self):
-        """空字符串物理表名被拒绝。"""
-        with pytest.raises(ValidationError, match="source_table"):
-            self._make_minimal_table("")
-
-
-# ════════════════════════════════════════════
-# ManifestTable.source_table 字段测试
-# ════════════════════════════════════════════
-
-class TestManifestTableSourceTable:
-    """ManifestTable.source_table 使用 SafePhysicalTableName 约束。"""
-
-    def _make_minimal_manifest_table(self, source_table: str) -> ManifestTable:
-        """创建最小合法 ManifestTable。"""
-        return ManifestTable(
-            table_ref="t",
-            source_table=source_table,
-        )
-
-    @pytest.mark.parametrize("malicious,desc", MALICIOUS_SAMPLES)
-    def test_reject_malicious_source_table(self, malicious: str, desc: str):
-        """恶意物理表名在 ManifestTable 构造时被拒绝。"""
-        with pytest.raises(ValidationError, match="source_table"):
-            self._make_minimal_manifest_table(malicious)
-
-    @pytest.mark.parametrize("valid", VALID_SIMPLE_AND_QUALIFIED)
-    def test_accept_valid_source_table(self, valid: str):
-        """合法物理表名在 ManifestTable 构造时通过。"""
-        table = self._make_minimal_manifest_table(valid)
-        assert table.source_table == valid
+        """空字符串物理表名被拒绝——两个模型均拒绝。"""
+        for label, model_cls, kwargs_fn in _SOURCE_TABLE_MODELS:
+            with pytest.raises(ValidationError, match="source_table"):
+                model_cls(**kwargs_fn(""))
 
 
 # ════════════════════════════════════════════

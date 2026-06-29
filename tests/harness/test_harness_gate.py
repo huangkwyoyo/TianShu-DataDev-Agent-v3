@@ -696,16 +696,53 @@ class TestHumanAcceptanceFlow:
             "占位指标应为 -1.0 表示无数据"
         )
 
-    def test_dimension_5_accepts_real_data(self):
-        """D5 接受真实审查数据并正确计算接受率。"""
+    def test_dimension_5_accepts_real_data_and_passes(self):
+        """D5 接受真实审查数据——达标时返回 PASS（Phase 4D 补全）。"""
         engine = HarnessMetricsEngine()
         result = engine.compute_dimension_5(review_results={
             "total_reviews": 10,
             "accepted_reviews": 8,
+            "reviewer_count": 3,  # 满足最低审查人数
         })
         assert result.metrics["total_reviews"] == 10
         assert result.metrics["accepted_reviews"] == 8
         assert result.metrics["human_acceptance_rate"] == 80.0
+        assert result.metrics["reviewer_count"] == 3
+        # 80% >= 70% 阈值 + 3 人审查 → PASS
+        assert result.verdict == "PASS", (
+            f"接受率 80% >= 70% + 3 人审查应 PASS，实际: {result.verdict}"
+        )
+
+    def test_dimension_5_reject_on_low_acceptance(self):
+        """D5 人工接受率 < 70% → REJECT（Phase 4D 补全）。"""
+        engine = HarnessMetricsEngine()
+        result = engine.compute_dimension_5(review_results={
+            "total_reviews": 10,
+            "accepted_reviews": 4,  # 40%
+            "reviewer_count": 3,
+        })
+        assert result.verdict == "REJECT", (
+            f"接受率 40% < 70% 应 REJECT，实际: {result.verdict}"
+        )
+        assert result.metrics["human_acceptance_rate"] == 40.0
+        assert any("40.0%" in d for d in result.details), (
+            f"详情应包含接受率不达标原因，实际: {result.details}"
+        )
+
+    def test_dimension_5_reject_on_insufficient_reviewers(self):
+        """D5 审查人数不足 → REJECT（Phase 4D 补全）。"""
+        engine = HarnessMetricsEngine()
+        result = engine.compute_dimension_5(review_results={
+            "total_reviews": 5,
+            "accepted_reviews": 5,  # 100%
+            "reviewer_count": 1,   # 只有 1 人审查——样本偏差风险
+        })
+        assert result.verdict == "REJECT", (
+            f"审查人数 1 < 3 应 REJECT（样本偏差风险），实际: {result.verdict}"
+        )
+        assert any("审查人数" in d for d in result.details), (
+            f"详情应包含审查人数不足原因，实际: {result.details}"
+        )
 
     def test_runner_produces_report_without_real_human_data(self):
         """完整 run_all() 即使无真实审查数据也生成报告。"""
@@ -729,7 +766,250 @@ class TestHumanAcceptanceFlow:
 
 
 # ════════════════════════════════════════════
-# 测试类 5：数据集加载 fixture 验证
+# 测试类 5：D4 编译与执行——Phase 4D 补全
+# ════════════════════════════════════════════
+
+
+class TestDimension4CompileAndExecute:
+    """D4 编译与执行——真实 Compiler + Executor 集成阈值判决。"""
+
+    def test_dimension_4_warn_when_no_data(self):
+        """D4：无 compile_results 时返回 WARN——不阻断退出。"""
+        engine = HarnessMetricsEngine()
+        result = engine.compute_dimension_4(None)
+        assert result.verdict == "WARN", (
+            f"无数据时应返回 WARN，实际: {result.verdict}"
+        )
+        assert result.metrics["compile_success_rate"] == -1.0
+        assert result.metrics["execute_success_rate"] == -1.0
+        assert result.metrics["compile_determinism"] == -1.0
+        assert "[stub]" in result.details[0]
+
+    def test_dimension_4_reject_on_low_compile_rate(self):
+        """D4：编译成功率 < 99% → REJECT。"""
+        engine = HarnessMetricsEngine()
+        result = engine.compute_dimension_4({
+            "total_plans": 100,
+            "compiled_count": 90,     # 90%
+            "executed_count": 90,
+            "deterministic_count": 100,
+            "failures": [
+                {"plan_id": "p1", "error": "编译失败: 语法错误"},
+            ],
+        })
+        assert result.verdict == "REJECT", (
+            f"编译成功率 90% < 99% 应 REJECT，实际: {result.verdict}"
+        )
+        assert result.metrics["compile_success_rate"] == 90.0
+        assert any("90.0%" in d for d in result.details), (
+            f"详情应包含编译率不达标原因，实际: {result.details}"
+        )
+
+    def test_dimension_4_reject_on_low_execute_rate(self):
+        """D4：执行成功率 < 95% → REJECT。"""
+        engine = HarnessMetricsEngine()
+        result = engine.compute_dimension_4({
+            "total_plans": 100,
+            "compiled_count": 100,    # 100%
+            "executed_count": 90,     # 90%
+            "deterministic_count": 100,
+            "failures": [
+                {"plan_id": "p2", "error": "执行失败: table not found"},
+            ],
+        })
+        assert result.verdict == "REJECT", (
+            f"执行成功率 90% < 95% 应 REJECT，实际: {result.verdict}"
+        )
+        assert result.metrics["execute_success_rate"] == 90.0
+
+    def test_dimension_4_reject_on_non_determinism(self):
+        """D4：编译确定性 < 100% → REJECT。"""
+        engine = HarnessMetricsEngine()
+        result = engine.compute_dimension_4({
+            "total_plans": 100,
+            "compiled_count": 100,
+            "executed_count": 100,
+            "deterministic_count": 99,  # 99%——有 1 个非确定性
+            "failures": [
+                {"plan_id": "p3", "error": "编译非确定性：两次编译 hash 不一致"},
+            ],
+        })
+        assert result.verdict == "REJECT", (
+            f"编译确定性 99% < 100% 应 REJECT，实际: {result.verdict}"
+        )
+        assert result.metrics["compile_determinism"] == 99.0
+
+    def test_dimension_4_pass_when_all_thresholds_met(self):
+        """D4：全部阈值达标 → PASS。"""
+        engine = HarnessMetricsEngine()
+        result = engine.compute_dimension_4({
+            "total_plans": 100,
+            "compiled_count": 100,    # 100% >= 99%
+            "executed_count": 96,     # 96% >= 95%
+            "deterministic_count": 100,  # 100% = 100%
+            "failures": [],
+        })
+        assert result.verdict == "PASS", (
+            f"全部达标应 PASS，实际: {result.verdict}"
+        )
+        assert result.metrics["compile_success_rate"] == 100.0
+        assert result.metrics["execute_success_rate"] == 96.0
+        assert result.metrics["compile_determinism"] == 100.0
+        assert any("PASS" in d for d in result.details), (
+            f"详情应包含门禁 PASS 信息，实际: {result.details}"
+        )
+
+    def test_dimension_4_handles_zero_plans(self):
+        """D4：plan 数为 0 时正确处理（除零保护）。"""
+        engine = HarnessMetricsEngine()
+        result = engine.compute_dimension_4({
+            "total_plans": 0,
+            "compiled_count": 0,
+            "executed_count": 0,
+            "deterministic_count": 0,
+            "failures": [],
+        })
+        # 0 个 plan 时所有比率为 0.0，compile_rate 0% < 99% → REJECT
+        assert result.verdict == "REJECT", (
+            f"0 个 plan 应 REJECT（编译成功率 0% < 99%），实际: {result.verdict}"
+        )
+
+
+# ════════════════════════════════════════════
+# 测试类 6：D7 运行稳健性——Phase 4D 补全
+# ════════════════════════════════════════════
+
+
+class TestDimension7OperationalRobustness:
+    """D7 运行稳健性——多运行退化检测。"""
+
+    def test_dimension_7_warn_when_no_data(self):
+        """D7：无 run_history 时返回 WARN——不阻断退出。"""
+        engine = HarnessMetricsEngine()
+        result = engine.compute_dimension_7(None)
+        assert result.verdict == "WARN", (
+            f"无数据时应返回 WARN，实际: {result.verdict}"
+        )
+        assert result.metrics["run_count"] == 0
+        assert "[stub]" in result.details[0]
+
+    def test_dimension_7_warn_when_empty_history(self):
+        """D7：空 run_history 时返回 WARN。"""
+        engine = HarnessMetricsEngine()
+        result = engine.compute_dimension_7([])
+        assert result.verdict == "WARN", (
+            f"空运行历史应返回 WARN，实际: {result.verdict}"
+        )
+
+    def test_dimension_7_reject_on_exceptions(self):
+        """D7：存在异常运行 → REJECT。"""
+        engine = HarnessMetricsEngine()
+        result = engine.compute_dimension_7([
+            {"token_usage": 1000, "latency_ms": 500},
+            {"token_usage": 1100, "latency_ms": 550},
+            {"token_usage": 1050, "latency_ms": 520, "exception": "LLM timeout"},
+        ])
+        assert result.verdict == "REJECT", (
+            f"存在异常运行应 REJECT，实际: {result.verdict}"
+        )
+        assert result.metrics["exception_count"] == 1
+        assert result.metrics["has_degradation"] is True
+
+    def test_dimension_7_reject_on_token_drift(self):
+        """D7：token 消耗漂移 > 50% → REJECT。"""
+        engine = HarnessMetricsEngine()
+        # 前半段 token ~1000，后半段 token ~2000→ 漂移 100%
+        result = engine.compute_dimension_7([
+            {"token_usage": 1000, "latency_ms": 500},
+            {"token_usage": 1100, "latency_ms": 550},
+            {"token_usage": 1050, "latency_ms": 520},
+            {"token_usage": 2000, "latency_ms": 600},
+            {"token_usage": 2100, "latency_ms": 650},
+            {"token_usage": 2050, "latency_ms": 630},
+        ])
+        assert result.verdict == "REJECT", (
+            f"token 漂移 > 50% 应 REJECT，实际: {result.verdict}"
+        )
+        assert result.metrics["token_drift_pct"] > 50.0, (
+            f"token 漂移应 > 50%，实际: {result.metrics['token_drift_pct']}%"
+        )
+        assert result.metrics["has_degradation"] is True
+
+    def test_dimension_7_reject_on_latency_drift(self):
+        """D7：延迟漂移 > 100% → REJECT。"""
+        engine = HarnessMetricsEngine()
+        # 前半段延迟 ~500ms，后半段延迟 ~1500ms→ 漂移 200%
+        result = engine.compute_dimension_7([
+            {"token_usage": 1000, "latency_ms": 500},
+            {"token_usage": 1100, "latency_ms": 550},
+            {"token_usage": 1050, "latency_ms": 520},
+            {"token_usage": 1200, "latency_ms": 1500},
+            {"token_usage": 1150, "latency_ms": 1550},
+            {"token_usage": 1180, "latency_ms": 1520},
+        ])
+        assert result.verdict == "REJECT", (
+            f"延迟漂移 > 100% 应 REJECT，实际: {result.verdict}"
+        )
+        assert result.metrics["latency_drift_pct"] > 100.0, (
+            f"延迟漂移应 > 100%，实际: {result.metrics['latency_drift_pct']}%"
+        )
+        assert result.metrics["has_degradation"] is True
+
+    def test_dimension_7_pass_with_stable_runs(self):
+        """D7：多次运行稳定无退化 → PASS。"""
+        engine = HarnessMetricsEngine()
+        result = engine.compute_dimension_7([
+            {"token_usage": 1000, "latency_ms": 500},
+            {"token_usage": 1050, "latency_ms": 520},
+            {"token_usage": 1020, "latency_ms": 510},
+            {"token_usage": 1080, "latency_ms": 530},
+        ])
+        assert result.verdict == "PASS", (
+            f"稳定运行应 PASS，实际: {result.verdict}"
+        )
+        assert result.metrics["exception_count"] == 0
+        assert result.metrics["has_degradation"] is False
+        assert result.metrics["run_count"] == 4
+        # token 和延迟漂移应在合理范围
+        assert abs(result.metrics["token_drift_pct"]) <= 50.0, (
+            f"token 漂移应在 ±50% 内，实际: {result.metrics['token_drift_pct']}%"
+        )
+        assert abs(result.metrics["latency_drift_pct"]) <= 100.0, (
+            f"延迟漂移应在 ±100% 内，实际: {result.metrics['latency_drift_pct']}%"
+        )
+
+    def test_dimension_7_skips_exception_runs_for_trend(self):
+        """D7：异常运行不计入 token/延迟趋势分析。"""
+        engine = HarnessMetricsEngine()
+        result = engine.compute_dimension_7([
+            {"token_usage": 1000, "latency_ms": 500},
+            {"token_usage": 99999, "latency_ms": 99999, "exception": "timeout"},
+            {"token_usage": 1100, "latency_ms": 550},
+            {"token_usage": 1050, "latency_ms": 520},
+        ])
+        # 异常运行被排除，trend 只基于正常运行的 3 个数据点
+        assert result.metrics["exception_count"] == 1
+        assert result.metrics["avg_token_usage"] < 2000, (
+            f"异常 token 不应计入均值，实际均值: {result.metrics['avg_token_usage']}"
+        )
+
+    def test_dimension_7_too_few_runs_skips_trend(self):
+        """D7：运行次数不足时不触发漂移检测（需 >= 3 次正常运行）。"""
+        engine = HarnessMetricsEngine()
+        result = engine.compute_dimension_7([
+            {"token_usage": 1000, "latency_ms": 500},
+            {"token_usage": 2000, "latency_ms": 1000},
+        ])
+        # 2 次运行 < 3 次阈值，不计算漂移
+        assert result.verdict == "PASS", (
+            f"运行次数不足时不触发趋势检测，应 PASS，实际: {result.verdict}"
+        )
+        assert result.metrics["token_drift_pct"] == 0.0
+        assert result.metrics["latency_drift_pct"] == 0.0
+
+
+# ════════════════════════════════════════════
+# 测试类 7：数据集加载 fixture 验证
 # ════════════════════════════════════════════
 
 

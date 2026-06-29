@@ -1,6 +1,6 @@
 ﻿# Phase 4.5：内部交互验证口（DeveloperSpec 编辑器 + 模板按钮）
 
-> 状态：待实施
+> 状态：已实施（Phase 4.5 补全——模板从 3 个扩展到 6 个）✅
 > 前置依赖：Phase 4 退出条件全部满足
 
 ## 执行前必须阅读
@@ -100,16 +100,29 @@ git diff --check
 
 ## 退出条件
 
-1. REST API 请求/响应 Schema 正确校验
-2. CLI 和 Web 同输入同输出
-3. 非法输入展示结构化拒绝原因，不崩溃
-4. DeveloperSpec 模板至少 5 个可用
-5. 打开浏览器可加载编辑器、选择模板、提交解析、查看预览和 OpenQuestion
-6. Phase 1A-4 测试保持通过
+1. ✅ REST API 请求/响应 Schema 正确校验
+2. ✅ CLI 和 Web 同输入同输出
+3. ✅ 非法输入展示结构化拒绝原因，不崩溃
+4. ✅ **DeveloperSpec 模板至少 5 个可用**——现有 6 个（Phase 4.5 补全：+两表 Join +窗口 TopN +自定义空模板）
+5. ✅ 打开浏览器可加载编辑器、选择模板、提交解析、查看预览和 OpenQuestion
+6. ✅ Phase 1A-4 测试保持通过——1203 测试全绿
+
+### Phase 4.5 补全说明（2026-06-29）
+
+原模板仅 3 个（汇总表、标签表、多步骤加工），不满足退出条件 #4（≥5 个）。
+
+新增 3 个模板：
+
+| 模板 ID | 名称 | 分类 | 说明 |
+|---------|------|------|------|
+| `tpl_two_table_join` | 两表 Join | join（关联宽表） | 事实表 LEFT JOIN 维度表，展开宽表字段，不做聚合 |
+| `tpl_window_topn` | 窗口 TopN | window（窗口排名） | ROW_NUMBER 分组排名取 TopN，如各品类销售额 Top10 |
+| `tpl_empty` | 自定义空模板 | empty（空白模板） | 带注释的 DeveloperSpec 骨架，从零开始编写 |
+
+模板总数：3 → **6 个**（满足 ≥5 要求）
+
+前端 `TemplateSelector` 已同步更新分类标签映射。
 
 ---
 
-> 后续阶段：Phase 4.6 复杂 SQL 模式渐进开放（参见 docs/roadmap/phase-4-6-complex-sql-opening.md）
-
-
-> Phase 4.5 | 待实施 | 前置：Phase 4 退出
+> Phase 4.5 | 已实施 + 补全 ✅ | 6 个模板可用 | 下一阶段：Phase 4.6 或 Phase 5

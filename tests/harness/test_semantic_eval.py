@@ -128,22 +128,26 @@ class TestSemanticWrongField:
 class TestSemanticWrongGrain:
     """语义错误：错粒度——分组键与声明不符。
 
-    当前状态：known_gap。Validator 无粒度完整性检查规则，
-    因此 evaluator 诚实报告 passed=False。
-    此测试记录当前能力边界——防止未来误以为已覆盖。
+    Phase 4C 补全后：Validator._validate_grain_completeness()
+    使用 ParsedDeveloperSpec.dimensions 作为事实源，
+    检查所有声明维度列是否出现在 group_keys 中。
     """
 
-    def test_grain_mismatch_is_known_gap_not_detected(self):
-        """错粒度——当前系统无法检测，evaluator 诚实报告 passed=False。
-
-        Validator 的所有 10 项检查均通过（字段均在 manifest 中存在），
-        PerfValidator 的 15 条规则也均通过——无规则检查分组键完整性。
+    def test_grain_mismatch_detected_by_validator(self):
+        """错粒度——声明 (date, region) 但 group_keys 仅含 date → Validator 拒绝。
 
         验证：
-        1. Validator 级别——所有字段合法，不触发任何拒绝
-        2. Evaluator 级别——SemanticEvaluator 诚实返回 passed=False
-        3. 报告级别——error_type_coverage[WRONG_GRAIN]=False 且出现在 known_gaps 中
+        1. Validator 级别——Q-VAL-GRAIN- 拒绝码
+        2. Evaluator 级别——SemanticEvaluator 返回 passed=True
+        3. 报告级别——error_type_coverage[WRONG_GRAIN]=True 且不在 known_gaps 中
         """
+        from tianshu_datadev.developer_spec.models import (
+            DimensionDecl,
+            MetricDecl,
+            OutputSpecDecl,
+            ParsedDeveloperSpec,
+        )
+
         manifest = SourceManifest(
             manifest_id="test_manifest_wg",
             spec_hash="abc",
@@ -177,7 +181,7 @@ class TestSemanticWrongGrain:
                     step_id="agg_wrong_grain",
                     group_keys=[
                         ColumnRef(table_ref="tf", column_name="date", normalized_name="date"),
-                        # 缺少 region——声明需要但实际未分组
+                        # 缺少 region
                     ],
                     metrics=[
                         AggregateSpec(
@@ -191,17 +195,40 @@ class TestSemanticWrongGrain:
             multi_table=False,
         )
 
-        # ── 层面 1：Validator 级别——所有字段合法，不触发拒绝 ──
-        validator = SqlBuildPlanValidator()
-        passed, questions = validator.validate(plan, manifest)
-        assert passed is True, (
-            f"当前 Validator 无粒度规则——应返回 passed=True。"
-            f"若此断言失败，说明 Validator 新增了粒度检查，"
-            f"请同步更新 _KNOWN_GAP_ERROR_TYPES。"
-            f"questions={[q.question_id for q in questions]}"
+        spec = ParsedDeveloperSpec(
+            spec_id="spec_wg",
+            spec_hash="abc",
+            title="粒度测试",
+            description="声明 (date, region) 两个维度",
+            input_tables=[],
+            metrics=[
+                MetricDecl(metric_name="total_amt", aggregation="SUM", input_column="amount", alias="total_amt"),
+            ],
+            dimensions=[
+                DimensionDecl(dimension_name="date", column_ref="date"),
+                DimensionDecl(dimension_name="region", column_ref="region"),
+            ],
+            output_spec=OutputSpecDecl(columns=["date", "region", "total_amt"], grain=["date", "region"]),
         )
 
-        # ── 层面 2：Evaluator 级别——诚实报告 passed=False ──
+        # ── Validator 级别——检测到 Q-VAL-GRAIN- ──
+        validator = SqlBuildPlanValidator()
+        passed, questions = validator.validate(plan, manifest, spec=spec)
+        assert passed is False, (
+            f"应因粒度不完整而拒绝。questions={[q.question_id for q in questions]}"
+        )
+        grain_issues = [
+            q for q in questions
+            if q.blocking and "Q-VAL-GRAIN-" in q.question_id
+        ]
+        assert len(grain_issues) >= 1, (
+            f"应有 Q-VAL-GRAIN- 拒绝码，实际 questions={[q.question_id for q in questions]}"
+        )
+        assert "region" in grain_issues[0].description, (
+            f"应提到缺失的维度 'region'，实际: {grain_issues[0].description}"
+        )
+
+        # ── Evaluator 级别——返回 passed=True ──
         evaluator = SemanticEvaluator()
         report = evaluator.run_all()
         grain_results = [
@@ -209,19 +236,17 @@ class TestSemanticWrongGrain:
             if r.error_type == SemanticErrorType.WRONG_GRAIN
         ]
         assert len(grain_results) == 1, "应有 1 个 WRONG_GRAIN 结果"
-        assert grain_results[0].passed is False, (
-            "错粒度当前无法检测——evaluator 应诚实报告 passed=False。"
-            "若此断言失败，说明 Validator 新增了粒度规则，"
-            "请将 WRONG_GRAIN 从 _KNOWN_GAP_ERROR_TYPES 移除。"
+        assert grain_results[0].passed is True, (
+            f"错粒度应被检测到（passed=True）。"
+            f"rejection_detail={grain_results[0].rejection_detail}"
         )
 
-        # ── 层面 3：报告级别——标记为 known_gap ──
-        assert report.error_type_coverage["WRONG_GRAIN"] is False, (
-            "WRONG_GRAIN 未被系统覆盖，coverage 应为 False"
+        # ── 报告级别——不在 known_gaps 中 ──
+        assert report.error_type_coverage["WRONG_GRAIN"] is True, (
+            "WRONG_GRAIN 已被覆盖，coverage 应为 True"
         )
-        assert "WRONG_GRAIN" in report.known_gaps, (
-            "WRONG_GRAIN 应在 known_gaps 中——这是系统能力边界，"
-            "不是测试失败"
+        assert "WRONG_GRAIN" not in report.known_gaps, (
+            "WRONG_GRAIN 不应在 known_gaps 中"
         )
 
 
@@ -233,20 +258,26 @@ class TestSemanticWrongGrain:
 class TestSemanticWrongAggregation:
     """语义错误：错聚合——聚合函数与声明不符。
 
-    当前状态：known_gap。Validator 无聚合类型声明对比规则，
-    因此 evaluator 诚实报告 passed=False。
-    PERF-009 仅检测 COUNT_DISTINCT + 无 group_keys 的特例，
-    不覆盖 COUNT vs COUNT_DISTINCT 的声明/实现不匹配。
+    Phase 4C 补全后：Validator._validate_aggregation_declaration()
+    使用 ParsedDeveloperSpec.metrics 作为事实源，
+    对比 AggregateSpec.aggregation 与 MetricDecl.aggregation。
     """
 
-    def test_aggregation_mismatch_is_known_gap_not_detected(self):
-        """错聚合——当前系统无法检测，evaluator 诚实报告 passed=False。
+    def test_aggregation_mismatch_detected_by_validator(self):
+        """错聚合——声明 COUNT_DISTINCT(user_id)，实际 COUNT(user_id) → Validator 拒绝。
 
         验证：
-        1. Validator 级别——字段合法，不触发任何拒绝
-        2. Evaluator 级别——SemanticEvaluator 诚实返回 passed=False
-        3. 报告级别——error_type_coverage[WRONG_AGGREGATION]=False 且出现在 known_gaps 中
+        1. Validator 级别——Q-VAL-AGG- 拒绝码
+        2. Evaluator 级别——SemanticEvaluator 返回 passed=True
+        3. 报告级别——error_type_coverage[WRONG_AGGREGATION]=True 且不在 known_gaps 中
         """
+        from tianshu_datadev.developer_spec.models import (
+            DimensionDecl,
+            MetricDecl,
+            OutputSpecDecl,
+            ParsedDeveloperSpec,
+        )
+
         manifest = SourceManifest(
             manifest_id="test_manifest_wa",
             spec_hash="abc",
@@ -291,17 +322,39 @@ class TestSemanticWrongAggregation:
             multi_table=False,
         )
 
-        # ── 层面 1：Validator 级别——字段合法，不触发拒绝 ──
-        validator = SqlBuildPlanValidator()
-        passed, questions = validator.validate(plan, manifest)
-        assert passed is True, (
-            f"当前 Validator 无聚合类型对比规则——应返回 passed=True。"
-            f"若此断言失败，说明 Validator 新增了聚合检查，"
-            f"请同步更新 _KNOWN_GAP_ERROR_TYPES。"
-            f"questions={[q.question_id for q in questions]}"
+        spec = ParsedDeveloperSpec(
+            spec_id="spec_wa",
+            spec_hash="abc",
+            title="聚合测试",
+            description="声明 COUNT_DISTINCT(user_id) as dau",
+            input_tables=[],
+            metrics=[
+                MetricDecl(metric_name="dau", aggregation="COUNT_DISTINCT", input_column="user_id", alias="dau"),
+            ],
+            dimensions=[
+                DimensionDecl(dimension_name="dt", column_ref="dt"),
+            ],
+            output_spec=OutputSpecDecl(columns=["dt", "dau"], grain=["dt"]),
         )
 
-        # ── 层面 2：Evaluator 级别——诚实报告 passed=False ──
+        # ── Validator 级别——检测到 Q-VAL-AGG- ──
+        validator = SqlBuildPlanValidator()
+        passed, questions = validator.validate(plan, manifest, spec=spec)
+        assert passed is False, (
+            f"应因聚合类型不匹配而拒绝。questions={[q.question_id for q in questions]}"
+        )
+        agg_issues = [
+            q for q in questions
+            if q.blocking and "Q-VAL-AGG-" in q.question_id
+        ]
+        assert len(agg_issues) >= 1, (
+            f"应有 Q-VAL-AGG- 拒绝码，实际 questions={[q.question_id for q in questions]}"
+        )
+        assert "COUNT_DISTINCT" in agg_issues[0].description or "COUNT" in agg_issues[0].description, (
+            f"应提到聚合类型，实际: {agg_issues[0].description}"
+        )
+
+        # ── Evaluator 级别——返回 passed=True ──
         evaluator = SemanticEvaluator()
         report = evaluator.run_all()
         agg_results = [
@@ -309,19 +362,17 @@ class TestSemanticWrongAggregation:
             if r.error_type == SemanticErrorType.WRONG_AGGREGATION
         ]
         assert len(agg_results) == 1, "应有 1 个 WRONG_AGGREGATION 结果"
-        assert agg_results[0].passed is False, (
-            "错聚合当前无法检测——evaluator 应诚实报告 passed=False。"
-            "若此断言失败，说明 Validator/PerfValidator 新增了聚合规则，"
-            "请将 WRONG_AGGREGATION 从 _KNOWN_GAP_ERROR_TYPES 移除。"
+        assert agg_results[0].passed is True, (
+            f"错聚合应被检测到（passed=True）。"
+            f"rejection_detail={agg_results[0].rejection_detail}"
         )
 
-        # ── 层面 3：报告级别——标记为 known_gap ──
-        assert report.error_type_coverage["WRONG_AGGREGATION"] is False, (
-            "WRONG_AGGREGATION 未被系统覆盖，coverage 应为 False"
+        # ── 报告级别——不在 known_gaps 中 ──
+        assert report.error_type_coverage["WRONG_AGGREGATION"] is True, (
+            "WRONG_AGGREGATION 已被覆盖，coverage 应为 True"
         )
-        assert "WRONG_AGGREGATION" in report.known_gaps, (
-            "WRONG_AGGREGATION 应在 known_gaps 中——这是系统能力边界，"
-            "不是测试失败"
+        assert "WRONG_AGGREGATION" not in report.known_gaps, (
+            "WRONG_AGGREGATION 不应在 known_gaps 中"
         )
 
 
@@ -565,10 +616,11 @@ class TestSemanticEvaluatorIntegration:
     def test_run_all_error_types(self):
         """SemanticEvaluator.run_all() 运行全部 5 类语义错误。
 
+        Phase 4C 补全后——全部 5/5 可检测。
         验证：
         - 5 类错误全部在 error_type_coverage 中
-        - known_gaps 记录当前能力边界
-        - summary 诚实报告 3/5 + 2 known gaps
+        - known_gaps 为空（所有语义维度均已覆盖）
+        - summary 报告 5/5
         """
         evaluator = SemanticEvaluator()
         report = evaluator.run_all()
@@ -579,14 +631,16 @@ class TestSemanticEvaluatorIntegration:
                 f"错误类型 {error_type.value} 未被覆盖"
             )
 
-        # 验证 known_gaps 存在且含预期的缺口类型
+        # 验证 error_type_coverage 全部为 True
+        for error_type in SemanticErrorType:
+            assert report.error_type_coverage[error_type.value] is True, (
+                f"Phase 4C 补全后 {error_type.value} 应被覆盖"
+            )
+
+        # 验证 known_gaps 为空——不再有缺口
         assert hasattr(report, "known_gaps"), "SemanticEvalReport 应有 known_gaps 字段"
-        assert isinstance(report.known_gaps, list), "known_gaps 应为列表"
-        assert "WRONG_GRAIN" in report.known_gaps, (
-            "WRONG_GRAIN 应在 known_gaps 中——当前 Validator 无粒度检查"
-        )
-        assert "WRONG_AGGREGATION" in report.known_gaps, (
-            "WRONG_AGGREGATION 应在 known_gaps 中——当前 Validator 无聚合类型检查"
+        assert report.known_gaps == [], (
+            f"Phase 4C 补全后 known_gaps 应为空，实际: {report.known_gaps}"
         )
 
         # 验证所有结果有合理的 rejection_detail
@@ -594,15 +648,10 @@ class TestSemanticEvaluatorIntegration:
             assert isinstance(result, SemanticCaseResult)
             assert result.case_id, "每个结果应有 case_id"
 
-        # 验证汇总信息——诚实报告缺口
+        # 验证汇总信息——5/5 全覆盖
         assert report.eval_id, "应生成 eval_id"
-        assert "known gaps" in report.summary, (
-            f"summary 应明确提到 known gaps。"
-            f"实际: {report.summary}"
-        )
-        assert "3/5" in report.summary, (
-            f"summary 应诚实报告 3/5（非 5/5）。"
-            f"实际: {report.summary}"
+        assert "5/5" in report.summary, (
+            f"summary 应报告 5/5。实际: {report.summary}"
         )
 
     def test_each_detection_has_code_path_message(self):

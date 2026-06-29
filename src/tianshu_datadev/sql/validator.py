@@ -1,14 +1,18 @@
-"""SqlBuildPlanValidator——事实源校验 + Join 门禁 + 语义校验。
+"""SqlBuildPlanValidator——事实源校验 + Join 门禁 + 语义校验 + 架构边界断言。
 
-验证流程（8 项检查）：
+验证流程（12 项检查）：
 1. 空 steps 拒绝
-2. 表引用校验——所有 ScanStep.table_ref 必须在 SourceManifest 中注册
-3. 字段引用校验——所有 ColumnRef 必须在对应表的 columns 中存在
-4. Join key 类型兼容——JoinStep 双方字段类型必须兼容
-5. WEAK/NONE Join 门禁——不得出现在 JoinStep 中（二次确认）
-6. 枚举值校验——CaseWhenStep 枚举值须声明（Phase 1C 占位）
-7. 时间过滤校验——大事实表必须有时间过滤 Predicate
-8. LIMIT 存在性——明细查询（无聚合）必须有 LIMIT
+2. 不支持的步骤类型——白名单外 Step 类型一律拒绝（架构边界断言）
+3. 多跳 Join 拒绝——单 Plan 内 ≥2 JoinStep → 拒绝（Phase 3C 遗留，Phase 4.6 开放）
+4. 表引用校验——所有 ScanStep.table_ref 必须在 SourceManifest 中注册
+5. 字段引用校验——所有 ColumnRef 必须在对应表的 columns 中存在
+6. Join key 类型兼容——JoinStep 双方字段类型必须兼容
+7. WEAK/NONE Join 门禁——不得出现在 JoinStep 中（二次确认）
+8. 枚举值校验——CaseWhenStep 枚举值须声明
+9. 时间过滤校验——大事实表必须有时间过滤 Predicate
+10. 明细查询 LIMIT 校验——无聚合时必须显式 LIMIT
+11. 窗口函数校验——白名单 + Frame 合法性 + WHERE 拒绝检测
+12. 窗口函数位置校验——窗口函数不得出现在 WHERE/HAVING 子句
 
 返回 (passed: bool, questions: list[OpenQuestion])。
 """
@@ -83,38 +87,127 @@ class SqlBuildPlanValidator:
         # 构建查询上下文
         ctx = _ValidationContext(plan, manifest, hypothesis)
 
-        # ── 2. 表引用校验 ──
+        # ── 2. 不支持的步骤类型（架构边界断言） ──
+        self._validate_unsupported_step_types(ctx, questions)
+
+        # ── 3. 多跳 Join 拒绝（Phase 3C 遗留） ──
+        self._validate_multi_hop_join(ctx, questions)
+
+        # ── 4. 表引用校验 ──
         self._validate_table_refs(ctx, questions)
 
-        # ── 3. 字段引用校验 ──
+        # ── 5. 字段引用校验 ──
         self._validate_column_refs(ctx, questions)
 
-        # ── 4. Join key 类型兼容 ──
+        # ── 6. Join key 类型兼容 ──
         self._validate_join_key_types(ctx, questions)
 
-        # ── 5. WEAK/NONE Join 门禁（二次确认） ──
+        # ── 7. WEAK/NONE Join 门禁（二次确认） ──
         self._validate_join_evidence_gate(ctx, questions)
 
-        # ── 6. 枚举值校验（Phase 3B 实现） ──
+        # ── 8. 枚举值校验（Phase 3B 实现） ──
         self._validate_enum_values(ctx, questions, spec)
 
-        # ── 7. 时间过滤校验 ──
+        # ── 9. 时间过滤校验 ──
         self._validate_time_filter(ctx, questions)
 
-        # ── 8. 明细查询 LIMIT 校验 ──
+        # ── 10. 明细查询 LIMIT 校验 ──
         self._validate_detail_limit(ctx, questions)
 
-        # ── 9. 窗口函数校验（Phase 3B 新增） ──
+        # ── 11. 窗口函数校验（Phase 3B 新增） ──
         self._validate_window_functions(ctx, questions)
 
-        # ── 10. 窗口函数位置校验（Phase 3B 新增） ──
+        # ── 12. 窗口函数位置校验（Phase 3B 新增） ──
         self._validate_window_position(ctx, questions)
+
+        # ── 13. 粒度完整性校验（Phase 4C 补全——原 known_gap） ──
+        self._validate_grain_completeness(ctx, questions, spec)
+
+        # ── 14. 聚合类型声明对比（Phase 4C 补全——原 known_gap） ──
+        self._validate_aggregation_declaration(ctx, questions, spec)
 
         # 有 blocking 问题 → 不通过
         all_passed = not any(q.blocking for q in questions)
         return all_passed, questions
 
     # ── 检查方法 ──
+
+    def _validate_unsupported_step_types(
+        self, ctx: _ValidationContext, questions: list[OpenQuestion]
+    ) -> None:
+        """检查所有 step 类型是否在支持的白名单中——架构边界断言。
+
+        Phase 3C 遗留规则：任何不在白名单中的 Step 类型一律拒绝。
+        白名单随 Phase 渐进开放——Phase 4.6 计划新增 SubqueryStep。
+
+        当前白名单：ScanStep, FilterStep, JoinStep, AggregateStep,
+        ProjectStep, CaseWhenStep, WindowStep, SortStep, LimitStep。
+        """
+        from tianshu_datadev.planning.sql_build_plan import (
+            AggregateStep,
+            CaseWhenStep,
+            FilterStep,
+            JoinStep,
+            LimitStep,
+            ProjectStep,
+            ScanStep,
+            SortStep,
+            WindowStep,
+        )
+
+        _allowed = (
+            ScanStep, FilterStep, JoinStep, AggregateStep,
+            ProjectStep, CaseWhenStep, WindowStep, SortStep, LimitStep,
+        )
+
+        for step in ctx.plan.steps:
+            if not isinstance(step, _allowed):
+                step_type_name = type(step).__name__
+                questions.append(
+                    OpenQuestion(
+                        question_id=f"Q-VAL-UNSUPPORTED-{step_type_name}",
+                        source="validator",
+                        field_ref=f"plan.steps.{step.step_id}",
+                        description=(
+                            f"不支持的步骤类型 '{step_type_name}'——"
+                            f"当前白名单: {[t.__name__ for t in _allowed]}。"
+                            f"该类型计划在后续 Phase 中开放（详见 Phase 4.6 规划）。"
+                        ),
+                        blocking=True,
+                    )
+                )
+
+    def _validate_multi_hop_join(
+        self, ctx: _ValidationContext, questions: list[OpenQuestion]
+    ) -> None:
+        """检查单 SqlBuildPlan 内 JoinStep 数量——Phase 3C 仅支持单跳 Join。
+
+        V-009d（Phase 4.6 预定义）：同一 SqlBuildPlan 内仅允许一张 JoinStep。
+        多跳 Join 应拆入多步 SqlProgram——每步最多一个 JoinStep，
+        通过 _temp 表传递中间结果。
+
+        此规则是 Phase 3C 遗留的硬门禁——Phase 4.6 Step 1 实施多跳 Join 时移除。
+        """
+        join_step_count = len(ctx.join_steps)
+        if join_step_count > 1:
+            # 收集所有 JoinStep 的 right_table_ref 用于诊断消息
+            joined_tables = [s.right_table_ref for s in ctx.join_steps]
+            chain = " → ".join(joined_tables)
+            questions.append(
+                OpenQuestion(
+                    question_id=f"Q-VAL-MULTIHOP-{ctx.plan.plan_id}",
+                    source="validator",
+                    field_ref="plan.steps",
+                    description=(
+                        f"多跳 Join 不支持——当前 SqlBuildPlan 包含 {join_step_count} 个 "
+                        f"JoinStep（右表引用链: {chain}）。"
+                        f"当前仅支持单跳 Join（两表关联），多跳 Join 应拆分为 "
+                        f"多步 SqlProgram：每步最多一个 JoinStep，通过 _temp 中间表传递结果。"
+                        f"Phase 4.6 计划开放多跳 Join（≤5 跳）。"
+                    ),
+                    blocking=True,
+                )
+            )
 
     def _validate_table_refs(self, ctx: _ValidationContext, questions: list[OpenQuestion]) -> None:
         """检查所有 ScanStep.table_ref 在 SourceManifest 中注册。"""
@@ -300,6 +393,150 @@ class SqlBuildPlanValidator:
 
         position_questions = validate_window_not_in_where(ctx.plan)
         questions.extend(position_questions)
+
+    # ── Phase 4C 新增：粒度完整性 + 聚合类型声明对比 ──
+
+    def _validate_grain_completeness(
+        self,
+        ctx: _ValidationContext,
+        questions: list[OpenQuestion],
+        spec: object | None = None,
+    ) -> None:
+        """检查所有声明的维度列是否出现在 GROUP BY 中。
+
+        从 ParsedDeveloperSpec.dimensions 获取所有声明的维度列引用，
+        与计划中 AggregateStep.group_keys 做交集对比。
+        缺失的维度列产生 Q-VAL-GRAIN- 拒绝码。
+
+        前置条件：spec 必须提供——若不提供，跳过检查（不误报）。
+        """
+        if spec is None:
+            return
+        if not ctx.aggregate_steps:
+            return
+
+        # 从 ParsedDeveloperSpec 提取声明的维度列
+        declared_dimensions: set[str] = set()
+        try:
+            dims = getattr(spec, "dimensions", None) or []
+            for dim in dims:
+                col_ref = getattr(dim, "column_ref", None)
+                if col_ref:
+                    declared_dimensions.add(col_ref)
+        except Exception:
+            return  # spec 结构不符预期——跳过，不误报
+
+        if not declared_dimensions:
+            return
+
+        # 收集所有 AggregateStep 的 group_keys 中的列名（归一化名）
+        for agg_step in ctx.aggregate_steps:
+            actual_grain: set[str] = {
+                gk.normalized_name for gk in agg_step.group_keys
+            }
+            missing = declared_dimensions - actual_grain
+            if missing:
+                questions.append(
+                    OpenQuestion(
+                        question_id=(
+                            f"Q-VAL-GRAIN-{agg_step.step_id}"
+                        ),
+                        source="validator",
+                        field_ref=f"{agg_step.step_id}.group_keys",
+                        description=(
+                            f"分组键不完整——声明维度列 {sorted(missing)} "
+                            f"未出现在 GROUP BY 中。"
+                            f"当前分组键：{sorted(actual_grain)}"
+                        ),
+                        blocking=True,
+                    )
+                )
+
+    def _validate_aggregation_declaration(
+        self,
+        ctx: _ValidationContext,
+        questions: list[OpenQuestion],
+        spec: object | None = None,
+    ) -> None:
+        """检查聚合函数类型是否与 DeveloperSpec 声明一致。
+
+        从 ParsedDeveloperSpec.metrics 获取所有声明的指标定义
+        （别名 → 聚合类型 + 输入列），与计划中 AggregateStep.metrics
+        逐项对比。不匹配产生 Q-VAL-AGG- 拒绝码。
+
+        前置条件：spec 必须提供——若不提供，跳过检查。
+        """
+        if spec is None:
+            return
+        if not ctx.aggregate_steps:
+            return
+
+        # 从 ParsedDeveloperSpec 提取声明的指标定义
+        declared_metrics: dict[str, tuple[str, str | None]] = {}  # alias → (aggregation, input_column)
+        try:
+            metrics = getattr(spec, "metrics", None) or []
+            for m in metrics:
+                alias = getattr(m, "alias", None)
+                agg_val = getattr(m, "aggregation", None)
+                input_col = getattr(m, "input_column", None)
+                if alias and agg_val:
+                    # AggregationType 是 (str, Enum)——取 .value 得到字符串
+                    agg_str = getattr(agg_val, "value", str(agg_val))
+                    declared_metrics[alias] = (agg_str, input_col)
+        except Exception:
+            return  # spec 结构不符预期——跳过
+
+        if not declared_metrics:
+            return
+
+        # 收集所有 AggregateStep 的实际聚合指标
+        for agg_step in ctx.aggregate_steps:
+            for metric in agg_step.metrics:
+                alias = metric.alias
+                if alias not in declared_metrics:
+                    continue  # 未声明的别名——由字段引用校验处理
+
+                declared_agg, declared_col = declared_metrics[alias]
+                actual_agg = str(metric.aggregation) if metric.aggregation else ""
+
+                # 对比聚合类型
+                if actual_agg != declared_agg:
+                    questions.append(
+                        OpenQuestion(
+                            question_id=(
+                                f"Q-VAL-AGG-{agg_step.step_id}-{alias}"
+                            ),
+                            source="validator",
+                            field_ref=f"{agg_step.step_id}.metrics.{alias}",
+                            description=(
+                                f"聚合函数不匹配——声明为 {declared_agg}({declared_col or '*'})，"
+                                f"实际为 {actual_agg}({metric.input_column or '*'})"
+                            ),
+                            blocking=True,
+                        )
+                    )
+                    continue
+
+                # 对比输入列（当声明了 input_column 且不为空时）
+                if declared_col:
+                    actual_col = metric.input_column or ""
+                    actual_col_normalized = actual_col
+                    if actual_col_normalized != declared_col:
+                        questions.append(
+                            OpenQuestion(
+                                question_id=(
+                                    f"Q-VAL-AGG-{agg_step.step_id}-{alias}"
+                                ),
+                                source="validator",
+                                field_ref=f"{agg_step.step_id}.metrics.{alias}",
+                                description=(
+                                    f"聚合输入列不匹配——声明为 "
+                                    f"{declared_agg}({declared_col})，"
+                                    f"实际为 {actual_agg}({actual_col})"
+                                ),
+                                blocking=True,
+                            )
+                        )
 
     def _validate_time_filter(self, ctx: _ValidationContext, questions: list[OpenQuestion]) -> None:
         """检查大事实表是否包含时间过滤条件。
