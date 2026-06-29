@@ -1,4 +1,4 @@
-# SQL IR 和编译器计划 — TianShu DataDev Agent v3
+﻿# SQL IR 和编译器计划 — TianShu DataDev Agent v3
 
 > 文档版本：Phase 0.5 DeveloperSpec-first 架构校正版
 
@@ -423,7 +423,7 @@ Phase 3B 通过 `WindowExpr` 和 `CaseWhenStep` 表达以下场景：
 
 ### 7.3 后续复杂 SQL 开放规则
 
-子查询、多跳 Join、DDL、DML 在 Phase 4 及以后按黄金用例逐项开放。每开放一种 SQL 能力，必须满足以下全部条件：
+子查询和多跳 Join 已纳入专属 Phase 4.6 规划（参见 docs/roadmap/phase-4-6-complex-sql-opening.md）。DDL/DML 在 Phase 4 及以后按黄金用例逐项开放。每开放一种 SQL 能力，必须满足以下全部条件：
 
 1. 新增严格 Pydantic 模型或等价 JSON Schema，`extra="forbid"`。
 2. Validator 校验 SourceManifest 注册、类型、引用关系和禁止字段。

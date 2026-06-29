@@ -1,4 +1,4 @@
-# Phase 3 Exit HarnessReport
+﻿# Phase 3 Exit HarnessReport
 
 > **报告 ID**：`hr_15af40bf5bae`
 > **Phase**：`phase-3-exit`
@@ -111,6 +111,9 @@ Pipeline E2E 测试: 2 个 (test_pipeline_e2e.py)
 - 文档: docs/03-sql-ir-and-compiler-plan.md:409, docs/roadmap/phase-3c-*.md
 
 **证据来源**：docs/03-sql-ir-and-compiler-plan.md §7; docs/01-target-architecture.md §3.3
+
+> **补充**：子查询与多跳 Join 的边界已从占位声明升级为具象可执行规划——
+> 详见 [[subquery-multihop-join-boundary_20260629_1500|子查询 & 多跳 Join 边界补充文档]]（含 Phase 4.6 归属、黄金用例、7 项规则具象化 checklist）。
 
 ---
 ### ℹ️ 维度 5：Phase 4 硬化的输入基线（判决: INFO）

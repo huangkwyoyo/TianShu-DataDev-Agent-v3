@@ -1,4 +1,4 @@
-# Phase 4.5：内部交互验证口（DeveloperSpec 编辑器 + 模板按钮）
+﻿# Phase 4.5：内部交互验证口（DeveloperSpec 编辑器 + 模板按钮）
 
 > 状态：待实施
 > 前置依赖：Phase 4 退出条件全部满足
@@ -108,5 +108,8 @@ git diff --check
 6. Phase 1A-4 测试保持通过
 
 ---
+
+> 后续阶段：Phase 4.6 复杂 SQL 模式渐进开放（参见 docs/roadmap/phase-4-6-complex-sql-opening.md）
+
 
 > Phase 4.5 | 待实施 | 前置：Phase 4 退出
