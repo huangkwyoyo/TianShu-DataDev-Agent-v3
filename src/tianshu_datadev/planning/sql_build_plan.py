@@ -153,6 +153,25 @@ class LimitStep(StrictModel):
     offset: int | None = None
 
 
+class SubqueryStep(StrictModel):
+    """子查询步骤——在 FROM 子句中嵌入完整的 SqlBuildPlan（Phase 4.6 Step 2）。
+
+    仅支持 FROM 子句中的派生表子查询，不支持：
+    - WHERE 中的关联子查询
+    - SELECT 列表中的标量子查询
+    - 超过 2 层嵌套
+
+    递归引用 SqlBuildPlan——由 from __future__ import annotations + Pydantic
+    ForwardRef 自动解析循环引用。
+    """
+
+    step_type: Literal["subquery"] = "subquery"
+    step_id: str
+    alias: str  # 派生表别名（如 order_agg）
+    inner_plan: SqlBuildPlan  # 嵌套的完整 SqlBuildPlan——递归引用
+    depth: int = 1  # 嵌套深度（从 1 开始计数，Validator 限制 ≤ 2）
+
+
 # ════════════════════════════════════════════
 # Step 联合类型
 # ════════════════════════════════════════════
@@ -168,6 +187,7 @@ StepNode = Annotated[
         WindowStep,
         SortStep,
         LimitStep,
+        SubqueryStep,
     ],
     Field(discriminator="step_type"),
 ]
@@ -179,7 +199,7 @@ StepNode = Annotated[
 
 
 class SqlBuildPlan(StrictModel):
-    """类型安全的 SQL 构建计划——8 Step IR 的有序序列。
+    """类型安全的 SQL 构建计划——9 Step IR 的有序序列（Phase 4.6 新增 SubqueryStep）。
 
     steps 的顺序即执行顺序。允许步骤重复（如多个 ScanStep、多个 FilterStep）。
     hypothesis_id 溯源到 RelationshipHypothesis，source_manifest_hash 溯源到 SourceManifest。

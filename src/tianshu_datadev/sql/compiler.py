@@ -30,6 +30,7 @@ from tianshu_datadev.planning.sql_build_plan import (
     ScanStep,
     SortStep,
     SqlBuildPlan,
+    SubqueryStep,
     WindowStep,
 )
 from tianshu_datadev.planning.sql_program import (
@@ -310,6 +311,12 @@ class DuckDbSqlCompiler:
                 else:
                     limit_clause = f"LIMIT {step.limit}"
 
+            elif isinstance(step, SubqueryStep):
+                # Phase 4.6 Step 2：递归渲染子查询
+                sub_sql = self._render_subquery_step(step)
+                if sub_sql:
+                    from_parts.append(sub_sql)
+
         # ── 合并 SELECT 列：基础列 + CASE WHEN + 窗口函数 ──
         all_select_cols = select_cols + case_when_cols + window_cols
 
@@ -355,6 +362,27 @@ class DuckDbSqlCompiler:
         return "\n".join(sql_parts)
 
     # ── 子句渲染 ──
+
+    def _render_subquery_step(self, step: SubqueryStep) -> str:
+        """V-010 兼容渲染——递归编译内层 SqlBuildPlan 为派生表。
+
+        渲染为 (SELECT ... ) AS alias 形式，不使用 CTE（WITH ... AS）。
+        内层计划通过递归调用 _render_sql() 生成完整 SQL 片段。
+
+        Args:
+            step: SubqueryStep——含嵌套 SqlBuildPlan
+
+        Returns:
+            派生表 SQL 片段，如 "(SELECT o.product_id, SUM(...) FROM ...) AS order_agg"
+        """
+        inner_sql = self._render_sql(step.inner_plan)
+        # 确保内层 SQL 有实质内容
+        if not inner_sql.strip():
+            raise ValueError(
+                f"子查询 '{step.alias}' 的内层计划渲染为空——"
+                f"inner_plan.steps 可能为空"
+            )
+        return f"(\n{inner_sql}\n) AS {step.alias}"
 
     def _render_join(self, step: JoinStep) -> str:
         """渲染 JoinStep 为 JOIN 子句。"""

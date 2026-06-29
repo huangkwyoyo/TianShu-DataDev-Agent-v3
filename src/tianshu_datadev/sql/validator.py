@@ -1,9 +1,13 @@
 """SqlBuildPlanValidator——事实源校验 + Join 门禁 + 语义校验 + 架构边界断言。
 
-验证流程（12 项检查）：
+验证流程（15 项检查，Phase 4.6 Step 1/2 完整实施）：
 1. 空 steps 拒绝
 2. 不支持的步骤类型——白名单外 Step 类型一律拒绝（架构边界断言）
-3. 多跳 Join 拒绝——单 Plan 内 ≥2 JoinStep → 拒绝（Phase 3C 遗留，Phase 4.6 开放）
+3. 多跳 Join 校验——V-009 四规则体系（Phase 4.6 Step 1 实施）
+   V-009a: 每步 evidence_level ≥ MEDIUM（_validate_join_evidence_gate 二次确认）
+   V-009b: 右表引用链无循环（validate_multi_hop_chain 跨 SqlProgram 校验）
+   V-009c: 多跳深度 ≤ 5（validate_multi_hop_chain 跨 SqlProgram 校验）
+   V-009d: 单 Plan 仅允许一张 JoinStep（_validate_multi_hop_join 硬门禁）
 4. 表引用校验——所有 ScanStep.table_ref 必须在 SourceManifest 中注册
 5. 字段引用校验——所有 ColumnRef 必须在对应表的 columns 中存在
 6. Join key 类型兼容——JoinStep 双方字段类型必须兼容
@@ -31,7 +35,12 @@ from tianshu_datadev.planning.sql_build_plan import (
     ScanStep,
     SqlBuildPlan,
     StepNode,
+    SubqueryStep,
+    WindowStep,
 )
+
+# SqlProgram 导入——Phase 4.6 Step 1 多跳链校验
+from tianshu_datadev.planning.sql_program import SqlProgram
 
 from .models import find_column_type, types_are_compatible
 
@@ -90,7 +99,7 @@ class SqlBuildPlanValidator:
         # ── 2. 不支持的步骤类型（架构边界断言） ──
         self._validate_unsupported_step_types(ctx, questions)
 
-        # ── 3. 多跳 Join 拒绝（Phase 3C 遗留） ──
+        # ── 3. 多跳 Join 校验——V-009d 单 Plan 硬门禁（Phase 4.6 Step 1） ──
         self._validate_multi_hop_join(ctx, questions)
 
         # ── 4. 表引用校验 ──
@@ -126,7 +135,108 @@ class SqlBuildPlanValidator:
         # ── 14. 聚合类型声明对比（Phase 4C 补全——原 known_gap） ──
         self._validate_aggregation_declaration(ctx, questions, spec)
 
+        # ── 15. 子查询校验——V-010a~e 五规则（Phase 4.6 Step 2） ──
+        self._validate_subquery(ctx, questions)
+
         # 有 blocking 问题 → 不通过
+        all_passed = not any(q.blocking for q in questions)
+        return all_passed, questions
+
+    def validate_multi_hop_chain(
+        self,
+        program: SqlProgram,
+    ) -> tuple[bool, list[OpenQuestion]]:
+        """V-009b + V-009c——跨 SqlProgram 的多跳 Join 链级别校验。
+
+        遍历 SqlProgram 中所有语句的 SqlBuildPlan，提取每个计划中的 JoinStep
+        （每计划最多 1 个，由 V-009d 保证），在链级别进行两项检查：
+
+        V-009b 循环检测：右表引用链中不得出现重复表引用。
+        V-009c 深度上限：整条链的 JoinStep 总数不得超过 5。
+
+        Args:
+            program: 待校验的 SqlProgram
+
+        Returns:
+            (all_passed, open_questions)
+        """
+        questions: list[OpenQuestion] = []
+
+        if not program.statements:
+            return True, questions
+
+        # 按拓扑顺序遍历语句，收集 JoinStep 信息
+        topo_order = program.topological_order
+        if not topo_order:
+            # 无拓扑排序时按 statements 原始顺序
+            ordered_stmts = program.statements
+        else:
+            stmt_map = {s.statement_id: s for s in program.statements}
+            ordered_stmts = [stmt_map[sid] for sid in topo_order if sid in stmt_map]
+
+        join_chain: list[dict] = []  # [{step_id, right_table_ref, statement_id}, ...]
+        seen_right_tables: set[str] = set()
+
+        for stmt in ordered_stmts:
+            plan = stmt.plan
+            for step in plan.steps:
+                if isinstance(step, JoinStep):
+                    join_chain.append({
+                        "step_id": step.step_id,
+                        "right_table_ref": step.right_table_ref,
+                        "statement_id": stmt.statement_id,
+                    })
+
+        # ── V-009c：深度上限 ≤ 5 ──
+        total_hops = len(join_chain)
+        if total_hops > 5:
+            chain_desc = " → ".join(
+                j["right_table_ref"] for j in join_chain
+            )
+            questions.append(
+                OpenQuestion(
+                    question_id=f"Q-VAL-MULTIHOP-DEPTH-{program.program_id}",
+                    source="validator",
+                    field_ref="SqlProgram.statements",
+                    description=(
+                        f"V-009c MULTI_HOP_DEPTH_EXCEEDED——"
+                        f"整条 Join 链包含 {total_hops} 跳（上限为 5 跳）。"
+                        f"右表引用链: {chain_desc}。"
+                        f"请减少 Join 跳数或将部分关联逻辑拆分为独立程序。"
+                    ),
+                    blocking=True,
+                )
+            )
+
+        # ── V-009b：循环检测——右表引用链中不得出现重复 ──
+        for j in join_chain:
+            right_ref = j["right_table_ref"]
+            # 跳过 _temp 中间表引用（由 SqlProgram 串联产生，不算循环）
+            if right_ref.startswith("_temp_"):
+                continue
+            if right_ref in seen_right_tables:
+                chain_desc = " → ".join(
+                    jj["right_table_ref"] for jj in join_chain
+                )
+                questions.append(
+                    OpenQuestion(
+                        question_id=(
+                            f"Q-VAL-MULTIHOP-CYCLE-{program.program_id}"
+                        ),
+                        source="validator",
+                        field_ref=f"SqlProgram.statements.{j['statement_id']}",
+                        description=(
+                            f"V-009b AMBIGUOUS_MULTI_HOP——"
+                            f"右表 '{right_ref}' 在 Join 链中重复出现。"
+                            f"链: {chain_desc}。"
+                            f"多跳 Join 链必须为线性——每个右表只能被 JOIN 一次，"
+                            f"否则说明 Join 顺序存在歧义（菱形 Join）。"
+                        ),
+                        blocking=True,
+                    )
+                )
+            seen_right_tables.add(right_ref)
+
         all_passed = not any(q.blocking for q in questions)
         return all_passed, questions
 
@@ -158,6 +268,7 @@ class SqlBuildPlanValidator:
         _allowed = (
             ScanStep, FilterStep, JoinStep, AggregateStep,
             ProjectStep, CaseWhenStep, WindowStep, SortStep, LimitStep,
+            SubqueryStep,
         )
 
         for step in ctx.plan.steps:
@@ -180,13 +291,13 @@ class SqlBuildPlanValidator:
     def _validate_multi_hop_join(
         self, ctx: _ValidationContext, questions: list[OpenQuestion]
     ) -> None:
-        """检查单 SqlBuildPlan 内 JoinStep 数量——Phase 3C 仅支持单跳 Join。
+        """V-009d 硬门禁——单 SqlBuildPlan 内仅允许一张 JoinStep。
 
-        V-009d（Phase 4.6 预定义）：同一 SqlBuildPlan 内仅允许一张 JoinStep。
-        多跳 Join 应拆入多步 SqlProgram——每步最多一个 JoinStep，
-        通过 _temp 表传递中间结果。
+        多跳 Join 通过 SqlProgram 串联实现——每步最多一个 JoinStep，
+        通过 _temp 表传递中间结果。链级别的循环检测（V-009b）和深度上限（V-009c）
+        由 validate_multi_hop_chain() 在 SqlProgram 级别校验。
 
-        此规则是 Phase 3C 遗留的硬门禁——Phase 4.6 Step 1 实施多跳 Join 时移除。
+        Phase 4.6 Step 1 实施——从 blanket rejection 升级为架构指导错误。
         """
         join_step_count = len(ctx.join_steps)
         if join_step_count > 1:
@@ -199,11 +310,10 @@ class SqlBuildPlanValidator:
                     source="validator",
                     field_ref="plan.steps",
                     description=(
-                        f"多跳 Join 不支持——当前 SqlBuildPlan 包含 {join_step_count} 个 "
-                        f"JoinStep（右表引用链: {chain}）。"
-                        f"当前仅支持单跳 Join（两表关联），多跳 Join 应拆分为 "
-                        f"多步 SqlProgram：每步最多一个 JoinStep，通过 _temp 中间表传递结果。"
-                        f"Phase 4.6 计划开放多跳 Join（≤5 跳）。"
+                        f"V-009d MULTI_HOP_PER_STEP_EXCEEDED——当前 SqlBuildPlan 包含 "
+                        f"{join_step_count} 个 JoinStep（右表引用链: {chain}），"
+                        f"超过单 Plan 上限（1 个）。多跳 Join 请使用 SqlProgram 串联——"
+                        f"每步一个 JoinStep，通过 _temp 中间表传递结果。链级别深度上限为 5 跳。"
                     ),
                     blocking=True,
                 )
@@ -393,6 +503,157 @@ class SqlBuildPlanValidator:
 
         position_questions = validate_window_not_in_where(ctx.plan)
         questions.extend(position_questions)
+
+    # ── Phase 4.6 Step 2 新增：子查询五规则校验 ──
+
+    def _validate_subquery(
+        self, ctx: _ValidationContext, questions: list[OpenQuestion]
+    ) -> None:
+        """V-010a~e 子查询专用校验——递归检查所有嵌套 SubqueryStep。
+
+        五条规则：
+        V-010a SUBQUERY_DEPTH_CHECK：嵌套深度 <= 2
+        V-010c SUBQUERY_FACT_SOURCE_CHECK：内层事实源一致性（递归校验）
+        V-010d SUBQUERY_WINDOW_FORBIDDEN：内层不含 WindowStep
+        V-010e SUBQUERY_JOIN_FORBIDDEN：内层仅单表（无 JoinStep）
+
+        递归遍历 SqlBuildPlan 的 steps——包括 SubqueryStep 嵌套的内层计划。
+        """
+        self._validate_subquery_recursive(ctx.plan, ctx, questions, depth=1)
+
+    def _validate_subquery_recursive(
+        self,
+        plan: SqlBuildPlan,
+        ctx: _ValidationContext,
+        questions: list[OpenQuestion],
+        depth: int = 1,
+    ) -> None:
+        """递归遍历计划中的 SubqueryStep，逐层应用 V-010 规则。
+
+        Args:
+            plan: 当前层级的 SqlBuildPlan
+            ctx: 验证上下文（manifest 信息用于事实源校验）
+            questions: 累积的 OpenQuestion 列表
+            depth: 当前递归深度（从 1 开始）
+        """
+        for step in plan.steps:
+            if not isinstance(step, SubqueryStep):
+                continue
+
+            sq = step
+            inner = sq.inner_plan
+
+            # ── V-010a：深度检查——嵌套不得超过 2 层 ──
+            effective_depth = sq.depth
+            if effective_depth > 2:
+                questions.append(
+                    OpenQuestion(
+                        question_id=f"Q-VAL-SUBQUERY-DEPTH-{sq.step_id}",
+                        source="validator",
+                        field_ref=f"plan.steps.{sq.step_id}.depth",
+                        description=(
+                            f"V-010a SUBQUERY_NESTING_TOO_DEEP——"
+                            f"子查询嵌套深度为 {effective_depth} 层，"
+                            f"超过上限（2 层）。"
+                            f"别名: '{sq.alias}'"
+                        ),
+                        blocking=True,
+                    )
+                )
+
+            # ── V-010d：内层不得含 WindowStep ──
+            inner_win_steps = [
+                s for s in inner.steps if isinstance(s, WindowStep)
+            ]
+            if inner_win_steps:
+                win_ids = [ws.step_id for ws in inner_win_steps]
+                questions.append(
+                    OpenQuestion(
+                        question_id=f"Q-VAL-SUBQUERY-WINDOW-{sq.step_id}",
+                        source="validator",
+                        field_ref=f"plan.steps.{sq.step_id}.inner_plan",
+                        description=(
+                            f"V-010d SUBQUERY_WINDOW_FORBIDDEN——"
+                            f"子查询 '{sq.alias}' 的内层计划包含 "
+                            f"{len(inner_win_steps)} 个 WindowStep "
+                            f"({win_ids})。子查询内禁止窗口函数，"
+                            f"窗口操作应在子查询外部进行。"
+                        ),
+                        blocking=True,
+                    )
+                )
+
+            # ── V-010e：内层仅单表（无 JoinStep） ──
+            inner_join_steps = [
+                s for s in inner.steps if isinstance(s, JoinStep)
+            ]
+            if inner_join_steps:
+                join_ids = [js.step_id for js in inner_join_steps]
+                questions.append(
+                    OpenQuestion(
+                        question_id=f"Q-VAL-SUBQUERY-JOIN-{sq.step_id}",
+                        source="validator",
+                        field_ref=f"plan.steps.{sq.step_id}.inner_plan",
+                        description=(
+                            f"V-010e SUBQUERY_JOIN_FORBIDDEN——"
+                            f"子查询 '{sq.alias}' 的内层计划包含 "
+                            f"{len(inner_join_steps)} 个 JoinStep "
+                            f"({join_ids})。子查询内仅允许单表扫描，"
+                            f"复杂关联请拆分为多步 SqlProgram。"
+                        ),
+                        blocking=True,
+                    )
+                )
+
+            # ── V-010c：事实源一致性——递归校验内层计划 ──
+            self._check_subquery_fact_source(sq, ctx, questions)
+
+            # ── 递归进入子查询的内层计划 ──
+            self._validate_subquery_recursive(
+                inner, ctx, questions, depth=sq.depth + 1
+            )
+
+    def _check_subquery_fact_source(
+        self,
+        sq: SubqueryStep,
+        ctx: _ValidationContext,
+        questions: list[OpenQuestion],
+    ) -> None:
+        """V-010c 事实源一致性——递归校验内层 SqlBuildPlan 的表引用。
+
+        确保内层计划的 ScanStep.table_ref 全部在 SourceManifest 中注册。
+        """
+        inner = sq.inner_plan
+        registered_tables = {t.table_ref for t in ctx.manifest.tables}
+
+        for s in inner.steps:
+            if not isinstance(s, ScanStep):
+                continue
+            # 跳过 _temp 中间表（由 SqlProgram 管理）
+            if s.table_ref.startswith("_temp_"):
+                continue
+            if s.table_ref not in registered_tables:
+                questions.append(
+                    OpenQuestion(
+                        question_id=(
+                            f"Q-VAL-SUBQUERY-SOURCE-"
+                            f"{sq.step_id}-{s.table_ref}"
+                        ),
+                        source="validator",
+                        field_ref=(
+                            f"plan.steps.{sq.step_id}"
+                            f".inner_plan.{s.step_id}"
+                        ),
+                        description=(
+                            f"V-010c SOURCE_CONFLICT——子查询 "
+                            f"'{sq.alias}' 内层 ScanStep "
+                            f"'{s.step_id}' 引用了未注册表 "
+                            f"'{s.table_ref}'。"
+                            f"已注册表: {sorted(registered_tables)}"
+                        ),
+                        blocking=True,
+                    )
+                )
 
     # ── Phase 4C 新增：粒度完整性 + 聚合类型声明对比 ──
 
