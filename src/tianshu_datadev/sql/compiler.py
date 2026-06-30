@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from tianshu_datadev.developer_spec.models import AggregationType
 from tianshu_datadev.planning.models import (
     Predicate,
     PredicateOperator,
@@ -245,6 +246,9 @@ class DuckDbSqlCompiler:
         order_by_parts: list[str] = []
         limit_clause: str = ""
 
+        has_aggregation = False  # 追踪是否已处理 AggregateStep
+        # 记录所有被 JOIN 的右表——后面组装 FROM 时排除，避免重复引用
+        joined_tables: set[str] = set()
         # CASE WHEN 列和窗口函数列（Phase 3B）
         case_when_cols: list[str] = []
         window_cols: list[str] = []
@@ -266,6 +270,8 @@ class DuckDbSqlCompiler:
                     where_parts.append(where_sql)
 
             elif isinstance(step, JoinStep):
+                # 记录右表——后续 FROM 组装时排除，避免 FROM a, b JOIN b 的重复引用
+                joined_tables.add(str(step.right_table_ref))
                 join_clause = self._render_join(step)
                 if join_clause:
                     join_parts.append(join_clause)
@@ -275,6 +281,7 @@ class DuckDbSqlCompiler:
                 agg_cols = self._render_aggregate(step)
                 if agg_cols:
                     select_cols = agg_cols  # 聚合覆盖 select
+                    has_aggregation = True  # 标记已聚合，后续 ProjectStep 不覆盖
                 # GROUP BY
                 for gk in step.group_keys:
                     group_by_parts.append(f"{gk.table_ref}.{gk.column_name}")
@@ -283,9 +290,15 @@ class DuckDbSqlCompiler:
                     having_clause = self._render_predicate(step.having)
 
             elif isinstance(step, ProjectStep):
-                proj_cols = self._render_project(step)
-                if proj_cols:
-                    select_cols = proj_cols
+                if has_aggregation:
+                    # 聚合后投影：保留聚合表达式，仅按 ProjectStep 定义的列顺序重排
+                    reordered = self._reorder_aggregation_cols(step, select_cols)
+                    if reordered:
+                        select_cols = reordered
+                else:
+                    proj_cols = self._render_project(step)
+                    if proj_cols:
+                        select_cols = proj_cols
 
             elif isinstance(step, CaseWhenStep):
                 # Phase 3B：渲染 CASE WHEN 表达式
@@ -329,9 +342,19 @@ class DuckDbSqlCompiler:
         else:
             sql_parts.append("SELECT *")
 
-        # FROM
+        # FROM——排除已在 JOIN 子句中出现的右表，避免 FROM a, b JOIN b 的重复引用
         if from_parts:
-            sql_parts.append(f"FROM\n  {' , '.join(from_parts)}")
+            if joined_tables:
+                from_parts_filtered = [
+                    fp for fp in from_parts
+                    if not any(fp.endswith(f" AS {jt}") for jt in joined_tables)
+                ]
+            else:
+                from_parts_filtered = from_parts
+            if from_parts_filtered:
+                sql_parts.append(f"FROM\n  {' , '.join(from_parts_filtered)}")
+            else:
+                sql_parts.append("FROM (VALUES (1)) AS _empty")  # 所有表都被 JOIN 覆盖时的 fallback
         else:
             sql_parts.append("FROM (VALUES (1)) AS _empty")  # fallback
 
@@ -401,7 +424,13 @@ class DuckDbSqlCompiler:
         return f"{join_type} JOIN\n  {right_table} AS {step.right_table_ref}\n  ON {on_clause}"
 
     def _render_aggregate(self, step: AggregateStep) -> list[str]:
-        """渲染聚合步骤为 SELECT 列列表。"""
+        """渲染聚合步骤为 SELECT 列列表。
+
+        Phase 4D 扩展：
+        - distinct=True → SUM(DISTINCT col) 等去重聚合
+        - input_expression → 多字段表达式（如 "quantity * unit_price"）
+        - filter → FILTER (WHERE ...) 条件聚合
+        """
         cols: list[str] = []
 
         # GROUP BY 列
@@ -410,21 +439,71 @@ class DuckDbSqlCompiler:
 
         # 聚合指标
         for m in step.metrics:
-            # 处理聚合函数——aggregation 已是 AggregationType 枚举，直接使用
-            agg_func = m.aggregation
-            if agg_func == "COUNT_DISTINCT":
-                if m.input_column:
-                    cols.append(f"COUNT(DISTINCT {m.input_column}) AS {m.alias}")
+            # 确定聚合输入：
+            #   优先级：input_expression > input_column > "*"
+            if m.input_expression:
+                # 多字段表达式——如 "quantity * unit_price"
+                input_part = m.input_expression
+            elif m.input_column:
+                if m.distinct and m.aggregation != AggregationType.COUNT_DISTINCT:
+                    # SUM(DISTINCT col) 等去重聚合（COUNT_DISTINCT 已独立处理）
+                    input_part = f"DISTINCT {m.input_column}"
                 else:
-                    cols.append(f"COUNT(DISTINCT *) AS {m.alias}")
+                    input_part = str(m.input_column)
             else:
+                input_part = "*"
+
+            # 渲染聚合函数
+            agg_func = m.aggregation
+            if agg_func == AggregationType.COUNT_DISTINCT:
                 if m.input_column:
-                    cols.append(f"{agg_func.upper()}({m.input_column}) AS {m.alias}")
+                    agg_expr = f"COUNT(DISTINCT {m.input_column})"
                 else:
-                    # COUNT(*) 的情况
-                    cols.append(f"{agg_func.upper()}(*) AS {m.alias}")
+                    agg_expr = "COUNT(DISTINCT *)"
+            else:
+                agg_expr = f"{agg_func.value}({input_part})"
+
+            # FILTER 子句——条件聚合（如 FILTER (WHERE status = 'STANDARD')）
+            if m.filter:
+                filter_sql = self._render_metric_filter(m.filter)
+                if filter_sql:
+                    agg_expr = f"{agg_expr} FILTER (WHERE {filter_sql})"
+
+            cols.append(f"{agg_expr} AS {m.alias}")
 
         return cols
+
+    def _render_metric_filter(self, filter_decl) -> str:
+        """渲染 MetricFilterDecl 为 SQL WHERE 片段——用于 FILTER 子句。
+
+        操作符映射：
+          eq → =, neq → !=, gt → >, gte → >=, lt → <, lte → <=,
+          in → IN, is_null → IS NULL, is_not_null → IS NOT NULL
+
+        Args:
+            filter_decl: MetricFilterDecl 实例
+
+        Returns:
+            SQL WHERE 片段（不含 WHERE 关键字），如 "status = 'STANDARD'"
+        """
+        op_map = {
+            "eq": "=", "neq": "!=",
+            "gt": ">", "gte": ">=", "lt": "<", "lte": "<=",
+            "in": "IN",
+            "is_null": "IS NULL", "is_not_null": "IS NOT NULL",
+        }
+        sql_op = op_map.get(filter_decl.operator, "=")
+        col = filter_decl.column
+
+        if filter_decl.operator in ("is_null", "is_not_null"):
+            return f"{col} {sql_op}"
+        elif filter_decl.operator == "in":
+            # value 应为逗号分隔的列表字符串
+            return f"{col} IN ({filter_decl.value})"
+        else:
+            # 值加单引号——编译器无法在编译时确定列类型，统一加引号
+            escaped = str(filter_decl.value).replace("'", "''")
+            return f"{col} {sql_op} '{escaped}'"
 
     def _render_project(self, step: ProjectStep) -> list[str]:
         """渲染投影步骤为 SELECT 列列表。
@@ -452,6 +531,66 @@ class DuckDbSqlCompiler:
                 else:
                     cols.append(col_expr)
         return cols
+
+    def _reorder_aggregation_cols(
+        self, step: ProjectStep, agg_select_cols: list[str]
+    ) -> list[str]:
+        """聚合后投影：按 ProjectStep 定义的输出列顺序重排聚合表达式。
+
+        AggregateStep 已生成正确的聚合 SELECT 表达式（如 "COUNT(id) AS pv"），
+        此方法仅按 ProjectStep.columns 的 alias 顺序重排，不覆盖表达式本体。
+
+        匹配规则：
+        - 聚合列格式为 "FUNC(...) AS alias" → 按 alias 匹配
+        - GROUP BY 列格式为 "table.col" → 按 col 名匹配
+
+        Args:
+            step: ProjectStep，定义最终输出列顺序
+            agg_select_cols: AggregateStep 生成的 SELECT 列列表
+
+        Returns:
+            重排后的 SELECT 列列表
+        """
+        reordered: list[str] = []
+        remaining = list(agg_select_cols)  # 可修改的副本，用于已匹配去重
+
+        for ae in step.columns:
+            target_alias = str(ae.alias) if ae.alias else ""
+            matched = None
+            for i, col_expr in enumerate(remaining):
+                # 匹配聚合指标：格式 "FUNC(...) AS <alias>"
+                if target_alias and col_expr.endswith(f" AS {target_alias}"):
+                    matched = remaining.pop(i)
+                    break
+                # 匹配 GROUP BY 列：格式 "table_ref.column_name"
+                if "." in col_expr:
+                    col_name = col_expr.rsplit(".", 1)[-1]
+                    if col_name == target_alias:
+                        matched = remaining.pop(i)
+                        break
+            if matched is not None:
+                reordered.append(matched)
+            else:
+                # 列不在聚合结果中——可能是 WindowExpr 或计算列，回退到 _render_project 单列渲染
+                reordered.append(self._render_single_project_alias(ae))
+
+        return reordered
+
+    def _render_single_project_alias(self, ae) -> str:
+        """渲染单个 AliasExpr 为 SQL 列表达式——用于 _reorder_aggregation_cols 的回退路径。"""
+        expr = ae.expression
+        if isinstance(expr, WindowExpr):
+            return self._render_window_expr(expr)
+        elif hasattr(expr, "column_name"):
+            col_expr = expr.column_name
+            if ae.alias and ae.alias != col_expr:
+                return f"{col_expr} AS {ae.alias}"
+            return col_expr
+        else:
+            col_expr = str(expr)
+            if ae.alias and ae.alias != col_expr:
+                return f"{col_expr} AS {ae.alias}"
+            return col_expr
 
     # ── Phase 3B：CASE WHEN 渲染 ──
 

@@ -14,7 +14,7 @@ import re
 from enum import Enum
 from typing import Annotated
 
-from pydantic import AfterValidator, BaseModel, ConfigDict
+from pydantic import AfterValidator, BaseModel, ConfigDict, field_validator
 
 # ════════════════════════════════════════════
 # 基础
@@ -251,13 +251,89 @@ class FilterDecl(StrictModel):
     value: str | int | float | list | None = None
 
 
+class MetricFilterDecl(StrictModel):
+    """指标的过滤条件——对应 SQL FILTER (WHERE ...) 子句。
+
+    用于表达条件聚合，如"有标准罚款的车牌数"应生成：
+    COUNT(DISTINCT plate_id) FILTER (WHERE fine_status = 'STANDARD')
+
+    所有字段均受 Pydantic 严格校验，禁止自由 SQL 片段。
+    """
+
+    column: str  # 过滤列名（必须在 manifest 中存在，由 Validator 校验）
+    # 允许的操作符——与 FilterDecl 保持一致
+    operator: str  # "eq" | "neq" | "gt" | "gte" | "lt" | "lte" | "in" | "is_null" | "is_not_null"
+    value: str  # 过滤值（统一为字符串，由编译器按列类型决定是否加引号）
+
+
 class MetricDecl(StrictModel):
-    """程序员声明的指标。"""
+    """程序员声明的指标——支持简单聚合、条件聚合、去重聚合、表达式聚合。
+
+    不可表达的场景（有独立 IR 承接）：
+    - 窗口函数 → WindowStep
+    - CASE WHEN 聚合 → CaseWhenStep
+    - 比率计算 → InferredComputedMetric（聚合后计算）
+    """
 
     metric_name: str
     aggregation: AggregationType
     input_column: str | None = None  # COUNT(*) 时为 None
     alias: str
+    # ── Phase 4D 新增字段 ──
+    filter: MetricFilterDecl | None = None  # 条件聚合（如 FILTER WHERE status='STANDARD'）
+    input_expression: str | None = None  # 多字段表达式（如 "quantity * unit_price"）
+    distinct: bool = False  # 去重聚合（用于 SUM(DISTINCT col)）
+
+
+class InferredWindowMetric(StrictModel):
+    """SpecEnricher 推断的窗口指标——后续由 Builder 转为 WindowStep。
+
+    不进 MetricDecl 的原因：窗口函数的语义与聚合函数完全不同，
+    需要 PARTITION BY / ORDER BY / 窗口帧等额外信息，
+    已有独立的 WindowStep IR 承接。
+    """
+
+    metric_name: str
+    window_function: str  # ROW_NUMBER | RANK | DENSE_RANK | SUM | AVG | LAG | LEAD | NTILE
+    input_column: str  # 窗口函数的输入列（必须在 manifest 中存在）
+    partition_by: list[str] = []  # PARTITION BY 列名列表
+    order_by: list[str] = []  # ORDER BY 列名列表（如 "amount DESC"）
+    alias: str
+    confidence: str = "medium"  # high | medium | low（LLM 推断置信度）
+
+
+class InferredComputedMetric(StrictModel):
+    """SpecEnricher 推断的计算指标——比率、百分位等聚合后计算。
+
+    不进 MetricDecl 的原因：这是聚合后的标量运算（如 a / b），
+    不是 SQL 聚合函数。需要在 SELECT 外层或子查询中计算。
+    """
+
+    metric_name: str
+    expression: str  # 计算表达式，如 "fined_plate_count / unique_plate_count"
+    depends_on: list[str] = []  # 依赖的其他指标 alias（必须先计算）
+    alias: str
+    confidence: str = "medium"  # high | medium | low
+
+
+class EnrichedSpec(StrictModel):
+    """SpecEnricher 产出——原始 spec + 推断补充。
+
+    设计原则：
+    - original_spec 原封不动保留，所有推断结果放在独立字段
+    - 程序员手写的 metrics 优先级最高，不可被覆盖
+    - 推断结果标记置信度，low 置信度由 Validator 生成 HumanResolution 问题
+    """
+
+    original_spec: ParsedDeveloperSpec
+    # 推断的简单聚合指标（可直接合并到 original_spec.metrics）
+    inferred_metrics: list[MetricDecl] = []
+    # 推断的窗口指标（后续转为 WindowStep）
+    inferred_window_metrics: list[InferredWindowMetric] = []
+    # 推断的计算指标（聚合后表达式计算）
+    inferred_computed_metrics: list[InferredComputedMetric] = []
+    # 丰富化元数据
+    enrichment_metadata: dict = {}  # 包含 source, confidence_summary, inference_time_ms 等
 
 
 class DimensionDecl(StrictModel):
@@ -314,13 +390,50 @@ class InputTableDecl(StrictModel):
     business_columns: list[ColumnDecl] = []  # 从 YAML business_columns 解析
 
 
-class OutputSpecDecl(StrictModel):
-    """输出规格——声明输出列、粒度和可选排序/行限制。"""
+class OutputColumnDecl(StrictModel):
+    """输出列声明——包含名称、类型和可选的 SQL 语义描述。
 
-    columns: list[str]  # 输出列名列表
+    description 字段承载结构化 DSL：
+    - 简单聚合: "COUNT(*)" / "SUM(amount)" / "COUNT(DISTINCT user_id)"
+    - 条件聚合: "COUNT(DISTINCT plate_id)，仅含 STANDARD 状态"
+    - 计算指标: "fined_count / total_count，范围 [0, 1]"
+    - 窗口函数: "ROW_NUMBER() OVER (PARTITION BY dt ORDER BY cnt DESC)"
+    - 不支持函数: "MEDIAN(amount)" → 标记低置信度，走人工
+
+    DescriptionParser 负责从 description 解析出 MetricDecl。
+    """
+
+    name: str  # 输出列名
+    type: str = "varchar"  # 输出列类型（date / bigint / decimal / varchar）
+    description: str | None = None  # SQL 语义描述——DescriptionParser 的输入
+
+
+class OutputSpecDecl(StrictModel):
+    """输出规格——声明输出列、粒度和可选排序/行限制。
+
+    Phase 4D 升级：columns 从 list[str] → list[OutputColumnDecl]，
+    支持每列附带 type 和 description，DescriptionParser 从中解析指标。
+    向后兼容：YAML 中写字符串 "col_name" 自动转为 OutputColumnDecl(name="col_name")。
+    """
+
+    columns: list[OutputColumnDecl]  # 输出列列表（含 name/type/description）
     grain: list[str]  # 输出粒度
     sort: list[SortDecl] | None = None
     limit: int | None = None
+
+    @field_validator("columns", mode="before")
+    @classmethod
+    def _coerce_columns(cls, v: list) -> list:
+        """向后兼容：list[str] 自动转为 list[OutputColumnDecl] 的 dict 形式。"""
+        result = []
+        for item in v:
+            if isinstance(item, str):
+                result.append({"name": item})
+            elif isinstance(item, dict):
+                result.append(item)
+            else:
+                result.append(item)
+        return result
 
 
 # ════════════════════════════════════════════

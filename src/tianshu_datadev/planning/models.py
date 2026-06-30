@@ -17,6 +17,7 @@ from pydantic import AfterValidator
 
 from tianshu_datadev.developer_spec.models import (
     AggregationType,
+    MetricFilterDecl,
     SortDirection,
     StrictModel,
 )
@@ -176,15 +177,24 @@ class Predicate(StrictModel):
 
 
 class AggregateSpec(StrictModel):
-    """聚合规格——函数名 + 输入列 + 输出别名。
+    """聚合规格——函数名 + 输入列 + 输出别名 + 可选过滤/去重/表达式。
 
     input_column 为 None 时表示 COUNT(*)。
     aggregation 使用 AggregationType 枚举——拒绝自由字符串进入 SQL 渲染。
+
+    Phase 4D 新增：
+    - filter: 条件聚合 FILTER (WHERE ...)
+    - input_expression: 多字段表达式（如 "quantity * unit_price"）
+    - distinct: SUM(DISTINCT col) 等去重聚合
     """
 
     aggregation: AggregationType  # 封闭枚举：COUNT | SUM | AVG | MIN | MAX | COUNT_DISTINCT
     input_column: SafeIdentifier | None = None  # None 表示 COUNT(*)
     alias: SafeIdentifier  # 输出列别名
+    # ── Phase 4D 新增字段 ──
+    filter: MetricFilterDecl | None = None  # 条件聚合 FILTER (WHERE ...)
+    input_expression: str | None = None  # 多字段表达式（如 "quantity * unit_price"）
+    distinct: bool = False  # 去重聚合（用于 SUM(DISTINCT col)，COUNT_DISTINCT 已独立处理）
 
 
 class SortSpec(StrictModel):

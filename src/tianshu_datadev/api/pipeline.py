@@ -10,6 +10,7 @@ from __future__ import annotations
 from tianshu_datadev.artifacts.contract_extractor import DataTransformContractExtractor
 from tianshu_datadev.artifacts.packager import PackageInputs, ReviewPackageBuilder
 from tianshu_datadev.developer_spec.models import (
+    EnrichedSpec,
     FieldSource,
     ManifestColumn,
     ManifestTable,
@@ -17,6 +18,8 @@ from tianshu_datadev.developer_spec.models import (
     SourceManifest,
 )
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
+from tianshu_datadev.planning.relationship_planner import FakeRelationshipPlanner
+from tianshu_datadev.planning.spec_enricher import FakeSpecEnricher
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan, SqlBuildPlanBuilder
 from tianshu_datadev.planning.sql_program import (
     SqlProgram,
@@ -105,8 +108,8 @@ def _build_manifest(spec: ParsedDeveloperSpec) -> SourceManifest:
             _add(d.column_ref)
 
         # 从输出列提取
-        for col_name in spec.output_spec.columns:
-            _add(col_name)
+        for col in spec.output_spec.columns:
+            _add(col.name)
 
         # 从排序列提取
         if spec.output_spec.sort:
@@ -126,6 +129,25 @@ def _build_manifest(spec: ParsedDeveloperSpec) -> SourceManifest:
         spec_hash=spec.spec_hash,
         tables=tables,
     )
+
+
+def _auto_table_mapping(spec: ParsedDeveloperSpec) -> dict[str, str]:
+    """从 DeveloperSpec 的 source_tables 自动构建 table_mapping（别名 → 物理表名）。
+
+    当 API 请求未显式提供 table_mapping 时，用此函数补齐，
+    确保编译器能将 table_ref（如 "ue"）解析为物理表名（如 "dwd.user_events"）。
+
+    Args:
+        spec: 已解析的 DeveloperSpec
+
+    Returns:
+        {alias: physical_table_name} 映射字典
+    """
+    mapping: dict[str, str] = {}
+    for t in spec.input_tables:
+        if t.table_alias and t.source_table:
+            mapping[t.table_alias] = str(t.source_table)
+    return mapping
 
 
 class FakePipeline:
@@ -151,9 +173,10 @@ class FakePipeline:
             "description": "单表聚合——按维度分组统计指标，如日活、销售额汇总",
             "category": "aggregation",
             "markdown_template": (
+                "```markdown\n"
                 "---\n"
                 "spec:\n"
-                "  type: aggregate_table\n"
+                "  type: aggregate_table  # aggregate_table（汇总表）| detail_table（明细表）| label_table（标签表）\n"
                 "  target_table: ads.metrics_daily\n"
                 "  target_grain: [stat_date]\n"
                 '  summary: "按日期汇总核心指标"\n'
@@ -162,7 +185,7 @@ class FakePipeline:
                 "    - name: dwd.user_events\n"
                 "      alias: ue\n"
                 "      row_count: ~1000万\n"
-                "      role: fact\n"
+                "      role: fact  # fact（事实表）| dim（维度表）\n"
                 "      time_field: event_time\n"
                 "      key_columns:\n"
                 "        - name: id\n"
@@ -181,11 +204,11 @@ class FakePipeline:
                 "\n"
                 "  metrics:\n"
                 "    - metric_name: pv\n"
-                "      aggregation: COUNT\n"
+                "      aggregation: COUNT  # COUNT（计数）| SUM（求和）| AVG（平均）| MIN（最小）| MAX（最大）| COUNT_DISTINCT（去重计数）\n"
                 "      input_column: id\n"
                 "      alias: pv\n"
                 "    - metric_name: uv\n"
-                "      aggregation: COUNT_DISTINCT\n"
+                "      aggregation: COUNT_DISTINCT  # COUNT（计数）| SUM（求和）| AVG（平均）| MIN（最小）| MAX（最大）| COUNT_DISTINCT（去重计数）\n"
                 "      input_column: user_id\n"
                 "      alias: uv\n"
                 "\n"
@@ -206,6 +229,7 @@ class FakePipeline:
                 "\n"
                 "## 业务目标\n"
                 "按日期统计 PV 和 UV，产出日报表。\n"
+                "```\n"
             ),
         },
         {
@@ -214,9 +238,10 @@ class FakePipeline:
             "description": "CASE WHEN 分类打标——按条件对数据进行分类标签加工",
             "category": "label",
             "markdown_template": (
+                "```markdown\n"
                 "---\n"
                 "spec:\n"
-                "  type: label_table\n"
+                "  type: label_table  # aggregate_table（汇总表）| detail_table（明细表）| label_table（标签表）\n"
                 "  target_table: ads.user_labels\n"
                 "  target_grain: [user_id]\n"
                 '  summary: "用户价值分层标签加工"\n'
@@ -225,7 +250,7 @@ class FakePipeline:
                 "    - name: dwd.user_orders\n"
                 "      alias: uo\n"
                 "      row_count: ~500万\n"
-                "      role: fact\n"
+                "      role: fact  # fact（事实表）| dim（维度表）\n"
                 "      time_field: order_time\n"
                 "      key_columns:\n"
                 "        - name: user_id\n"
@@ -241,11 +266,11 @@ class FakePipeline:
                 "\n"
                 "  metrics:\n"
                 "    - metric_name: total_amount\n"
-                "      aggregation: SUM\n"
+                "      aggregation: SUM  # COUNT（计数）| SUM（求和）| AVG（平均）| MIN（最小）| MAX（最大）| COUNT_DISTINCT（去重计数）\n"
                 "      input_column: order_amount\n"
                 "      alias: total_amount\n"
                 "    - metric_name: order_cnt\n"
-                "      aggregation: COUNT\n"
+                "      aggregation: COUNT  # COUNT（计数）| SUM（求和）| AVG（平均）| MIN（最小）| MAX（最大）| COUNT_DISTINCT（去重计数）\n"
                 "      input_column: user_id\n"
                 "      alias: order_cnt\n"
                 "\n"
@@ -268,6 +293,7 @@ class FakePipeline:
                 "\n"
                 "## 业务目标\n"
                 "按用户汇总消费金额和订单数，输出价值分层标签。\n"
+                "```\n"
             ),
         },
         {
@@ -276,9 +302,10 @@ class FakePipeline:
             "description": "多表 Join + 聚合——两表关联后分组统计，产出宽表",
             "category": "multi_step",
             "markdown_template": (
+                "```markdown\n"
                 "---\n"
                 "spec:\n"
-                "  type: aggregate_table\n"
+                "  type: aggregate_table  # aggregate_table（汇总表）| detail_table（明细表）| label_table（标签表）\n"
                 "  target_table: ads.order_analysis\n"
                 "  target_grain: [order_date, category]\n"
                 '  summary: "订单品类分析——订单表关联商品维度表"\n'
@@ -287,7 +314,7 @@ class FakePipeline:
                 "    - name: dwd.orders\n"
                 "      alias: o\n"
                 "      row_count: ~2000万\n"
-                "      role: fact\n"
+                "      role: fact  # fact（事实表）| dim（维度表）\n"
                 "      time_field: order_date\n"
                 "      key_columns:\n"
                 "        - name: order_id\n"
@@ -309,7 +336,7 @@ class FakePipeline:
                 "    - name: dim.product\n"
                 "      alias: p\n"
                 "      row_count: ~10万\n"
-                "      role: dim\n"
+                "      role: dim  # fact（事实表）| dim（维度表）\n"
                 "      key_columns:\n"
                 "        - name: product_id\n"
                 "          type: bigint\n"
@@ -324,11 +351,11 @@ class FakePipeline:
                 "\n"
                 "  metrics:\n"
                 "    - metric_name: order_cnt\n"
-                "      aggregation: COUNT\n"
+                "      aggregation: COUNT  # COUNT（计数）| SUM（求和）| AVG（平均）| MIN（最小）| MAX（最大）| COUNT_DISTINCT（去重计数）\n"
                 "      input_column: order_id\n"
                 "      alias: order_cnt\n"
                 "    - metric_name: total_amount\n"
-                "      aggregation: SUM\n"
+                "      aggregation: SUM  # COUNT（计数）| SUM（求和）| AVG（平均）| MIN（最小）| MAX（最大）| COUNT_DISTINCT（去重计数）\n"
                 "      input_column: order_amount\n"
                 "      alias: total_amount\n"
                 "\n"
@@ -343,7 +370,7 @@ class FakePipeline:
                 "      right_table: p\n"
                 "      left_key: product_id\n"
                 "      right_key: product_id\n"
-                "      join_type: INNER\n"
+                "      join_type: INNER  # INNER（内连接）| LEFT（左连接）| RIGHT（右连接）| FULL（全连接）\n"
                 "\n"
                 "  output_columns:\n"
                 "    - name: order_date\n"
@@ -360,6 +387,7 @@ class FakePipeline:
                 "\n"
                 "## 业务目标\n"
                 "关联订单事实表和商品维度表，按日期和品类统计订单量和金额。\n"
+                "```\n"
             ),
         },
         {
@@ -368,9 +396,10 @@ class FakePipeline:
             "description": "两表关联——事实表关联维度表，展开宽表字段，不做聚合",
             "category": "join",
             "markdown_template": (
+                "```markdown\n"
                 "---\n"
                 "spec:\n"
-                "  type: detail_table\n"
+                "  type: detail_table  # aggregate_table（汇总表）| detail_table（明细表）| label_table（标签表）\n"
                 "  target_table: ads.order_detail_wide\n"
                 "  target_grain: [order_id]\n"
                 '  summary: "订单明细宽表——关联商品维度，展开品类和名称"\n'
@@ -379,7 +408,7 @@ class FakePipeline:
                 "    - name: dwd.orders\n"
                 "      alias: o\n"
                 "      row_count: ~2000万\n"
-                "      role: fact\n"
+                "      role: fact  # fact（事实表）| dim（维度表）\n"
                 "      time_field: order_date\n"
                 "      key_columns:\n"
                 "        - name: order_id\n"
@@ -401,7 +430,7 @@ class FakePipeline:
                 "    - name: dim.product\n"
                 "      alias: p\n"
                 "      row_count: ~10万\n"
-                "      role: dim\n"
+                "      role: dim  # fact（事实表）| dim（维度表）\n"
                 "      key_columns:\n"
                 "        - name: product_id\n"
                 "          type: bigint\n"
@@ -422,7 +451,7 @@ class FakePipeline:
                 "      right_table: p\n"
                 "      left_key: product_id\n"
                 "      right_key: product_id\n"
-                "      join_type: LEFT\n"
+                "      join_type: LEFT  # INNER（内连接）| LEFT（左连接）| RIGHT（右连接）| FULL（全连接）\n"
                 "\n"
                 "  output_columns:\n"
                 "    - name: order_id\n"
@@ -446,6 +475,7 @@ class FakePipeline:
                 "## 业务目标\n"
                 "关联订单事实表和商品维度表，展开商品名称、品类、品牌等维度属性，\n"
                 "产出订单明细宽表供下游分析使用。\n"
+                "```\n"
             ),
         },
         {
@@ -454,9 +484,10 @@ class FakePipeline:
             "description": "窗口函数排名——ROW_NUMBER/RANK 分组排序取 TopN，如各品类销售额 Top10 商品",
             "category": "window",
             "markdown_template": (
+                "```markdown\n"
                 "---\n"
                 "spec:\n"
-                "  type: aggregate_table\n"
+                "  type: aggregate_table  # aggregate_table（汇总表）| detail_table（明细表）| label_table（标签表）\n"
                 "  target_table: ads.category_top10_product\n"
                 "  target_grain: [category, product_id]\n"
                 '  summary: "各品类销售额 Top10 商品排名"\n'
@@ -465,7 +496,7 @@ class FakePipeline:
                 "    - name: dwd.order_items\n"
                 "      alias: oi\n"
                 "      row_count: ~5000万\n"
-                "      role: fact\n"
+                "      role: fact  # fact（事实表）| dim（维度表）\n"
                 "      time_field: order_date\n"
                 "      key_columns:\n"
                 "        - name: item_id\n"
@@ -487,7 +518,7 @@ class FakePipeline:
                 "    - name: dim.product\n"
                 "      alias: p\n"
                 "      row_count: ~10万\n"
-                "      role: dim\n"
+                "      role: dim  # fact（事实表）| dim（维度表）\n"
                 "      key_columns:\n"
                 "        - name: product_id\n"
                 "          type: bigint\n"
@@ -502,7 +533,7 @@ class FakePipeline:
                 "\n"
                 "  metrics:\n"
                 "    - metric_name: total_sales\n"
-                "      aggregation: SUM\n"
+                "      aggregation: SUM  # COUNT（计数）| SUM（求和）| AVG（平均）| MIN（最小）| MAX（最大）| COUNT_DISTINCT（去重计数）\n"
                 "      input_column: sale_amount\n"
                 "      alias: total_sales\n"
                 "\n"
@@ -517,7 +548,7 @@ class FakePipeline:
                 "      right_table: p\n"
                 "      left_key: product_id\n"
                 "      right_key: product_id\n"
-                "      join_type: INNER\n"
+                "      join_type: INNER  # INNER（内连接）| LEFT（左连接）| RIGHT（右连接）| FULL（全连接）\n"
                 "\n"
                 "  output_columns:\n"
                 "    - name: category\n"
@@ -541,6 +572,7 @@ class FakePipeline:
                 "## 窗口函数说明\n"
                 "使用 ROW_NUMBER() OVER (PARTITION BY category ORDER BY total_sales DESC) 排名，\n"
                 "外层 WHERE rank_in_category <= 10 取 TopN。\n"
+                "```\n"
             ),
         },
         {
@@ -549,9 +581,10 @@ class FakePipeline:
             "description": "空白模板——从零开始编写 DeveloperSpec，适合自定义需求",
             "category": "empty",
             "markdown_template": (
+                "```markdown\n"
                 "---\n"
                 "spec:\n"
-                "  type: aggregate_table       # aggregate_table | detail_table | label_table\n"
+                "  type: aggregate_table  # aggregate_table（汇总表）| detail_table（明细表）| label_table（标签表）\n"
                 "  target_table: ads.目标表名\n"
                 "  target_grain: [维度列1, 维度列2]\n"
                 '  summary: "一句话描述业务目标"\n'
@@ -560,7 +593,7 @@ class FakePipeline:
                 "    - name: dwd.源表名\n"
                 "      alias: 别名（两个字母）\n"
                 "      row_count: ~估算行数\n"
-                "      role: fact                 # fact | dim\n"
+                "      role: fact  # fact（事实表）| dim（维度表）\n"
                 "      time_field: 时间字段名      # 如有\n"
                 "      key_columns:\n"
                 "        - name: 主键列名\n"
@@ -573,7 +606,7 @@ class FakePipeline:
                 "\n"
                 "  metrics:                       # 指标声明（可选）\n"
                 "    # - metric_name: 指标名\n"
-                "    #   aggregation: SUM|COUNT|COUNT_DISTINCT|AVG|MAX|MIN\n"
+                "    #   aggregation: SUM（求和）| COUNT（计数）| COUNT_DISTINCT（去重计数）| AVG（平均）| MAX（最大）| MIN（最小）\n"
                 "    #   input_column: 输入列名\n"
                 "    #   alias: 输出别名\n"
                 "\n"
@@ -586,7 +619,7 @@ class FakePipeline:
                 "    #   right_table: 右表别名\n"
                 "    #   left_key: 左键列名\n"
                 "    #   right_key: 右键列名\n"
-                "    #   join_type: INNER|LEFT|RIGHT\n"
+                "    #   join_type: INNER（内连接）| LEFT（左连接）| RIGHT（右连接）| FULL（全连接）\n"
                 "\n"
                 "  output_columns:                # 输出列定义\n"
                 "    # - name: 列名\n"
@@ -600,6 +633,7 @@ class FakePipeline:
                 "\n"
                 "## 数据说明\n"
                 "在此补充数据源、字段含义、业务口径等说明。\n"
+                "```\n"
             ),
         },
     ]
@@ -613,6 +647,37 @@ class FakePipeline:
         self._base_output_dir = base_output_dir
         self._results: dict[str, dict] = {}  # request_id → 内部产物
         self._packages: dict[str, object] = {}  # request_id → ReviewPackageManifest
+        self._relationship_planner = FakeRelationshipPlanner()  # 多表时生成 Join 推测
+        self._spec_enricher = FakeSpecEnricher()  # 指标推断（规则匹配，Phase 4 替换为 LLM）
+
+    @staticmethod
+    def _apply_enrichment(spec: ParsedDeveloperSpec, manifest: SourceManifest, enricher) -> ParsedDeveloperSpec:
+        """应用 SpecEnricher 推断——将推断指标合并到 spec.metrics 中。
+
+        程序员手写的 metrics 优先级最高（不可覆盖），
+        仅追加 inferred_metrics 中不与现有 alias 冲突的条目。
+
+        Args:
+            spec: 原始 DeveloperSpec
+            manifest: 源数据清单
+            enricher: SpecEnricher 实例
+
+        Returns:
+            增强后的 ParsedDeveloperSpec（metrics 已合并推断结果）
+        """
+        enriched: EnrichedSpec = enricher.enrich(spec, manifest)
+        if not enriched.inferred_metrics:
+            return spec
+        # 仅合并不与手写 alias 冲突的推断指标
+        declared_aliases = {m.alias for m in spec.metrics}
+        new_metrics = [
+            m for m in enriched.inferred_metrics
+            if m.alias not in declared_aliases
+        ]
+        if not new_metrics:
+            return spec
+        combined = list(spec.metrics) + new_metrics
+        return spec.model_copy(update={"metrics": combined})
 
     @staticmethod
     def _gen_request_id(spec: ParsedDeveloperSpec) -> str:
@@ -666,8 +731,21 @@ class FakePipeline:
         spec = parser.parse(markdown_text)
         manifest = _build_manifest(spec)
 
+        # 未显式提供 table_mapping 时，自动从 spec 的 source_tables 推断
+        if not table_mapping:
+            table_mapping = _auto_table_mapping(spec)
+
+        # SpecEnricher：从业务描述推断缺失指标（Phase 4D）
+        spec = self._apply_enrichment(spec, manifest, self._spec_enricher)
+
+        # 多表时通过 FakeRelationshipPlanner 生成 Join 推测
+        extra_questions = []
+        hypothesis = None
+        if len(spec.input_tables) > 1:
+            hypothesis, extra_questions = self._relationship_planner.plan(spec, manifest)
+
         builder = SqlBuildPlanBuilder()
-        plan, plan_questions = builder.build(spec)
+        plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
 
         validator = SqlBuildPlanValidator()
         passed, val_questions = validator.validate(plan, manifest)
@@ -680,7 +758,7 @@ class FakePipeline:
             "table_mapping": table_mapping or {},
         }
 
-        all_questions = list(plan_questions) + list(val_questions)
+        all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
         return {
             "request_id": request_id,
             "spec_id": spec.spec_id,
@@ -711,13 +789,26 @@ class FakePipeline:
         spec = parser.parse(markdown_text)
         manifest = _build_manifest(spec)
 
+        # 未显式提供 table_mapping 时，自动从 spec 的 source_tables 推断
+        if not table_mapping:
+            table_mapping = _auto_table_mapping(spec)
+
+        # SpecEnricher：从业务描述推断缺失指标（Phase 4D）
+        spec = self._apply_enrichment(spec, manifest, self._spec_enricher)
+
+        # 多表时通过 FakeRelationshipPlanner 生成 Join 推测
+        extra_questions = []
+        hypothesis = None
+        if len(spec.input_tables) > 1:
+            hypothesis, extra_questions = self._relationship_planner.plan(spec, manifest)
+
         builder = SqlBuildPlanBuilder()
-        plan, plan_questions = builder.build(spec)
+        plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
 
         # Validator 验证（非阻断——记录问题供排查）
         validator = SqlBuildPlanValidator()
         _passed, val_questions = validator.validate(plan, manifest)
-        all_questions = list(plan_questions) + list(val_questions)
+        all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
 
         compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
         compiled = compiler.compile(plan)
@@ -809,9 +900,22 @@ class FakePipeline:
         # 2. 构建 SourceManifest
         manifest = _build_manifest(spec)
 
+        # 未显式提供 table_mapping 时，自动从 spec 的 source_tables 推断
+        if not table_mapping:
+            table_mapping = _auto_table_mapping(spec)
+
+        # 2.5 SpecEnricher：从业务描述推断缺失指标（Phase 4D）
+        spec = self._apply_enrichment(spec, manifest, self._spec_enricher)
+
+        # 2.6 多表时通过 FakeRelationshipPlanner 生成 Join 推测
+        extra_questions = []
+        hypothesis = None
+        if len(spec.input_tables) > 1:
+            hypothesis, extra_questions = self._relationship_planner.plan(spec, manifest)
+
         # 3. 构建 SqlBuildPlan
         builder = SqlBuildPlanBuilder()
-        plan, plan_questions = builder.build(spec)
+        plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
 
         # 4. Validator 验证
         validator = SqlBuildPlanValidator()
@@ -848,7 +952,7 @@ class FakePipeline:
             execution_trace=trace.model_dump(),
             result_summary=summary.model_dump(),
             data_transform_contract=contract.model_dump(),
-            open_questions=[q.model_dump() for q in spec.open_questions + plan_questions],
+            open_questions=[q.model_dump() for q in spec.open_questions + plan_questions + extra_questions],
             validation_questions=[q.model_dump() for q in val_questions],
             perf_results=[],
             retry_count=0,
@@ -967,9 +1071,9 @@ class FakePipeline:
             ms = [m.alias for m in step.metrics]
             desc_parts.append(f"按 {', '.join(gk)} 分组，聚合: {', '.join(ms)}")
         elif stype == "project":
-            cols = [a.alias for a in step.aliases[:5]]
-            if len(step.aliases) > 5:
-                cols.append(f"+{len(step.aliases) - 5}")
+            cols = [a.alias for a in step.columns[:5]]
+            if len(step.columns) > 5:
+                cols.append(f"+{len(step.columns) - 5}")
             desc_parts.append(f"投影列: {', '.join(cols)}")
         elif stype == "sort":
             sc = [f"{s.column} {s.direction}" for s in step.sort_keys]
@@ -1139,7 +1243,7 @@ class FakePipeline:
             "joins": joins,
             "time_range": time_range,
             "output_spec": {
-                "columns": spec.output_spec.columns,
+                "columns": [c.model_dump() for c in spec.output_spec.columns],
                 "grain": spec.output_spec.grain,
                 "sort_columns": [s.column for s in (spec.output_spec.sort or [])],
                 "limit": spec.output_spec.limit,
@@ -1164,8 +1268,21 @@ class FakePipeline:
         spec = parser.parse(markdown_text)
         manifest = _build_manifest(spec)
 
+        # 未显式提供 table_mapping 时，自动从 spec 的 source_tables 推断
+        if not table_mapping:
+            table_mapping = _auto_table_mapping(spec)
+
+        # SpecEnricher：从业务描述推断缺失指标（Phase 4D）
+        spec = self._apply_enrichment(spec, manifest, self._spec_enricher)
+
+        # 多表时通过 FakeRelationshipPlanner 生成 Join 推测
+        extra_questions = []
+        hypothesis = None
+        if len(spec.input_tables) > 1:
+            hypothesis, extra_questions = self._relationship_planner.plan(spec, manifest)
+
         builder = SqlBuildPlanBuilder()
-        plan, plan_questions = builder.build(spec)
+        plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
 
         validator = SqlBuildPlanValidator()
         passed, val_questions = validator.validate(plan, manifest)
@@ -1176,7 +1293,7 @@ class FakePipeline:
             "table_mapping": table_mapping or {},
         }
 
-        all_questions = list(plan_questions) + list(val_questions)
+        all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
 
         # 提取步骤摘要
         steps = [self._step_to_summary(s) for s in plan.steps]
@@ -1216,12 +1333,25 @@ class FakePipeline:
         spec = parser.parse(markdown_text)
         manifest = _build_manifest(spec)
 
+        # 未显式提供 table_mapping 时，自动从 spec 的 source_tables 推断
+        if not table_mapping:
+            table_mapping = _auto_table_mapping(spec)
+
+        # SpecEnricher：从业务描述推断缺失指标（Phase 4D）
+        spec = self._apply_enrichment(spec, manifest, self._spec_enricher)
+
+        # 多表时通过 FakeRelationshipPlanner 生成 Join 推测
+        extra_questions = []
+        hypothesis = None
+        if len(spec.input_tables) > 1:
+            hypothesis, extra_questions = self._relationship_planner.plan(spec, manifest)
+
         builder = SqlBuildPlanBuilder()
-        plan, plan_questions = builder.build(spec)
+        plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
 
         validator = SqlBuildPlanValidator()
         _passed, val_questions = validator.validate(plan, manifest)
-        all_questions = list(plan_questions) + list(val_questions)
+        all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
 
         compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
         compiled = compiler.compile(plan)

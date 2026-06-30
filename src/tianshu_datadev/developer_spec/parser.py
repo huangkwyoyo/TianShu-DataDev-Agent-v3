@@ -566,18 +566,24 @@ class DeveloperSpecParser:
 
         7 项禁止检查：output_columns 为空 → E006。
         """
-        # 从 output_columns 提取列名列表
+        # 从 output_columns 提取列声明列表（name + type + description）
+        from tianshu_datadev.developer_spec.models import OutputColumnDecl
         raw_output_cols = spec_dict.get("output_columns", []) or []
-        columns: list[str] = []
+        columns: list[OutputColumnDecl] = []
         for col in raw_output_cols:
             if isinstance(col, dict):
                 # 检查每个输出列是否包含禁止的 SQL 字段
                 self._check_forbidden_sql_fields(col, f"output_column {col.get('name', '?')}")
                 name = col.get("name", "")
                 if name:
-                    columns.append(name)
+                    columns.append(OutputColumnDecl(
+                        name=name,
+                        type=col.get("type", "varchar"),
+                        description=col.get("description"),
+                    ))
             elif isinstance(col, str):
-                columns.append(col)
+                # 向后兼容：纯字符串列名
+                columns.append(OutputColumnDecl(name=col))
 
         if not columns:
             raise ParseError(

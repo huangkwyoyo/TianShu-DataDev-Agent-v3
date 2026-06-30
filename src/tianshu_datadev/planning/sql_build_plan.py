@@ -501,8 +501,8 @@ class SqlBuildPlanBuilder:
                 _add(s.column)
 
         # 输出列的源列
-        for col_name in spec.output_spec.columns:
-            _add(col_name)
+        for col in spec.output_spec.columns:
+            _add(col.name)
 
         return cols
 
@@ -576,14 +576,18 @@ class SqlBuildPlanBuilder:
                     )
                 )
 
-        # metrics
+        # metrics——透传 MetricDecl 的全部字段（含 Phase 4D 新增的 filter/input_expression/distinct）
         agg_metrics: list[AggregateSpec] = []
         for m in spec.metrics:
             agg_metrics.append(
                 AggregateSpec(
-                    aggregation=m.aggregation,  # 直接传递 AggregationType 枚举
+                    aggregation=m.aggregation,
                     input_column=m.input_column,
                     alias=m.alias,
+                    # Phase 4D：透传条件聚合、表达式聚合、去重标志
+                    filter=m.filter,
+                    input_expression=m.input_expression,
+                    distinct=m.distinct,
                 )
             )
 
@@ -600,7 +604,8 @@ class SqlBuildPlanBuilder:
     def _build_project_step(self, spec: ParsedDeveloperSpec) -> ProjectStep:
         """从 spec.output_spec 构建 ProjectStep。"""
         proj_cols: list[AliasExpr] = []
-        for col_name in spec.output_spec.columns:
+        for col in spec.output_spec.columns:
+            col_name = col.name
             normalized = self._normalizer.normalize(col_name)
             proj_cols.append(
                 AliasExpr(
@@ -613,7 +618,7 @@ class SqlBuildPlanBuilder:
                 )
             )
 
-        step_id_content = {"columns": spec.output_spec.columns}
+        step_id_content = {"columns": [c.name for c in spec.output_spec.columns]}
         return ProjectStep(
             step_id=SqlBuildPlan.generate_step_id("project", step_id_content),
             columns=proj_cols,

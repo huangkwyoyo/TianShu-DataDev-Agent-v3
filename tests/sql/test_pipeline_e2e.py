@@ -79,8 +79,8 @@ def _build_manifest(spec) -> SourceManifest:
             _add(d.column_ref)
 
         # 从输出列提取
-        for col_name in spec.output_spec.columns:
-            _add(col_name)
+        for col in spec.output_spec.columns:
+            _add(col.name)
 
         # 从排序列提取
         if spec.output_spec.sort:

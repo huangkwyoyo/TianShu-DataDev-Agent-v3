@@ -77,6 +77,9 @@ from .temp_table import (
     validate_temp_table_refs,
 )
 
+# ── SpecEnricher（Phase 4D 指标推断） ──
+from .spec_enricher import FakeSpecEnricher, SpecEnricher
+
 __all__ = [
     # IR 基础类型
     "AggregateSpec",
@@ -130,4 +133,7 @@ __all__ = [
     "validate_consumer_is_declared",
     "validate_temp_table_naming",
     "validate_temp_table_refs",
+    # SpecEnricher（Phase 4D 指标推断）
+    "FakeSpecEnricher",
+    "SpecEnricher",
 ]
