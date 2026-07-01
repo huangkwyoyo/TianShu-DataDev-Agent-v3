@@ -150,6 +150,352 @@ class TestParserRejection:
 # Hash 确定性
 # ════════════════════════════════════════════
 
+# ════════════════════════════════════════════
+# ComputeSteps 解析——环检测与 DAG 校验
+# ════════════════════════════════════════════
+
+# 最小合法 Spec 模板——包含 compute_steps 的基础 YAML 结构
+_MINIMAL_COMPUTE_STEPS_SPEC_TEMPLATE = """```markdown
+---
+spec:
+  type: aggregate_table
+  target_table: ads.test_cs
+  target_grain: [id]
+  summary: "ComputeSteps 解析测试"
+  source_tables:
+    - name: dwd.test_fact
+      alias: t
+      row_count: ~100万
+      role: fact
+      key_columns:
+        - name: id
+          type: bigint
+          nullable: false
+      business_columns:
+        - name: val
+          type: bigint
+          nullable: true
+{compute_steps_yaml}
+  output_columns:
+    - name: id
+      type: bigint
+    - name: result
+      type: bigint
+---
+# 测试
+```
+"""
+
+# 单个 ComputeStep 的最小合法声明
+_VALID_STEP_TEMPLATE = """    - step_name: {name}
+      source: {source}
+      group_by: [id]
+      metrics:
+        - metric_name: cnt
+          aggregation: COUNT
+          input_column: id
+          alias: cnt
+      output_alias: {alias}"""
+
+
+def _make_compute_steps_spec(steps_yaml: str) -> str:
+    """构造含 compute_steps 声明的完整 Markdown 测试文本。"""
+    return _MINIMAL_COMPUTE_STEPS_SPEC_TEMPLATE.format(
+        compute_steps_yaml=steps_yaml,
+    )
+
+
+class TestComputeStepsParser:
+    """compute_steps 解析——环检测、引用校验、合法 DAG 通过。"""
+
+    # ── 禁止场景（应抛出 ParseError）──
+
+    def test_self_loop_rejected(self):
+        """自引用步骤 → ParseError（source 引用自己，被前向引用检查拦截）。
+
+        注：自引用步骤的 source=自身，而自身尚未加入 step_names，
+        因此前向引用检查（L854）先于自引用检查（L862）触发。
+        错误码和消息均为前向引用路径。
+        """
+        steps = _VALID_STEP_TEMPLATE.format(
+            name="step_a", source="step_a", alias="a_alias",
+        )
+        text = _make_compute_steps_spec(f"  compute_steps:\n{steps}\n")
+        parser = DeveloperSpecParser()
+        with pytest.raises(ParseError) as exc:
+            parser.parse(text)
+        assert exc.value.error_code == ParseErrorCode.E004_UNDECLARED_FIELD_REF
+        assert "step_a" in exc.value.message
+        assert "无效" in exc.value.message or "已声明的 step_name" in exc.value.message
+
+    def test_forward_reference_rejected(self):
+        """引用未声明的步骤 → ParseError（前向引用拦截）。"""
+        steps = (
+            _VALID_STEP_TEMPLATE.format(
+                name="step_a", source="step_b", alias="a_alias",
+            )
+            + "\n"
+            + _VALID_STEP_TEMPLATE.format(
+                name="step_b", source="input", alias="b_alias",
+            )
+        )
+        text = _make_compute_steps_spec(f"  compute_steps:\n{steps}\n")
+        parser = DeveloperSpecParser()
+        with pytest.raises(ParseError) as exc:
+            parser.parse(text)
+        assert exc.value.error_code == ParseErrorCode.E004_UNDECLARED_FIELD_REF
+        assert "step_b" in exc.value.message
+
+    def test_duplicate_step_name_rejected(self):
+        """重复 step_name → ParseError。"""
+        step = _VALID_STEP_TEMPLATE.format(
+            name="step_a", source="input", alias="a_alias",
+        )
+        steps = f"{step}\n{step}"  # 两个同名步骤
+        text = _make_compute_steps_spec(f"  compute_steps:\n{steps}\n")
+        parser = DeveloperSpecParser()
+        with pytest.raises(ParseError) as exc:
+            parser.parse(text)
+        assert exc.value.error_code == ParseErrorCode.E005_DUPLICATE_TABLE_ALIAS
+        assert "重复" in exc.value.message
+
+    def test_list_source_duplicate_element_rejected(self):
+        """source 列表中元素重复 → ParseError。"""
+        steps = (
+            _VALID_STEP_TEMPLATE.format(
+                name="step_a", source="input", alias="a_alias",
+            )
+            + "\n"
+            + "    - step_name: step_b\n"
+            + "      source: [step_a, step_a]\n"
+            + "      group_by: [id]\n"
+            + "      metrics:\n"
+            + "        - metric_name: cnt2\n"
+            + "          aggregation: SUM\n"
+            + "          input_column: val\n"
+            + "          alias: cnt2\n"
+            + "      output_alias: b_alias"
+        )
+        text = _make_compute_steps_spec(f"  compute_steps:\n{steps}\n")
+        parser = DeveloperSpecParser()
+        with pytest.raises(ParseError) as exc:
+            parser.parse(text)
+        assert exc.value.error_code == ParseErrorCode.E004_UNDECLARED_FIELD_REF
+        assert "重复" in exc.value.message
+
+    def test_missing_output_alias_rejected(self):
+        """缺少 output_alias → ParseError。"""
+        steps = (
+            "    - step_name: step_a\n"
+            "      source: input\n"
+            "      group_by: [id]\n"
+            "      metrics:\n"
+            "        - metric_name: cnt\n"
+            "          aggregation: COUNT\n"
+            "          input_column: id\n"
+            "          alias: cnt\n"
+        )
+        text = _make_compute_steps_spec(f"  compute_steps:\n{steps}\n")
+        parser = DeveloperSpecParser()
+        with pytest.raises(ParseError) as exc:
+            parser.parse(text)
+        assert exc.value.error_code == ParseErrorCode.E001_YAML_PARSE_FAILED
+        assert "output_alias" in exc.value.message
+
+    def test_forward_reference_in_list_source_rejected(self):
+        """source 列表中含未声明步骤 → ParseError（前向引用拦截，列表形式）。"""
+        steps = (
+            _VALID_STEP_TEMPLATE.format(
+                name="step_a", source="input", alias="a_alias",
+            )
+            + "\n"
+            + "    - step_name: step_b\n"
+            + "      source: [step_a, step_c]\n"
+            + "      group_by: [id]\n"
+            + "      metrics:\n"
+            + "        - metric_name: cnt2\n"
+            + "          aggregation: SUM\n"
+            + "          input_column: val\n"
+            + "          alias: cnt2\n"
+            + "      output_alias: b_alias"
+        )
+        text = _make_compute_steps_spec(f"  compute_steps:\n{steps}\n")
+        parser = DeveloperSpecParser()
+        with pytest.raises(ParseError) as exc:
+            parser.parse(text)
+        assert exc.value.error_code == ParseErrorCode.E004_UNDECLARED_FIELD_REF
+        assert "step_c" in exc.value.message
+
+    def test_forward_reference_in_list_source_with_input_rejected(self):
+        """source 列表含 'input' + 未声明步骤 → ParseError（前向引用拦截）。"""
+        steps = (
+            "    - step_name: step_a\n"
+            "      source: [input, step_b]\n"
+            "      group_by: [id]\n"
+            "      metrics:\n"
+            "        - metric_name: cnt\n"
+            "          aggregation: COUNT\n"
+            "          input_column: id\n"
+            "          alias: cnt\n"
+            "      output_alias: a_alias\n"
+            + _VALID_STEP_TEMPLATE.format(
+                name="step_b", source="input", alias="b_alias",
+            )
+        )
+        text = _make_compute_steps_spec(f"  compute_steps:\n{steps}\n")
+        parser = DeveloperSpecParser()
+        with pytest.raises(ParseError) as exc:
+            parser.parse(text)
+        assert exc.value.error_code == ParseErrorCode.E004_UNDECLARED_FIELD_REF
+        assert "step_b" in exc.value.message
+
+    def test_empty_source_list_rejected(self):
+        """source 为空列表 → ParseError。"""
+        steps = (
+            "    - step_name: step_a\n"
+            "      source: []\n"
+            "      group_by: [id]\n"
+            "      metrics:\n"
+            "        - metric_name: cnt\n"
+            "          aggregation: COUNT\n"
+            "          input_column: id\n"
+            "          alias: cnt\n"
+            "      output_alias: a_alias"
+        )
+        text = _make_compute_steps_spec(f"  compute_steps:\n{steps}\n")
+        parser = DeveloperSpecParser()
+        with pytest.raises(ParseError) as exc:
+            parser.parse(text)
+        assert exc.value.error_code == ParseErrorCode.E001_YAML_PARSE_FAILED
+        assert "不能为空" in exc.value.message
+
+    def test_undeclared_metric_field_in_input_source_rejected(self):
+        """source=input 时指标引用未声明字段 → ParseError。"""
+        steps = (
+            "    - step_name: step_a\n"
+            "      source: input\n"
+            "      group_by: [id]\n"
+            "      metrics:\n"
+            "        - metric_name: bad_metric\n"
+            "          aggregation: SUM\n"
+            "          input_column: nonexistent_col\n"
+            "          alias: bad\n"
+            "      output_alias: a_alias"
+        )
+        text = _make_compute_steps_spec(f"  compute_steps:\n{steps}\n")
+        parser = DeveloperSpecParser()
+        with pytest.raises(ParseError) as exc:
+            parser.parse(text)
+        assert exc.value.error_code == ParseErrorCode.E004_UNDECLARED_FIELD_REF
+        assert "nonexistent_col" in exc.value.message
+
+    # ── 允许场景（应成功解析）──
+
+    def test_linear_chain_accepted(self):
+        """2 步线性链 A→B 通过解析，compute_steps 结构正确。"""
+        steps = (
+            _VALID_STEP_TEMPLATE.format(
+                name="daily_agg", source="input", alias="daily_alias",
+            )
+            + "\n"
+            + "    - step_name: monthly_avg\n"
+            + "      source: daily_agg\n"
+            + "      group_by: [id]\n"
+            + "      metrics:\n"
+            + "        - metric_name: avg_val\n"
+            + "          aggregation: AVG\n"
+            + "          input_column: cnt\n"
+            + "          alias: avg_val\n"
+            + "      output_alias: monthly_alias"
+        )
+        text = _make_compute_steps_spec(f"  compute_steps:\n{steps}\n")
+        parser = DeveloperSpecParser()
+        spec = parser.parse(text)
+        assert spec is not None
+        assert spec.compute_steps is not None
+        assert len(spec.compute_steps) == 2
+        assert spec.compute_steps[0].step_name == "daily_agg"
+        assert spec.compute_steps[0].source == "input"
+        assert spec.compute_steps[1].step_name == "monthly_avg"
+        assert spec.compute_steps[1].source == "daily_agg"
+
+    def test_diamond_dag_accepted(self):
+        """4 步菱形 DAG A→B,A→C,B→D,C→D 通过解析。"""
+        steps = (
+            _VALID_STEP_TEMPLATE.format(
+                name="root", source="input", alias="root_alias",
+            )
+            + "\n"
+            + _VALID_STEP_TEMPLATE.format(
+                name="branch_a", source="root", alias="a_alias",
+            )
+            + "\n"
+            + _VALID_STEP_TEMPLATE.format(
+                name="branch_b", source="root", alias="b_alias",
+            )
+            + "\n"
+            + "    - step_name: merged\n"
+            + "      source: [branch_a, branch_b]\n"
+            + "      group_by: [id]\n"
+            + "      metrics:\n"
+            + "        - metric_name: total\n"
+            + "          aggregation: SUM\n"
+            + "          input_column: cnt\n"
+            + "          alias: total\n"
+            + "      output_alias: merged_alias"
+        )
+        text = _make_compute_steps_spec(f"  compute_steps:\n{steps}\n")
+        parser = DeveloperSpecParser()
+        spec = parser.parse(text)
+        assert spec is not None
+        assert spec.compute_steps is not None
+        assert len(spec.compute_steps) == 4
+        # 验证合流步骤的 source 为列表
+        merged = spec.compute_steps[3]
+        assert merged.step_name == "merged"
+        assert isinstance(merged.source, list)
+        assert set(merged.source) == {"branch_a", "branch_b"}
+
+    def test_single_input_step_accepted(self):
+        """单步 input source → 通过解析，compute_steps 含 1 个步骤。"""
+        steps = _VALID_STEP_TEMPLATE.format(
+            name="only_step", source="input", alias="only_alias",
+        )
+        text = _make_compute_steps_spec(f"  compute_steps:\n{steps}\n")
+        parser = DeveloperSpecParser()
+        spec = parser.parse(text)
+        assert spec is not None
+        assert spec.compute_steps is not None
+        assert len(spec.compute_steps) == 1
+        assert spec.compute_steps[0].source == "input"
+
+    def test_no_compute_steps_is_none(self):
+        """不声明 compute_steps → spec.compute_steps 为 None（向后兼容）。"""
+        text = _make_compute_steps_spec("")
+        parser = DeveloperSpecParser()
+        spec = parser.parse(text)
+        assert spec is not None
+        assert spec.compute_steps is None
+
+    def test_compute_steps_hash_determinism(self):
+        """相同 compute_steps 两次解析产生相同 spec_hash。"""
+        steps = (
+            _VALID_STEP_TEMPLATE.format(
+                name="step_a", source="input", alias="a_alias",
+            )
+            + "\n"
+            + _VALID_STEP_TEMPLATE.format(
+                name="step_b", source="step_a", alias="b_alias",
+            )
+        )
+        text = _make_compute_steps_spec(f"  compute_steps:\n{steps}\n")
+        parser = DeveloperSpecParser()
+        spec1 = parser.parse(text)
+        spec2 = parser.parse(text)
+        assert spec1.spec_hash == spec2.spec_hash
+        assert len(spec1.spec_hash) == 16
+
+
 class TestParserHashDeterminism:
     """normalized_spec_hash 确定性验证。"""
 
