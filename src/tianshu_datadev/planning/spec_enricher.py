@@ -1007,7 +1007,8 @@ _METRIC_JSON_SCHEMA = {
                     "metric_name": {"type": "string"},
                     "window_function": {
                         "type": "string",
-                        "enum": ["ROW_NUMBER", "RANK", "DENSE_RANK", "SUM", "AVG", "LAG", "LEAD"],
+                        "enum": ["ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE",
+                                 "LAG", "LEAD", "SUM_OVER", "AVG_OVER", "COUNT_OVER"],
                     },
                     "input_column": {"type": "string"},
                     "partition_by": {
@@ -1050,6 +1051,29 @@ _METRIC_JSON_SCHEMA = {
     "required": ["inferred_metrics", "inferred_window_metrics", "inferred_computed_metrics"],
     "additionalProperties": False,
 }
+
+
+# ════════════════════════════════════════════
+# 窗口函数白名单 + 表达式安全校验常量
+# ════════════════════════════════════════════
+
+# 合法窗口函数名集合——与 planning.models.WindowFunction 枚举保持一致
+_VALID_WINDOW_FUNCTIONS: frozenset[str] = frozenset({
+    "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE",
+    "LAG", "LEAD", "SUM_OVER", "AVG_OVER", "COUNT_OVER",
+})
+
+# 旧名→新名映射——兼容历史 JSON Schema 中的命名（SUM→SUM_OVER, AVG→AVG_OVER）
+_WINDOW_FUNCTION_ALIASES: dict[str, str] = {
+    "SUM": "SUM_OVER",
+    "AVG": "AVG_OVER",
+}
+
+# expression 字段中禁止出现的 SQL 特殊字符——与 _PHYSICAL_TABLE_NAME_FORBIDDEN 同策略
+_FORBIDDEN_EXPRESSION_CHARS: frozenset[str] = frozenset({";", "'", '"', "`"})
+
+# expression 字段中禁止出现的 SQL 注释/注入模式
+_FORBIDDEN_EXPRESSION_PATTERNS: tuple[str, ...] = ("--", "/*")
 
 
 class SpecEnricher:
@@ -1225,10 +1249,17 @@ class SpecEnricher:
 
         # 解析窗口指标
         for item in raw.get("inferred_window_metrics", []):
+            wf = item.get("window_function", "")
+            # 旧名兼容映射——SUM→SUM_OVER, AVG→AVG_OVER
+            if wf in _WINDOW_FUNCTION_ALIASES:
+                wf = _WINDOW_FUNCTION_ALIASES[wf]
+            # 白名单校验——非法窗口函数静默丢弃
+            if wf not in _VALID_WINDOW_FUNCTIONS:
+                continue
             inferred_window.append(
                 InferredWindowMetric(
                     metric_name=item.get("metric_name", ""),
-                    window_function=item.get("window_function", ""),
+                    window_function=wf,
                     input_column=item.get("input_column", ""),
                     partition_by=item.get("partition_by", []),
                     order_by=item.get("order_by", []),
@@ -1239,10 +1270,16 @@ class SpecEnricher:
 
         # 解析计算指标
         for item in raw.get("inferred_computed_metrics", []):
+            expr = item.get("expression", "")
+            # 安全检查——含 SQL 注入字符的表达式静默丢弃
+            if any(c in expr for c in _FORBIDDEN_EXPRESSION_CHARS):
+                continue
+            if any(p in expr for p in _FORBIDDEN_EXPRESSION_PATTERNS):
+                continue
             inferred_computed.append(
                 InferredComputedMetric(
                     metric_name=item.get("metric_name", ""),
-                    expression=item.get("expression", ""),
+                    expression=expr,
                     depends_on=item.get("depends_on", []),
                     alias=item.get("alias", ""),
                     confidence=item.get("confidence", "medium"),
