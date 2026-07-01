@@ -348,6 +348,36 @@ class PackageRichResponse(StrictModel):
     file_tree: list[ArtifactTreeNode] = []  # 文件树根节点列表
 
 
+class RunAllRichResponse(StrictModel):
+    """前端全流程一键执行富响应——合并 PlanRich + ExecuteRich + PackageRich 全部信息。
+
+    前端一次 POST /api/run-all-rich 即可获得：
+    - 步骤摘要 + Join 证据（PlanRichResponse）
+    - SQL 文本 + 执行追踪（ExecuteRichResponse）
+    - 文件树（PackageRichResponse）
+    - 基础结果（RunAllResponse）
+    """
+
+    request_id: str
+    spec_id: str
+    plan_id: str
+    package_id: str
+    package_dir: str
+    execution_trace: ExecutionTraceSummary
+    result_summary: ResultSummarySummary
+    artifact_count: int
+    open_questions: list[OpenQuestionSummary] = []
+    # 富 Execute 字段
+    generated_sql: str = ""
+    sql_sha256: str = ""
+    compiler_version: str = ""
+    # 富 Plan 字段
+    steps: list[PlanStepSummary] = []
+    join_evidence: list[JoinEvidenceItem] = []
+    # 富 Package 字段
+    file_tree: list[ArtifactTreeNode] = []
+
+
 class HealthResponse(StrictModel):
     """GET /api/health 响应——API 健康检查。"""
 

@@ -8,36 +8,43 @@ API 只返回 artifact 引用和结构化摘要。
 from __future__ import annotations
 
 import hashlib
+import logging
+import time
+from typing import TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
 
 from tianshu_datadev.artifacts.contract_extractor import DataTransformContractExtractor
 from tianshu_datadev.artifacts.packager import PackageInputs, ReviewPackageBuilder
 from tianshu_datadev.developer_spec.models import (
-    EnrichedSpec,
-    FieldSource,
-    ManifestColumn,
-    ManifestTable,
     ParsedDeveloperSpec,
-    SourceManifest,
 )
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
+from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
 from tianshu_datadev.planning.cross_validator import cross_validate
 from tianshu_datadev.planning.relationship_planner import RelationshipPlanner
 from tianshu_datadev.planning.spec_enricher import SpecEnricher
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan, SqlBuildPlanBuilder
-from tianshu_datadev.planning.sql_program import (
-    SqlProgram,
-    SqlProgramBuilder,
-    SqlStatement,
-    StatementKind,
+from tianshu_datadev.api.templates import TEMPLATES
+from tianshu_datadev.planning.program_factory import (
+    build_sql_program,
+    build_sql_program_from_chain,
+    build_sql_program_from_compute_steps,
 )
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
 from tianshu_datadev.sql.executor import DuckDBExecutor
 from tianshu_datadev.sql.models import SqlArtifact
 from tianshu_datadev.sql.validator import SqlBuildPlanValidator
 
+if TYPE_CHECKING:
+    from tianshu_datadev.developer_spec.models import OpenQuestion, ParseWarning, SourceManifest
+    from tianshu_datadev.llm.adapters.base import ProviderAdapter
+    from tianshu_datadev.planning.relationship_hypothesis import RelationshipHypothesis
+    from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan
+
 
 def _summarize_open_questions(
-    questions: list,
+    questions: list[OpenQuestion],
 ) -> list[dict]:
     """将 OpenQuestion 列表转换为 API 摘要格式。"""
     return [
@@ -51,7 +58,7 @@ def _summarize_open_questions(
     ]
 
 
-def _summarize_warnings(warnings: list) -> list[dict]:
+def _summarize_warnings(warnings: list[ParseWarning]) -> list[dict]:
     """将 ParseWarning 列表转换为 API 摘要格式。"""
     result = []
     for w in warnings:
@@ -62,77 +69,6 @@ def _summarize_warnings(warnings: list) -> list[dict]:
             "severity": severity,
         })
     return result
-
-
-def _build_manifest(spec: ParsedDeveloperSpec) -> SourceManifest:
-    """从 ParsedDeveloperSpec 构建 SourceManifest——涵盖所有列引用。
-
-    不仅包含 input_tables 中显式声明的列，还从 metrics、dimensions、
-    output_spec 中提取被引用但未显式声明的列（以 "varchar" 类型补充）。
-
-    与 tests/sql/test_pipeline_e2e.py 中的 _build_manifest 逻辑一致。
-    """
-    tables: list[ManifestTable] = []
-    for t in spec.input_tables:
-        seen: set[str] = set()
-        cols: list[ManifestColumn] = []
-
-        def _add(col_name: str) -> None:
-            """添加列（去重），从原始声明中查找类型信息。"""
-            if col_name in seen:
-                return
-            seen.add(col_name)
-            dtype = "varchar"
-            for src_list in [t.columns, t.key_columns, t.business_columns]:
-                for c in src_list:
-                    if c.column_name == col_name:
-                        dtype = c.data_type or "varchar"
-                        break
-            cols.append(
-                ManifestColumn(
-                    column_name=col_name,
-                    normalized_name=col_name.lower(),
-                    data_type=dtype,
-                    nullable=True,
-                    source=FieldSource.DEVELOPER_SPEC,
-                )
-            )
-
-        # 从显式声明的列开始
-        for c in t.columns + t.key_columns + t.business_columns:
-            _add(c.column_name)
-
-        # 从指标引用中提取
-        for m in spec.metrics:
-            if m.input_column:
-                _add(m.input_column)
-
-        # 从维度引用中提取
-        for d in spec.dimensions:
-            _add(d.column_ref)
-
-        # 从输出列提取
-        for col in spec.output_spec.columns:
-            _add(col.name)
-
-        # 从排序列提取
-        if spec.output_spec.sort:
-            for s in spec.output_spec.sort:
-                _add(s.column)
-
-        tables.append(
-            ManifestTable(
-                table_ref=t.table_alias,
-                source_table=t.source_table,
-                columns=cols,
-                estimated_row_count=t.row_count,
-            )
-        )
-    return SourceManifest(
-        manifest_id=f"manifest_{spec.spec_hash[:12]}",
-        spec_hash=spec.spec_hash,
-        tables=tables,
-    )
 
 
 def _auto_table_mapping(spec: ParsedDeveloperSpec) -> dict[str, str]:
@@ -168,559 +104,62 @@ class Pipeline:
     每次 API 调用独立创建组件实例，无状态泄漏。
     """
 
-    # ── 预设 DeveloperSpec 模板 ──────────────────────────
-
-    TEMPLATES: list[dict] = [
-        {
-            "template_id": "tpl_aggregation",
-            "name": "汇总表",
-            "description": "单表聚合——按维度分组统计指标，如日活、销售额汇总",
-            "category": "aggregation",
-            "markdown_template": (
-                "```markdown\n"
-                "---\n"
-                "spec:\n"
-                "  type: aggregate_table  # aggregate_table（汇总表）| detail_table（明细表）| label_table（标签表）\n"
-                "  target_table: ads.metrics_daily\n"
-                "  target_grain: [stat_date]\n"
-                '  summary: "按日期汇总核心指标"\n'
-                "\n"
-                "  source_tables:\n"
-                "    - name: dwd.user_events\n"
-                "      alias: ue\n"
-                "      row_count: ~1000万\n"
-                "      role: fact  # fact（事实表）| dim（维度表）\n"
-                "      time_field: event_time\n"
-                "      key_columns:\n"
-                "        - name: id\n"
-                "          type: bigint\n"
-                "          nullable: false\n"
-                "      business_columns:\n"
-                "        - name: event_time\n"
-                "          type: timestamp\n"
-                "          nullable: false\n"
-                "        - name: user_id\n"
-                "          type: bigint\n"
-                "          nullable: false\n"
-                "        - name: event_type\n"
-                "          type: varchar\n"
-                "          nullable: true\n"
-                "\n"
-                "  metrics:\n"
-                "    - metric_name: pv\n"
-                "      aggregation: COUNT  # COUNT（计数）| SUM（求和）| AVG（平均）| MIN（最小）| MAX（最大）| COUNT_DISTINCT（去重计数）\n"
-                "      input_column: id\n"
-                "      alias: pv\n"
-                "    - metric_name: uv\n"
-                "      aggregation: COUNT_DISTINCT  # COUNT（计数）| SUM（求和）| AVG（平均）| MIN（最小）| MAX（最大）| COUNT_DISTINCT（去重计数）\n"
-                "      input_column: user_id\n"
-                "      alias: uv\n"
-                "\n"
-                "  dimensions:\n"
-                "    - dimension_name: stat_date\n"
-                "      column_ref: stat_date\n"
-                "\n"
-                "  output_columns:\n"
-                "    - name: stat_date\n"
-                "      type: date\n"
-                "    - name: pv\n"
-                "      type: bigint\n"
-                "    - name: uv\n"
-                "      type: bigint\n"
-                "---\n"
-                "\n"
-                "# 汇总表模板\n"
-                "\n"
-                "## 业务目标\n"
-                "按日期统计 PV 和 UV，产出日报表。\n"
-                "```\n"
-            ),
-        },
-        {
-            "template_id": "tpl_label_table",
-            "name": "标签表",
-            "description": "CASE WHEN 分类打标——按条件对数据进行分类标签加工",
-            "category": "label",
-            "markdown_template": (
-                "```markdown\n"
-                "---\n"
-                "spec:\n"
-                "  type: label_table  # aggregate_table（汇总表）| detail_table（明细表）| label_table（标签表）\n"
-                "  target_table: ads.user_labels\n"
-                "  target_grain: [user_id]\n"
-                '  summary: "用户价值分层标签加工"\n'
-                "\n"
-                "  source_tables:\n"
-                "    - name: dwd.user_orders\n"
-                "      alias: uo\n"
-                "      row_count: ~500万\n"
-                "      role: fact  # fact（事实表）| dim（维度表）\n"
-                "      time_field: order_time\n"
-                "      key_columns:\n"
-                "        - name: user_id\n"
-                "          type: bigint\n"
-                "          nullable: false\n"
-                "      business_columns:\n"
-                "        - name: order_amount\n"
-                "          type: decimal(18,2)\n"
-                "          nullable: true\n"
-                "        - name: order_time\n"
-                "          type: timestamp\n"
-                "          nullable: false\n"
-                "\n"
-                "  metrics:\n"
-                "    - metric_name: total_amount\n"
-                "      aggregation: SUM  # COUNT（计数）| SUM（求和）| AVG（平均）| MIN（最小）| MAX（最大）| COUNT_DISTINCT（去重计数）\n"
-                "      input_column: order_amount\n"
-                "      alias: total_amount\n"
-                "    - metric_name: order_cnt\n"
-                "      aggregation: COUNT  # COUNT（计数）| SUM（求和）| AVG（平均）| MIN（最小）| MAX（最大）| COUNT_DISTINCT（去重计数）\n"
-                "      input_column: user_id\n"
-                "      alias: order_cnt\n"
-                "\n"
-                "  dimensions:\n"
-                "    - dimension_name: user_id\n"
-                "      column_ref: user_id\n"
-                "\n"
-                "  output_columns:\n"
-                "    - name: user_id\n"
-                "      type: bigint\n"
-                "    - name: total_amount\n"
-                "      type: decimal(18,2)\n"
-                "    - name: order_cnt\n"
-                "      type: bigint\n"
-                "    - name: value_level\n"
-                "      type: varchar\n"
-                "---\n"
-                "\n"
-                "# 标签表模板\n"
-                "\n"
-                "## 业务目标\n"
-                "按用户汇总消费金额和订单数，输出价值分层标签。\n"
-                "```\n"
-            ),
-        },
-        {
-            "template_id": "tpl_multi_step",
-            "name": "多步骤加工",
-            "description": "多表 Join + 聚合——两表关联后分组统计，产出宽表",
-            "category": "multi_step",
-            "markdown_template": (
-                "```markdown\n"
-                "---\n"
-                "spec:\n"
-                "  type: aggregate_table  # aggregate_table（汇总表）| detail_table（明细表）| label_table（标签表）\n"
-                "  target_table: ads.order_analysis\n"
-                "  target_grain: [order_date, category]\n"
-                '  summary: "订单品类分析——订单表关联商品维度表"\n'
-                "\n"
-                "  source_tables:\n"
-                "    - name: dwd.orders\n"
-                "      alias: o\n"
-                "      row_count: ~2000万\n"
-                "      role: fact  # fact（事实表）| dim（维度表）\n"
-                "      time_field: order_date\n"
-                "      key_columns:\n"
-                "        - name: order_id\n"
-                "          type: bigint\n"
-                "          nullable: false\n"
-                "        - name: product_id\n"
-                "          type: bigint\n"
-                "          nullable: false\n"
-                "      business_columns:\n"
-                "        - name: order_date\n"
-                "          type: date\n"
-                "          nullable: false\n"
-                "        - name: order_amount\n"
-                "          type: decimal(18,2)\n"
-                "          nullable: true\n"
-                "        - name: product_id\n"
-                "          type: bigint\n"
-                "          nullable: false\n"
-                "    - name: dim.product\n"
-                "      alias: p\n"
-                "      row_count: ~10万\n"
-                "      role: dim  # fact（事实表）| dim（维度表）\n"
-                "      key_columns:\n"
-                "        - name: product_id\n"
-                "          type: bigint\n"
-                "          nullable: false\n"
-                "      business_columns:\n"
-                "        - name: category\n"
-                "          type: varchar\n"
-                "          nullable: true\n"
-                "        - name: product_name\n"
-                "          type: varchar\n"
-                "          nullable: true\n"
-                "\n"
-                "  metrics:\n"
-                "    - metric_name: order_cnt\n"
-                "      aggregation: COUNT  # COUNT（计数）| SUM（求和）| AVG（平均）| MIN（最小）| MAX（最大）| COUNT_DISTINCT（去重计数）\n"
-                "      input_column: order_id\n"
-                "      alias: order_cnt\n"
-                "    - metric_name: total_amount\n"
-                "      aggregation: SUM  # COUNT（计数）| SUM（求和）| AVG（平均）| MIN（最小）| MAX（最大）| COUNT_DISTINCT（去重计数）\n"
-                "      input_column: order_amount\n"
-                "      alias: total_amount\n"
-                "\n"
-                "  dimensions:\n"
-                "    - dimension_name: order_date\n"
-                "      column_ref: order_date\n"
-                "    - dimension_name: category\n"
-                "      column_ref: category\n"
-                "\n"
-                "  joins:\n"
-                "    - left_table: o\n"
-                "      right_table: p\n"
-                "      left_key: product_id\n"
-                "      right_key: product_id\n"
-                "      join_type: INNER  # INNER（内连接）| LEFT（左连接）| RIGHT（右连接）| FULL（全连接）\n"
-                "\n"
-                "  output_columns:\n"
-                "    - name: order_date\n"
-                "      type: date\n"
-                "    - name: category\n"
-                "      type: varchar\n"
-                "    - name: order_cnt\n"
-                "      type: bigint\n"
-                "    - name: total_amount\n"
-                "      type: decimal(18,2)\n"
-                "---\n"
-                "\n"
-                "# 订单品类分析\n"
-                "\n"
-                "## 业务目标\n"
-                "关联订单事实表和商品维度表，按日期和品类统计订单量和金额。\n"
-                "```\n"
-            ),
-        },
-        {
-            "template_id": "tpl_two_table_join",
-            "name": "两表 Join",
-            "description": "两表关联——事实表关联维度表，展开宽表字段，不做聚合",
-            "category": "join",
-            "markdown_template": (
-                "```markdown\n"
-                "---\n"
-                "spec:\n"
-                "  type: detail_table  # aggregate_table（汇总表）| detail_table（明细表）| label_table（标签表）\n"
-                "  target_table: ads.order_detail_wide\n"
-                "  target_grain: [order_id]\n"
-                '  summary: "订单明细宽表——关联商品维度，展开品类和名称"\n'
-                "\n"
-                "  source_tables:\n"
-                "    - name: dwd.orders\n"
-                "      alias: o\n"
-                "      row_count: ~2000万\n"
-                "      role: fact  # fact（事实表）| dim（维度表）\n"
-                "      time_field: order_date\n"
-                "      key_columns:\n"
-                "        - name: order_id\n"
-                "          type: bigint\n"
-                "          nullable: false\n"
-                "        - name: product_id\n"
-                "          type: bigint\n"
-                "          nullable: false\n"
-                "      business_columns:\n"
-                "        - name: order_date\n"
-                "          type: date\n"
-                "          nullable: false\n"
-                "        - name: order_amount\n"
-                "          type: decimal(18,2)\n"
-                "          nullable: true\n"
-                "        - name: user_id\n"
-                "          type: bigint\n"
-                "          nullable: false\n"
-                "    - name: dim.product\n"
-                "      alias: p\n"
-                "      row_count: ~10万\n"
-                "      role: dim  # fact（事实表）| dim（维度表）\n"
-                "      key_columns:\n"
-                "        - name: product_id\n"
-                "          type: bigint\n"
-                "          nullable: false\n"
-                "      business_columns:\n"
-                "        - name: product_name\n"
-                "          type: varchar\n"
-                "          nullable: true\n"
-                "        - name: category\n"
-                "          type: varchar\n"
-                "          nullable: true\n"
-                "        - name: brand\n"
-                "          type: varchar\n"
-                "          nullable: true\n"
-                "\n"
-                "  joins:\n"
-                "    - left_table: o\n"
-                "      right_table: p\n"
-                "      left_key: product_id\n"
-                "      right_key: product_id\n"
-                "      join_type: LEFT  # INNER（内连接）| LEFT（左连接）| RIGHT（右连接）| FULL（全连接）\n"
-                "\n"
-                "  output_columns:\n"
-                "    - name: order_id\n"
-                "      type: bigint\n"
-                "    - name: order_date\n"
-                "      type: date\n"
-                "    - name: order_amount\n"
-                "      type: decimal(18,2)\n"
-                "    - name: user_id\n"
-                "      type: bigint\n"
-                "    - name: product_name\n"
-                "      type: varchar\n"
-                "    - name: category\n"
-                "      type: varchar\n"
-                "    - name: brand\n"
-                "      type: varchar\n"
-                "---\n"
-                "\n"
-                "# 订单明细宽表\n"
-                "\n"
-                "## 业务目标\n"
-                "关联订单事实表和商品维度表，展开商品名称、品类、品牌等维度属性，\n"
-                "产出订单明细宽表供下游分析使用。\n"
-                "```\n"
-            ),
-        },
-        {
-            "template_id": "tpl_window_topn",
-            "name": "窗口 TopN",
-            "description": "窗口函数排名——ROW_NUMBER/RANK 分组排序取 TopN，如各品类销售额 Top10 商品",
-            "category": "window",
-            "markdown_template": (
-                "```markdown\n"
-                "---\n"
-                "spec:\n"
-                "  type: aggregate_table  # aggregate_table（汇总表）| detail_table（明细表）| label_table（标签表）\n"
-                "  target_table: ads.category_top10_product\n"
-                "  target_grain: [category, product_id]\n"
-                '  summary: "各品类销售额 Top10 商品排名"\n'
-                "\n"
-                "  source_tables:\n"
-                "    - name: dwd.order_items\n"
-                "      alias: oi\n"
-                "      row_count: ~5000万\n"
-                "      role: fact  # fact（事实表）| dim（维度表）\n"
-                "      time_field: order_date\n"
-                "      key_columns:\n"
-                "        - name: item_id\n"
-                "          type: bigint\n"
-                "          nullable: false\n"
-                "        - name: product_id\n"
-                "          type: bigint\n"
-                "          nullable: false\n"
-                "      business_columns:\n"
-                "        - name: order_date\n"
-                "          type: date\n"
-                "          nullable: false\n"
-                "        - name: sale_amount\n"
-                "          type: decimal(18,2)\n"
-                "          nullable: true\n"
-                "        - name: product_id\n"
-                "          type: bigint\n"
-                "          nullable: false\n"
-                "    - name: dim.product\n"
-                "      alias: p\n"
-                "      row_count: ~10万\n"
-                "      role: dim  # fact（事实表）| dim（维度表）\n"
-                "      key_columns:\n"
-                "        - name: product_id\n"
-                "          type: bigint\n"
-                "          nullable: false\n"
-                "      business_columns:\n"
-                "        - name: category\n"
-                "          type: varchar\n"
-                "          nullable: true\n"
-                "        - name: product_name\n"
-                "          type: varchar\n"
-                "          nullable: true\n"
-                "\n"
-                "  metrics:\n"
-                "    - metric_name: total_sales\n"
-                "      aggregation: SUM  # COUNT（计数）| SUM（求和）| AVG（平均）| MIN（最小）| MAX（最大）| COUNT_DISTINCT（去重计数）\n"
-                "      input_column: sale_amount\n"
-                "      alias: total_sales\n"
-                "\n"
-                "  dimensions:\n"
-                "    - dimension_name: category\n"
-                "      column_ref: category\n"
-                "    - dimension_name: product_id\n"
-                "      column_ref: product_id\n"
-                "\n"
-                "  joins:\n"
-                "    - left_table: oi\n"
-                "      right_table: p\n"
-                "      left_key: product_id\n"
-                "      right_key: product_id\n"
-                "      join_type: INNER  # INNER（内连接）| LEFT（左连接）| RIGHT（右连接）| FULL（全连接）\n"
-                "\n"
-                "  output_columns:\n"
-                "    - name: category\n"
-                "      type: varchar\n"
-                "    - name: product_id\n"
-                "      type: bigint\n"
-                "    - name: product_name\n"
-                "      type: varchar\n"
-                "    - name: total_sales\n"
-                "      type: decimal(18,2)\n"
-                "    - name: rank_in_category\n"
-                "      type: int\n"
-                "---\n"
-                "\n"
-                "# 各品类销售额 Top10 商品\n"
-                "\n"
-                "## 业务目标\n"
-                "按品类分组，计算每个商品的销售额汇总，使用 ROW_NUMBER 窗口函数\n"
-                "按销售额降序排名，取各品类 Top 10 商品。\n"
-                "\n"
-                "## 窗口函数说明\n"
-                "使用 ROW_NUMBER() OVER (PARTITION BY category ORDER BY total_sales DESC) 排名，\n"
-                "外层 WHERE rank_in_category <= 10 取 TopN。\n"
-                "```\n"
-            ),
-        },
-        {
-            "template_id": "tpl_empty",
-            "name": "自定义空模板",
-            "description": "空白模板——从零开始编写 DeveloperSpec，适合自定义需求",
-            "category": "empty",
-            "markdown_template": (
-                "```markdown\n"
-                "---\n"
-                "spec:\n"
-                "  type: aggregate_table  # aggregate_table（汇总表）| detail_table（明细表）| label_table（标签表）\n"
-                "  target_table: ads.目标表名\n"
-                "  target_grain: [维度列1, 维度列2]\n"
-                '  summary: "一句话描述业务目标"\n'
-                "\n"
-                "  source_tables:\n"
-                "    - name: dwd.源表名\n"
-                "      alias: 别名（两个字母）\n"
-                "      row_count: ~估算行数\n"
-                "      role: fact  # fact（事实表）| dim（维度表）\n"
-                "      time_field: 时间字段名      # 如有\n"
-                "      key_columns:\n"
-                "        - name: 主键列名\n"
-                "          type: 类型              # bigint | varchar | ...\n"
-                "          nullable: false\n"
-                "      business_columns:\n"
-                "        - name: 业务列名\n"
-                "          type: 类型\n"
-                "          nullable: true\n"
-                "\n"
-                "  metrics:                       # 指标声明（可选）\n"
-                "    # - metric_name: 指标名\n"
-                "    #   aggregation: SUM（求和）| COUNT（计数）| COUNT_DISTINCT（去重计数）| AVG（平均）| MAX（最大）| MIN（最小）\n"
-                "    #   input_column: 输入列名\n"
-                "    #   alias: 输出别名\n"
-                "\n"
-                "  dimensions:                    # 维度声明（可选）\n"
-                "    # - dimension_name: 维度名\n"
-                "    #   column_ref: 列引用\n"
-                "\n"
-                "  joins:                         # Join 声明（可选，多表时填写）\n"
-                "    # - left_table: 左表别名\n"
-                "    #   right_table: 右表别名\n"
-                "    #   left_key: 左键列名\n"
-                "    #   right_key: 右键列名\n"
-                "    #   join_type: INNER（内连接）| LEFT（左连接）| RIGHT（右连接）| FULL（全连接）\n"
-                "\n"
-                "  output_columns:                # 输出列定义\n"
-                "    # - name: 列名\n"
-                "    #   type: 类型\n"
-                "---\n"
-                "\n"
-                "# 标题\n"
-                "\n"
-                "## 业务目标\n"
-                "在此描述业务需求和分析目标。\n"
-                "\n"
-                "## 数据说明\n"
-                "在此补充数据源、字段含义、业务口径等说明。\n"
-                "```\n"
-            ),
-        },
-    ]
-
-    def __init__(self, base_output_dir: str = "generated/review_packages"):
+    def __init__(
+        self,
+        base_output_dir: str = "generated/review_packages",
+        adapter: ProviderAdapter | None = None,
+    ):
         """初始化流水线。
 
         Args:
             base_output_dir: ReviewPackage 输出根目录
+            adapter: LLM Provider 适配器——None 时全链路确定性运行（Fake 模式），
+                     注入后 RelationshipPlanner + SpecEnricher 均走 LLM 推断。
         """
         self._base_output_dir = base_output_dir
         self._results: dict[str, dict] = {}  # request_id → 内部产物
         self._packages: dict[str, object] = {}  # request_id → ReviewPackageManifest
-        # 多表时生成 Join 推测——llm_client=None 退化为纯显式声明模式
-        self._relationship_planner = RelationshipPlanner()
-        self._spec_enricher = SpecEnricher()  # 指标推断（LLM 驱动，llm_client=None 退化规则匹配）
+        self._timestamps: dict[str, float] = {}  # request_id → 写入时间戳（用于 TTL 过期清理）
+        self._ttl_seconds: int = 1800  # 缓存过期时间（秒），默认 30 分钟
+        # adapter=None 时退化为纯规则/显式声明模式（确定性）
+        self._relationship_planner = RelationshipPlanner(adapter=adapter)
+        self._spec_enricher = SpecEnricher(adapter=adapter)
 
-    @staticmethod
-    def _apply_enrichment(spec: ParsedDeveloperSpec, manifest: SourceManifest, enricher) -> ParsedDeveloperSpec:
-        """应用 SpecEnricher 推断——将推断指标合并到 spec 中。
+    # ── 缓存生命周期管理 ──────────────────────────────
 
-        程序员手写的 metrics 优先级最高（不可覆盖），
-        仅追加 inferred_metrics 中不与现有 alias 冲突的条目。
+    def _store_result(self, request_id: str, data: dict) -> None:
+        """缓存中间结果并记录写入时间戳——供 TTL 过期清理使用。"""
+        self._results[request_id] = data
+        self._timestamps[request_id] = time.time()
 
-        Phase 5 新增：合入跨粒度 compute_steps + JoinDecl——
-        SpecEnricher._detect_cross_grain_dependency 产出放入 enrichment_metadata，
-        此处解码并合并到 spec.compute_steps / spec.joins。
+    def _store_package(self, request_id: str, package: object) -> None:
+        """缓存打包结果并记录写入时间戳——供 TTL 过期清理使用。"""
+        self._packages[request_id] = package
+        self._timestamps[request_id] = time.time()
 
-        Args:
-            spec: 原始 DeveloperSpec
-            manifest: 源数据清单
-            enricher: SpecEnricher 实例
+    def _purge_expired(self) -> int:
+        """清理所有超过 TTL 的缓存条目。
+
+        遍历 _timestamps 字典，移除 _results 和 _packages 中的过期条目。
+        每次公共方法入口调用——惰性清理，零额外定时器开销。
 
         Returns:
-            增强后的 ParsedDeveloperSpec
+            清理的条目数
         """
-        from tianshu_datadev.developer_spec.models import ComputeStep, JoinDecl
-
-        enriched: EnrichedSpec = enricher.enrich(spec, manifest)
-
-        # ── 合并推断指标 ──
-        declared_aliases = {m.alias for m in spec.metrics}
-        new_metrics = [
-            m for m in enriched.inferred_metrics
-            if m.alias not in declared_aliases
+        now = time.time()
+        expired_ids = [
+            rid for rid, ts in self._timestamps.items()
+            if now - ts > self._ttl_seconds
         ]
-        combined_metrics = list(spec.metrics) + new_metrics
+        for rid in expired_ids:
+            self._results.pop(rid, None)
+            self._packages.pop(rid, None)
+            self._timestamps.pop(rid, None)
+        if expired_ids:
+            logger.debug("TTL 过期清理完成，移除 %d 条缓存", len(expired_ids))
+        return len(expired_ids)
 
-        # ── 合并跨粒度 compute_steps + joins ──
-        meta = enriched.enrichment_metadata
-        generated_steps_data = meta.get("generated_compute_steps", [])
-        generated_joins_data = meta.get("generated_joins", [])
-
-        combined_steps = list(spec.compute_steps) if spec.compute_steps else []
-        combined_joins = list(spec.joins) if spec.joins else []
-
-        if generated_steps_data:
-            for sd in generated_steps_data:
-                combined_steps.append(ComputeStep(**sd))
-        if generated_joins_data:
-            for jd in generated_joins_data:
-                combined_joins.append(JoinDecl(**jd))
-
-        # ── 合并窗口指标 ──
-        new_window_metrics = list(enriched.inferred_window_metrics)
-
-        # 仅当有实际变更时才更新
-        needs_update = bool(
-            new_metrics or generated_steps_data or generated_joins_data
-            or new_window_metrics
-        )
-        if not needs_update:
-            return spec
-
-        update_dict: dict = {"metrics": combined_metrics}
-        if combined_steps:
-            update_dict["compute_steps"] = combined_steps
-        if combined_joins:
-            update_dict["joins"] = combined_joins
-        if new_window_metrics:
-            update_dict["inferred_window_metrics"] = new_window_metrics
-
-        return spec.model_copy(update=update_dict)
+    # ── 核心管线方法 ──────────────────────────────
 
     @staticmethod
     def _gen_request_id(spec: ParsedDeveloperSpec) -> str:
@@ -732,7 +171,7 @@ class Pipeline:
         spec: ParsedDeveloperSpec,
         manifest: SourceManifest,
         table_mapping: dict | None = None,
-    ) -> tuple[ParsedDeveloperSpec, object | None, list, dict]:
+    ) -> tuple[ParsedDeveloperSpec, RelationshipHypothesis | None, list[OpenQuestion], dict[str, str]]:
         """统一入口：SpecEnricher → RelationshipPlanner → 交叉验证。
 
         消除 5 个入口点中重复的 15 行代码块。
@@ -750,10 +189,10 @@ class Pipeline:
             table_mapping = _auto_table_mapping(spec)
 
         # SpecEnricher：从业务描述推断缺失指标
-        spec = self._apply_enrichment(spec, manifest, self._spec_enricher)
+        spec = self._spec_enricher.apply_enrichment(spec, manifest)
 
         # RelationshipPlanner：多表时生成 Join 推测
-        extra_questions: list = []
+        extra_questions: list[OpenQuestion] = []
         hypothesis = None
         if len(spec.input_tables) > 1:
             hypothesis, extra_questions = self._relationship_planner.plan(spec, manifest)
@@ -764,6 +203,80 @@ class Pipeline:
             extra_questions.extend(xv_questions)
 
         return spec, hypothesis, extra_questions, table_mapping or {}
+
+    def _parse_and_enrich(
+        self,
+        method: str,
+        markdown_text: str,
+        table_mapping: dict | None = None,
+        *,
+        pipeline_stages: list[str] | None = None,
+    ) -> dict:
+        """Stage 1+2 统一入口：Parser + Enrich/Plan。
+
+        build_plan / execute / run_all / build_plan_rich / execute_rich
+        五个入口方法共享此逻辑——消除各方法中重复的 25 行 parser+enrich 代码。
+
+        Args:
+            method: 调用方方法名（用于日志标记）
+            markdown_text: DeveloperSpec Markdown 全文
+            table_mapping: table_ref → 物理表名（可选）
+            pipeline_stages: 完整阶段列表（run_all 传 7 阶段，其余默认 5 阶段）
+
+        Returns:
+            成功时：{"ok": True, "spec": ..., "manifest": ..., "hypothesis": ...,
+                      "extra_questions": ..., "table_mapping": ...}
+            失败时：{"ok": False, "error_response": {...}}
+        """
+        # ── Stage 1: Parser ──
+        try:
+            parser = DeveloperSpecParser()
+            spec = parser.parse(markdown_text)
+            manifest = build_manifest_from_spec(spec)
+        except Exception as e:
+            self._log_stage_failure(method, "parser", e)
+            error_info = self._capture_error("parser", e)
+            return {
+                "ok": False,
+                "error_response": {
+                    "request_id": "",
+                    "pipeline_error": error_info,
+                    "pipeline_stages": self._build_pipeline_stages(
+                        "parser", error_info, pipeline_stages,
+                    ),
+                },
+            }
+
+        # ── Stage 2: Enrich + Plan ──
+        try:
+            spec, hypothesis, extra_questions, table_mapping = self._enrich_and_plan(
+                spec, manifest, table_mapping,
+            )
+        except Exception as e:
+            self._log_stage_failure(method, "enrich", e)
+            request_id = self._gen_request_id(spec)
+            self._store_result(request_id, {"parsed_spec": spec, "manifest": manifest})
+            error_info = self._capture_error("enrich", e)
+            return {
+                "ok": False,
+                "error_response": {
+                    "request_id": request_id,
+                    "spec_id": spec.spec_id,
+                    "pipeline_error": error_info,
+                    "pipeline_stages": self._build_pipeline_stages(
+                        "enrich", error_info, pipeline_stages,
+                    ),
+                },
+            }
+
+        return {
+            "ok": True,
+            "spec": spec,
+            "manifest": manifest,
+            "hypothesis": hypothesis,
+            "extra_questions": extra_questions,
+            "table_mapping": table_mapping or {},
+        }
 
     # ── 错误处理辅助方法 ─────────────────────────────────
 
@@ -783,6 +296,30 @@ class Pipeline:
             "error_type": type(exc).__name__,
             "error_message": str(exc),
         }
+
+    @staticmethod
+    def _log_stage_failure(
+        method: str,
+        stage: str,
+        exc: Exception,
+        request_id: str = "pending",
+    ) -> None:
+        """统一错误日志输出——使用标准 logging 替代 print。
+
+        Args:
+            method: 调用方法名（parse_only/build_plan/execute/run_all/...）
+            stage: 失败阶段标识（parser/enrich/build/compile/execute/contract/package）
+            exc: 捕获的异常
+            request_id: 请求 ID——parser 阶段失败时为 "pending"
+        """
+        logger.error(
+            "%s: %s 阶段失败 - %s: %s [request_id=%s]",
+            method,
+            stage,
+            type(exc).__name__,
+            exc,
+            request_id,
+        )
 
     @staticmethod
     def _build_pipeline_stages(
@@ -831,23 +368,25 @@ class Pipeline:
 
     # ── 公共方法 ──────────────────────────────────────────
 
-    def parse_only(self, markdown_text: str) -> dict:
-        """仅解析 DeveloperSpec——返回 SpecParseResponse 的 dict。
+    def parse_only(self, markdown_text: str, rich: bool = False) -> dict:
+        """解析 DeveloperSpec——返回 SpecParseResponse / SpecRichResponse 的 dict。
 
         解析失败时返回 200 + pipeline_error，保留错误信息供前端展示。
 
         Args:
             markdown_text: DeveloperSpec Markdown 全文
+            rich: True 时返回完整表/字段/指标/维度/Join/时间范围（前端 SPA 用）
 
         Returns:
-            符合 SpecParseResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
+            符合 SpecParseResponse 或 SpecRichResponse 结构的 dict
         """
+        self._purge_expired()
         # ── Stage: parser ──
         try:
             parser = DeveloperSpecParser()
             spec = parser.parse(markdown_text)
         except Exception as e:
-            print(f"[Pipeline] parse_only: parser 阶段失败 - {type(e).__name__}: {e}")
+            self._log_stage_failure("parse_only", "parser", e)
             error_info = self._capture_error("parser", e)
             return {
                 "request_id": "",
@@ -856,9 +395,9 @@ class Pipeline:
             }
 
         request_id = self._gen_request_id(spec)
-        self._results[request_id] = {"parsed_spec": spec}
+        self._store_result(request_id, {"parsed_spec": spec})
 
-        return {
+        base = {
             "request_id": request_id,
             "spec_id": spec.spec_id,
             "spec_hash": spec.spec_hash,
@@ -873,6 +412,56 @@ class Pipeline:
             "open_questions": _summarize_open_questions(spec.open_questions),
             "parse_warnings": _summarize_warnings(spec.parse_warnings),
         }
+        if not rich:
+            return base
+
+        # ── Rich 扩展字段 ──
+        tables = []
+        for t in spec.input_tables:
+            tables.append({
+                "table_alias": t.table_alias,
+                "source_table": str(t.source_table),
+                "row_count": t.row_count,
+                "role": t.role,
+                "column_count": len(t.columns) + len(t.key_columns) + len(t.business_columns),
+                "has_time_field": t.time_field is not None,
+                "has_partition": t.partition_field is not None,
+            })
+        joins = []
+        for j in (spec.joins or []):
+            joins.append({
+                "left_table": j.left_table,
+                "right_table": j.right_table,
+                "left_key": j.left_key,
+                "right_key": j.right_key,
+                "join_type": _safe_enum_value(j, "join_type"),
+            })
+        time_range = None
+        if spec.time_range:
+            time_range = {
+                "column_ref": spec.time_range.column_ref,
+                "start": spec.time_range.start,
+                "end": spec.time_range.end,
+            }
+        base["tables"] = tables
+        base["metrics"] = [
+            {"metric_name": m.metric_name, "aggregation": m.aggregation.value,
+             "input_column": m.input_column, "alias": m.alias}
+            for m in spec.metrics
+        ]
+        base["dimensions"] = [
+            {"dimension_name": d.dimension_name, "column_ref": d.column_ref}
+            for d in spec.dimensions
+        ]
+        base["joins"] = joins
+        base["time_range"] = time_range
+        base["output_spec"] = {
+            "columns": [c.model_dump() for c in spec.output_spec.columns],
+            "grain": spec.output_spec.grain,
+            "sort_columns": [s.column for s in (spec.output_spec.sort or [])],
+            "limit": spec.output_spec.limit,
+        }
+        return base
 
     def build_plan(self, markdown_text: str, table_mapping: dict[str, str] | None = None) -> dict:
         """解析 + 构建 SqlBuildPlan + Validator 验证——返回 PlanResponse 的 dict。
@@ -886,36 +475,16 @@ class Pipeline:
         Returns:
             符合 PlanResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
         """
-        # ── Stage 1: Parser ──
-        try:
-            parser = DeveloperSpecParser()
-            spec = parser.parse(markdown_text)
-            manifest = _build_manifest(spec)
-        except Exception as e:
-            print(f"[Pipeline] build_plan: parser 阶段失败 - {type(e).__name__}: {e}")
-            error_info = self._capture_error("parser", e)
-            return {
-                "request_id": "",
-                "pipeline_error": error_info,
-                "pipeline_stages": self._build_pipeline_stages("parser", error_info),
-            }
-
-        # ── Stage 2: Enrich + Plan ──
-        try:
-            spec, hypothesis, extra_questions, table_mapping = self._enrich_and_plan(
-                spec, manifest, table_mapping,
-            )
-        except Exception as e:
-            print(f"[Pipeline] build_plan: enrich 阶段失败 - {type(e).__name__}: {e}")
-            request_id = self._gen_request_id(spec)
-            self._results[request_id] = {"parsed_spec": spec, "manifest": manifest}
-            error_info = self._capture_error("enrich", e)
-            return {
-                "request_id": request_id,
-                "spec_id": spec.spec_id,
-                "pipeline_error": error_info,
-                "pipeline_stages": self._build_pipeline_stages("enrich", error_info),
-            }
+        self._purge_expired()
+        # ── Stage 1-2: Parser + Enrich ──
+        parsed = self._parse_and_enrich("build_plan", markdown_text, table_mapping)
+        if not parsed["ok"]:
+            return parsed["error_response"]
+        spec = parsed["spec"]
+        manifest = parsed["manifest"]
+        hypothesis = parsed["hypothesis"]
+        extra_questions = parsed["extra_questions"]
+        table_mapping = parsed["table_mapping"]
 
         # ── Stage 3: Build + Validate ──
         plan = None
@@ -929,7 +498,7 @@ class Pipeline:
                 chain_id = hashlib.md5(
                     "|".join(s.step_name for s in spec.compute_steps).encode()
                 ).hexdigest()[:8]
-                sql_program = self._build_sql_program_from_compute_steps(
+                sql_program = build_sql_program_from_compute_steps(
                     plans, spec, chain_id
                 )
                 validator = SqlBuildPlanValidator()
@@ -942,7 +511,7 @@ class Pipeline:
                 chain_id = hashlib.md5(
                     "|".join(c.candidate_id for c in hypothesis.candidates).encode()
                 ).hexdigest()[:8]
-                sql_program = self._build_sql_program_from_chain(
+                sql_program = build_sql_program_from_chain(
                     plans, spec.spec_hash, chain_id
                 )
                 validator = SqlBuildPlanValidator()
@@ -953,15 +522,15 @@ class Pipeline:
                 plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
                 validator = SqlBuildPlanValidator()
                 passed, val_questions = validator.validate(plan, manifest)
-                sql_program = self._build_sql_program(plan, spec.spec_hash)
+                sql_program = build_sql_program(plan, spec.spec_hash)
 
         except Exception as e:
-            print(f"[Pipeline] build_plan: build 阶段失败 - {type(e).__name__}: {e}")
+            self._log_stage_failure("build_plan", "build", e)
             request_id = self._gen_request_id(spec)
             partial: dict = {"parsed_spec": spec, "manifest": manifest}
             if plan is not None:
                 partial["plan"] = plan
-            self._results[request_id] = partial
+            self._store_result(request_id, partial)
             error_info = self._capture_error("build", e)
             return {
                 "request_id": request_id,
@@ -972,12 +541,12 @@ class Pipeline:
             }
 
         request_id = self._gen_request_id(spec)
-        self._results[request_id] = {
+        self._store_result(request_id, {
             "parsed_spec": spec,
             "manifest": manifest,
             "plan": plan,
             "table_mapping": table_mapping or {},
-        }
+        })
 
         all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
         return {
@@ -1009,36 +578,16 @@ class Pipeline:
         Returns:
             符合 ExecuteResponse 结构的 dict，失败时额外含 pipeline_error + pipeline_stages
         """
-        # ── Stage 1: Parser ──
-        try:
-            parser = DeveloperSpecParser()
-            spec = parser.parse(markdown_text)
-            manifest = _build_manifest(spec)
-        except Exception as e:
-            print(f"[Pipeline] execute: parser 阶段失败 - {type(e).__name__}: {e}")
-            error_info = self._capture_error("parser", e)
-            return {
-                "request_id": "",
-                "pipeline_error": error_info,
-                "pipeline_stages": self._build_pipeline_stages("parser", error_info),
-            }
-
-        # ── Stage 2: Enrich + Plan ──
-        try:
-            spec, hypothesis, extra_questions, table_mapping = self._enrich_and_plan(
-                spec, manifest, table_mapping,
-            )
-        except Exception as e:
-            print(f"[Pipeline] execute: enrich 阶段失败 - {type(e).__name__}: {e}")
-            request_id = self._gen_request_id(spec)
-            self._results[request_id] = {"parsed_spec": spec, "manifest": manifest}
-            error_info = self._capture_error("enrich", e)
-            return {
-                "request_id": request_id,
-                "spec_id": spec.spec_id,
-                "pipeline_error": error_info,
-                "pipeline_stages": self._build_pipeline_stages("enrich", error_info),
-            }
+        self._purge_expired()
+        # ── Stage 1-2: Parser + Enrich ──
+        parsed = self._parse_and_enrich("execute", markdown_text, table_mapping)
+        if not parsed["ok"]:
+            return parsed["error_response"]
+        spec = parsed["spec"]
+        manifest = parsed["manifest"]
+        hypothesis = parsed["hypothesis"]
+        extra_questions = parsed["extra_questions"]
+        table_mapping = parsed["table_mapping"]
 
         # ── Stage 3-5: Build → Compile → Execute（按分支） ──
         # 跨阶段变量——初始化为 None，按阶段赋值
@@ -1057,7 +606,7 @@ class Pipeline:
                 chain_id = hashlib.md5(
                     "|".join(s.step_name for s in spec.compute_steps).encode()
                 ).hexdigest()[:8]
-                sql_program = self._build_sql_program_from_compute_steps(
+                sql_program = build_sql_program_from_compute_steps(
                     plans, spec, chain_id
                 )
                 validator = SqlBuildPlanValidator()
@@ -1085,7 +634,7 @@ class Pipeline:
                 chain_id = hashlib.md5(
                     "|".join(c.candidate_id for c in hypothesis.candidates).encode()
                 ).hexdigest()[:8]
-                sql_program = self._build_sql_program_from_chain(
+                sql_program = build_sql_program_from_chain(
                     plans, spec.spec_hash, chain_id
                 )
                 validator = SqlBuildPlanValidator()
@@ -1125,8 +674,8 @@ class Pipeline:
 
         except Exception as e:
             # ── 错误处理：日志 + 保留已完成产物 + 返回部分结果 ──
-            print(f"[Pipeline] execute: {stage} 阶段失败 - {type(e).__name__}: {e}")
             request_id = self._gen_request_id(spec)
+            self._log_stage_failure("execute", stage, e, request_id)
             # 保存已完成产物供事后查询
             partial: dict = {
                 "parsed_spec": spec,
@@ -1139,7 +688,7 @@ class Pipeline:
             elif program_artifact is not None:
                 partial["program_artifact"] = program_artifact
             partial["table_mapping"] = table_mapping or {}
-            self._results[request_id] = partial
+            self._store_result(request_id, partial)
 
             # 提取部分可用字段——根据已完成的阶段
             _plan_id = plan.plan_id if plan is not None else ""
@@ -1171,7 +720,7 @@ class Pipeline:
 
         # ── 成功路径——现有逻辑不变 ──
         request_id = self._gen_request_id(spec)
-        self._results[request_id] = {
+        self._store_result(request_id, {
             "parsed_spec": spec,
             "manifest": manifest,
             "plan": plan,
@@ -1179,7 +728,7 @@ class Pipeline:
             "trace": trace,
             "summary": summary,
             "table_mapping": table_mapping or {},
-        }
+        })
 
         return {
             "request_id": request_id,
@@ -1205,135 +754,12 @@ class Pipeline:
             "open_questions": _summarize_open_questions(all_questions),
         }
 
-    @staticmethod
-    def _build_sql_program(plan: SqlBuildPlan, spec_hash: str) -> SqlProgram:
-        """从单个 SqlBuildPlan 构建最小 SqlProgram（单语句 STANDALONE）。
-
-        这是 Pipeline 自动化多语句构建的基础——
-        当前将单 plan 包装为单语句 SqlProgram，
-        未来多语句拆分逻辑在此扩展（如按 _temp 依赖拆分）。
-
-        Args:
-            plan: SqlBuildPlan 实例
-            spec_hash: 对应 DeveloperSpec 的 SHA-256
-
-        Returns:
-            含单个 STANDALONE 语句的 SqlProgram
-        """
-        stmt = SqlStatement(
-            statement_id=plan.plan_id,
-            plan=plan,
-            kind=StatementKind.STANDALONE,
-        )
-        builder = SqlProgramBuilder()
-        return builder.build_from_statements(
-            statements=[stmt],
-            spec_hash=spec_hash,
-            final_output=plan.plan_id,
-        )
-
-    @staticmethod
-    def _build_sql_program_from_chain(
-        plans: list[SqlBuildPlan], spec_hash: str, chain_id: str
-    ) -> SqlProgram:
-        """从多 Plan 链构建 SqlProgram——每步 PRODUCER/FINAL，通过 _temp 串联。
-
-        中间 Plan 标记为 PRODUCER，产生 _temp 中间表供下游消费。
-        最终 Plan 标记为 FINAL，产生最终输出。
-        """
-        statements: list[SqlStatement] = []
-        for idx, plan in enumerate(plans):
-            is_final = (idx == len(plans) - 1)
-            produces = None if is_final else f"_temp_c{chain_id}_{idx}"
-            depends_on = [plans[idx - 1].plan_id] if idx > 0 else []
-
-            stmt = SqlStatement(
-                statement_id=plan.plan_id,
-                plan=plan,
-                kind=StatementKind.FINAL if is_final else StatementKind.PRODUCER,
-                depends_on=depends_on,
-                produces=produces,
-            )
-            statements.append(stmt)
-
-        builder = SqlProgramBuilder()
-        return builder.build_from_statements(
-            statements=statements,
-            spec_hash=spec_hash,
-            final_output=plans[-1].plan_id,
-        )
-
-    @staticmethod
-    def _build_sql_program_from_compute_steps(
-        plans: list[SqlBuildPlan],
-        spec,  # ParsedDeveloperSpec（含 compute_steps）
-        chain_id: str,
-    ) -> SqlProgram:
-        """从 ComputeSteps Plan 链构建 SqlProgram——使用 step_name 命名 _temp 表。
-
-        与 _build_sql_program_from_chain 的区别：
-        - 使用 spec.compute_steps 的 step_name 命名 _temp 表（而非 idx）
-        - 确保 produces 与 Builder 中 ScanStep 的 table_ref 一致
-        - 支持 DAG 依赖——合流步骤 depends_on 包含所有上游 plan_id
-        """
-        steps = spec.compute_steps or []
-        # 构建 step_name → plan 映射（含 plan_id）
-        step_plan_map: dict[str, SqlBuildPlan] = {}
-        for cs, plan in zip(steps, plans):
-            step_plan_map[cs.step_name] = plan
-
-        statements: list[SqlStatement] = []
-        # 跟踪哪些步骤被其他步骤依赖——不被依赖的为 FINAL
-        consumed: set[str] = set()
-        for cs in steps:
-            src_list = cs.source if isinstance(cs.source, list) else [cs.source]
-            for src in src_list:
-                if src != "input" and src in step_plan_map:
-                    consumed.add(src)
-
-        for cs, plan in zip(steps, plans):
-            is_final = cs.step_name not in consumed
-            src_list = cs.source if isinstance(cs.source, list) else [cs.source]
-
-            # 计算依赖——所有非 input 的上游 step
-            depends_on: list[str] = []
-            for src in src_list:
-                if src != "input" and src in step_plan_map:
-                    depends_on.append(step_plan_map[src].plan_id)
-
-            # 使用 step_name 命名 _temp 表——与 Builder 中 ScanStep.table_ref 一致
-            produces = (
-                None
-                if is_final
-                else f"_temp_c{chain_id}_{cs.step_name}"
-            )
-
-            stmt = SqlStatement(
-                statement_id=plan.plan_id,
-                plan=plan,
-                kind=StatementKind.FINAL if is_final else StatementKind.PRODUCER,
-                depends_on=depends_on,
-                produces=produces,
-            )
-            statements.append(stmt)
-
-        # final_output 为所有 FINAL 语句的最后一个
-        final_plans = [
-            s for s in statements if s.kind == StatementKind.FINAL
-        ]
-        final_output = final_plans[-1].statement_id if final_plans else statements[-1].statement_id
-
-        builder = SqlProgramBuilder()
-        return builder.build_from_statements(
-            statements=statements,
-            spec_hash=spec.spec_hash,
-            final_output=final_output,
-        )
-
     def run_all(
         self, markdown_text: str,
         table_mapping: dict[str, str] | None = None,
         table_paths: dict[str, str] | None = None,
+        *,
+        rich: bool = False,
     ) -> dict:
         """全流程 + ReviewPackage 打包——返回 RunAllResponse 的 dict。
 
@@ -1348,38 +774,21 @@ class Pipeline:
         Returns:
             符合 RunAllResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
         """
+        self._purge_expired()
         _RUN_ALL_STAGES = ["parser", "enrich", "build", "compile", "execute", "contract", "package"]
 
-        # ── Stage 1: Parser ──
-        try:
-            parser = DeveloperSpecParser()
-            spec = parser.parse(markdown_text)
-            manifest = _build_manifest(spec)
-        except Exception as e:
-            print(f"[Pipeline] run_all: parser 阶段失败 - {type(e).__name__}: {e}")
-            error_info = self._capture_error("parser", e)
-            return {
-                "request_id": "",
-                "pipeline_error": error_info,
-                "pipeline_stages": self._build_pipeline_stages("parser", error_info, _RUN_ALL_STAGES),
-            }
-
-        # ── Stage 2: Enrich + Plan ──
-        try:
-            spec, hypothesis, extra_questions, table_mapping = self._enrich_and_plan(
-                spec, manifest, table_mapping,
-            )
-        except Exception as e:
-            print(f"[Pipeline] run_all: enrich 阶段失败 - {type(e).__name__}: {e}")
-            request_id = self._gen_request_id(spec)
-            self._results[request_id] = {"parsed_spec": spec, "manifest": manifest}
-            error_info = self._capture_error("enrich", e)
-            return {
-                "request_id": request_id,
-                "spec_id": spec.spec_id,
-                "pipeline_error": error_info,
-                "pipeline_stages": self._build_pipeline_stages("enrich", error_info, _RUN_ALL_STAGES),
-            }
+        # ── Stage 1-2: Parser + Enrich ──
+        parsed = self._parse_and_enrich(
+            "run_all", markdown_text, table_mapping,
+            pipeline_stages=_RUN_ALL_STAGES,
+        )
+        if not parsed["ok"]:
+            return parsed["error_response"]
+        spec = parsed["spec"]
+        manifest = parsed["manifest"]
+        hypothesis = parsed["hypothesis"]
+        extra_questions = parsed["extra_questions"]
+        table_mapping = parsed["table_mapping"]
 
         # ── Stage 3-7: Build → Compile → Execute → Contract → Package ──
         plan = None
@@ -1405,7 +814,7 @@ class Pipeline:
                 chain_id = hashlib.md5(
                     "|".join(s.step_name for s in spec.compute_steps).encode()
                 ).hexdigest()[:8]
-                sql_program = self._build_sql_program_from_compute_steps(
+                sql_program = build_sql_program_from_compute_steps(
                     plans, spec, chain_id
                 )
                 plan = plans[-1]
@@ -1459,7 +868,7 @@ class Pipeline:
                 )
                 packager = ReviewPackageBuilder()
                 package_manifest = packager.build(package_inputs)
-                self._results[request_id] = {
+                self._store_result(request_id, {
                     "package": package_manifest,
                     "sql_artifact": SqlArtifact(
                         artifact_id=SqlArtifact.generate_artifact_id(
@@ -1474,7 +883,7 @@ class Pipeline:
                     "parsed_spec": spec,
                     "manifest": manifest,
                     "table_mapping": table_mapping or {},
-                }
+                })
 
                 # ComputeSteps 路径独立返回
                 return {
@@ -1503,7 +912,7 @@ class Pipeline:
                 chain_id = hashlib.md5(
                     "|".join(c.candidate_id for c in hypothesis.candidates).encode()
                 ).hexdigest()[:8]
-                sql_program = self._build_sql_program_from_chain(
+                sql_program = build_sql_program_from_chain(
                     plans, spec.spec_hash, chain_id
                 )
                 plan = plans[-1]
@@ -1539,7 +948,7 @@ class Pipeline:
                 execute_executor = DuckDBExecutor(table_paths=table_paths or {})
                 trace, summary = execute_executor.execute(compiled_sql)
 
-                sql_program = self._build_sql_program(plan, spec.spec_hash)
+                sql_program = build_sql_program(plan, spec.spec_hash)
 
             # ── 公共阶段：Contract + Package（非 ComputeSteps 路径） ──
             stage = "contract"
@@ -1574,8 +983,8 @@ class Pipeline:
             package_manifest = packager.build(package_inputs)
 
         except Exception as e:
-            print(f"[Pipeline] run_all: {stage} 阶段失败 - {type(e).__name__}: {e}")
             request_id = self._gen_request_id(spec)
+            self._log_stage_failure("run_all", stage, e, request_id)
             # 保存已完成产物
             partial: dict = {"parsed_spec": spec, "manifest": manifest}
             if plan is not None:
@@ -1589,7 +998,7 @@ class Pipeline:
             if contract is not None:
                 partial["contract"] = contract
             partial["table_mapping"] = table_mapping or {}
-            self._results[request_id] = partial
+            self._store_result(request_id, partial)
 
             _plan_id = plan.plan_id if plan is not None else ""
             _contract_id = contract.contract_id if contract is not None else ""
@@ -1614,7 +1023,7 @@ class Pipeline:
             }
 
         # ── 成功路径（非 ComputeSteps） ──
-        self._results[request_id] = {
+        self._store_result(request_id, {
             "parsed_spec": spec,
             "manifest": manifest,
             "plan": plan,
@@ -1622,10 +1031,10 @@ class Pipeline:
             "trace": trace,
             "summary": summary,
             "table_mapping": table_mapping or {},
-        }
-        self._packages[request_id] = package_manifest
+        })
+        self._store_package(request_id, package_manifest)
 
-        return {
+        result: dict = {
             "request_id": request_id,
             "spec_id": spec.spec_id,
             "plan_id": plan.plan_id,
@@ -1651,28 +1060,72 @@ class Pipeline:
             ),
             "artifact_count": len(package_manifest.artifacts),
         }
+        if rich:
+            # 提取 SQL 文本——兼容 CompiledSql 对象和纯字符串
+            if hasattr(compiled_sql, "sql"):
+                result["generated_sql"] = compiled_sql.sql
+                result["sql_sha256"] = compiled_sql.sql_sha256
+                result["compiler_version"] = compiled_sql.compiler_version
+            else:
+                result["generated_sql"] = compiled_sql or ""
+                result["sql_sha256"] = ""
+                result["compiler_version"] = ""
+            # 步骤摘要 + Join 证据（来自 PlanRichResponse）
+            result["steps"] = [self._step_to_summary(s) for s in plan.steps]
+            result["join_evidence"] = self._extract_join_evidence(plan)
+            # 文件树（来自 PackageRichResponse）
+            result["file_tree"] = self._build_file_tree(package_manifest.artifacts)
+        return result
 
-    def get_package(self, request_id: str) -> dict | None:
+    def run_all_rich(
+        self, markdown_text: str,
+        table_mapping: dict[str, str] | None = None,
+        table_paths: dict[str, str] | None = None,
+    ) -> dict:
+        """前端专用：全流程+打包+富结果——返回 RunAllRichResponse dict。
+
+        一步获得 PlanRich + ExecuteRich + PackageRich 的全部信息，
+        前端无需分两次请求。
+
+        Args:
+            markdown_text: DeveloperSpec Markdown 全文
+            table_mapping: table_ref → 物理表名
+            table_paths: 物理表名 → CSV 文件路径
+
+        Returns:
+            符合 RunAllRichResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
+        """
+        return self.run_all(
+            markdown_text, table_mapping, table_paths, rich=True,
+        )
+
+    def get_package(self, request_id: str, rich: bool = False) -> dict | None:
         """获取已打包的 ReviewPackageManifest。
 
         Args:
             request_id: 请求唯一标识
+            rich: True 时返回 file_tree（前端 SPA 用），False 时返回平面 artifact 列表
 
         Returns:
-            符合 PackageResponse 结构的 dict，不存在时返回 None
+            符合 PackageResponse / PackageRichResponse 结构的 dict，不存在时返回 None
         """
+        self._purge_expired()
         manifest = self._packages.get(request_id)
         if manifest is None:
             return None
-        return {
+        base = {
             "request_id": manifest.request_id,
             "package_id": manifest.package_id,
             "created_at": manifest.created_at,
-            "artifacts": [a.model_dump() for a in manifest.artifacts],
             "artifact_count": len(manifest.artifacts),
             "spec_hash": manifest.spec_hash,
             "retry_count": manifest.retry_count,
         }
+        if rich:
+            base["file_tree"] = self._build_file_tree(manifest.artifacts)
+        else:
+            base["artifacts"] = [a.model_dump() for a in manifest.artifacts]
+        return base
 
     # ── Phase 4.5B 前端 SPA 专用方法 ──────────────────────
 
@@ -1689,7 +1142,7 @@ class Pipeline:
                 "description": t["description"],
                 "category": t["category"],
             }
-            for t in self.TEMPLATES
+            for t in TEMPLATES
         ]
 
     def get_template(self, template_id: str) -> dict | None:
@@ -1701,7 +1154,7 @@ class Pipeline:
         Returns:
             完整模板定义 dict，不存在时返回 None
         """
-        for t in self.TEMPLATES:
+        for t in TEMPLATES:
             if t["template_id"] == template_id:
                 return dict(t)
         return None
@@ -1748,7 +1201,7 @@ class Pipeline:
         }
 
     @staticmethod
-    def _extract_join_evidence(plan) -> list[dict]:
+    def _extract_join_evidence(plan: SqlBuildPlan) -> list[dict]:
         """从 SqlBuildPlan 的 join_hypothesis 中提取 Join 证据。
 
         Args:
@@ -1832,94 +1285,8 @@ class Pipeline:
         return _to_list(tree_root)
 
     def parse_rich(self, markdown_text: str) -> dict:
-        """前端专用：完整解析 DeveloperSpec——返回 SpecRichResponse dict。
-
-        包含全部结构化解析结果：表、字段、指标、维度、Join、时间范围等。
-        解析失败时返回 200 + pipeline_error。
-
-        Args:
-            markdown_text: DeveloperSpec Markdown 全文
-
-        Returns:
-            符合 SpecRichResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
-        """
-        # ── Stage: parser ──
-        try:
-            parser = DeveloperSpecParser()
-            spec = parser.parse(markdown_text)
-        except Exception as e:
-            print(f"[Pipeline] parse_rich: parser 阶段失败 - {type(e).__name__}: {e}")
-            error_info = self._capture_error("parser", e)
-            return {
-                "request_id": "",
-                "pipeline_error": error_info,
-                "pipeline_stages": self._build_pipeline_stages("parser", error_info),
-            }
-
-        request_id = self._gen_request_id(spec)
-        self._results[request_id] = {"parsed_spec": spec}
-
-        # 构建表声明摘要
-        tables = []
-        for t in spec.input_tables:
-            tables.append({
-                "table_alias": t.table_alias,
-                "source_table": str(t.source_table),
-                "row_count": t.row_count,
-                "role": t.role,
-                "column_count": len(t.columns) + len(t.key_columns) + len(t.business_columns),
-                "has_time_field": t.time_field is not None,
-                "has_partition": t.partition_field is not None,
-            })
-
-        # 构建 Join 声明摘要
-        joins = []
-        for j in (spec.joins or []):
-            joins.append({
-                "left_table": j.left_table,
-                "right_table": j.right_table,
-                "left_key": j.left_key,
-                "right_key": j.right_key,
-                "join_type": _safe_enum_value(j, "join_type"),
-            })
-
-        # 构建时间范围摘要
-        time_range = None
-        if spec.time_range:
-            time_range = {
-                "column_ref": spec.time_range.column_ref,
-                "start": spec.time_range.start,
-                "end": spec.time_range.end,
-                "inclusive": spec.time_range.inclusive,
-            }
-
-        return {
-            "request_id": request_id,
-            "spec_id": spec.spec_id,
-            "spec_hash": spec.spec_hash,
-            "title": spec.title,
-            "description": spec.description,
-            "tables": tables,
-            "metrics": [
-                {"metric_name": m.metric_name, "aggregation": _safe_enum_value(m, "aggregation"),
-                 "input_column": m.input_column, "alias": m.alias}
-                for m in spec.metrics
-            ],
-            "dimensions": [
-                {"dimension_name": d.dimension_name, "column_ref": d.column_ref}
-                for d in spec.dimensions
-            ],
-            "joins": joins,
-            "time_range": time_range,
-            "output_spec": {
-                "columns": [c.model_dump() for c in spec.output_spec.columns],
-                "grain": spec.output_spec.grain,
-                "sort_columns": [s.column for s in (spec.output_spec.sort or [])],
-                "limit": spec.output_spec.limit,
-            },
-            "open_questions": _summarize_open_questions(spec.open_questions),
-            "parse_warnings": _summarize_warnings(spec.parse_warnings),
-        }
+        """前端专用：完整解析 DeveloperSpec。委托到 parse_only(rich=True)。"""
+        return self.parse_only(markdown_text, rich=True)
 
     def build_plan_rich(
         self, markdown_text: str, table_mapping: dict[str, str] | None = None,
@@ -1935,36 +1302,16 @@ class Pipeline:
         Returns:
             符合 PlanRichResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
         """
-        # ── Stage 1: Parser ──
-        try:
-            parser = DeveloperSpecParser()
-            spec = parser.parse(markdown_text)
-            manifest = _build_manifest(spec)
-        except Exception as e:
-            print(f"[Pipeline] build_plan_rich: parser 阶段失败 - {type(e).__name__}: {e}")
-            error_info = self._capture_error("parser", e)
-            return {
-                "request_id": "",
-                "pipeline_error": error_info,
-                "pipeline_stages": self._build_pipeline_stages("parser", error_info),
-            }
-
-        # ── Stage 2: Enrich + Plan ──
-        try:
-            spec, hypothesis, extra_questions, table_mapping = self._enrich_and_plan(
-                spec, manifest, table_mapping,
-            )
-        except Exception as e:
-            print(f"[Pipeline] build_plan_rich: enrich 阶段失败 - {type(e).__name__}: {e}")
-            request_id = self._gen_request_id(spec)
-            self._results[request_id] = {"parsed_spec": spec, "manifest": manifest}
-            error_info = self._capture_error("enrich", e)
-            return {
-                "request_id": request_id,
-                "spec_id": spec.spec_id,
-                "pipeline_error": error_info,
-                "pipeline_stages": self._build_pipeline_stages("enrich", error_info),
-            }
+        self._purge_expired()
+        # ── Stage 1-2: Parser + Enrich ──
+        parsed = self._parse_and_enrich("build_plan_rich", markdown_text, table_mapping)
+        if not parsed["ok"]:
+            return parsed["error_response"]
+        spec = parsed["spec"]
+        manifest = parsed["manifest"]
+        hypothesis = parsed["hypothesis"]
+        extra_questions = parsed["extra_questions"]
+        table_mapping = parsed["table_mapping"]
 
         # ── Stage 3: Build + Validate ──
         plan = None
@@ -1975,12 +1322,12 @@ class Pipeline:
             validator = SqlBuildPlanValidator()
             passed, val_questions = validator.validate(plan, manifest)
         except Exception as e:
-            print(f"[Pipeline] build_plan_rich: build 阶段失败 - {type(e).__name__}: {e}")
+            self._log_stage_failure("build_plan_rich", "build", e)
             request_id = self._gen_request_id(spec)
             partial: dict = {"parsed_spec": spec, "manifest": manifest}
             if plan is not None:
                 partial["plan"] = plan
-            self._results[request_id] = partial
+            self._store_result(request_id, partial)
             error_info = self._capture_error("build", e)
             return {
                 "request_id": request_id,
@@ -1991,10 +1338,10 @@ class Pipeline:
             }
 
         request_id = self._gen_request_id(spec)
-        self._results[request_id] = {
+        self._store_result(request_id, {
             "parsed_spec": spec, "manifest": manifest, "plan": plan,
             "table_mapping": table_mapping or {},
-        }
+        })
 
         all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
 
@@ -2034,36 +1381,16 @@ class Pipeline:
         Returns:
             符合 ExecuteRichResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
         """
-        # ── Stage 1: Parser ──
-        try:
-            parser = DeveloperSpecParser()
-            spec = parser.parse(markdown_text)
-            manifest = _build_manifest(spec)
-        except Exception as e:
-            print(f"[Pipeline] execute_rich: parser 阶段失败 - {type(e).__name__}: {e}")
-            error_info = self._capture_error("parser", e)
-            return {
-                "request_id": "",
-                "pipeline_error": error_info,
-                "pipeline_stages": self._build_pipeline_stages("parser", error_info),
-            }
-
-        # ── Stage 2: Enrich + Plan ──
-        try:
-            spec, hypothesis, extra_questions, table_mapping = self._enrich_and_plan(
-                spec, manifest, table_mapping,
-            )
-        except Exception as e:
-            print(f"[Pipeline] execute_rich: enrich 阶段失败 - {type(e).__name__}: {e}")
-            request_id = self._gen_request_id(spec)
-            self._results[request_id] = {"parsed_spec": spec, "manifest": manifest}
-            error_info = self._capture_error("enrich", e)
-            return {
-                "request_id": request_id,
-                "spec_id": spec.spec_id,
-                "pipeline_error": error_info,
-                "pipeline_stages": self._build_pipeline_stages("enrich", error_info),
-            }
+        self._purge_expired()
+        # ── Stage 1-2: Parser + Enrich ──
+        parsed = self._parse_and_enrich("execute_rich", markdown_text, table_mapping)
+        if not parsed["ok"]:
+            return parsed["error_response"]
+        spec = parsed["spec"]
+        manifest = parsed["manifest"]
+        hypothesis = parsed["hypothesis"]
+        extra_questions = parsed["extra_questions"]
+        table_mapping = parsed["table_mapping"]
 
         # ── Stage 3-5: Build → Compile → Execute ──
         plan = None
@@ -2088,15 +1415,15 @@ class Pipeline:
             trace, summary = executor.execute(compiled)
 
         except Exception as e:
-            print(f"[Pipeline] execute_rich: {stage} 阶段失败 - {type(e).__name__}: {e}")
             request_id = self._gen_request_id(spec)
+            self._log_stage_failure("execute_rich", stage, e, request_id)
             partial: dict = {"parsed_spec": spec, "manifest": manifest}
             if plan is not None:
                 partial["plan"] = plan
             if compiled is not None:
                 partial["compiled"] = compiled
             partial["table_mapping"] = table_mapping or {}
-            self._results[request_id] = partial
+            self._store_result(request_id, partial)
 
             _plan_id = plan.plan_id if plan is not None else ""
             _sql_sha256 = getattr(compiled, "sql_sha256", "") if compiled is not None else ""
@@ -2118,11 +1445,11 @@ class Pipeline:
             }
 
         request_id = self._gen_request_id(spec)
-        self._results[request_id] = {
+        self._store_result(request_id, {
             "parsed_spec": spec, "manifest": manifest, "plan": plan,
             "compiled": compiled, "trace": trace, "summary": summary,
             "table_mapping": table_mapping or {},
-        }
+        })
 
         return {
             "request_id": request_id,
@@ -2147,29 +1474,6 @@ class Pipeline:
                 "numeric_sums": summary.numeric_sums,
             },
             "open_questions": _summarize_open_questions(all_questions),
-        }
-
-    def get_package_rich(self, request_id: str) -> dict | None:
-        """前端专用：获取 ReviewPackage 文件树——返回 PackageRichResponse dict。
-
-        Args:
-            request_id: 请求唯一标识
-
-        Returns:
-            符合 PackageRichResponse 结构的 dict，不存在时返回 None
-        """
-        manifest = self._packages.get(request_id)
-        if manifest is None:
-            return None
-        file_tree = self._build_file_tree(manifest.artifacts)
-        return {
-            "request_id": manifest.request_id,
-            "package_id": manifest.package_id,
-            "created_at": manifest.created_at,
-            "artifact_count": len(manifest.artifacts),
-            "spec_hash": manifest.spec_hash,
-            "retry_count": manifest.retry_count,
-            "file_tree": file_tree,
         }
 
 

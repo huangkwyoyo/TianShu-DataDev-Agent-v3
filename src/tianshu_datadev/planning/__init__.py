@@ -72,6 +72,7 @@ from .sql_program import (
 # ── TempTableSpec（Phase 3A） ──
 from .temp_table import (
     TempTableSpec,
+    make_temp_name,
     validate_consumer_is_declared,
     validate_temp_table_naming,
     validate_temp_table_refs,
@@ -82,6 +83,13 @@ from .spec_enricher import FakeSpecEnricher, SpecEnricher
 
 # ── 交叉验证（Phase 4E 指标↔Join 一致性） ──
 from .cross_validator import cross_validate
+
+# ── SqlProgram 工厂（从 Pipeline 提取——供编排器复用） ──
+from .program_factory import (
+    build_sql_program,
+    build_sql_program_from_chain,
+    build_sql_program_from_compute_steps,
+)
 
 __all__ = [
     # IR 基础类型
@@ -134,6 +142,7 @@ __all__ = [
     "validate_program_dag",
     # TempTableSpec（Phase 3A）
     "TempTableSpec",
+    "make_temp_name",
     "validate_consumer_is_declared",
     "validate_temp_table_naming",
     "validate_temp_table_refs",
@@ -142,4 +151,8 @@ __all__ = [
     "SpecEnricher",
     # 交叉验证（Phase 4E 指标↔Join 一致性）
     "cross_validate",
+    # SqlProgram 工厂
+    "build_sql_program",
+    "build_sql_program_from_chain",
+    "build_sql_program_from_compute_steps",
 ]

@@ -643,10 +643,10 @@ class TestPipelineStep2:
 
     def test_build_sql_program_single_statement(self):
         """_build_sql_program() 从单 plan 构建 STANDALONE SqlProgram。"""
-        from tianshu_datadev.api.pipeline import Pipeline
+        from tianshu_datadev.planning.program_factory import build_sql_program
 
         plan = _make_minimal_plan("plan_step2_test")
-        sql_program = Pipeline._build_sql_program(plan, "spec_hash_step2")
+        sql_program = build_sql_program(plan, "spec_hash_step2")
 
         # 基本字段
         assert sql_program.program_id.startswith("program_")

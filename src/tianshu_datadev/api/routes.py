@@ -99,6 +99,19 @@ async def run_all(request: Request, body: RunAllRequest):
     return result
 
 
+@api_router.post("/run-all-rich")
+async def run_all_rich(request: Request, body: RunAllRequest):
+    """前端专用：全流程一键执行+富结果——返回 RunAllRichResponse。
+
+    一步获得 PlanRich + ExecuteRich + PackageRich 的全部信息：
+    步骤摘要、Join 证据、SQL 文本、执行追踪、文件树。
+    前端无需分两次请求（execute-rich + package-rich）。
+    """
+    pipeline = request.app.state.pipeline
+    result = pipeline.run_all_rich(body.markdown_text, body.table_mapping, body.table_paths)
+    return result
+
+
 # ════════════════════════════════════════════
 # Phase 4.5B — 前端 SPA 专用端点
 # ════════════════════════════════════════════
@@ -182,7 +195,7 @@ async def get_package_rich(request: Request, request_id: str):
     返回文件树结构供前端渲染 Review Package 文件浏览器。
     """
     pipeline = request.app.state.pipeline
-    result = pipeline.get_package_rich(request_id)
+    result = pipeline.get_package(request_id, rich=True)
     if result is None:
         return JSONResponse(
             status_code=404,

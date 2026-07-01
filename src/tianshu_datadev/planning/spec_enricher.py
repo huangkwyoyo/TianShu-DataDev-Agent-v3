@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Any
+from typing import TYPE_CHECKING
 
 from tianshu_datadev.developer_spec.models import (
     AggregationType,
@@ -34,6 +34,9 @@ from tianshu_datadev.developer_spec.models import (
     ParsedDeveloperSpec,
     SourceManifest,
 )
+
+if TYPE_CHECKING:
+    from tianshu_datadev.llm.adapters.base import ProviderAdapter
 
 # ════════════════════════════════════════════
 # 规则推断——中文关键词 → 聚合函数映射
@@ -1080,19 +1083,19 @@ class SpecEnricher:
     """Phase 4 LLM 指标推断器——调用 LLM 从业务描述推断指标。
 
     使用嵌入 8 条硬约束的 System Prompt + JSON Schema 约束输出。
-    需要注入 LLM 客户端（如 Anthropic/OpenAI SDK），Phase 4 装配。
+    需要注入 ProviderAdapter，Phase 4 装配。
 
     与 FakeSpecEnricher 接口完全一致，可在 Pipeline 中直接替换。
     """
 
-    def __init__(self, llm_client: Any = None):
+    def __init__(self, adapter: ProviderAdapter | None = None):
         """初始化 LLM 推断器。
 
         Args:
-            llm_client: LLM 客户端（如 anthropic.Anthropic()），Phase 4 注入。
-                        None 时退化为 FakeSpecEnricher。
+            adapter: LLM Provider 适配器，Phase 4 注入。
+                     None 时退化为 FakeSpecEnricher（纯规则推断）。
         """
-        self._llm = llm_client
+        self._adapter = adapter
         self._fake = FakeSpecEnricher()
 
     def enrich(
@@ -1102,7 +1105,7 @@ class SpecEnricher:
     ) -> EnrichedSpec:
         """执行 LLM 推断，返回 EnrichedSpec。
 
-        当前退化为 FakeSpecEnricher（未注入 LLM 客户端时）。
+        adapter=None → 退化为 FakeSpecEnricher（纯规则推断）。
 
         Args:
             spec: 已解析的 DeveloperSpec
@@ -1111,11 +1114,76 @@ class SpecEnricher:
         Returns:
             EnrichedSpec——original_spec + 推断结果
         """
-        if self._llm is None:
+        if self._adapter is None:
             return self._fake.enrich(spec, manifest)
 
         # Phase 4：构建 Prompt → 调用 LLM → 解析 JSON → 校验 → 返回 EnrichedSpec
         return self._llm_enrich(spec, manifest)
+
+    def apply_enrichment(
+        self,
+        spec: ParsedDeveloperSpec,
+        manifest: SourceManifest,
+    ) -> ParsedDeveloperSpec:
+        """应用 enrich 结果——将推断指标合并到 spec 中。
+
+        程序员手写的 metrics 优先级最高（不可覆盖），
+        仅追加 inferred_metrics 中不与现有 alias 冲突的条目。
+
+        也合入跨粒度 compute_steps + JoinDecl + 窗口指标。
+
+        Args:
+            spec: 原始 DeveloperSpec
+            manifest: 源数据清单
+
+        Returns:
+            增强后的 ParsedDeveloperSpec（如无变更则返回原对象）
+        """
+        enriched: EnrichedSpec = self.enrich(spec, manifest)
+
+        # ── 合并推断指标 ──
+        declared_aliases = {m.alias for m in spec.metrics}
+        new_metrics = [
+            m for m in enriched.inferred_metrics
+            if m.alias not in declared_aliases
+        ]
+        combined_metrics = list(spec.metrics) + new_metrics
+
+        # ── 合并跨粒度 compute_steps + joins ──
+        meta = enriched.enrichment_metadata
+        generated_steps_data = meta.get("generated_compute_steps", [])
+        generated_joins_data = meta.get("generated_joins", [])
+
+        combined_steps = list(spec.compute_steps) if spec.compute_steps else []
+        combined_joins = list(spec.joins) if spec.joins else []
+
+        if generated_steps_data:
+            for sd in generated_steps_data:
+                combined_steps.append(ComputeStep(**sd))
+        if generated_joins_data:
+            for jd in generated_joins_data:
+                combined_joins.append(JoinDecl(**jd))
+
+        # ── 合并窗口指标 ──
+        new_window_metrics = list(enriched.inferred_window_metrics)
+
+        # 仅当有实际变更时才更新
+        needs_update = bool(
+            new_metrics or generated_steps_data or generated_joins_data
+            or new_window_metrics
+        )
+        if not needs_update:
+            return spec
+
+        update_dict: dict = {"metrics": combined_metrics}
+        if combined_steps:
+            update_dict["compute_steps"] = combined_steps
+        if combined_joins:
+            update_dict["joins"] = combined_joins
+        if new_window_metrics:
+            update_dict["inferred_window_metrics"] = new_window_metrics
+
+        return spec.model_copy(update=update_dict)
 
     def _build_context(self, spec: ParsedDeveloperSpec, manifest: SourceManifest) -> dict:
         """构建 LLM 调用的 Context 部分——不包含数据样本（遵守 H8）。
@@ -1177,10 +1245,7 @@ class SpecEnricher:
         raw: dict = {"inferred_metrics": [], "inferred_window_metrics": [], "inferred_computed_metrics": []}
 
         try:
-            from tianshu_datadev.llm.adapters import AnthropicAdapter
-
-            adapter = AnthropicAdapter()
-            raw = adapter.invoke(
+            raw = self._adapter.invoke(
                 system_message=_METRIC_INFERENCE_SYSTEM_PROMPT,
                 user_message=json.dumps(context, ensure_ascii=False),
                 json_schema=_METRIC_JSON_SCHEMA,

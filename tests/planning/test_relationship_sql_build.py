@@ -270,7 +270,7 @@ def _build_test_manifest(
 
 
 class TestRelationshipPlannerDegradation:
-    """退化路径——llm_client=None → 完全复刻 Fake 行为。"""
+    """退化路径——adapter=None → 完全复刻 Fake 行为。"""
 
     def test_degradation_explicit_join(self):
         """无 LLM client → 显式 Join 与 Fake 一致。"""
@@ -279,7 +279,7 @@ class TestRelationshipPlannerDegradation:
         spec = parser.parse(text)
 
         fake = FakeRelationshipPlanner()
-        rp = RelationshipPlanner(llm_client=None)
+        rp = RelationshipPlanner(adapter=None)
 
         hyp_fake, q_fake = fake.plan(spec)
         hyp_rp, q_rp = rp.plan(spec)
@@ -295,7 +295,7 @@ class TestRelationshipPlannerDegradation:
         spec = parser.parse(text)
 
         fake = FakeRelationshipPlanner()
-        rp = RelationshipPlanner(llm_client=None)
+        rp = RelationshipPlanner(adapter=None)
 
         hyp_fake, q_fake = fake.plan(spec)
         hyp_rp, q_rp = rp.plan(spec)
@@ -329,7 +329,7 @@ class TestRelationshipPlannerContextBuilder:
             spec.spec_hash,
         )
 
-        rp = RelationshipPlanner(llm_client=None)
+        rp = RelationshipPlanner(adapter=None)
         ctx = rp._build_context(spec, manifest)
 
         assert "table_schemas" in ctx
@@ -353,7 +353,7 @@ class TestRelationshipPlannerContextBuilder:
             spec.spec_hash,
         )
 
-        rp = RelationshipPlanner(llm_client=None)
+        rp = RelationshipPlanner(adapter=None)
         ctx = rp._build_context(spec, manifest)
 
         assert "existing_joins" in ctx
@@ -374,7 +374,7 @@ class TestRelationshipPlannerContextBuilder:
             spec.spec_hash,
         )
 
-        rp = RelationshipPlanner(llm_client=None)
+        rp = RelationshipPlanner(adapter=None)
         ctx = rp._build_context(spec, manifest)
 
         assert "business_description" in ctx
@@ -659,7 +659,7 @@ class TestRelationshipPlannerResponseParser:
 
     def test_parse_valid_high_confidence(self):
         """合法 JSON + 列名存在 + high confidence → 保留。"""
-        rp = RelationshipPlanner(llm_client=None)
+        rp = RelationshipPlanner(adapter=None)
         raw = {
             "inferred_joins": [
                 {
@@ -681,7 +681,7 @@ class TestRelationshipPlannerResponseParser:
 
     def test_parse_multiple_candidates(self):
         """多个合法候选 → 全部保留。"""
-        rp = RelationshipPlanner(llm_client=None)
+        rp = RelationshipPlanner(adapter=None)
         raw = {
             "inferred_joins": [
                 {
@@ -701,7 +701,7 @@ class TestRelationshipPlannerResponseParser:
 
     def test_parse_invalid_field_name_discarded(self):
         """H1 违反——字段名不在 manifest 中 → 丢弃该候选。"""
-        rp = RelationshipPlanner(llm_client=None)
+        rp = RelationshipPlanner(adapter=None)
         raw = {
             "inferred_joins": [
                 {
@@ -720,7 +720,7 @@ class TestRelationshipPlannerResponseParser:
 
     def test_parse_invalid_table_alias_discarded(self):
         """表别名无效 → 丢弃。"""
-        rp = RelationshipPlanner(llm_client=None)
+        rp = RelationshipPlanner(adapter=None)
         raw = {
             "inferred_joins": [
                 {
@@ -739,20 +739,20 @@ class TestRelationshipPlannerResponseParser:
 
     def test_parse_empty_inferred_joins(self):
         """空数组 → 0 候选，不抛异常。"""
-        rp = RelationshipPlanner(llm_client=None)
+        rp = RelationshipPlanner(adapter=None)
         result = rp._parse_llm_response({"inferred_joins": []}, self._basic_manifest())
         assert len(result) == 0
         assert isinstance(result, list)
 
     def test_parse_missing_inferred_joins_key(self):
         """缺少 inferred_joins 键 → 0 候选。"""
-        rp = RelationshipPlanner(llm_client=None)
+        rp = RelationshipPlanner(adapter=None)
         result = rp._parse_llm_response({}, self._basic_manifest())
         assert len(result) == 0
 
     def test_parse_self_join_rejected(self):
         """同一表自 Join → 丢弃（留给 Builder 自引用检测处理）。"""
-        rp = RelationshipPlanner(llm_client=None)
+        rp = RelationshipPlanner(adapter=None)
         raw = {
             "inferred_joins": [
                 {
@@ -767,7 +767,7 @@ class TestRelationshipPlannerResponseParser:
 
     def test_parse_invalid_confidence_defaults_to_medium(self):
         """非法 confidence → 容错默认 medium。"""
-        rp = RelationshipPlanner(llm_client=None)
+        rp = RelationshipPlanner(adapter=None)
         raw = {
             "inferred_joins": [
                 {

@@ -53,6 +53,34 @@ class TempTableSpec(StrictModel):
     cleanup_after: str = "program_end"  # 清理时机（当前仅支持 program_end）
 
 
+def make_temp_name(chain_id: str, step_identifier: str) -> str:
+    """生成 _temp 中间表名——Builder/Factory/Compiler 的唯一命名入口。
+
+    所有需要创建或引用 _temp 表的代码必须通过此函数生成表名，
+    禁止手写 f"_temp_c{{chain_id}}_{{step}}" 魔术字符串。
+
+    命名格式：_temp_c{chain_id}_{step_identifier}
+    - chain_id：8 字符 hex 摘要，标识同一执行链
+    - step_identifier：步骤索引（多跳链）或 step_name（ComputeSteps DAG）
+
+    内置安全校验——生成的表名必须通过 validate_temp_table_naming() 白名单检查。
+
+    Args:
+        chain_id: 执行链 ID（8 字符 hex 摘要）
+        step_identifier: 步骤标识——整数索引的字符串形式或 ComputeStep.step_name
+
+    Returns:
+        符合 _temp 命名规范的中间表名
+
+    Raises:
+        ValueError: 生成的表名未通过白名单校验（理论上不会，但作为安全门禁保留）
+    """
+    temp_id = f"_temp_c{chain_id}_{step_identifier}"
+    # 安全门禁——确保生成的表名符合白名单规范
+    validate_temp_table_naming(temp_id)
+    return temp_id
+
+
 def validate_temp_table_naming(temp_id: str) -> None:
     """校验 _temp 表名的合法性——前缀 + 字符 allowlist + 长度上限。
 

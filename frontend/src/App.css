@@ -222,12 +222,49 @@ body {
   flex-direction: column;
 }
 
+.editor-wrapper {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.editor-wrapper:focus-within {
+  border-color: var(--accent);
+}
+
+.editor-fence {
+  display: flex;
+  align-items: center;
+  padding: 4px 12px;
+  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: #0d1117;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.editor-fence-top {
+  border-bottom: 1px solid var(--border);
+}
+
+.editor-fence-bottom {
+  border-top: 1px solid var(--border);
+}
+
+.fence-marker {
+  color: var(--accent);
+  margin-right: 2px;
+}
+
 .spec-editor textarea {
   width: 100%;
   min-height: 280px;
   padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border: none;
+  border-radius: 0;
   background: var(--bg-input);
   color: var(--text);
   font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
@@ -239,7 +276,6 @@ body {
 
 .spec-editor textarea:focus {
   outline: none;
-  border-color: var(--accent);
 }
 
 .editor-hint {

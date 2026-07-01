@@ -602,7 +602,7 @@ class SourceConflict(StrictModel):
     conflict_type: ConflictType
 
 
-class SourceAnomaly(StrictModel):
+class ManifestAnomaly(StrictModel):
     """快照采样或注册表查询中发现的异常——非冲突，但值得记录。"""
 
     anomaly_id: str
@@ -682,4 +682,4 @@ class SourceManifest(StrictModel):
     spec_hash: str
     tables: list[ManifestTable] = []
     conflicts: list[SourceConflict] = []
-    anomalies: list[SourceAnomaly] = []
+    anomalies: list[ManifestAnomaly] = []

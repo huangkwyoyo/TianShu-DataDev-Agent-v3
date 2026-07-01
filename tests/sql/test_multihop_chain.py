@@ -883,7 +883,7 @@ class TestBuildMultiIntegration:
 
     def test_chain_validates(self):
         """多跳链 SqlProgram 应通过 validate_multi_hop_chain。"""
-        from tianshu_datadev.api.pipeline import Pipeline
+        from tianshu_datadev.planning.program_factory import build_sql_program_from_chain
         from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
 
         spec = self._make_three_table_spec()
@@ -893,7 +893,7 @@ class TestBuildMultiIntegration:
         plans = builder.build_multi(spec, hypothesis)
 
         chain_id = "test_chain"
-        sql_program = Pipeline._build_sql_program_from_chain(
+        sql_program = build_sql_program_from_chain(
             plans, spec.spec_hash, chain_id
         )
 
@@ -1294,7 +1294,7 @@ class TestBuildFromStepsBranch:
 
     def test_branch_sql_program_dag_dependencies(self):
         """SqlProgram 应正确反映 DAG 依赖——合流步骤依赖两个分支。"""
-        from tianshu_datadev.api.pipeline import Pipeline
+        from tianshu_datadev.planning.program_factory import build_sql_program_from_compute_steps
         from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
 
         spec = self._make_branch_spec()
@@ -1302,7 +1302,7 @@ class TestBuildFromStepsBranch:
         plans = builder.build_from_steps(spec)
 
         chain_id = "test_branch"
-        sql_program = Pipeline._build_sql_program_from_compute_steps(
+        sql_program = build_sql_program_from_compute_steps(
             plans, spec, chain_id
         )
 

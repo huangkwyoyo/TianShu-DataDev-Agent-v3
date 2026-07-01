@@ -150,15 +150,16 @@ class TestTemplateButtons:
         assert not missing, f"JS bundle 中未找到模板关键词: {missing}"
 
     def test_template_ids_in_pipeline(self):
-        """验证模板 ID 存在于流水线定义中（模板由 API 端提供，非前端硬编码）。
+        """验证模板 ID 存在于模板定义中（模板由 API 端提供，非前端硬编码）。
 
         Phase 4.5 要求至少 5 个模板（退出条件 #4）。
+        TEMPLATES 已从 pipeline.py 外置到 api/templates.py（风险 #8）。
         """
-        pipeline_path = os.path.join(
-            _ROOT, "src", "tianshu_datadev", "api", "pipeline.py"
+        templates_path = os.path.join(
+            _ROOT, "src", "tianshu_datadev", "api", "templates.py"
         )
-        with open(pipeline_path, "r", encoding="utf-8") as f:
-            pipeline_src = f.read()
+        with open(templates_path, "r", encoding="utf-8") as f:
+            templates_src = f.read()
 
         template_ids = [
             "tpl_aggregation",
@@ -169,11 +170,11 @@ class TestTemplateButtons:
             "tpl_empty",              # Phase 4.5 补全
         ]
         for tid in template_ids:
-            assert tid in pipeline_src, (
-                f"模板 ID '{tid}' 未在 pipeline.py 的 TEMPLATES 中找到"
+            assert tid in templates_src, (
+                f"模板 ID '{tid}' 未在 templates.py 的 TEMPLATES 中找到"
             )
         # 验证模板数量 >= 5（Phase 4.5 退出条件 #4）
-        template_count = pipeline_src.count('"template_id":')
+        template_count = templates_src.count('"template_id":')
         assert template_count >= 5, (
             f"模板数量 {template_count} < 5——不满足 Phase 4.5 退出条件 #4"
         )

@@ -437,6 +437,231 @@ class TestMetricVariantsInCompiler:
 
 
 # ════════════════════════════════════════════
+# Aggregate + Project 集成测试
+# ════════════════════════════════════════════
+
+
+class TestAggregateProjectIntegration:
+    """验证 AggregateStep 后跟 ProjectStep 时聚合表达式不被覆盖。"""
+
+    def test_project_after_aggregate_preserves_count(self):
+        """单表聚合+投影：ProjectStep 不应覆盖 COUNT 表达式。"""
+        spec = _parse_spec("fixtures/golden/golden_no_time_range.md")
+
+        builder = SqlBuildPlanBuilder()
+        plan, _ = builder.build(spec)
+
+        compiler = DuckDbSqlCompiler()
+        compiled = compiler.compile(plan)
+
+        # 核心验证：聚合表达式 COUNT(id) 必须保留在 SQL 中
+        assert "COUNT(tf.id) AS cnt" in compiled.sql, (
+            f"聚合表达式 COUNT(tf.id) AS cnt 被 ProjectStep 覆盖，实际 SQL:\n{compiled.sql}"
+        )
+
+        # GROUP BY 子句必须存在
+        assert "GROUP BY" in compiled.sql.upper(), (
+            f"缺少 GROUP BY 子句，实际 SQL:\n{compiled.sql}"
+        )
+
+    def test_project_after_aggregate_preserves_all_metrics(self):
+        """多指标聚合+投影：所有聚合表达式应保留。"""
+        parser = DeveloperSpecParser()
+        spec_text = """```markdown
+---
+spec:
+  type: aggregate_table
+  target_table: ads.test_metrics
+
+  source_tables:
+    - name: dwd.test_fact
+      alias: tf
+      row_count: ~100万
+      role: fact
+      key_columns:
+        - name: id
+          type: bigint
+          nullable: false
+        - name: user_id
+          type: bigint
+          nullable: false
+        - name: order_amount
+          type: decimal
+          nullable: false
+      business_columns:
+        - name: event_time
+          type: timestamp
+          nullable: false
+
+  metrics:
+    - metric_name: pv
+      aggregation: COUNT
+      input_column: id
+      alias: pv
+    - metric_name: uv
+      aggregation: COUNT_DISTINCT
+      input_column: user_id
+      alias: uv
+    - metric_name: total_amount
+      aggregation: SUM
+      input_column: order_amount
+      alias: total_amount
+
+  dimensions:
+    - dimension_name: stat_date
+      column_ref: stat_date
+
+  output_columns:
+    - name: stat_date
+      type: date
+    - name: pv
+      type: bigint
+    - name: uv
+      type: bigint
+    - name: total_amount
+      type: decimal
+---
+
+# 多指标聚合测试
+```
+"""
+        spec = parser.parse(spec_text)
+        builder = SqlBuildPlanBuilder()
+        plan, _ = builder.build(spec)
+
+        compiler = DuckDbSqlCompiler()
+        compiled = compiler.compile(plan)
+
+        # 三个聚合表达式都必须保留（编译器会自动添加表前缀）
+        assert "COUNT(tf.id) AS pv" in compiled.sql, (
+            f"COUNT(tf.id) AS pv 被覆盖，实际 SQL:\n{compiled.sql}"
+        )
+        assert "COUNT(DISTINCT tf.user_id) AS uv" in compiled.sql, (
+            f"COUNT(DISTINCT tf.user_id) AS uv 被覆盖，实际 SQL:\n{compiled.sql}"
+        )
+        assert "SUM(tf.order_amount) AS total_amount" in compiled.sql, (
+            f"SUM(tf.order_amount) AS total_amount 被覆盖，实际 SQL:\n{compiled.sql}"
+        )
+
+        # 确认输出列顺序正确（stat_date → pv → uv → total_amount）
+        sql_upper = compiled.sql.upper()
+        select_start = sql_upper.index("SELECT") + 6
+        from_pos = sql_upper.index("FROM")
+        select_clause = compiled.sql[select_start:from_pos]
+
+        # stat_date 应在 pv 之前（列顺序）
+        assert select_clause.index("stat_date") < select_clause.index("pv"), (
+            f"列顺序错误：stat_date 应在 pv 之前，实际 SELECT:\n{select_clause}"
+        )
+
+    def test_aggregate_with_filter_preserved(self):
+        """带 FILTER 的聚合+投影：FILTER 子句应保留。"""
+        parser = DeveloperSpecParser()
+        spec_text = """```markdown
+---
+spec:
+  type: aggregate_table
+  target_table: ads.test_filter
+
+  source_tables:
+    - name: dwd.test_fact
+      alias: tf
+      row_count: ~100万
+      role: fact
+      key_columns:
+        - name: user_id
+          type: bigint
+          nullable: false
+        - name: status
+          type: varchar
+          nullable: true
+
+  metrics:
+    - metric_name: valid_users
+      aggregation: COUNT
+      input_column: user_id
+      alias: valid_users
+      filter:
+        column: status
+        operator: eq
+        value: ACTIVE
+
+  dimensions:
+    - dimension_name: stat_date
+      column_ref: stat_date
+
+  output_columns:
+    - name: stat_date
+      type: date
+    - name: valid_users
+      type: bigint
+---
+
+# FILTER 聚合测试
+```
+"""
+        spec = parser.parse(spec_text)
+        builder = SqlBuildPlanBuilder()
+        plan, _ = builder.build(spec)
+
+        compiler = DuckDbSqlCompiler()
+        compiled = compiler.compile(plan)
+
+        # FILTER 子句必须保留
+        assert "FILTER (WHERE status = 'ACTIVE')" in compiled.sql, (
+            f"FILTER 子句被覆盖，实际 SQL:\n{compiled.sql}"
+        )
+        assert "COUNT(tf.user_id)" in compiled.sql, (
+            f"COUNT(tf.user_id) 被覆盖，实际 SQL:\n{compiled.sql}"
+        )
+
+    def test_no_aggregate_project_only_no_interference(self):
+        """无聚合纯投影：_reorder_aggregation_cols 不影响普通 ProjectStep。"""
+        parser = DeveloperSpecParser()
+        spec_text = """```markdown
+---
+spec:
+  type: detail_table
+  target_table: ads.test_detail
+
+  source_tables:
+    - name: dwd.test_fact
+      alias: tf
+      row_count: ~100万
+      role: fact
+      columns:
+        - name: id
+          type: bigint
+          nullable: false
+        - name: user_id
+          type: bigint
+          nullable: false
+
+  output_columns:
+    - name: id
+      type: bigint
+    - name: user_id
+      type: bigint
+---
+
+# 纯投影测试
+```
+"""
+        spec = parser.parse(spec_text)
+        builder = SqlBuildPlanBuilder()
+        plan, _ = builder.build(spec)
+
+        compiler = DuckDbSqlCompiler()
+        compiled = compiler.compile(plan)
+
+        # 无聚合时的纯投影：列名应直接出现在 SELECT 中
+        assert "id" in compiled.sql
+        assert "user_id" in compiled.sql
+        # 不应有 GROUP BY
+        assert "GROUP BY" not in compiled.sql.upper()
+
+
+# ════════════════════════════════════════════
 # 窗口过滤子查询包裹测试（P1-3）
 # ════════════════════════════════════════════
 
@@ -1560,7 +1785,7 @@ class TestConditionalBranch:
             OutputSpecDecl, ParsedDeveloperSpec,
         )
         from tianshu_datadev.planning.spec_enricher import SpecEnricher
-        from tianshu_datadev.api.pipeline import _build_manifest
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
 
         metrics = [
             MetricDecl(
@@ -1607,7 +1832,7 @@ class TestConditionalBranch:
             ),
         )
 
-        manifest = _build_manifest(spec)
+        manifest = build_manifest_from_spec(spec)
         enricher = SpecEnricher()
         enriched = enricher.enrich(spec, manifest)
 
@@ -2005,7 +2230,8 @@ class TestWindowPipelineE2E:
 
     def test_pipeline_merges_window_metrics_into_spec(self):
         """Pipeline._apply_enrichment 将窗口指标合入 ParsedDeveloperSpec。"""
-        from tianshu_datadev.api.pipeline import Pipeline, _build_manifest
+        from tianshu_datadev.api.pipeline import Pipeline
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
         from tianshu_datadev.planning.spec_enricher import SpecEnricher
         from tianshu_datadev.developer_spec.models import (
             InputTableDecl,
@@ -2040,9 +2266,9 @@ class TestWindowPipelineE2E:
                 grain=[],
             ),
         )
-        manifest = _build_manifest(spec)
+        manifest = build_manifest_from_spec(spec)
         enricher = SpecEnricher()
-        enriched_spec = Pipeline._apply_enrichment(spec, manifest, enricher)
+        enriched_spec = enricher.apply_enrichment(spec, manifest)
 
         # 验证窗口指标已合入——rn 列的 description 含 ROW_NUMBER() OVER (...)
         assert len(enriched_spec.inferred_window_metrics) >= 1, (
@@ -2055,7 +2281,8 @@ class TestWindowPipelineE2E:
 
     def test_builder_includes_window_step_in_single_table_plan(self):
         """单表路径：Builder 将 WindowStep 插入聚合后、投影前。"""
-        from tianshu_datadev.api.pipeline import Pipeline, _build_manifest
+        from tianshu_datadev.api.pipeline import Pipeline
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
         from tianshu_datadev.developer_spec.models import (
             InputTableDecl,
             OutputColumnDecl,
@@ -2089,9 +2316,9 @@ class TestWindowPipelineE2E:
                 grain=[],
             ),
         )
-        manifest = _build_manifest(spec)
+        manifest = build_manifest_from_spec(spec)
         enricher = SpecEnricher()
-        enriched_spec = Pipeline._apply_enrichment(spec, manifest, enricher)
+        enriched_spec = enricher.apply_enrichment(spec, manifest)
 
         builder = SqlBuildPlanBuilder()
         plan, questions = builder.build(enriched_spec)
@@ -2113,7 +2340,8 @@ class TestWindowPipelineE2E:
 
     def test_window_deterministic_compilation(self):
         """相同窗口指标产生确定性 WindowStep 和 SQL。"""
-        from tianshu_datadev.api.pipeline import Pipeline, _build_manifest
+        from tianshu_datadev.api.pipeline import Pipeline
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
         from tianshu_datadev.developer_spec.models import (
             InputTableDecl,
             OutputColumnDecl,
@@ -2147,17 +2375,17 @@ class TestWindowPipelineE2E:
                 grain=[],
             ),
         )
-        manifest = _build_manifest(spec)
+        manifest = build_manifest_from_spec(spec)
         enricher = SpecEnricher()
 
         # 两次独立构建
-        spec1 = Pipeline._apply_enrichment(spec, manifest, enricher)
+        spec1 = enricher.apply_enrichment(spec, manifest)
         plan1, _ = SqlBuildPlanBuilder().build(spec1)
         compiler1 = DuckDbSqlCompiler(table_mapping={"t": "test_t"})
         sql1 = compiler1.compile(plan1).sql
 
         # 重新解析（模拟独立运行）
-        spec2 = Pipeline._apply_enrichment(spec, manifest, enricher)
+        spec2 = enricher.apply_enrichment(spec, manifest)
         plan2, _ = SqlBuildPlanBuilder().build(spec2)
         compiler2 = DuckDbSqlCompiler(table_mapping={"t": "test_t"})
         sql2 = compiler2.compile(plan2).sql

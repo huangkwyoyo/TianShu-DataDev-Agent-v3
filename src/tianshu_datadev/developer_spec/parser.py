@@ -473,6 +473,16 @@ class DeveloperSpecParser:
                     field_ref=raw.get("metric_name"),
                 ) from None
 
+            # Phase 4D：解析 filter / input_expression / distinct
+            raw_filter = raw.get("filter")
+            metric_filter = None
+            if raw_filter and isinstance(raw_filter, dict):
+                metric_filter = MetricFilterDecl(
+                    column=raw_filter.get("column", ""),
+                    operator=raw_filter.get("operator", "eq"),
+                    value=str(raw_filter.get("value", "")),
+                )
+
             metrics.append(MetricDecl(
                 metric_name=raw.get("metric_name", ""),
                 aggregation=aggregation,
@@ -480,6 +490,10 @@ class DeveloperSpecParser:
                 alias=raw.get("alias", raw.get("metric_name", "")),
                 # ── Phase 5：多条件变体 ──
                 variants=self._parse_metric_variants(raw.get("variants", [])),
+                # ── Phase 4D：filter / input_expression / distinct ──
+                filter=metric_filter,
+                input_expression=raw.get("input_expression"),
+                distinct=raw.get("distinct", False),
             ))
 
         return metrics

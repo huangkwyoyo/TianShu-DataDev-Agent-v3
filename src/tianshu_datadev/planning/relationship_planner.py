@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING
 
 from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer
 from tianshu_datadev.developer_spec.models import JoinDecl, OpenQuestion, ParsedDeveloperSpec, SourceManifest
@@ -20,6 +21,9 @@ from .relationship_hypothesis import (
     RelationshipHypothesis,
 )
 from .relationship_validator import RelationshipValidator
+
+if TYPE_CHECKING:
+    from tianshu_datadev.llm.adapters.base import ProviderAdapter
 
 
 class FakeRelationshipPlanner:
@@ -420,10 +424,10 @@ class RelationshipPlanner:
     """Phase 4E LLM Join 推断器——调用 LLM 从表结构和业务描述推断 Join 关系。
 
     使用嵌入 7 条硬约束的 System Prompt + JSON 约束输出。
-    需要注入 LLM 客户端（如 Anthropic SDK），Phase 4E 装配。
+    需要注入 ProviderAdapter，Phase 4E 装配。
 
     与 FakeRelationshipPlanner 接口完全一致——相同 (spec, manifest) → (hypothesis, questions)。
-    llm_client=None 时完全退化为 FakeRelationshipPlanner 行为。
+    adapter=None 时完全退化为 FakeRelationshipPlanner 行为。
     """
 
     # 字段类型兼容性矩阵——同组类型视为兼容
@@ -437,19 +441,19 @@ class RelationshipPlanner:
 
     def __init__(
         self,
-        llm_client: Any = None,
+        adapter: ProviderAdapter | None = None,
         validator: RelationshipValidator | None = None,
         normalizer: FieldNormalizer | None = None,
     ):
         """初始化 LLM 推断器。
 
         Args:
-            llm_client: LLM 客户端（如 anthropic.Anthropic()），Phase 4E 注入。
-                        None 时退化为 FakeRelationshipPlanner。
+            adapter: LLM Provider 适配器，Phase 4E 注入。
+                     None 时退化为 FakeRelationshipPlanner（纯规则推断）。
             validator: 证据评级器，None 使用默认 RelationshipValidator
             normalizer: 字段名归一化器，None 使用默认 FieldNormalizer
         """
-        self._llm = llm_client
+        self._adapter = adapter
         self._validator = validator or RelationshipValidator()
         self._normalizer = normalizer or FieldNormalizer()
         self._fake = FakeRelationshipPlanner(self._validator, self._normalizer)
@@ -461,8 +465,8 @@ class RelationshipPlanner:
     ) -> tuple[RelationshipHypothesis, list[OpenQuestion]]:
         """基于 spec + manifest 构建 RelationshipHypothesis。
 
-        llm_client=None → 退化到 FakeRelationshipPlanner。
-        llm_client 已注入 → LLM 推断隐式 Join 并与显式声明合并。
+        adapter=None → 退化到 FakeRelationshipPlanner。
+        adapter 已注入 → LLM 推断隐式 Join 并与显式声明合并。
 
         Args:
             spec: 已解析的 DeveloperSpec
@@ -471,7 +475,7 @@ class RelationshipPlanner:
         Returns:
             (RelationshipHypothesis, list[OpenQuestion])
         """
-        if self._llm is None:
+        if self._adapter is None:
             return self._fake.plan(spec, manifest)
 
         return self._llm_plan(spec, manifest)
@@ -617,10 +621,7 @@ class RelationshipPlanner:
         raw: dict = {"inferred_joins": []}
 
         try:
-            from tianshu_datadev.llm.adapters import AnthropicAdapter
-
-            adapter = AnthropicAdapter()
-            raw = adapter.invoke(
+            raw = self._adapter.invoke(
                 system_message=_RELATIONSHIP_INFERENCE_PROMPT,
                 user_message=json.dumps(context, ensure_ascii=False),
                 json_schema=_RELATIONSHIP_JSON_SCHEMA,

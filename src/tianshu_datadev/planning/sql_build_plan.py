@@ -38,6 +38,7 @@ from .models import (
     WindowFunction,
 )
 from .relationship_hypothesis import RelationshipHypothesis
+from .temp_table import make_temp_name
 
 # ════════════════════════════════════════════
 # 8 Step 类型（strict Pydantic，extra="forbid"）
@@ -428,7 +429,7 @@ class SqlBuildPlanBuilder:
             elif len(sources) == 1:
                 # ── 线性步骤：从单个上游 _temp 表扫描 ──
                 src = sources[0]
-                temp_ref = f"_temp_c{chain_id}_{src}"
+                temp_ref = make_temp_name(chain_id, src)
                 upstream_cols = step_outputs.get(src, [])
                 up_col_map = {c.normalized_name for c in upstream_cols}
                 scan_cols: list[ColumnRef] = []
@@ -469,7 +470,7 @@ class SqlBuildPlanBuilder:
                 # ── 合流步骤：从多个上游 _temp 表扫描 + Join ──
                 temp_refs: list[str] = []
                 for src in sources:
-                    temp_ref = f"_temp_c{chain_id}_{src}"
+                    temp_ref = make_temp_name(chain_id, src)
                     temp_refs.append(temp_ref)
                     upstream_cols = step_outputs.get(src, [])
                     # 扫描上游全部列
@@ -554,7 +555,7 @@ class SqlBuildPlanBuilder:
                 # 合流步骤：用第一个源的 _temp 表名作为条件列的 table_ref
                 cw_table_ref = ""
                 if isinstance(cs.source, list) and len(cs.source) > 0:
-                    cw_table_ref = f"_temp_c{chain_id}_{cs.source[0]}"
+                    cw_table_ref = make_temp_name(chain_id, cs.source[0])
                 case_step = self._build_case_when_from_decl(
                     cs.case_when, cs.step_name, chain_id, source_table=cw_table_ref,
                 )
@@ -581,7 +582,7 @@ class SqlBuildPlanBuilder:
                 # 合流步骤：使用第一个源的 _temp 表别名消除列歧义
                 proj_table_ref = ""
                 if isinstance(cs.source, list) and len(cs.source) > 0:
-                    proj_table_ref = f"_temp_c{chain_id}_{cs.source[0]}"
+                    proj_table_ref = make_temp_name(chain_id, cs.source[0])
                 project = self._build_project_step(spec, default_table_ref=proj_table_ref)
                 # 排除 CaseWhenStep 已产出的列——避免 SELECT 中重复
                 if cs.case_when and cs.case_when.output_column:
@@ -1004,7 +1005,7 @@ class SqlBuildPlanBuilder:
                 left_source = candidate.left_table
                 joined_tables.append(candidate.left_table)
             else:
-                left_source = f"_temp_c{chain_id}_{idx - 1}"
+                left_source = make_temp_name(chain_id, str(idx - 1))
 
             joined_tables.append(candidate.right_table)
 

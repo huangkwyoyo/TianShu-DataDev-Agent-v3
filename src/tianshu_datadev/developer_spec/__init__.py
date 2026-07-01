@@ -28,7 +28,7 @@ from .models import (
     SafePhysicalTableName,
     SortDecl,
     SortDirection,
-    SourceAnomaly,
+    ManifestAnomaly,
     SourceConflict,
     SourceManifest,
     StrictModel,
@@ -63,7 +63,7 @@ __all__ = [
     "ManifestTable",
     "ManifestColumn",
     "FieldSource",
-    "SourceAnomaly",
+    "ManifestAnomaly",
     "ForeignKeyRef",
     "ComputeStep",
     # 枚举

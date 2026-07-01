@@ -25,7 +25,7 @@ from .models import (
     ManifestTable,
     OpenQuestion,
     ParsedDeveloperSpec,
-    SourceAnomaly,
+    ManifestAnomaly,
     SourceConflict,
     SourceManifest,
 )
@@ -107,7 +107,7 @@ class SourceManifestBuilder:
         tables = self._build_manifest_tables(spec)
 
         all_conflicts: list[SourceConflict] = []
-        all_anomalies: list[SourceAnomaly] = []
+        all_anomalies: list[ManifestAnomaly] = []
         open_questions: list[OpenQuestion] = []
 
         # 2. 从 SchemaRegistry 补充
@@ -219,7 +219,7 @@ class SourceManifestBuilder:
         self,
         tables: list[ManifestTable],
         registry: SchemaRegistry,
-    ) -> tuple[list[SourceConflict], list[SourceAnomaly]]:
+    ) -> tuple[list[SourceConflict], list[ManifestAnomaly]]:
         """从 SchemaRegistry 补充字段信息，并检测冲突。
 
         规则：
@@ -231,12 +231,12 @@ class SourceManifestBuilder:
         永远不会静默覆盖 developer_spec 已声明的值。
         """
         conflicts: list[SourceConflict] = []
-        anomalies: list[SourceAnomaly] = []
+        anomalies: list[ManifestAnomaly] = []
 
         for table in tables:
             registry_meta = registry.get_table_metadata(table.source_table)
             if registry_meta is None:
-                anomalies.append(SourceAnomaly(
+                anomalies.append(ManifestAnomaly(
                     anomaly_id=f"ANOMALY-{uuid.uuid4().hex[:8]}",
                     table_ref=table.table_ref,
                     description=f"表 '{table.source_table}' 在 SchemaRegistry 中不存在",
@@ -272,7 +272,7 @@ class SourceManifestBuilder:
                 reg_col = reg_columns.get(col.normalized_name)
                 if reg_col is None:
                     # 字段在 registry 中不存在
-                    anomalies.append(SourceAnomaly(
+                    anomalies.append(ManifestAnomaly(
                         anomaly_id=f"ANOMALY-{uuid.uuid4().hex[:8]}",
                         table_ref=table.table_ref,
                         column_ref=col.column_name,
@@ -450,3 +450,75 @@ class SourceManifestBuilder:
     def _build_manifest_id(self, spec_hash: str) -> str:
         """生成 manifest_id——前缀 'manifest_' + spec_hash 前 8 位。"""
         return f"manifest_{spec_hash[:8]}"
+
+
+def build_manifest_from_spec(spec: ParsedDeveloperSpec) -> SourceManifest:
+    """从 ParsedDeveloperSpec 构建 SourceManifest——涵盖所有列引用。
+
+    不仅包含 input_tables 中显式声明的列，还从 metrics、dimensions、
+    output_spec 中提取被引用但未显式声明的列（以 "varchar" 类型补充）。
+
+    这是一个轻量级构建器——不涉及 SchemaRegistry 或 SnapshotProfile。
+    需要完整冲突检测时，使用 SourceManifestBuilder.build()。
+    """
+    tables: list[ManifestTable] = []
+    for t in spec.input_tables:
+        seen: set[str] = set()
+        cols: list[ManifestColumn] = []
+
+        def _add(col_name: str) -> None:
+            """添加列（去重），从原始声明中查找类型信息。"""
+            if col_name in seen:
+                return
+            seen.add(col_name)
+            dtype = "varchar"
+            for src_list in [t.columns, t.key_columns, t.business_columns]:
+                for c in src_list:
+                    if c.column_name == col_name:
+                        dtype = c.data_type or "varchar"
+                        break
+            cols.append(
+                ManifestColumn(
+                    column_name=col_name,
+                    normalized_name=col_name.lower(),
+                    data_type=dtype,
+                    nullable=True,
+                    source=FieldSource.DEVELOPER_SPEC,
+                )
+            )
+
+        # 从显式声明的列开始
+        for c in t.columns + t.key_columns + t.business_columns:
+            _add(c.column_name)
+
+        # 从指标引用中提取
+        for m in spec.metrics:
+            if m.input_column:
+                _add(m.input_column)
+
+        # 从维度引用中提取
+        for d in spec.dimensions:
+            _add(d.column_ref)
+
+        # 从输出列提取
+        for col in spec.output_spec.columns:
+            _add(col.name)
+
+        # 从排序列提取
+        if spec.output_spec.sort:
+            for s in spec.output_spec.sort:
+                _add(s.column)
+
+        tables.append(
+            ManifestTable(
+                table_ref=t.table_alias,
+                source_table=t.source_table,
+                columns=cols,
+                estimated_row_count=t.row_count,
+            )
+        )
+    return SourceManifest(
+        manifest_id=f"manifest_{spec.spec_hash[:12]}",
+        spec_hash=spec.spec_hash,
+        tables=tables,
+    )

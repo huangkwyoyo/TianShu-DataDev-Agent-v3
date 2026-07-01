@@ -171,7 +171,7 @@ class TestRegistryNoOverride:
             assert event_col.source == FieldSource.DEVELOPER_SPEC
 
 
-class TestSourceAnomaly:
+class TestManifestAnomaly:
     """SOURCE_ANOMALY 测试。"""
 
     def test_table_not_found_in_registry(self):

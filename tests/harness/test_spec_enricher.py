@@ -1,7 +1,7 @@
 """SpecEnricher tests - Phase 4D metric inference layer.
 
 Covers:
-1. SpecEnricher rule-based inference（llm_client=None 退化）
+1. SpecEnricher rule-based inference（adapter=None 退化）
 2. Hand-declared metric protection (no overwrite)
 3. EnrichedSpec serialization
 4. MetricDecl extended fields (filter/input_expression/distinct)
@@ -29,7 +29,7 @@ from tianshu_datadev.planning.spec_enricher import (
 )
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
-from tianshu_datadev.api.pipeline import _build_manifest
+from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
 
 
 # ============================================================
@@ -144,7 +144,7 @@ spec:
 @pytest.fixture
 def sample_manifest(sample_spec: ParsedDeveloperSpec):
     """Build manifest from sample_spec."""
-    return _build_manifest(sample_spec)
+    return build_manifest_from_spec(sample_spec)
 
 
 @pytest.fixture
@@ -203,7 +203,7 @@ spec:
 @pytest.fixture
 def cross_grain_manifest(cross_grain_spec: ParsedDeveloperSpec):
     """Build manifest from cross_grain_spec."""
-    return _build_manifest(cross_grain_spec)
+    return build_manifest_from_spec(cross_grain_spec)
 
 
 # ============================================================
@@ -236,11 +236,11 @@ class TestKeywordInference:
 
 
 # ============================================================
-# SpecEnricher tests（退化路径——llm_client=None → FakeSpecEnricher）
+# SpecEnricher tests（退化路径——adapter=None → FakeSpecEnricher）
 # ============================================================
 
 class TestSpecEnricher:
-    """SpecEnricher end-to-end tests（退化路径 llm_client=None）。"""
+    """SpecEnricher end-to-end tests（退化路径 adapter=None）。"""
 
     def test_enrich_returns_enriched_spec(self, sample_spec, sample_manifest):
         """Should return EnrichedSpec with correct metadata."""
@@ -279,7 +279,7 @@ class TestSpecEnricher:
 
     def test_conditional_metric_inference(self, sample_spec_with_filter):
         """'fined_plate_count' should be inferred from output_columns."""
-        manifest = _build_manifest(sample_spec_with_filter)
+        manifest = build_manifest_from_spec(sample_spec_with_filter)
         enricher = SpecEnricher()
         result = enricher.enrich(sample_spec_with_filter, manifest)
         inferred_aliases = {m.alias for m in result.inferred_metrics}
@@ -616,8 +616,8 @@ class TestApplyEnrichment:
         """Should add inferred 'uv' metric to spec."""
         from tianshu_datadev.api.pipeline import Pipeline
         enricher = SpecEnricher()
-        result = Pipeline._apply_enrichment(
-            sample_spec, sample_manifest, enricher
+        result = enricher.apply_enrichment(
+            sample_spec, sample_manifest
         )
         assert "uv" in {m.alias for m in result.metrics}
 
@@ -625,8 +625,8 @@ class TestApplyEnrichment:
         """Inferred metrics with conflicting aliases should not duplicate."""
         from tianshu_datadev.api.pipeline import Pipeline
         enricher = SpecEnricher()
-        result = Pipeline._apply_enrichment(
-            sample_spec, sample_manifest, enricher
+        result = enricher.apply_enrichment(
+            sample_spec, sample_manifest
         )
         pv_count = sum(1 for m in result.metrics if m.alias == "pv")
         assert pv_count == 1
@@ -683,8 +683,8 @@ class TestCrossGrainDependency:
         """Pipeline._apply_enrichment 将 compute_steps 合并到 spec。"""
         from tianshu_datadev.api.pipeline import Pipeline
         enricher = SpecEnricher()
-        result = Pipeline._apply_enrichment(
-            cross_grain_spec, cross_grain_manifest, enricher
+        result = enricher.apply_enrichment(
+            cross_grain_spec, cross_grain_manifest
         )
 
         # 验证 compute_steps 已合并
@@ -734,8 +734,8 @@ class TestCrossGrainE2E:
 
         # 1. SpecEnricher + 合并 compute_steps
         enricher = SpecEnricher()
-        enriched_spec = Pipeline._apply_enrichment(
-            cross_grain_spec, cross_grain_manifest, enricher
+        enriched_spec = enricher.apply_enrichment(
+            cross_grain_spec, cross_grain_manifest
         )
 
         # 2. Builder——走 build_from_steps 路径
@@ -768,8 +768,8 @@ class TestCrossGrainE2E:
 
         # 1. Enrich + 合并
         enricher = SpecEnricher()
-        enriched_spec = Pipeline._apply_enrichment(
-            cross_grain_spec, cross_grain_manifest, enricher
+        enriched_spec = enricher.apply_enrichment(
+            cross_grain_spec, cross_grain_manifest
         )
 
         # 2. Builder
@@ -892,10 +892,10 @@ class TestScalarSubquery:
 
     def test_detects_undeclared_denominator(self):
         """分母未声明 → 应生成全局聚合步骤。"""
-        from tianshu_datadev.api.pipeline import _build_manifest
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
 
         spec = self._make_scalar_subquery_spec()
-        manifest = _build_manifest(spec)
+        manifest = build_manifest_from_spec(spec)
         enricher = SpecEnricher()
         enriched = enricher.enrich(spec, manifest)
 
@@ -934,10 +934,10 @@ class TestScalarSubquery:
 
     def test_global_aggregate_infers_count_distinct_for_unique(self):
         """含 'unique' 的 dep 应推断 COUNT_DISTINCT 聚合。"""
-        from tianshu_datadev.api.pipeline import _build_manifest
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
 
         spec = self._make_scalar_subquery_spec()
-        manifest = _build_manifest(spec)
+        manifest = build_manifest_from_spec(spec)
         enricher = SpecEnricher()
         enriched = enricher.enrich(spec, manifest)
 
@@ -970,10 +970,10 @@ class TestScalarSubquery:
 
     def test_scalar_subquery_cross_join_generated(self):
         """标量子查询场景应生成 CROSS JOIN（空 join key）。"""
-        from tianshu_datadev.api.pipeline import _build_manifest
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
 
         spec = self._make_scalar_subquery_spec()
-        manifest = _build_manifest(spec)
+        manifest = build_manifest_from_spec(spec)
         enricher = SpecEnricher()
         enriched = enricher.enrich(spec, manifest)
 
@@ -996,17 +996,18 @@ class TestScalarSubquery:
         """标量子查询 DuckDB 端到端——罚款率在 [0, 1] 范围。"""
         import duckdb
 
-        from tianshu_datadev.api.pipeline import Pipeline, _build_manifest
+        from tianshu_datadev.api.pipeline import Pipeline
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
         from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
         from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
 
         spec = self._make_scalar_subquery_spec()
-        manifest = _build_manifest(spec)
+        manifest = build_manifest_from_spec(spec)
         enricher = SpecEnricher()
         enriched = enricher.enrich(spec, manifest)
 
         # 应用 Enricher 推断——合入 compute_steps
-        enriched_spec = Pipeline._apply_enrichment(spec, manifest, enricher)
+        enriched_spec = enricher.apply_enrichment(spec, manifest)
 
         # 验证 compute_steps 已合并
         assert enriched_spec.compute_steps is not None
