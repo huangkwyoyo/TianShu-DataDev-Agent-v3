@@ -23,6 +23,7 @@ from tianshu_datadev.developer_spec.models import (
 )
 
 from .sql_build_plan import (
+    ColumnRef,
     JoinStep,
     ScanStep,
     SqlBuildPlan,
@@ -33,6 +34,89 @@ from .temp_table import (
     validate_temp_table_naming,
     validate_temp_table_refs,
 )
+
+
+def _derive_temp_tables_from_statements(
+    statements: list[SqlStatement],
+) -> list[TempTableSpec]:
+    """从 statements 的 produces / ScanStep._temp_ 引用自动推导 TempTableSpec 列表。
+
+    当调用方未显式传入 temp_tables 时，此函数根据：
+    - PRODUCER 语句的 produces 字段 → TempTableSpec.produced_by
+    - 各语句 ScanStep 中的 _temp_ 表引用 → TempTableSpec.consumed_by
+
+    自动构建完整的 temp_tables，确保 DAG 校验的一致性检查能通过。
+    """
+    # 收集生产者：{temp_id: produced_by}
+    producer_map: dict[str, str] = {}
+    for stmt in statements:
+        if stmt.produces:
+            producer_map[stmt.produces] = stmt.statement_id
+
+    # 收集消费者：{temp_id: [consumed_by_statement_ids]}
+    consumer_map: dict[str, list[str]] = {tid: [] for tid in producer_map}
+    for stmt in statements:
+        temp_refs = _collect_temp_refs_from_plan(stmt.plan)
+        for temp_id in temp_refs:
+            if temp_id not in consumer_map:
+                consumer_map[temp_id] = []
+            if stmt.statement_id not in consumer_map[temp_id]:
+                consumer_map[temp_id].append(stmt.statement_id)
+
+    # 构建 TempTableSpec 列表——仅包含有生产者的 _temp 表
+    # 同时构建 statement_id → plan 映射，用于提取产出列
+    stmt_plan_map: dict[str, SqlBuildPlan] = {
+        s.statement_id: s.plan for s in statements
+    }
+
+    temp_tables: list[TempTableSpec] = []
+    for temp_id, produced_by in producer_map.items():
+        # 从生产者 Plan 的最后一个 ProjectStep 提取产出列
+        col_defs = _extract_output_columns(stmt_plan_map.get(produced_by))
+        temp_tables.append(TempTableSpec(
+            temp_id=temp_id,
+            produced_by=produced_by,
+            consumed_by=consumer_map.get(temp_id, []),
+            column_defs=col_defs,
+        ))
+
+    return temp_tables
+
+
+def _extract_output_columns(plan: SqlBuildPlan | None) -> list[ColumnRef]:
+    """从 SqlBuildPlan 的最后一个 ProjectStep 提取产出列。
+
+    ProjectStep.columns 是 AliasExpr 列表——提取 alias 作为 ColumnRef.column_name，
+    确保 TempTableSpec 的 column_defs 类型正确。
+
+    若 plan 为 None 或无 ProjectStep，返回空列表。
+    """
+    if plan is None:
+        return []
+
+    from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer
+
+    _normalizer = FieldNormalizer()
+
+    for step in reversed(plan.steps):
+        if step.step_type == "project" and hasattr(step, "columns"):
+            col_defs: list[ColumnRef] = []
+            for col_expr in step.columns:
+                # AliasExpr 有 alias 属性；普通 ColumnRef 直接使用
+                if hasattr(col_expr, "alias") and col_expr.alias:
+                    col_name = col_expr.alias
+                elif hasattr(col_expr, "column_name"):
+                    col_name = col_expr.column_name
+                else:
+                    continue
+                col_defs.append(ColumnRef(
+                    table_ref="",
+                    column_name=col_name,
+                    normalized_name=_normalizer.normalize(col_name),
+                ))
+            return col_defs
+    return []
+
 
 # ════════════════════════════════════════════
 # StatementKind 枚举
@@ -489,6 +573,10 @@ class SqlProgramBuilder:
             SqlProgram——含计算后的 topological_order
         """
         program_id = SqlProgram.generate_program_id(spec_hash) if spec_hash else "program_test"
+
+        # 自动生成 temp_tables——从 statements 的 produces / ScanStep._temp_ 引用推导
+        if not temp_tables:
+            temp_tables = _derive_temp_tables_from_statements(statements)
 
         # 计算拓扑排序
         try:
