@@ -1244,7 +1244,7 @@ class Pipeline:
         statements: list[SqlStatement] = []
         for idx, plan in enumerate(plans):
             is_final = (idx == len(plans) - 1)
-            produces = None if is_final else f"_temp_{chain_id}_{idx}"
+            produces = None if is_final else f"_temp_c{chain_id}_{idx}"
             depends_on = [plans[idx - 1].plan_id] if idx > 0 else []
 
             stmt = SqlStatement(
@@ -1305,7 +1305,7 @@ class Pipeline:
             produces = (
                 None
                 if is_final
-                else f"_temp_{chain_id}_{cs.step_name}"
+                else f"_temp_c{chain_id}_{cs.step_name}"
             )
 
             stmt = SqlStatement(
@@ -1420,11 +1420,11 @@ class Pipeline:
                 compiled_sql = program_artifact.compiled.statements[-1]
 
                 stage = "execute"
-                executor = DuckDBExecutor()
+                executor = DuckDBExecutor(table_paths=table_paths or {})
                 program_result = executor.execute_program(
-                    program_artifact, table_paths=table_paths or {}
+                    program_artifact.compiled
                 )
-                execution_trace = program_result.statements[-1].trace if program_result.statements else None
+                execution_trace = program_result.results[-1].trace if program_result.results else None
 
                 stage = "contract"
                 extractor = DataTransformContractExtractor()
@@ -1433,22 +1433,42 @@ class Pipeline:
                 stage = "package"
                 request_id = self._gen_request_id(spec)
                 package_inputs = PackageInputs(
-                    developer_spec_text=markdown_text,
-                    parsed_spec=spec,
-                    source_manifest=manifest,
-                    sql_artifact=SqlArtifact(
-                        compiled=compiled_sql,
-                        execution_trace=execution_trace,
-                    ),
-                    contract=contract,
                     request_id=request_id,
-                    spec_id=spec.spec_id,
+                    original_spec_md=markdown_text,
+                    parsed_spec=spec.model_dump(),
+                    source_manifest=manifest.model_dump(),
+                    sql_build_plan=plan.model_dump(),
+                    sql_artifact=SqlArtifact(
+                        artifact_id=SqlArtifact.generate_artifact_id(
+                            plan.plan_id, program_artifact.compiler_version
+                        ),
+                        compiled_sql=compiled_sql,
+                        spec_hash=spec.spec_hash,
+                        plan_id=plan.plan_id,
+                    ).model_dump(),
+                    execution_trace=execution_trace.model_dump() if execution_trace else {},
+                    result_summary=(
+                        program_result.results[-1].summary.model_dump()
+                        if program_result and program_result.results else {}
+                    ),
+                    data_transform_contract=contract.model_dump(),
+                    open_questions=[],
+                    validation_questions=[],
+                    perf_results=[],
+                    retry_count=0,
                 )
                 packager = ReviewPackageBuilder()
                 package_manifest = packager.build(package_inputs)
                 self._results[request_id] = {
                     "package": package_manifest,
-                    "sql_artifact": SqlArtifact(compiled=compiled_sql, execution_trace=execution_trace),
+                    "sql_artifact": SqlArtifact(
+                        artifact_id=SqlArtifact.generate_artifact_id(
+                            plan.plan_id, program_artifact.compiler_version
+                        ),
+                        compiled_sql=compiled_sql,
+                        spec_hash=spec.spec_hash,
+                        plan_id=plan.plan_id,
+                    ),
                     "contract": contract,
                     "plan": plan,
                     "parsed_spec": spec,
@@ -1464,7 +1484,7 @@ class Pipeline:
                     "validation_passed": passed,
                     "execution_status": execution_trace.status if execution_trace else "not_executed",
                     "row_count": execution_trace.row_count if execution_trace else 0,
-                    "elapsed_ms": execution_trace.elapsed_ms if execution_trace else 0,
+                    "elapsed_ms": execution_trace.execution_time_ms if execution_trace else 0,
                     "open_questions": _summarize_open_questions(
                         list(plan_questions) + list(val_questions) + list(extra_questions)
                     ),
