@@ -1462,7 +1462,7 @@ class TestConditionalBranch:
 
             # 确定 chain_id——从编译 SQL 中提取
             import re
-            temp_match = re.search(r'_temp_([a-f0-9]{8})_', plan_sqls[2])
+            temp_match = re.search(r'_temp_c([a-f0-9]{8})_', plan_sqls[2])
             assert temp_match, f"合并 SQL 应引用 _temp_ 表: {plan_sqls[2]}"
             chain_id = temp_match.group(1)
 
@@ -1471,10 +1471,10 @@ class TestConditionalBranch:
             con.execute(f"DROP TABLE IF EXISTS _temp_test_branch_normal")
             # 按 Builder 生成的 _temp 表名重建
             con.execute(
-                f"CREATE TEMP TABLE \"_temp_{chain_id}_branch_vip\" AS {plan_sqls[0]}"
+                f"CREATE TEMP TABLE \"_temp_c{chain_id}_branch_vip\" AS {plan_sqls[0]}"
             )
             con.execute(
-                f"CREATE TEMP TABLE \"_temp_{chain_id}_branch_normal\" AS {plan_sqls[1]}"
+                f"CREATE TEMP TABLE \"_temp_c{chain_id}_branch_normal\" AS {plan_sqls[1]}"
             )
 
             # 执行合并步骤——直接使用编译 SQL（已引用正确的 _temp 表名）

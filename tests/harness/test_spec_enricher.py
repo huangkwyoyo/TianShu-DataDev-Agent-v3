@@ -812,7 +812,7 @@ class TestCrossGrainE2E:
         result = None
         for cs, compiled in zip(steps, compiled_plans):
             is_final = cs.step_name not in consumed
-            temp_name = f"_temp_{chain_id}_{cs.step_name}"
+            temp_name = f"_temp_c{chain_id}_{cs.step_name}"
 
             if is_final:
                 result = con.execute(compiled.sql).fetchall()
@@ -1048,7 +1048,7 @@ class TestScalarSubquery:
             # 执行中间步骤——写入 _temp 表
             for i, cs in enumerate(enriched_spec.compute_steps):
                 if i < len(enriched_spec.compute_steps) - 1:
-                    temp_name = f"_temp_{chain_id}_{cs.step_name}"
+                    temp_name = f"_temp_c{chain_id}_{cs.step_name}"
                     con.execute(
                         f"CREATE TEMP TABLE \"{temp_name}\" AS {plan_sqls[i]}"
                     )
