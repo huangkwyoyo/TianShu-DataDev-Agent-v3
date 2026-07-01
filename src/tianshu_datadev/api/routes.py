@@ -1,6 +1,6 @@
 """Phase 4.5A — REST API 路由处理器。
 
-5 个端点，全部通过 FakePipeline 编排：
+5 个端点，全部通过 Pipeline 编排：
   POST /api/spec/parse      — 解析 DeveloperSpec
   POST /api/plan             — 解析 + 构建 SqlBuildPlan + 验证
   POST /api/execute          — 全流程编译+执行（dry_run）

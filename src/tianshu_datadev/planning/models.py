@@ -100,7 +100,7 @@ class NullOrder(str, Enum):
 
 
 class WindowFunction(str, Enum):
-    """窗口函数白名单——Phase 3B 支持 8 种窗口函数。
+    """窗口函数白名单——Phase 3B 支持 9 种窗口函数。
 
     禁止不在白名单中的窗口函数名进入 IR。
     """
@@ -108,6 +108,7 @@ class WindowFunction(str, Enum):
     ROW_NUMBER = "ROW_NUMBER"
     RANK = "RANK"
     DENSE_RANK = "DENSE_RANK"
+    NTILE = "NTILE"
     LAG = "LAG"
     LEAD = "LEAD"
     SUM_OVER = "SUM_OVER"
@@ -157,10 +158,15 @@ class SqlLiteral(StrictModel):
     支持 str / int / float / bool / None（NULL）。
     使用模型包装而非裸 Python 字面量，确保 Schema 约束和序列化一致。
 
+    Phase 5 新增 is_sql_expr——当为 True 时 value 为可信 SQL 表达式片段，
+    Compiler 直接渲染 value 而非加引号包裹。仅 Builder 确定性代码可设置。
+    用于相对日期渲染（如 CURRENT_DATE - INTERVAL 30 DAY）。
+
     注意：命名为 SqlLiteral 而非 Literal，避免与 typing.Literal 冲突。
     """
 
     value: str | int | float | bool | None
+    is_sql_expr: bool = False  # True 时 value 为可信 SQL 表达式——不加引号直接渲染
 
 
 class Predicate(StrictModel):
@@ -186,6 +192,9 @@ class AggregateSpec(StrictModel):
     - filter: 条件聚合 FILTER (WHERE ...)
     - input_expression: 多字段表达式（如 "quantity * unit_price"）
     - distinct: SUM(DISTINCT col) 等去重聚合
+
+    Phase 5 新增：
+    - source_table: 源表别名——自引用/多表场景下消除列歧义（如 "emp_self_left.id"）
     """
 
     aggregation: AggregationType  # 封闭枚举：COUNT | SUM | AVG | MIN | MAX | COUNT_DISTINCT
@@ -195,6 +204,8 @@ class AggregateSpec(StrictModel):
     filter: MetricFilterDecl | None = None  # 条件聚合 FILTER (WHERE ...)
     input_expression: str | None = None  # 多字段表达式（如 "quantity * unit_price"）
     distinct: bool = False  # 去重聚合（用于 SUM(DISTINCT col)，COUNT_DISTINCT 已独立处理）
+    # ── Phase 5 新增字段 ──
+    source_table: str | None = None  # 源表别名——多表场景下消除列歧义
 
 
 class SortSpec(StrictModel):

@@ -5,7 +5,7 @@ Phase 1B 实现：
 - Join 推测：JoinCandidate / RelationshipEvidence / RelationshipHypothesis
 - 证据评级：RelationshipValidator（确定性）
 - Fake Planner：FakeRelationshipPlanner（仅处理显式 Join 声明）
-- SqlBuildPlan：8 Step 类型 + SqlBuildPlanBuilder（Fake，确定性）
+- SqlBuildPlan：8 Step 类型 + SqlBuildPlanBuilder（确定性）
 """
 
 # ── IR 基础类型 ──
@@ -38,8 +38,8 @@ from .relationship_hypothesis import (
     RelationshipHypothesis,
 )
 
-# ── Fake Join 推测器 ──
-from .relationship_planner import FakeRelationshipPlanner
+# ── Join 推测器（Fake + LLM） ──
+from .relationship_planner import FakeRelationshipPlanner, RelationshipPlanner
 
 # ── 证据评级器 ──
 from .relationship_validator import RelationshipValidator
@@ -80,6 +80,9 @@ from .temp_table import (
 # ── SpecEnricher（Phase 4D 指标推断） ──
 from .spec_enricher import FakeSpecEnricher, SpecEnricher
 
+# ── 交叉验证（Phase 4E 指标↔Join 一致性） ──
+from .cross_validator import cross_validate
+
 __all__ = [
     # IR 基础类型
     "AggregateSpec",
@@ -107,8 +110,9 @@ __all__ = [
     "RelationshipHypothesis",
     # 证据评级
     "RelationshipValidator",
-    # Fake Planner
+    # Join 推测器
     "FakeRelationshipPlanner",
+    "RelationshipPlanner",
     # SqlBuildPlan
     "AggregateStep",
     "CaseWhenStep",
@@ -136,4 +140,6 @@ __all__ = [
     # SpecEnricher（Phase 4D 指标推断）
     "FakeSpecEnricher",
     "SpecEnricher",
+    # 交叉验证（Phase 4E 指标↔Join 一致性）
+    "cross_validate",
 ]

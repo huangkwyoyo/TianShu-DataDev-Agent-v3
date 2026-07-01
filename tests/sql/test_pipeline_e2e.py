@@ -185,7 +185,7 @@ class TestPipelineE2E:
         """两表 Join 全链路验证——从解析到编译产物。"""
         # 1. 解析 explicit_join spec
         from tianshu_datadev.planning.relationship_planner import (
-            FakeRelationshipPlanner,
+            RelationshipPlanner,
         )
 
         spec = DeveloperSpecParser().parse(
@@ -195,8 +195,8 @@ class TestPipelineE2E:
         # 2. 构建 SourceManifest
         manifest = _build_manifest(spec)
 
-        # 3. RelationshipHypothesis → SqlBuildPlan
-        planner = FakeRelationshipPlanner()
+        # 3. RelationshipHypothesis → SqlBuildPlan（无 LLM client → 退化与 Fake 一致）
+        planner = RelationshipPlanner()
         hypothesis, _ = planner.plan(spec)
         builder = SqlBuildPlanBuilder()
         plan, _ = builder.build(spec, hypothesis)

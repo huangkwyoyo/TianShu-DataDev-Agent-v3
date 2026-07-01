@@ -413,8 +413,8 @@ class TestSparkPlanMapper:
         contract.window_specs = [
             WindowSpecSummary(
                 statement_id="stmt_bad",
-                function="NTILE",
-                alias="ntile_rank",
+                function="CUME_DIST",  # CUME_DIST 不在 9 种白名单中
+                alias="cume_rank",
                 partition_by=["stat_date"],
                 order_by=["total_amount"],
             ),

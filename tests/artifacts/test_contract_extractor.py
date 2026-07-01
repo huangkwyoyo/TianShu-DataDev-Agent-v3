@@ -29,7 +29,7 @@ from tianshu_datadev.planning.models import (
     WindowExpr,
     WindowFunction,
 )
-from tianshu_datadev.planning.relationship_planner import FakeRelationshipPlanner
+from tianshu_datadev.planning.relationship_planner import RelationshipPlanner
 from tianshu_datadev.planning.sql_build_plan import (
     AggregateStep,
     CaseWhenStep,
@@ -156,7 +156,7 @@ class TestContractExtractorJoin:
         """两表 Join plan 抽取——Contract.join_relationships 含证据链。"""
         spec = _parse_spec("fixtures/relationship/explicit_join_spec.md")
 
-        planner = FakeRelationshipPlanner()
+        planner = RelationshipPlanner()
         hypothesis, _ = planner.plan(spec)
 
         builder = SqlBuildPlanBuilder()
@@ -193,7 +193,7 @@ class TestContractExtractorJoin:
         """带 Join 的 plan——抽取确定性。"""
         spec = _parse_spec("fixtures/relationship/explicit_join_spec.md")
 
-        planner = FakeRelationshipPlanner()
+        planner = RelationshipPlanner()
         hypothesis, _ = planner.plan(spec)
 
         builder = SqlBuildPlanBuilder()
@@ -639,14 +639,14 @@ class TestContractExtractorV1:
 
 
 class TestPipelineStep2:
-    """FakePipeline._build_sql_program() + 条件选择 v1/lite。"""
+    """Pipeline._build_sql_program() + 条件选择 v1/lite。"""
 
     def test_build_sql_program_single_statement(self):
         """_build_sql_program() 从单 plan 构建 STANDALONE SqlProgram。"""
-        from tianshu_datadev.api.pipeline import FakePipeline
+        from tianshu_datadev.api.pipeline import Pipeline
 
         plan = _make_minimal_plan("plan_step2_test")
-        sql_program = FakePipeline._build_sql_program(plan, "spec_hash_step2")
+        sql_program = Pipeline._build_sql_program(plan, "spec_hash_step2")
 
         # 基本字段
         assert sql_program.program_id.startswith("program_")

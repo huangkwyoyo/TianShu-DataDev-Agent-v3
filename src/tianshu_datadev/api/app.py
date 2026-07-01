@@ -16,16 +16,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .error_handlers import register_error_handlers
-from .pipeline import FakePipeline
+from .pipeline import Pipeline
 from .routes import api_router
 
 
-def create_app(pipeline: FakePipeline | None = None) -> FastAPI:
+def create_app(pipeline: Pipeline | None = None) -> FastAPI:
     """创建 FastAPI 应用实例。
 
     Args:
-        pipeline: 可选的 FakePipeline 实例（测试时可注入 mock）。
-                  若为 None，使用默认 FakePipeline。
+        pipeline: 可选的 Pipeline 实例（测试时可注入 mock）。
+                  若为 None，使用默认 Pipeline。
 
     Returns:
         配置完成的 FastAPI 应用
@@ -46,7 +46,7 @@ def create_app(pipeline: FakePipeline | None = None) -> FastAPI:
     )
 
     # 注入流水线
-    app.state.pipeline = pipeline or FakePipeline()
+    app.state.pipeline = pipeline or Pipeline()
 
     # 注册异常处理器
     register_error_handlers(app)

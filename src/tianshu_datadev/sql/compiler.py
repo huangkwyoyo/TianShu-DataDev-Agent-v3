@@ -224,18 +224,249 @@ class DuckDbSqlCompiler:
     def _render_sql(self, plan: SqlBuildPlan) -> str:
         """将 SqlBuildPlan 渲染为完整的 DuckDB SQL 字符串。
 
-        渲染顺序：
-        SELECT <project_cols + case_when + window_exprs>
-        FROM <scan_table>
-        [JOIN <right_table> ON <keys>]
-        [WHERE <filters>]
-        [GROUP BY <group_keys>]
-        [HAVING <having>]
-        [ORDER BY <sort>]
-        [LIMIT <n>]
+        当 FilterStep 引用窗口函数别名时，自动切换为子查询包裹模式：
+        SELECT * FROM (
+          SELECT ..., ROW_NUMBER() OVER(...) AS rn FROM ... GROUP BY ...
+        ) _sub WHERE _sub.rn <= N
 
         Phase 3B 新增：CaseWhenStep 和 WindowStep 渲染到 SELECT 子句。
+        Phase 5 新增：窗口过滤子查询包裹——支持全部 8 种窗口函数。
         """
+        # ── 收集窗口函数别名 ──
+        window_aliases: set[str] = self._collect_window_aliases(plan)
+
+        # ── 检测是否有 FilterStep 引用窗口别名 ──
+        needs_window_wrap = False
+        if window_aliases:
+            for step in plan.steps:
+                if isinstance(step, FilterStep):
+                    if self._predicate_references_any(
+                        step.predicate, window_aliases
+                    ):
+                        needs_window_wrap = True
+                        break
+
+        if needs_window_wrap:
+            return self._render_window_wrapped_sql(plan, window_aliases)
+        else:
+            return self._render_flat_sql(plan)
+
+    def _collect_window_aliases(self, plan: SqlBuildPlan) -> set[str]:
+        """收集计划中所有 WindowStep 产出的别名。"""
+        aliases: set[str] = set()
+        for step in plan.steps:
+            if isinstance(step, WindowStep):
+                for wexpr in step.window_exprs:
+                    if wexpr.alias:
+                        aliases.add(str(wexpr.alias))
+        return aliases
+
+    def _predicate_references_any(
+        self, pred: Predicate, aliases: set[str]
+    ) -> bool:
+        """递归检查 Predicate 树是否引用了给定别名集合中的任何列。
+
+        检查 ColumnRef.column_name 是否在 aliases 中，
+        对嵌套 Predicate（AND/OR/NOT）递归遍历。
+
+        Args:
+            pred: 待检查的谓词树
+            aliases: 窗口函数别名集合
+
+        Returns:
+            True 如果谓词引用了至少一个给定别名
+        """
+        # 检查 left 侧
+        col_name = getattr(pred.left, "column_name", None)
+        if col_name and col_name in aliases:
+            return True
+        if isinstance(pred.left, Predicate):
+            if self._predicate_references_any(pred.left, aliases):
+                return True
+
+        # 检查 right 侧
+        if pred.right is not None:
+            if isinstance(pred.right, Predicate):
+                if self._predicate_references_any(pred.right, aliases):
+                    return True
+            elif not isinstance(pred.right, list):
+                col_name = getattr(pred.right, "column_name", None)
+                if col_name and col_name in aliases:
+                    return True
+
+        return False
+
+    def _render_window_wrapped_sql(
+        self, plan: SqlBuildPlan, window_aliases: set[str]
+    ) -> str:
+        """窗口过滤子查询包裹渲染——全部 8 种窗口函数通用。
+
+        将计划拆分为内层（到最后一个 WindowStep 为止）和外层：
+        内层：SELECT agg_cols, window_cols FROM ... GROUP BY ...
+        外层：SELECT * FROM (内层) AS _sub WHERE post_window_filters ORDER BY ... LIMIT ...
+
+        不引入 CTE，使用 FROM 子句派生表。
+
+        Args:
+            plan: 含 WindowStep + 引用窗口列的 FilterStep 的 SqlBuildPlan
+            window_aliases: WindowStep 产出的别名集合
+
+        Returns:
+            包裹后的完整 SQL 字符串
+        """
+        from tianshu_datadev.planning.sql_build_plan import (
+            FilterStep,
+            LimitStep,
+            SortStep,
+            WindowStep,
+        )
+
+        # ── 找到最后一个 WindowStep 的索引作为拆分点 ──
+        split_idx = 0
+        for i, step in enumerate(plan.steps):
+            if isinstance(step, WindowStep):
+                split_idx = i
+
+        inner_steps = plan.steps[: split_idx + 1]
+        outer_steps = plan.steps[split_idx + 1:]
+
+        # ── 渲染内层 SQL ──
+        inner_plan = plan.model_copy(update={"steps": list(inner_steps)})
+        inner_sql = self._render_flat_sql(inner_plan)
+
+        # ── 渲染外层 ──
+        outer_where: list[str] = []
+        outer_order_by: list[str] = []
+        outer_limit: str = ""
+
+        for step in outer_steps:
+            if isinstance(step, FilterStep):
+                # 重写 predicate——列引用加上 _sub. 前缀
+                where_sql = self._render_predicate_with_prefix(
+                    step.predicate, "_sub"
+                )
+                if where_sql:
+                    outer_where.append(where_sql)
+            elif isinstance(step, SortStep):
+                for s in step.order_by:
+                    direction = (
+                        s.direction.value
+                        if hasattr(s.direction, "value")
+                        else str(s.direction)
+                    )
+                    outer_order_by.append(f"_sub.{s.column} {direction}")
+            elif isinstance(step, LimitStep):
+                if step.offset is not None:
+                    outer_limit = (
+                        f"LIMIT {step.limit} OFFSET {step.offset}"
+                    )
+                else:
+                    outer_limit = f"LIMIT {step.limit}"
+            # ProjectStep 在外层不再处理——外层统一用 SELECT *
+
+        # ── 组装外层 SQL ──
+        outer_parts: list[str] = []
+        outer_parts.append("SELECT *")
+        outer_parts.append(f"FROM (\n{inner_sql}\n) AS _sub")
+
+        if outer_where:
+            outer_parts.append(f"WHERE\n  {' AND '.join(outer_where)}")
+
+        if outer_order_by:
+            outer_parts.append(
+                f"ORDER BY\n  {', '.join(outer_order_by)}"
+            )
+
+        if outer_limit:
+            outer_parts.append(outer_limit)
+
+        return "\n".join(outer_parts)
+
+    def _render_predicate_with_prefix(
+        self, pred: Predicate, prefix: str
+    ) -> str:
+        """渲染 Predicate 并将所有 ColumnRef 的 table_ref 替换为给定前缀。
+
+        用于子查询包裹场景——内层列在外部需要通过 _sub. 前缀引用。
+
+        Args:
+            pred: 待渲染的 Predicate
+            prefix: 表前缀（如 "_sub"）
+
+        Returns:
+            SQL 表达式字符串
+        """
+        left_str = self._render_predicate_operand_with_prefix(
+            pred.left, prefix
+        )
+        right_str = self._render_predicate_operand_with_prefix(
+            pred.right, prefix
+        )
+
+        op = pred.operator
+        op_str = self._operator_to_sql(op)
+
+        if op in (PredicateOperator.AND, PredicateOperator.OR):
+            return f"({left_str} {op_str} {right_str})"
+
+        if op == PredicateOperator.NOT:
+            return f"NOT ({left_str})"
+
+        if op in (PredicateOperator.IS_NULL, PredicateOperator.IS_NOT_NULL):
+            return f"{left_str} {op_str}"
+
+        if op == PredicateOperator.IN:
+            if isinstance(pred.right, list):
+                values = ", ".join(
+                    self._render_literal(v) for v in pred.right
+                )
+                return f"{left_str} IN ({values})"
+            return f"{left_str} IN ({right_str})"
+
+        if op == PredicateOperator.NOT_IN:
+            if isinstance(pred.right, list):
+                values = ", ".join(
+                    self._render_literal(v) for v in pred.right
+                )
+                return f"{left_str} NOT IN ({values})"
+            return f"{left_str} NOT IN ({right_str})"
+
+        if op == PredicateOperator.BETWEEN:
+            if isinstance(pred.right, list) and len(pred.right) == 2:
+                low = self._render_literal(pred.right[0])
+                high = self._render_literal(pred.right[1])
+                return f"{left_str} BETWEEN {low} AND {high}"
+
+        if op == PredicateOperator.LIKE:
+            return f"{left_str} LIKE {right_str}"
+
+        return f"{left_str} {op_str} {right_str}"
+
+    def _render_predicate_operand_with_prefix(
+        self, operand, prefix: str
+    ) -> str:
+        """渲染 Predicate 操作数——ColumnRef 加前缀，嵌套 Predicate 递归处理。
+
+        Args:
+            operand: ColumnRef / Predicate / SqlLiteral / None
+            prefix: 表前缀
+
+        Returns:
+            SQL 表达式字符串
+        """
+        if operand is None:
+            return "NULL"
+        if isinstance(operand, Predicate):
+            return self._render_predicate_with_prefix(operand, prefix)
+        if isinstance(operand, SqlLiteral):
+            return self._render_literal(operand)
+        if hasattr(operand, "column_name"):
+            col = operand.column_name
+            return f"{prefix}.{col}"
+        return str(operand)
+
+    def _render_flat_sql(self, plan: SqlBuildPlan) -> str:
+        """标准扁平 SQL 渲染——不含窗口过滤子查询包裹。"""
         # 收集各子句
         select_cols: list[str] = []
         from_parts: list[str] = []
@@ -284,7 +515,10 @@ class DuckDbSqlCompiler:
                     has_aggregation = True  # 标记已聚合，后续 ProjectStep 不覆盖
                 # GROUP BY
                 for gk in step.group_keys:
-                    group_by_parts.append(f"{gk.table_ref}.{gk.column_name}")
+                    if gk.table_ref:
+                        group_by_parts.append(f"{gk.table_ref}.{gk.column_name}")
+                    else:
+                        group_by_parts.append(gk.column_name)
                 # HAVING
                 if step.having:
                     having_clause = self._render_predicate(step.having)
@@ -408,9 +642,16 @@ class DuckDbSqlCompiler:
         return f"(\n{inner_sql}\n) AS {step.alias}"
 
     def _render_join(self, step: JoinStep) -> str:
-        """渲染 JoinStep 为 JOIN 子句。"""
+        """渲染 JoinStep 为 JOIN 子句。
+
+        CROSS JOIN 无 ON 子句——join_keys 为空列表。
+        """
         join_type = step.join_type.value if hasattr(step.join_type, "value") else str(step.join_type)
         right_table = self._resolve_table(step.right_table_ref)
+
+        # CROSS JOIN——无等值条件
+        if join_type == "CROSS" or not step.join_keys:
+            return f"CROSS JOIN\n  {right_table} AS {step.right_table_ref}"
 
         # 渲染 join keys
         on_parts: list[str] = []
@@ -435,21 +676,27 @@ class DuckDbSqlCompiler:
 
         # GROUP BY 列
         for gk in step.group_keys:
-            cols.append(f"{gk.table_ref}.{gk.column_name}")
+            if gk.table_ref:
+                cols.append(f"{gk.table_ref}.{gk.column_name}")
+            else:
+                cols.append(gk.column_name)
 
         # 聚合指标
         for m in step.metrics:
+            # ── 列前缀——自引用/多表场景消除歧义 ──
+            col_prefix = f"{m.source_table}." if m.source_table else ""
+
             # 确定聚合输入：
             #   优先级：input_expression > input_column > "*"
             if m.input_expression:
-                # 多字段表达式——如 "quantity * unit_price"
+                # 多字段表达式——如 "quantity * unit_price"（不加前缀，已是完整表达式）
                 input_part = m.input_expression
             elif m.input_column:
                 if m.distinct and m.aggregation != AggregationType.COUNT_DISTINCT:
                     # SUM(DISTINCT col) 等去重聚合（COUNT_DISTINCT 已独立处理）
-                    input_part = f"DISTINCT {m.input_column}"
+                    input_part = f"DISTINCT {col_prefix}{m.input_column}"
                 else:
-                    input_part = str(m.input_column)
+                    input_part = f"{col_prefix}{m.input_column}"
             else:
                 input_part = "*"
 
@@ -457,7 +704,7 @@ class DuckDbSqlCompiler:
             agg_func = m.aggregation
             if agg_func == AggregationType.COUNT_DISTINCT:
                 if m.input_column:
-                    agg_expr = f"COUNT(DISTINCT {m.input_column})"
+                    agg_expr = f"COUNT(DISTINCT {col_prefix}{m.input_column})"
                 else:
                     agg_expr = "COUNT(DISTINCT *)"
             else:
@@ -520,7 +767,10 @@ class DuckDbSqlCompiler:
                     cols.append(col_expr)
             elif hasattr(expr, "column_name"):
                 col_expr = expr.column_name
-                if ae.alias and ae.alias != col_expr:
+                # 有 table_ref 时添加表前缀——消除 Join 后列歧义
+                if hasattr(expr, "table_ref") and expr.table_ref:
+                    col_expr = f"{expr.table_ref}.{col_expr}"
+                if ae.alias and ae.alias != expr.column_name:
                     cols.append(f"{col_expr} AS {ae.alias}")
                 else:
                     cols.append(col_expr)
@@ -643,8 +893,9 @@ class DuckDbSqlCompiler:
               [<frame>]
             ) AS <alias>
 
-        支持 8 种白名单窗口函数：
+        支持 9 种白名单窗口函数：
         - ROW_NUMBER / RANK / DENSE_RANK：无参数
+        - NTILE：整数参数（桶数）
         - LAG / LEAD：单参数（列引用）
         - SUM_OVER / AVG_OVER / COUNT_OVER：单参数（列引用）
 
@@ -659,6 +910,7 @@ class DuckDbSqlCompiler:
             "ROW_NUMBER": "ROW_NUMBER()",
             "RANK": "RANK()",
             "DENSE_RANK": "DENSE_RANK()",
+            "NTILE": "NTILE",
             "LAG": "LAG",
             "LEAD": "LEAD",
             "SUM_OVER": "SUM",
@@ -835,7 +1087,13 @@ class DuckDbSqlCompiler:
 
     @staticmethod
     def _render_literal(lit: SqlLiteral) -> str:
-        """渲染 SqlLiteral 为 SQL 字面量。"""
+        """渲染 SqlLiteral 为 SQL 字面量。
+
+        is_sql_expr=True 时 value 为可信 SQL 表达式（如 CURRENT_DATE - INTERVAL 30 DAY），
+        直接渲染不加引号——仅 Builder 确定性代码可设置此标志。
+        """
+        if lit.is_sql_expr:
+            return str(lit.value)
         v = lit.value
         if v is None:
             return "NULL"
@@ -910,7 +1168,16 @@ class DuckDbSqlCompiler:
             _validate_physical_table_name(value)
 
     def _resolve_table(self, table_ref: str) -> str:
-        """将 table_ref（别名）解析为物理表名。"""
+        """将 table_ref（别名）解析为物理表名。
+
+        自引用场景（P2-6）：table_ref 可能以 _self_left / _self_right 结尾，
+        此时去除后缀后用原始别名查表映射，使两个别名指向同一物理表。
+        """
+        # 自引用别名回退：去除 _self_left / _self_right 后缀后查映射
+        for suffix in ("_self_right", "_self_left"):
+            if table_ref.endswith(suffix):
+                base = table_ref[: -len(suffix)]
+                return self._table_mapping.get(base, base)
         return self._table_mapping.get(table_ref, table_ref)
 
     # ── 多语句编译（Phase 3A） ──

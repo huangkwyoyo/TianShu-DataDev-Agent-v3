@@ -69,6 +69,7 @@ _WINDOW_FUNCTION_MAP: dict[str, SparkWindowFunction] = {
     "ROW_NUMBER": SparkWindowFunction.ROW_NUMBER,
     "RANK": SparkWindowFunction.RANK,
     "DENSE_RANK": SparkWindowFunction.DENSE_RANK,
+    "NTILE": SparkWindowFunction.NTILE,
     "LAG": SparkWindowFunction.LAG,
     "LEAD": SparkWindowFunction.LEAD,
     "SUM_OVER": SparkWindowFunction.SUM_OVER,

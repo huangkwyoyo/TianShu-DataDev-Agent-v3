@@ -201,8 +201,8 @@ class TestWindowFunctionWhitelist:
         questions = validate_window_exprs(plan)
         assert len(questions) == 0
 
-    def test_all_eight_functions_compilable(self):
-        """全部 8 种窗口函数可通过编译。"""
+    def test_all_nine_functions_compilable(self):
+        """全部 9 种窗口函数可通过编译。"""
         all_funcs = [
             WindowExpr(
                 function=WindowFunction.ROW_NUMBER,
@@ -219,6 +219,12 @@ class TestWindowFunctionWhitelist:
                 function=WindowFunction.DENSE_RANK,
                 order_by=[SortSpec(column="salary", direction="DESC")],
                 alias="dr",
+            ),
+            WindowExpr(
+                function=WindowFunction.NTILE,
+                input=SqlLiteral(value=4),
+                order_by=[SortSpec(column="salary", direction="DESC")],
+                alias="nt",
             ),
             WindowExpr(
                 function=WindowFunction.LAG,
@@ -277,10 +283,10 @@ class TestWindowFunctionRejection:
         """非法函数名在 Pydantic 层被拦截。"""
         with pytest.raises(ValidationError):
             WindowExpr(
-                function="NTILE",  # 不在白名单中
+                function="PERCENT_RANK",  # 不在白名单中
                 partition_by=[],
                 order_by=[],
-                alias="nt",
+                alias="pr",
             )
 
     def test_invalid_function_name_string_rejected(self):
@@ -301,6 +307,7 @@ class TestWindowFunctionRejection:
             WindowFunction.ROW_NUMBER,
             WindowFunction.RANK,
             WindowFunction.DENSE_RANK,
+            WindowFunction.NTILE,
             WindowFunction.LAG,
             WindowFunction.LEAD,
         ]

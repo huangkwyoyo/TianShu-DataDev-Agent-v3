@@ -173,11 +173,11 @@ def _normalize_predicate(
         new_right, right_records = _normalize_predicate(pred.right)
         records.extend(right_records)
 
-    # 规则: BETWEEN → >= AND <
+    # 规则: BETWEEN → >= AND <=（保持包含上界的语义）
     if pred.operator == PredicateOperator.BETWEEN and isinstance(pred.right, list):
         if len(pred.right) == 2:
             original = f"BETWEEN({pred.right[0].value}, {pred.right[1].value})"
-            normalized = f">= {pred.right[0].value} AND < {pred.right[1].value}"
+            normalized = f">= {pred.right[0].value} AND <= {pred.right[1].value}"
             records.append(
                 PredicateNormRecord(
                     original=original,
@@ -185,8 +185,7 @@ def _normalize_predicate(
                     rule="between_to_range",
                 )
             )
-            # 展开为 (left >= low) AND (left < high)
-            # 注意：BETWEEN 通常是包含上界的，但这里简化为开区间
+            # 展开为 (left >= low) AND (left <= high)——保持 BETWEEN 包含两端语义
             right_low, right_high = pred.right[0], pred.right[1]
             return (
                 Predicate(
@@ -200,7 +199,7 @@ def _normalize_predicate(
                         left=copy.deepcopy(new_left) if isinstance(new_left, Predicate)
                         else new_left.model_copy() if hasattr(new_left, "model_copy")
                         else new_left,
-                        operator=PredicateOperator.LT,
+                        operator=PredicateOperator.LTE,
                         right=right_high,
                     ),
                 ),

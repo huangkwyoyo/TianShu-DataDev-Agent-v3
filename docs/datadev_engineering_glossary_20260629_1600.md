@@ -533,6 +533,13 @@ SafeIdentifier("user-id")       # → ValidationError（含连字符）
 
 DuckDbSqlCompiler 是 sql_plan_to_sql() 的实现。它遍历 SqlBuildPlan 的 steps 列表，按步骤类型调用对应的渲染方法（`_render_scan()`、`_render_join()`、`_render_aggregate()` 等），生成完整的 DuckDB SQL 语句。关键约束：相同 SqlBuildPlan 重复编译必须产生字节一致的 SQL 和相同 SHA-256。Compiler 在渲染前运行 4 个优化 pass（列裁剪、谓词规范化、无用排序消除、常量折叠），优化必须是幂等的。
 
+Phase 4D 扩展：
+- **FILTER 子句支持**：`_render_metric_filter()` 将 MetricFilterDecl 渲染为 `FILTER (WHERE ...)` 子句——支持 8 种操作符（eq/neq/gt/gte/lt/lte/in/is_null/is_not_null），值统一加单引号
+- **input_expression 支持**：`"quantity * unit_price"` 等多字段表达式直接透传为聚合输入
+- **distinct 标志**：`SUM(DISTINCT col)` 渲染支持（distinct=True 时添加 DISTINCT 修饰）
+- **聚合后投影重排**：`_reorder_aggregation_cols()` 在 AggregateStep 后跟 ProjectStep 时，按 ProjectStep 定义的列顺序重排聚合输出——不覆盖表达式本体，仅调整顺序
+- **Join 右表去重**：FROM 子句自动排除已在 JOIN 子句中出现的右表，避免 `FROM a, b JOIN b` 的重复引用
+
 **在当前项目中的位置**
 
 - `src/tianshu_datadev/sql/compiler.py:61` — DuckDbSqlCompiler
@@ -554,13 +561,16 @@ CompiledSql（单语句）或 ProgramCompiledSql（多语句）。包含 compile
 
 **简单例子**
 
-SqlBuildPlan(steps=[ScanStep(table_ref="o", required_columns=[ColumnRef("o.user_id"), ColumnRef("o.order_time")]), AggregateStep(group_keys=[...], agg_funcs=[...])]) → Compiler 渲染为 `SELECT DATE_TRUNC('day', o.order_time) AS stat_date, COUNT(DISTINCT o.user_id) AS dau FROM dwd.order_fact AS o WHERE o.order_time >= '2026-06-22' AND o.order_time < '2026-06-29' GROUP BY DATE_TRUNC('day', o.order_time) ORDER BY stat_date DESC`。
+SqlBuildPlan(steps=[ScanStep(table_ref="o", required_columns=[ColumnRef("o.user_id"), ColumnRef("o.order_time")]), AggregateStep(group_keys=[...], agg_funcs=[AggregateSpec(aggregation=COUNT_DISTINCT, input_column="o.user_id", alias="dau")]), SortStep(sort_keys=[SortSpec(column=stat_date, direction=DESC)])]) → Compiler 渲染为 `SELECT DATE_TRUNC('day', o.order_time) AS stat_date, COUNT(DISTINCT o.user_id) AS dau FROM dwd.order_fact AS o WHERE o.order_time >= '2026-06-22' AND o.order_time < '2026-06-29' GROUP BY DATE_TRUNC('day', o.order_time) ORDER BY stat_date DESC`。
+
+Phase 4D 示例——条件聚合：MetricDecl(filter=MetricFilterDecl(column="fine_status", operator="eq", value="STANDARD")) → 渲染为 `COUNT(DISTINCT plate_id) FILTER (WHERE fine_status = 'STANDARD') AS fined_count`。
 
 **Owner 审查时应该问什么**
 
 1. "如何验证'相同 SqlBuildPlan 重复编译产生相同 SQL 和 SHA-256'？有对应的测试吗？"
 2. "Compiler 的 4 个优化 Pass 中，哪些是默认开启的？哪些可以关闭？"
 3. "如果未来需要支持 Spark SQL 方言（如 `DATE_TRUNC` vs `TRUNC`），CompilerBackend 如何切换？"
+4. "Phase 4D 的 FILTER 子句渲染中，value 统一加单引号——数字类型的过滤值（如 amount > 1000）会产生类型转换问题吗？"
 
 ---
 
@@ -2085,7 +2095,552 @@ feedback = ReviewFeedback(
 
 ---
 
-## 49. 项目缩写速查
+## 50. SpecEnricher / FakeSpecEnricher
+
+**一句话解释**：位于 Parser 与 Builder 之间的指标推断层——从业务描述中推断程序员未显式声明的聚合/窗口/计算指标，不修改程序员手写声明。
+
+**是什么**
+
+SpecEnricher 是 Parser → Builder 链路的中间组件。它接收 ParsedDeveloperSpec + SourceManifest，对 output_columns 中未被 spec.metrics 覆盖的指标列进行推断。分两层实现：
+- **FakeSpecEnricher（Phase 1）**：纯规则匹配——中文关键词→聚合函数映射（"去重用户数"→COUNT_DISTINCT）、description 结构化 DSL 解析（"COUNT(*)"、"SUM(amount)"）、列名匹配（中文→英文列名映射表）
+- **SpecEnricher（Phase 4）**：LLM 驱动——嵌入 8 条硬约束的 System Prompt（列名只能从 manifest 选、聚合函数 6 种白名单、不推断 JOIN、不修改手写声明等），未注入 LLM 时退化为 FakeSpecEnricher
+
+核心设计原则：不修改程序员手写的 metrics——显式声明优先级 > LLM 推断（H5 硬约束）。
+
+**解决什么问题**
+
+程序员在 DeveloperSpec 中只声明核心指标定义时，SpecEnricher 自动补充缺失的指标声明——减轻手写负担。规则版（Fake）用于离线验证，LLM 版（Phase 4）用于灵活场景。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/planning/spec_enricher.py:388` — FakeSpecEnricher
+- `src/tianshu_datadev/planning/spec_enricher.py:622` — SpecEnricher（LLM 骨架）
+- `src/tianshu_datadev/planning/spec_enricher.py:40-73` — 6 类规则模式（聚合/条件/比率/窗口/函数描述解析）
+- `tests/harness/test_spec_enricher.py` — 574 行测试
+
+**输入是什么**
+
+ParsedDeveloperSpec（含 output_columns 的业务描述）+ SourceManifest。
+
+**输出是什么**
+
+EnrichedSpec——原始 spec 原封不动保留，推断结果放在独立字段（inferred_metrics / inferred_window_metrics / inferred_computed_metrics）。
+
+**出错会导致什么风险**
+
+如果规则版推断出错误的聚合类型（如"金额"推断为 SUM 但实际是 COUNT）——SQL 语义错误且无明显信号（因为推断字段没有 HumanResolution 机制）。如果 LLM 版违反 H1（编造列名）——生成的 BUG AggregateSpec 通过 Builder 进入 SqlBuildPlan。
+
+**简单例子**
+
+output_columns: `[{name: "dau", description: "COUNT(DISTINCT user_id)"}]` 但 spec.metrics 中无 dau 定义 → FakeSpecEnricher 从 description 解析出 COUNT_DISTINCT(user_id) → 填充 inferred_metrics=[MetricDecl(aggregation=COUNT_DISTINCT, input_column="user_id")]。
+
+**Owner 审查时应该问什么**
+
+1. "FakeSpecEnricher 和 SpecEnricher 的接口是否可以互换？在 Pipeline 中如何热切换？"
+2. "推断结果的 confidence 字段在 Fake 版中是 hardcoded 还是动态计算？"
+3. "如果 spec.metrics 已覆盖了所有 output_columns——SpecEnricher 还做什么？"
+
+---
+
+## 51. EnrichedSpec
+
+**一句话解释**：SpecEnricher 产出的丰富化规格——原始 ParsedDeveloperSpec + 三组推断指标 + 丰富化元数据，Builder 消费此产出生成 SqlBuildPlan。
+
+**是什么**
+
+EnrichedSpec 是 SpecEnricher 输出的 Pydantic StrictModel，设计约束：不修改原始 spec，所有推断结果放在独立字段。
+- `original_spec`：原始 ParsedDeveloperSpec（不变——优先级最高）
+- `inferred_metrics: list[MetricDecl]`：推断的简单聚合指标
+- `inferred_window_metrics: list[InferredWindowMetric]`：推断的窗口函数指标（需 WindowStep 承接）
+- `inferred_computed_metrics: list[InferredComputedMetric]`：推断的计算指标（比率/表达式，聚合后计算）
+- `enrichment_metadata: dict`：来源、耗时 ms、推断总数
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/developer_spec/models.py` — EnrichedSpec 定义
+
+**输入是什么**
+
+ParsedDeveloperSpec + SourceManifest（由 SpecEnricher 消费后产出 EnrichedSpec）。
+
+**输出是什么**
+
+EnrichedSpec——Builder 消费 original_spec 和 inferred_* 三组字段，生成 SqlBuildPlan。
+
+**出错会导致什么风险**
+
+如果 EnrichedSpec 的 inferred 字段与 original_spec 冲突（如同名指标两个定义）——Builder 需要明确的合并规则（手写优先级 > 推断），否则产生重复 AggregateSpec。
+
+**简单例子**
+
+```python
+EnrichedSpec(
+    original_spec=parsed_spec,
+    inferred_metrics=[MetricDecl(metric_name="dau", aggregation=COUNT_DISTINCT, input_column="user_id")],
+    enrichment_metadata={"source": "FakeSpecEnricher", "method": "rule_based", "total_inferred": 1}
+)
+```
+
+**Owner 审查时应该问什么**
+
+1. "Builder 消费 EnrichedSpec 时，original_spec.metrics 和 inferred_metrics 中的同名指标如何合并？"
+2. "inferred_computed_metrics 最终在 Compiler 中渲染成什么 SQL 片段？"
+
+---
+
+## 52. OutputColumnDecl
+
+**一句话解释**：输出列声明——包含名称、类型和可选的 SQL 语义描述（结构化 DSL），SpecEnricher 的 description parser 从中提取指标定义。
+
+**是什么**
+
+OutputColumnDecl 是 OutputSpecDecl 的列级单元。Phase 4D 升级后 `columns` 从 `list[str]` 变为 `list[OutputColumnDecl]`，每列可附带：
+- `name`：输出列名
+- `type`：输出列类型（date / bigint / decimal / varchar）
+- `description`：结构化 DSL——"COUNT(*)"（简单聚合）、"COUNT(DISTINCT user_id)"（去重聚合）、"fined_count / total_count"（计算指标）、"ROW_NUMBER() OVER (PARTITION BY dt ORDER BY cnt DESC)"（窗口函数）
+
+支持向后兼容：YAML 中写字符串 "col_name" 自动转为 OutputColumnDecl(name="col_name")，通过 field_validator _coerce_columns 实现。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/developer_spec/models.py` — OutputColumnDecl 定义
+- `src/tianshu_datadev/developer_spec/models.py` — OutputSpecDecl._coerce_columns（list[str]→list[OutputColumnDecl] 向后兼容）
+- `src/tianshu_datadev/planning/spec_enricher.py:114-184` — _parse_description_to_metric() 解析入口
+- `src/tianshu_datadev/planning/spec_enricher.py:187-217` — _parse_description_to_computed()
+- `src/tianshu_datadev/planning/spec_enricher.py:220-256` — _parse_description_to_window()
+
+**输入是什么**
+
+程序员在 DeveloperSpec YAML 元数据块中声明的输出列规格。
+
+**输出是什么**
+
+OutputColumnDecl 实例——被 Builder 消费生成 ProjectStep 和 AggregateStep 的列引用。
+
+**出错会导致什么风险**
+
+如果 description 中的 SQL 签名与实际列引用不一致（如 "COUNT(DISTINCT user_id)" 但 user_id 不在 manifest 中）——推断出的 MetricDecl 在 Validator 阶段被拒绝。如果 description 为空——SpecEnricher 纯靠规则推断聚合类型，置信度较低。
+
+**简单例子**
+
+```yaml
+columns:
+  - name: dau
+    type: bigint
+    description: "COUNT(DISTINCT user_id)"
+  - name: stat_date
+    type: date
+```
+
+**Owner 审查时应该问什么**
+
+1. "OutputColumnDecl 的 description 字段如果写了一个不支持的函数（如 MEDIAN）——SpecEnricher 如何处理？"
+2. "向后兼容的 list[str] → list[OutputColumnDecl] 转换是在 Parser 层还是 Pydantic 的 field_validator 层做的？"
+
+---
+
+## 53. MetricDecl 扩展（Phase 4D）
+
+**一句话解释**：指标声明新增条件聚合、表达式聚合、去重标志——支持 FILTER (WHERE ...) 子句和多字段表达式，扩展 SQL 聚合表达能力。
+
+**是什么**
+
+Phase 4D 为 MetricDecl 新增三个可选字段：
+- `filter: MetricFilterDecl | None`：条件聚合过滤条件——如 `COUNT(DISTINCT plate_id) FILTER (WHERE fine_status = 'STANDARD')`。MetricFilterDecl 含 column、operator（8 种白名单）、value
+- `input_expression: str | None`：多字段表达式——如 `"quantity * unit_price"`，编译时直接透传
+- `distinct: bool`：去重聚合标志——如 `SUM(DISTINCT amount)`
+
+这些字段在 SqlBuildPlanBuilder（透传至 AggregateSpec）和 DuckDbSqlCompiler（渲染为 SQL FILTER 子句）中同步更新。
+
+**解决什么问题**
+
+覆盖 Phase 1-3 无法表达的业务场景：条件聚合（"有标准罚款的车牌数"）、表达式聚合（"金额×数量求和"）、去重求和（"去重金额汇总"）。避免程序员使用自由 SQL 片段来绕过。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/developer_spec/models.py` — MetricFilterDecl + MetricDecl.filter/input_expression/distinct
+- `src/tianshu_datadev/planning/sql_build_plan.py:576-592` — Builder 透传至 AggregateSpec
+- `src/tianshu_datadev/sql/compiler.py:439-529` — Compiler 渲染 FILTER 子句（_render_metric_filter）
+- `src/tianshu_datadev/planning/models.py` — AggregateSpec.filter/input_expression/distinct
+
+**输入是什么**
+
+程序员在 DeveloperSpec 中声明的 MetricDecl 中的 filter/input_expression/distinct 字段。
+
+**输出是什么**
+
+编译后的 SQL——含 FILTER (WHERE ...) 子句、DISTINCT 修饰、表达式替代列引用。
+
+**出错会导致什么风险**
+
+如果 MetricFilterDecl.operator 不受限制——程序员或 LLM 可注入任意操作符。如果 filter.value 不做类型处理（Compiler 统一加单引号）——数字过滤值（如 amount > 1000）可能生成 `amount > '1000'`（隐式类型转换，性能下降）。
+
+**简单例子**
+
+`MetricDecl(metric_name="fined_count", aggregation=COUNT_DISTINCT, input_column="plate_id", filter=MetricFilterDecl(column="fine_status", operator="eq", value="STANDARD"))` → Compiler 渲染为 `COUNT(DISTINCT plate_id) FILTER (WHERE fine_status = 'STANDARD') AS fined_count`。
+
+**Owner 审查时应该问什么**
+
+1. "MetricFilterDecl 的 operator 白名单在哪里定义？新增一个操作符需要改哪些文件？"
+2. "input_expression 是否有安全审查机制（如禁止包含子查询）？谁负责这个审查？"
+
+---
+
+## 54. SparkPlan IR
+
+**一句话解释**：Spark 侧的类型化中间表示——9 种封闭 Step 类型（与 SqlBuildPlan 对称），从 DataTransformContractV1 确定性映射，不包含 SQL 文本或 PySpark 代码。
+
+**是什么**
+
+SparkPlan IR 是 Phase 5 的核心交付物。它定义 9 种 SparkStep 类型（READ/FILTER/JOIN/AGGREGATE/PROJECT/CASE_WHEN/WINDOW/SORT/LIMIT），每种是结构化 Pydantic StrictModel。SparkPlan 从 DataTransformContractV1 确定性映射（通过 mapper.py），不读取 SQL 文本或 SqlBuildPlan。相同 Contract → 相同 SparkPlan → 相同 plan_hash。步骤按固定顺序组装：Read → Filter → Join → Aggregate → Window → CaseWhen → Project → Sort → Limit。
+
+**解决什么问题**
+
+为 SQL 和 Spark 提供可等价对比的对称 IR——Phase 7 PlanComparator 通过对比 SqlBuildPlan 和 SparkPlan 的结构等价性（而非对比 SQL 文本和 PySpark 文本），实现跨引擎正确性验证，不受执行顺序差异影响。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/spark/models.py:261` — SparkPlan 顶层容器
+- `src/tianshu_datadev/spark/models.py:29-41` — SparkStepType 枚举（9 种）
+- `src/tianshu_datadev/spark/models.py:88-241` — 9 个 SparkStep 类（SparkReadStep 等）
+- `src/tianshu_datadev/spark/mapper.py:98` — map_contract_to_spark_plan() 入口
+- `src/tianshu_datadev/spark/models.py:282-321` — generate_plan_id() / compute_plan_hash()
+- `src/tianshu_datadev/spark/__init__.py` — 模块导出
+- `tests/spark/test_spark_plan.py` — SparkPlan 测试
+
+**输入是什么**
+
+DataTransformContractV1（从 SqlProgram 确定性抽取的业务规格，含 input_tables、filters、join_relationships、aggregations、output_columns 等）。
+
+**输出是什么**
+
+SparkPlan——含 plan_id（从 contract_hash 派生 SHA-256[:12]）、version（"v1"）、steps（list[SparkStep]）、source_contract_hash、write_mode。
+
+**出错会导致什么风险**
+
+如果 SparkPlan 的 step 枚举与 SqlBuildPlan 不同步（如 SQL 侧新增 SubqueryStep 但 Spark 侧无对应映射）——PlanEquivalence 判定为 UNSUPPORTED_COMPARISON，覆盖不全。如果 Contract→SparkPlan 映射非确定性——相同 Contract 不同映射结果导致 Phase 7 跨验证假失败。
+
+**简单例子**
+
+ContractInputTable(table_ref="od") → SparkPlanMapper → SparkReadStep(alias="od", source_path="order_daily/", format="parquet")。ContractAggregation(function="COUNT_DISTINCT", input_column="user_id") → SparkAggregateStep(metrics=[SparkAggregateSpec(function=COUNT_DISTINCT, input_column="user_id")])。
+
+**Owner 审查时应该问什么**
+
+1. "SparkPlan 和 SqlBuildPlan 的 step 类型数量是否完全对标？各自有哪些对方没有的类型？"
+2. "SparkPlan 的 plan_hash 和 SqlBuildPlan 的 plan_id 计算方式是否可跨 IR 对比？"
+
+---
+
+## 55. SparkPlanMapper
+
+**一句话解释**：DataTransformContractV1 → SparkPlan 的确定性映射函数——9 类 Contract 信息通过 9 条规则代码映射为 9 种 SparkStep，纯函数无副作用、无 LLM 调用。
+
+**是什么**
+
+SparkPlanMapper 定义 `map_contract_to_spark_plan(contract) → SparkPlanMappingResult`。每条映射规则是确定性代码：ContractInputTable → SparkReadStep（path 约定 `{table_name}/`）、ContractPredicate → SparkFilterStep（结构化三元组直传）、ContractJoin → SparkJoinStep（evidence_chain 直传）、ContractAggregation + grouping_keys → SparkAggregateStep（合并为一个步骤）、ContractOutputColumn → SparkProjectStep、CaseWhenLabelSpec → SparkCaseWhenStep、WindowSpecSummary → SparkWindowStep、ContractSort → SparkSortStep、ContractLimit → SparkLimitStep。步骤按固定顺序组装，BLOCKING gap 或 unsupported pattern 存在时 success=False。
+
+**解决什么问题**
+
+确保 SQL 和 Spark 从同一份业务规格（DataTransformContractV1）出发——SparkDeveloper 不读取 DeveloperSpec 或 SqlBuildPlan，避免两套独立的业务理解产生口径不一致。SparkPlanMapper 是 SQL 和 Spark 之间的"翻译层"。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/spark/mapper.py:98` — map_contract_to_spark_plan() 主函数
+- `src/tianshu_datadev/spark/mapper.py:237-604` — 9 个 _map_* 辅助函数
+- `src/tianshu_datadev/spark/mapper.py:57-95` — 5 个映射查表（_AGG_FUNCTION_MAP 等）
+- `tests/spark/test_spark_plan.py` — 映射测试
+
+**输入是什么**
+
+已验证的 DataTransformContractV1 实例。
+
+**输出是什么**
+
+SparkPlanMappingResult——success=True 时 spark_plan 非空、unsupported/gaps 为空；success=False 时记录所有阻断项。
+
+**出错会导致什么风险**
+
+如果映射规则遗漏了某个 Contract 字段（如 window_specs 的帧定义）——SparkPlan 丢失窗口帧信息。如果步骤顺序错误（如 Aggregate 在 Join 前）——Phase 6 SparkDeveloper 生成调用链错误的 PySpark 代码。
+
+**简单例子**
+
+```python
+result = map_contract_to_spark_plan(contract)
+assert result.success == True
+assert len(result.spark_plan.steps) > 0  # 至少 1 个 ReadStep + 其他
+```
+
+**Owner 审查时应该问什么**
+
+1. "如果 Contract 的 output_columns 为空——mapper 返回什么状态？"
+2. "BLOCKING 级别和 WARN 级别的 ContractGap 有什么区别？在 Pipeline 中分别如何处理？"
+
+---
+
+## 56. PlanEquivalence（计划等价判定）
+
+**一句话解释**：SqlBuildPlan step 与 SparkPlan step 的结构等价判定规则集——通过归一化字段名对比每种 step 类型的业务语义，替代 SQL/Spark 文本对比。
+
+**是什么**
+
+PlanEquivalence 定义一组确定性对比函数（每种 step 类型一个），入口为 `compare_plans(sql_steps, spark_steps) → PlanEquivalenceResult`。所有对比前执行字段名归一化（`normalize_field_name`: 去表别名前缀、统一小写），再对比结构化字段：
+- scan：source_table/alias 数量+集合一致
+- filter：(left, operator, right) 三元组等价
+- join：(left_table, right_table, left_key, right_key, join_type) 等价
+- aggregate：group_keys 集合 + metrics 的 (function, input_column, alias) 等价
+- project：输出列名和别名集合一致
+- case_when：output_alias、label 集合、else 值一致
+- window：(function, alias, partition_by, order_by) 等价
+- sort：排序规格一致
+- limit：limit/offset 值一致
+
+产出三个判定级别：EQUIVALENT、NOT_EQUIVALENT、UNSUPPORTED_COMPARISON。暂不支持 subquery 类型的对比。
+
+**解决什么问题**
+
+替代 SQL 文本和 PySpark 代码的直接对比——文本对比无法处理执行顺序差异（如 Filter 下推导致 SQL/Spark 步骤顺序不同但语义等价）。结构化 IR 对比只关心业务语义，不关心执行顺序。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/spark/plan_equivalence.py:759` — compare_plans() 入口
+- `src/tianshu_datadev/spark/plan_equivalence.py:87-718` — 9 个 step 对比函数
+- `src/tianshu_datadev/spark/plan_equivalence.py:61-79` — normalize_field_name()
+- `src/tianshu_datadev/spark/plan_equivalence.py:726-756` — _STEP_COMPARATORS 注册表 + _UNSUPPORTED_STEP_TYPES
+- `docs/05-cross-validation-and-repair-plan.md` — 跨验证规划
+
+**出错会导致什么风险**
+
+如果 normalize_field_name 处理不当（如 "o.user_id" 归一化为 "user_id" 但 "user_id" 本身是另一个字段）——假 EQUIVALENT。如果 SQL 和 Spark 步长不对等（如 SQL 用 2 个 FilterStep，Spark 合并为 1 个）——NOT_EQUIVALENT 但实际语义等价。
+
+**简单例子**
+
+SQL 侧：ScanStep("od") + AggregateStep(group_keys=["stat_date"], metrics=[COUNT(DISTINCT user_id)]) → Spark 侧：SparkReadStep(alias="od") + SparkAggregateStep(group_keys=["stat_date"], metrics=[COUNT_DISTINCT(user_id)]) → compare_aggregate_steps 判定 EQUIVALENT。
+
+**Owner 审查时应该问什么**
+
+1. "PlanEquivalence 的 UNSUPPORTED_COMPARISON 在什么条件下触发？"
+2. "如果 SQL 侧有排序但 Spark 侧没有——compare_plans() 的 overall_verdict 是什么？"
+
+---
+
+## 57. UnsupportedPattern / ContractGap / SparkPlanMappingResult
+
+**一句话解释**：Contract → SparkPlan 映射中的三种阻断/警告产出——记录哪些数据变换模式无法映射、Contract 缺什么信息、映射的完整状态。
+
+**是什么**
+
+三种阻断模型配合使用：
+- **UnsupportedPattern**：Contract 中某些模式无法映射为 SparkStep。当前不支持的模式：相关子查询、CTE、自定义窗口帧（非默认帧）、CROSS JOIN（无证据笛卡尔积）。含 pattern_id、contract_field、reason、suggested_workaround
+- **ContractGap**：Contract 缺失映射所需的必要信息。如 output_columns 为空、aggregations 中的 function 不在白名单内、grouping_keys 为空做无分组聚合。severity=BLOCKING（阻断）或 WARN（警告）
+- **SparkPlanMappingResult**：映射的完整状态——success（BLOCKING gap 或 unsupported 存在时=False）、spark_plan（成功时非空）、unsupported/gaps/warnings
+
+**解决什么问题**
+
+为 Phase 7 跨引擎验证提供阻断原因的结构化记录——人工审查者可以明确知道哪些模式无法映射及原因。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/spark/models.py:329-372` — 三种阻断模型定义
+- `src/tianshu_datadev/spark/mapper.py` — 各 _map_* 函数中触发阻断条件
+
+**简单例子**
+
+```python
+# 映射失败：Contract 无输入表
+SparkPlanMappingResult(
+    success=False, spark_plan=None,
+    unsupported=[],
+    gaps=[ContractGap(gap_id="gap_input_tables", contract_field="input_tables",
+                       missing_info="Contract 不含任何输入表", severity="BLOCKING")],
+    warnings=[]
+)
+```
+
+**Owner 审查时应该问什么**
+
+1. "UnsupportedPattern 和 ContractGap 的本质区别和触发条件各是什么？"
+2. "如果 Phase 5 新增了对子查询的映射支持——需要修改哪些文件？"
+
+---
+
+## 59. Spec Schema（规格模式）
+
+**一句话解释**：ParsedDeveloperSpec 的字段体系——定义了程序员需求书可表达的业务语义边界，是 Builder 能生成什么 Plan 的上限。
+
+**是什么**
+
+Spec Schema 是 `ParsedDeveloperSpec` 及其子模型（`InputTableDecl`、`MetricDecl`、`DimensionDecl`、`JoinDecl`、`OutputSpecDecl`、`TimeRangeDecl` 等）共同构成的字段体系。它是 Parser 的输出格式、Builder 的输入格式——处于管线中"自然语言理解"与"代码生成"的分界线上。关键定位：
+
+- **上游（Parser）**：LLM 推理从自然语言需求书中提取结构化字段，填入 Spec Schema
+- **下游（Builder）**：硬编码规则读取 Spec Schema 字段，映射为 SqlBuildPlan 的 10 种 Step IR
+- **Spec Schema ≠ Step IR**：Spec Schema 描述"要算什么"（业务语义），Step IR 描述"怎么算"（执行计划）
+
+当前 Spec Schema 假设"一次聚合 + 一条 Join 链"的线性计算模型，不支持多步中间聚合、多分支并行计算、跨粒度依赖等 DAG 计算场景。
+
+**解决什么问题**
+
+为 Parser（LLM）和 Builder（硬编码）提供明确的接口契约——Parser 知道要产出什么字段，Builder 知道能从哪些字段读取业务意图。Spec Schema 的表达能力 = 系统能自动生成 SQL 的业务场景上限。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/developer_spec/models.py:535` — ParsedDeveloperSpec 顶层定义
+- `src/tianshu_datadev/developer_spec/models.py:269` — MetricDecl（指标声明）
+- `src/tianshu_datadev/developer_spec/models.py:339` — DimensionDecl（维度声明）
+- `src/tianshu_datadev/developer_spec/models.py:346` — JoinDecl（Join 声明）
+- `src/tianshu_datadev/developer_spec/models.py:356` — TimeRangeDecl（时间范围）
+- `src/tianshu_datadev/developer_spec/models.py:376` — InputTableDecl（源表声明）
+- `src/tianshu_datadev/developer_spec/models.py:393` — OutputColumnDecl（输出列声明）
+- `src/tianshu_datadev/developer_spec/models.py:411` — OutputSpecDecl（输出规格）
+- `src/tianshu_datadev/developer_spec/models.py:288` — InferredWindowMetric（窗口指标推断）
+- `src/tianshu_datadev/developer_spec/models.py:305` — InferredComputedMetric（计算指标推断）
+- `src/tianshu_datadev/developer_spec/models.py:319` — EnrichedSpec（丰富化规格）
+
+**输入是什么**
+
+不适用——Spec Schema 是类型定义，不是运行时组件。它的实例由 Parser 填充。
+
+**输出是什么**
+
+不适用——它是 Builder 的输入契约。
+
+**出错会导致什么风险**
+
+如果 Spec Schema 表达能力不足——程序员的需求书中合法的业务过程无法用任何字段组合表达 → Parser 无法产出完整结构化 Spec → Builder 缺失关键信息 → 生成的 SQL 不完整或语义错误。如果 Spec Schema 过于复杂——Parser（LLM）难以稳定产出符合 Schema 的 JSON → Schema 校验失败率升高 → 自动化率下降。
+
+**简单例子**
+
+当前 Spec Schema 能表达的："用户表 Join 订单表，按天汇总订单金额"——`metrics: [{aggregation: SUM, input_column: "amount"}]` + `dimensions: [{column_ref: "stat_date"}]`。
+
+当前 Spec Schema 不能表达的："先按天汇总订单金额，再按月对日汇总求平均"——无法声明"第一步的产出是第二步的输入"。
+
+**Owner 审查时应该问什么**
+
+1. "ParsedDeveloperSpec 的字段总数是多少？其中哪些字段是程序员手写的、哪些是 SpecEnricher 推断的、哪些是 Builder 自己计算的？"
+2. "如果要新增一个 Spec 字段（如 intermediate_aggregations），从定义到 Builder 消费，需要改哪些文件？"
+3. "Spec Schema 和 Step IR（10 种 StepNode）之间的映射关系是否文档化了？还是只在 Builder 代码中隐式存在？"
+
+---
+
+## 60. ComputeStep（计算步骤声明）
+
+**一句话解释**：Spec Schema 的新增字段——在 DeveloperSpec 中声明分步计算，每步定义输入来源、聚合逻辑和输出别名，替代当前扁平的 `metrics` 列表。
+
+**是什么**
+
+ComputeStep 是 Spec Schema 扩展的核心概念。它将当前"一个 metrics 列表 + 一个 dimensions 列表 = 一层聚合"的线性模型，扩展为可声明多步计算的 DAG 模型。每个 ComputeStep 包含：
+
+- `step_name`：步骤名称（在 Spec 内唯一，用于下游引用）
+- `source`：输入来源——`"input"`（源表直接计算）或 `step_name`（引用前面步骤的产出）
+- `group_by`：此步骤的 GROUP BY 列
+- `metrics`：此步骤的聚合指标
+- `output_alias`：此步骤产出的中间表别名（供后续步骤 FROM 引用）
+
+多个 ComputeStep 构成一个 DAG——后续步骤通过 `source` 引用前面步骤，Builder 据此生成 SqlProgram 的 statement 依赖链。
+
+**解决什么问题**
+
+覆盖阻断级缺陷 P0-1（多步聚合链）："先按天汇总→再按月求平均→最后 Join 用户表"这类需求可以声明为 3 个 ComputeStep，Builder 生成 3 个 SqlStatement 的链。
+
+**在当前项目中的位置**
+
+- **待实现**——当前 Spec Schema 中不存在此字段
+- `src/tianshu_datadev/developer_spec/models.py` — 新增 ComputeStep 模型
+- `src/tianshu_datadev/planning/sql_build_plan.py` — Builder 新增 `_build_from_compute_steps()`
+
+**输入是什么**
+
+程序员在 DeveloperSpec 中声明的分步计算规格（由 Parser 解析填充）。如果程序员未显式声明，由 SpecEnricher（LLM）从自然语言业务描述推断。
+
+**输出是什么**
+
+ComputeStep 列表——被 Builder 消费，生成对应数量的 SqlStatement（每个 step → 一个 statement，含 AggregateStep + ProjectStep）。
+
+**出错会导致什么风险**
+
+如果 ComputeStep 的 `source` 引用形成环——Builder 无法生成合法 SqlProgram → 拓扑排序失败 → 编译阻断。如果 `source` 引用了不存在的 step_name——类似缺失依赖，Validator 在 DAG 校验阶段拦截。
+
+**简单例子**
+
+```yaml
+compute_steps:
+  - step_name: daily_agg
+    source: input
+    group_by: [dt, user_id]
+    metrics:
+      - metric_name: daily_amount
+        aggregation: SUM
+        input_column: amount
+    output_alias: daily_summary
+
+  - step_name: monthly_avg
+    source: daily_agg
+    group_by: [month, user_id]
+    metrics:
+      - metric_name: avg_daily_amount
+        aggregation: AVG
+        input_column: daily_amount
+    output_alias: monthly_summary
+```
+
+**Owner 审查时应该问什么**
+
+1. "ComputeStep 的 source 除了引用 input 和其他 step_name，还能引用什么？"
+2. "如果两个 ComputeStep 的 source 相同（都引用 daily_agg），Builder 如何处理？会产生重复计算吗？"
+
+---
+
+## 61. Spec DAG（规格依赖图）
+
+**一句话解释**：多个 ComputeStep 之间的依赖关系图——描述中间计算结果如何被下游步骤引用，Builder 据此生成 SqlProgram 的 statement 依赖链。
+
+**是什么**
+
+Spec DAG 不是独立的数据结构，而是从 ComputeStep 列表的 `source` 字段推导出的有向无环图。节点 = ComputeStep + 源表，边 = "A 的产出被 B 引用"。与 SqlProgram 的 statement DAG 一一对应——每个 ComputeStep 生成一个 SqlStatement，Spec DAG 的边转换为 statement 的 `depends_on`。
+
+关键约束：
+- 必须是 DAG（无环）——拓扑排序可解
+- 每个步骤的 `source` 必须已声明（无悬空引用）
+- 最终输出步骤通过 OutputSpecDecl 指定
+
+**解决什么问题**
+
+为 Builder 提供明确的依赖信息——Builder 不需要重新推理步骤间的数据流，直接从 Spec DAG 生成 SqlProgram 的 statement 依赖链。
+
+**在当前项目中的位置**
+
+- **待实现**——依赖 ComputeStep 引入后自动由 Builder 推导
+- `src/tianshu_datadev/planning/sql_build_plan.py:316` — build_multi() 可扩展为消费 Spec DAG
+
+**输入是什么**
+
+ComputeStep 列表——Builder 读取每个步骤的 `source` 字段，构建邻接表。
+
+**输出是什么**
+
+拓扑排序后的步骤执行顺序 + 中间表命名映射。
+
+**出错会导致什么风险**
+
+如果 Spec DAG 存在环——Builder 在拓扑排序时检测到循环依赖 → 必须抛出明确错误（类似 SqlProgram 的 CIRCULAR_DEPENDENCY）。如果 Spec DAG 存在孤立节点（无下游引用且非最终输出）——警告但允许（可能是冗余计算）。
+
+**简单例子**
+
+```
+源表(orders) → daily_agg → monthly_avg → final_join(users)
+                      ↘
+                  weekly_avg ────────────→ final_join(users)
+```
+
+这个 DAG 有分支（daily_agg 被两个下游引用），Builder 生成 3 个 PRODUCER statement + 1 个 FINAL statement。
+
+**Owner 审查时应该问什么**
+
+1. "Spec DAG 和 SqlProgram 的 statement DAG 是否保证一一对应？在什么情况下会不对应？"
+2. "如何处理菱形依赖（Diamond Dependency）——两个中间步骤被同一个下游步骤引用？"
+
+---
+
+## 62. 项目缩写速查
 
 | 缩写 | 全称 | 含义 |
 |------|------|------|
@@ -2115,10 +2670,22 @@ feedback = ReviewFeedback(
 | **HR** | HumanResolution | 程序员对 OpenQuestion 的回答或 HumanReview 判定 |
 | **BC** | B/C 暂停条件 | Phase 的"停止继续往下做"的条件 |
 | **HR** | HarnessReport | Phase 门禁评测报告 |
+| **SE** | SpecEnricher | 指标推断层（规则/LLM 双模） |
+| **ES** | EnrichedSpec | 丰富化规格（含推断指标） |
+| **OCD** | OutputColumnDecl | 输出列声明（含 DSL 描述） |
+| **MFD** | MetricFilterDecl | 条件聚合过滤声明（FILTER WHERE） |
+| **SPK** | SparkPlan | Spark 侧类型化中间表示 |
+| **SPM** | SparkPlanMapper | Contract→SparkPlan 确定性映射 |
+| **PEQ** | PlanEquivalence | SQL/Spark 结构等价判定 |
+| **UP** | UnsupportedPattern | 无法映射的变换模式 |
+| **CG** | ContractGap | Contract 缺失的必要信息 |
+| **SS** | Spec Schema | ParsedDeveloperSpec 字段体系——Builder 输入契约 |
+| **CS** | ComputeStep | 分步计算声明——Spec 扩展核心字段 |
+| **SDAG** | Spec DAG | 规格依赖图——从 ComputeStep.source 推导 |
 
 ---
 
-> 本文基于项目代码基线（2026-06-29）生成，覆盖 49 个核心工程术语。
+> 本文基于项目代码基线（2026-07-01）生成，覆盖 61 个核心工程术语。
 > 每个术语遵循"九件事"说明格式：名称→是什么→解决什么问题→项目位置→输入→输出→风险→例子→审查问题。
 > 参考：[[AGENTS.md]] | [[03-sql-ir-and-compiler-plan]] | [[01-target-architecture]] | 各 Phase Roadmap 文档
 > 关联文档：[[subquery-multihop-join-boundary_20260629_1500]] | [[phase-3-exit-report]]

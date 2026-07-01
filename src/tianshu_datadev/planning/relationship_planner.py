@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import json
+
 from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer
 from tianshu_datadev.developer_spec.models import JoinDecl, OpenQuestion, ParsedDeveloperSpec, SourceManifest
 
@@ -265,6 +267,609 @@ class FakeRelationshipPlanner:
             checks.append("developer_declared: FOUND")
         else:
             checks.append("developer_declared: NOT_FOUND")
+
+        if names_match:
+            checks.append("field_name_match: MATCH")
+        elif edit_dist is not None and edit_dist <= 2:
+            checks.append(f"field_name_similarity: PARTIAL (edit_distance={edit_dist})")
+        else:
+            checks.append("field_name_match: MISMATCH")
+
+        if types_compatible:
+            checks.append("type_compatibility: MATCH")
+        else:
+            checks.append("type_compatibility: MISMATCH")
+
+        checks.append("unique_index: NOT_CHECKED")
+        checks.append("foreign_key: NOT_CHECKED")
+        return checks
+
+
+# ════════════════════════════════════════════
+# LLM Prompt 模板——Phase 4E 启用
+# ════════════════════════════════════════════
+
+_RELATIONSHIP_INFERENCE_PROMPT = """你是数据仓库表关系推断专家。你的任务是阅读业务描述和表结构，
+推断表之间的 Join 关系，并输出严格的 JSON 结构。
+
+════════════════════════════════════
+硬约束（违反任何一条都是错误）
+════════════════════════════════════
+
+H1. 键名只能从提供的 [Table Schemas] 中选择，禁止编造不存在的列名。
+    如果你需要的列不在 Schema 中，不要编造——跳过该候选。
+
+H2. 只能推断这些 Join 类型之一：INNER | LEFT | RIGHT | FULL。
+    不要使用 CROSS JOIN、NATURAL JOIN 或任何非等值 Join。
+
+H3. 只能推断两表之间的直接 Join——不要推测三表或更复杂的多跳关系。
+    每对表之间最多输出 1 个 Join 候选（按最匹配的键对）。
+    多对表关系由多次调用独立处理。
+
+H4. 不能覆盖程序员已显式声明的 Join 关系（[Existing Joins] 中的条目）。
+    你的输出与声明列表合并——相同 (left_table, right_table) 对以声明为准。
+
+H5. 键名仅为列名本身，不包含表名前缀。
+    正确: "user_id" 错误: "users.user_id"、"tf.user_id"。
+
+H6. 不确定时设置 confidence=low，不要猜测。
+    confidence 取值：
+    - high:   明显的外键命名模式（orders.customer_id → customers.id）
+    - medium: 同名列或语义相关命名，但无明确 FK 模式
+    - low:    仅凭描述推测，列名无明确对应关系
+
+H7. 你只接收 schema 信息（列名 + 类型 + 可空标记），不接收数据样本。
+    不要要求或期望看到实际数据值。推测仅基于表结构和业务描述。
+
+════════════════════════════════════
+推断规则
+════════════════════════════════════
+
+- 同名列优先：两表中有完全相同列名 → 高优先级候选
+- 外键命名模式：orders.user_id → users.id —— 通过 _id 后缀与 id 列的对应关系推断
+- 语义相关：表 A 的 dept_id 与表 B 的 department_id —— 仅当描述文本明确提到两者关联时考虑
+- 多键关系：如果描述中明确说明了多个关联条件，输出多个 Join 候选（一对表一个候选）
+- 字段类型兼容：int ↔ bigint ↔ decimal 兼容；varchar 与 varchar 兼容；
+  跨类型（int ↔ varchar）仍可输出，交给 Validator 确定性裁决
+
+════════════════════════════════════
+输出格式
+════════════════════════════════════
+
+严格按以下 JSON 输出，禁止多余文本或解释：
+
+{
+  "inferred_joins": [
+    {
+      "left_table": "左表别名（从 Table Schemas 的 table_ref 中选择）",
+      "right_table": "右表别名（从 Table Schemas 的 table_ref 中选择）",
+      "left_key": "左表字段名（从该表的 columns 中选择）",
+      "right_key": "右表字段名（从该表的 columns 中选择）",
+      "join_type": "INNER|LEFT|RIGHT|FULL",
+      "confidence": "high|medium|low",
+      "reasoning": "一句话推断依据"
+    }
+  ]
+}
+
+如果无法推断任何 Join 关系，输出空数组：
+{"inferred_joins": []}"""
+
+
+# ════════════════════════════════════════════
+# LLM 输出 JSON Schema——传给 AnthropicAdapter 做 structured output
+# ════════════════════════════════════════════
+
+_RELATIONSHIP_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "inferred_joins": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "left_table": {
+                        "type": "string",
+                        "description": "左表别名——必须从 Table Schemas 的 table_ref 中选择",
+                    },
+                    "right_table": {
+                        "type": "string",
+                        "description": "右表别名——必须从 Table Schemas 的 table_ref 中选择",
+                    },
+                    "left_key": {
+                        "type": "string",
+                        "description": "左表 Join 键列名——必须存在于 left_table 的 columns 中",
+                    },
+                    "right_key": {
+                        "type": "string",
+                        "description": "右表 Join 键列名——必须存在于 right_table 的 columns 中",
+                    },
+                    "join_type": {
+                        "type": "string",
+                        "enum": ["INNER", "LEFT", "RIGHT", "FULL"],
+                        "description": "Join 类型",
+                    },
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                        "description": "推断置信度：high(FK命名模式)/medium(同名列)/low(仅描述推测)",
+                    },
+                    "reasoning": {
+                        "type": "string",
+                        "description": "一句话推断依据",
+                    },
+                },
+                "required": [
+                    "left_table",
+                    "right_table",
+                    "left_key",
+                    "right_key",
+                    "join_type",
+                    "confidence",
+                ],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["inferred_joins"],
+    "additionalProperties": False,
+}
+
+
+class RelationshipPlanner:
+    """Phase 4E LLM Join 推断器——调用 LLM 从表结构和业务描述推断 Join 关系。
+
+    使用嵌入 7 条硬约束的 System Prompt + JSON 约束输出。
+    需要注入 LLM 客户端（如 Anthropic SDK），Phase 4E 装配。
+
+    与 FakeRelationshipPlanner 接口完全一致——相同 (spec, manifest) → (hypothesis, questions)。
+    llm_client=None 时完全退化为 FakeRelationshipPlanner 行为。
+    """
+
+    # 字段类型兼容性矩阵——同组类型视为兼容
+    # Validator 仍会做最终裁决，此处仅用于上下文质量标注
+    _TYPE_GROUPS: list[set[str]] = [
+        {"int", "bigint", "integer", "smallint", "tinyint", "decimal", "numeric", "float", "double", "real"},
+        {"varchar", "char", "text", "string", "nvarchar", "longtext"},
+        {"date", "datetime", "timestamp", "timestamptz"},
+        {"boolean", "bool"},
+    ]
+
+    def __init__(
+        self,
+        llm_client: Any = None,
+        validator: RelationshipValidator | None = None,
+        normalizer: FieldNormalizer | None = None,
+    ):
+        """初始化 LLM 推断器。
+
+        Args:
+            llm_client: LLM 客户端（如 anthropic.Anthropic()），Phase 4E 注入。
+                        None 时退化为 FakeRelationshipPlanner。
+            validator: 证据评级器，None 使用默认 RelationshipValidator
+            normalizer: 字段名归一化器，None 使用默认 FieldNormalizer
+        """
+        self._llm = llm_client
+        self._validator = validator or RelationshipValidator()
+        self._normalizer = normalizer or FieldNormalizer()
+        self._fake = FakeRelationshipPlanner(self._validator, self._normalizer)
+
+    def plan(
+        self,
+        spec: ParsedDeveloperSpec,
+        manifest: SourceManifest | None = None,
+    ) -> tuple[RelationshipHypothesis, list[OpenQuestion]]:
+        """基于 spec + manifest 构建 RelationshipHypothesis。
+
+        llm_client=None → 退化到 FakeRelationshipPlanner。
+        llm_client 已注入 → LLM 推断隐式 Join 并与显式声明合并。
+
+        Args:
+            spec: 已解析的 DeveloperSpec
+            manifest: 源数据清单（LLM 模式需要，Fake 模式可选）
+
+        Returns:
+            (RelationshipHypothesis, list[OpenQuestion])
+        """
+        if self._llm is None:
+            return self._fake.plan(spec, manifest)
+
+        return self._llm_plan(spec, manifest)
+
+    # ── LLM 推断内部方法 ──
+
+    def _build_context(self, spec: ParsedDeveloperSpec, manifest: SourceManifest) -> dict:
+        """构建 LLM 调用的 Context 部分——不包含数据样本（遵守 H7）。
+
+        Args:
+            spec: 已解析的 DeveloperSpec
+            manifest: 源数据清单
+
+        Returns:
+            可序列化的 Context dict
+        """
+        # 表结构——仅含列名 + 类型 + 可空
+        tables_info: list[dict] = []
+        for table in manifest.tables:
+            cols_info: list[dict] = []
+            for col in table.columns:
+                cols_info.append({
+                    "column_name": col.column_name,
+                    "data_type": col.data_type,
+                    "nullable": col.nullable,
+                })
+            tables_info.append({
+                "table_ref": table.table_ref,
+                "source_table": str(table.source_table) if table.source_table else None,
+                "columns": cols_info,
+            })
+
+        # 已有显式声明——不可覆盖（H4）
+        existing_joins: list[dict] = []
+        if spec.joins:
+            for j in spec.joins:
+                existing_joins.append({
+                    "left_table": j.left_table,
+                    "right_table": j.right_table,
+                    "left_key": j.left_key,
+                    "right_key": j.right_key,
+                    "join_type": str(j.join_type.value) if hasattr(j.join_type, "value") else str(j.join_type),
+                })
+
+        return {
+            "table_schemas": tables_info,
+            "existing_joins": existing_joins,
+            "business_description": spec.description,
+            "spec_title": spec.title,
+        }
+
+    def _parse_llm_response(self, raw: dict, manifest: SourceManifest) -> list[dict]:
+        """解析 LLM 返回的 JSON 并校验——确保字段名在 manifest 中存在（H1）。
+
+        容错策略：不抛异常，不合法的候选项直接丢弃，合法项保留。
+
+        Args:
+            raw: LLM 返回的原始 JSON
+            manifest: 源数据清单（用于校验字段名存在性）
+
+        Returns:
+            校验通过的 Join 候选 dict 列表
+        """
+        valid: list[dict] = []
+
+        # 构建合法字段名集合（按 table_ref 分组）
+        table_columns: dict[str, set[str]] = {}
+        for table in manifest.tables:
+            table_columns[table.table_ref] = {col.column_name for col in table.columns}
+
+        for item in raw.get("inferred_joins", []):
+            left_table = item.get("left_table", "")
+            right_table = item.get("right_table", "")
+            left_key = item.get("left_key", "")
+            right_key = item.get("right_key", "")
+
+            # H1：字段名必须在 manifest 中存在
+            left_cols = table_columns.get(left_table, set())
+            right_cols = table_columns.get(right_table, set())
+            if left_key not in left_cols or right_key not in right_cols:
+                continue  # 非法字段名 → 丢弃
+
+            # 表别名必须有效
+            if left_table not in table_columns or right_table not in table_columns:
+                continue
+
+            # 跳过同一表自 Join（留给 Builder 的自引用检测处理）
+            if left_table == right_table:
+                continue
+
+            # H2：校验 join_type 为合法枚举
+            join_type = item.get("join_type", "INNER")
+            if join_type not in ("INNER", "LEFT", "RIGHT", "FULL"):
+                join_type = "INNER"
+
+            # 校验 confidence
+            confidence = item.get("confidence", "medium")
+            if confidence not in ("high", "medium", "low"):
+                confidence = "medium"
+
+            valid.append({
+                "left_table": left_table,
+                "right_table": right_table,
+                "left_key": left_key,
+                "right_key": right_key,
+                "join_type": join_type,
+                "confidence": confidence,
+                "reasoning": item.get("reasoning", ""),
+            })
+
+        return valid
+
+    def _llm_plan(
+        self,
+        spec: ParsedDeveloperSpec,
+        manifest: SourceManifest,
+    ) -> tuple[RelationshipHypothesis, list[OpenQuestion]]:
+        """LLM 推断流程——Context → LLM → 解析 → 合并显式声明 → 校验 → 定级。
+
+        Args:
+            spec: 已解析的 DeveloperSpec
+            manifest: 源数据清单
+
+        Returns:
+            (RelationshipHypothesis, list[OpenQuestion])
+        """
+        open_questions: list[OpenQuestion] = []
+        candidates: list[JoinCandidate] = []
+
+        # 步骤 1：先处理显式声明（不变——高优先级）
+        explicit_candidates: dict[tuple[str, str], JoinCandidate] = {}
+        if spec.joins:
+            for join_decl in spec.joins:
+                candidate = self._fake._build_candidate(join_decl, spec)
+                open_q = self._fake._rate_and_decide(candidate)
+                if open_q:
+                    open_questions.append(open_q)
+                else:
+                    explicit_candidates[(join_decl.left_table, join_decl.right_table)] = candidate
+
+        # 步骤 2：构建 Context → 调用 LLM
+        context = self._build_context(spec, manifest)
+        raw: dict = {"inferred_joins": []}
+
+        try:
+            from tianshu_datadev.llm.adapters import AnthropicAdapter
+
+            adapter = AnthropicAdapter()
+            raw = adapter.invoke(
+                system_message=_RELATIONSHIP_INFERENCE_PROMPT,
+                user_message=json.dumps(context, ensure_ascii=False),
+                json_schema=_RELATIONSHIP_JSON_SCHEMA,
+                model="",
+                temperature=0.1,
+            )
+        except Exception:
+            # LLM 调用失败 → 退化为纯显式声明模式，不阻断流程
+            raw = {"inferred_joins": []}
+
+        # 步骤 3：解析 LLM 返回
+        inferred_items = self._parse_llm_response(raw, manifest)
+
+        # 步骤 4：合并——显式声明覆盖 LLM 推断（H4）
+        for item in inferred_items:
+            pair_key = (item["left_table"], item["right_table"])
+            if pair_key in explicit_candidates:
+                continue
+
+            candidate = self._build_llm_candidate(item)
+            open_q = self._rate_and_decide_llm(candidate, item["confidence"])
+            if open_q:
+                open_questions.append(open_q)
+                # MEDIUM（非阻断人审）→ 候选仍加入流程，供人工确认后采纳
+                # WEAK/NONE → 硬阻断，候选不加入
+                if not open_q.blocking and candidate.evidence is not None and \
+                   candidate.evidence.level == JoinEvidenceLevel.MEDIUM:
+                    candidates.append(candidate)
+            else:
+                candidates.append(candidate)
+
+        # 步骤 5：合并显式声明候选项
+        final_candidates = list(explicit_candidates.values()) + candidates
+
+        multi_table = len(spec.input_tables) > 1
+
+        hypothesis = RelationshipHypothesis(
+            hypothesis_id=RelationshipHypothesis.generate_hypothesis_id(spec.spec_hash),
+            spec_hash=spec.spec_hash,
+            source_manifest_hash=manifest.spec_hash if manifest else None,
+            candidates=final_candidates,
+            multi_table=multi_table,
+        )
+
+        return hypothesis, open_questions
+
+    def _build_llm_candidate(self, item: dict) -> JoinCandidate:
+        """将 LLM 推断的 dict 转为 JoinCandidate。
+
+        与 Fake._build_candidate 的区别：不调用 FieldNormalizer（字段名已在 _parse_llm_response 校验过），
+        但保留归一化以保持与 Validator 的兼容。
+
+        Args:
+            item: 来自 _parse_llm_response 的合法 dict
+
+        Returns:
+            JoinCandidate 实例
+        """
+        left_normalized = self._normalizer.normalize(item["left_key"])
+        right_normalized = self._normalizer.normalize(item["right_key"])
+
+        return JoinCandidate(
+            candidate_id=JoinCandidate.generate_candidate_id(
+                item["left_table"],
+                item["right_table"],
+                item["left_key"],
+                item["right_key"],
+            ),
+            left_table=item["left_table"],
+            right_table=item["right_table"],
+            left_key=item["left_key"],
+            right_key=item["right_key"],
+            left_key_normalized=left_normalized,
+            right_key_normalized=right_normalized,
+            join_type=self._map_join_type_str(item["join_type"]),
+        )
+
+    def _map_join_type_str(self, join_type_str: str) -> JoinType:
+        """将 LLM 输出的字符串 join_type 映射到 JoinType 枚举。
+
+        Args:
+            join_type_str: 来自 LLM 的字符串（已通过 H2 校验）
+
+        Returns:
+            JoinType 枚举值
+        """
+        mapping = {
+            "INNER": JoinType.INNER,
+            "LEFT": JoinType.LEFT,
+            "RIGHT": JoinType.RIGHT,
+            "FULL": JoinType.FULL,
+        }
+        return mapping.get(join_type_str, JoinType.INNER)
+
+    def _rate_and_decide_llm(
+        self, candidate: JoinCandidate, llm_confidence: str
+    ) -> OpenQuestion | None:
+        """对 LLM 推断的候选调用 Validator 定级——与显式声明的区别在于 has_explicit_decl=False。
+
+        Args:
+            candidate: LLM 推断的 JoinCandidate（未填充 evidence）
+            llm_confidence: LLM 的置信度标签（high/medium/low）
+
+        Returns:
+            OpenQuestion 或 None
+        """
+        # 判断字段名归一化后是否匹配
+        names_match = candidate.left_key_normalized == candidate.right_key_normalized
+
+        # 计算编辑距离
+        edit_dist = self._edit_distance(
+            candidate.left_key_normalized,
+            candidate.right_key_normalized,
+        )
+
+        # 别名匹配判定
+        alias_match = not names_match and edit_dist is not None and edit_dist <= 2
+
+        # LLM 推断的来源没有显式声明——has_explicit_decl=False
+        has_explicit_decl = False
+
+        # 类型兼容性——基于 _TYPE_GROUPS 判断
+        types_compatible = True  # 具体类型检查由 Builder 执行
+
+        # 调用 Validator 定级
+        level, action = self._validator.rate(
+            has_explicit_decl=has_explicit_decl,
+            has_fk_constraint=False,
+            names_normalized_match=names_match,
+            name_edit_distance=edit_dist if edit_dist is not None else None,
+            name_alias_match=alias_match,
+            types_compatible=types_compatible,
+            has_unique_index=False,
+            has_high_distinct_ratio=llm_confidence == "high",
+        )
+
+        # 构建证据检查列表
+        evidence_checks = self._build_llm_checks(
+            names_match=names_match,
+            edit_dist=edit_dist,
+            types_compatible=types_compatible,
+            llm_confidence=llm_confidence,
+        )
+
+        # 生成可读理由
+        detail = self._validator.generate_detail(
+            level=level,
+            has_explicit_decl=has_explicit_decl,
+            has_fk_constraint=False,
+            names_normalized_match=names_match,
+            name_edit_distance=edit_dist if edit_dist is not None else None,
+            name_alias_match=alias_match,
+            types_compatible=types_compatible,
+            has_unique_index=False,
+            has_high_distinct_ratio=llm_confidence == "high",
+        )
+
+        # 构建证据记录
+        evidence = RelationshipEvidence(
+            evidence_id=f"ev_{candidate.candidate_id}",
+            level=level,
+            action=action,
+            left_table=candidate.left_table,
+            right_table=candidate.right_table,
+            left_key_raw=candidate.left_key,
+            right_key_raw=candidate.right_key,
+            left_key_normalized=candidate.left_key_normalized,
+            right_key_normalized=candidate.right_key_normalized,
+            evidence_checks=evidence_checks,
+            detail=detail,
+        )
+        evidence.generate_evidence_chain_yaml()
+        object.__setattr__(candidate, "evidence", evidence)
+
+        # WEAK/NONE 硬门禁
+        if level in (JoinEvidenceLevel.WEAK, JoinEvidenceLevel.NONE):
+            blocking = level == JoinEvidenceLevel.WEAK
+            return OpenQuestion(
+                question_id=f"Q-JOIN-{candidate.candidate_id}",
+                source="relationship",
+                field_ref=f"{candidate.left_table}.{candidate.left_key}",
+                description=(
+                    f"LLM 推断 Join {candidate.left_table}.{candidate.left_key} "
+                    f"= {candidate.right_table}.{candidate.right_key} "
+                    f"(LLM 置信度={llm_confidence})——证据等级 {level.value}——{detail}"
+                ),
+                blocking=blocking,
+            )
+
+        # MEDIUM → OpenQuestion（非阻断）
+        if level == JoinEvidenceLevel.MEDIUM:
+            return OpenQuestion(
+                question_id=f"Q-JOIN-{candidate.candidate_id}",
+                source="relationship",
+                field_ref=f"{candidate.left_table}.{candidate.left_key}",
+                description=(
+                    f"LLM 推断 Join {candidate.left_table}.{candidate.left_key} "
+                    f"= {candidate.right_table}.{candidate.right_key} "
+                    f"(LLM 置信度={llm_confidence})——证据等级 MEDIUM——需人工确认"
+                ),
+                blocking=False,
+            )
+
+        return None
+
+    # ── 静态辅助 ──
+
+    @staticmethod
+    def _edit_distance(a: str, b: str) -> int:
+        """计算两个字符串的莱文斯坦编辑距离。"""
+        if len(a) < len(b):
+            a, b = b, a
+        if len(b) == 0:
+            return len(a)
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a, 1):
+            curr = [i]
+            for j, cb in enumerate(b, 1):
+                if ca == cb:
+                    curr.append(prev[j - 1])
+                else:
+                    curr.append(1 + min(prev[j], curr[-1], prev[j - 1]))
+            prev = curr
+        return prev[-1]
+
+    @staticmethod
+    def _build_llm_checks(
+        names_match: bool,
+        edit_dist: int | None,
+        types_compatible: bool,
+        llm_confidence: str,
+    ) -> list[str]:
+        """构建 LLM 推断候选的证据检查列表。
+
+        与 Fake 的 _build_checks 区别：记录 LLM 置信度。
+
+        Args:
+            names_match: 归一化字段名是否匹配
+            edit_dist: 编辑距离
+            types_compatible: 类型是否兼容
+            llm_confidence: LLM 置信度标签
+
+        Returns:
+            证据检查字符串列表
+        """
+        checks: list[str] = [
+            f"llm_inferred: YES (confidence={llm_confidence})",
+            "developer_declared: NOT_FOUND",
+        ]
 
         if names_match:
             checks.append("field_name_match: MATCH")

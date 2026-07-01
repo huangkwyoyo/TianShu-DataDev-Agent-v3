@@ -28,6 +28,7 @@ _VALID_WINDOW_FUNCTIONS: frozenset[WindowFunction] = frozenset({
     WindowFunction.ROW_NUMBER,
     WindowFunction.RANK,
     WindowFunction.DENSE_RANK,
+    WindowFunction.NTILE,
     WindowFunction.LAG,
     WindowFunction.LEAD,
     WindowFunction.SUM_OVER,
@@ -40,6 +41,7 @@ _RANKING_FUNCTIONS: frozenset[WindowFunction] = frozenset({
     WindowFunction.ROW_NUMBER,
     WindowFunction.RANK,
     WindowFunction.DENSE_RANK,
+    WindowFunction.NTILE,
     WindowFunction.LAG,
     WindowFunction.LEAD,
 })
@@ -163,8 +165,14 @@ def validate_window_not_in_where(
 ) -> list[OpenQuestion]:
     """检查窗口函数是否出现在 WHERE / HAVING 子句中。
 
-    窗口函数只能在 SELECT 和 ORDER BY 中使用，
-    不能出现在 WHERE / HAVING 子句中——这是 SQL 标准约束。
+    Phase 5 更新：FilterStep 引用窗口列不再阻断——
+    DuckDbSqlCompiler._render_window_wrapped_sql 自动生成子查询包裹：
+        SELECT * FROM (<inner>) AS _sub WHERE _sub.<window_col> <= N
+
+    窗口函数不能在原始 SQL 的 WHERE/HAVING 中使用是 SQL 标准约束，
+    但 Compiler 通过子查询包裹等价绕过——语义等价且不违反 SQL 标准。
+
+    仍检查 HAVING 中的窗口引用（由子查询包裹无法处理的嵌套场景）。
 
     Args:
         plan: 待校验的 SqlBuildPlan
@@ -179,13 +187,7 @@ def validate_window_not_in_where(
 
     questions: list[OpenQuestion] = []
 
-    # 窗口函数在 IR 中只能出现在 WindowStep 中，
-    # FilterStep 和 AggregateStep.having 使用的是 Predicate，
-    # 而 Predicate 不接受 WindowExpr 作为操作数。
-    # 因此类型系统已阻止窗口函数进入 WHERE/HAVING。
-    # 此检查是二次安全确认。
-
-    # 检查所有 FilterStep ——确认 predicates 中不引用窗口函数别名
+    # 收集窗口别名
     window_aliases: set[str] = set()
     for step in plan.steps:
         if isinstance(step, WindowStep):
@@ -198,6 +200,8 @@ def validate_window_not_in_where(
             if isinstance(step, FilterStep):
                 col_name = getattr(step.predicate.left, "column_name", "")
                 if col_name in window_aliases:
+                    # Phase 5：窗口列在 FilterStep 中不再阻断——
+                    # Compiler._render_window_wrapped_sql 自动生成子查询包裹
                     questions.append(
                         OpenQuestion(
                             question_id=(
@@ -207,9 +211,10 @@ def validate_window_not_in_where(
                             source="WindowValidator",
                             description=(
                                 f"窗口函数别名 '{col_name}' 出现在 FilterStep "
-                                f"（等效 WHERE 子句）中——窗口函数不能用于 WHERE"
+                                f"（等效 WHERE 子句）中——"
+                                f"Compiler 将通过子查询包裹（SELECT * FROM (...) AS _sub WHERE ...）处理"
                             ),
-                            blocking=True,
+                            blocking=False,  # Phase 5：非阻断——Compiler 已支持
                         )
                     )
 

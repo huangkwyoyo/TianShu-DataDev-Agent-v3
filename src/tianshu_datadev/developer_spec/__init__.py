@@ -7,6 +7,7 @@ from .field_normalizer import FieldNormalizer, NormalizationConfig
 from .models import (
     AggregationType,
     ColumnDecl,
+    ComputeStep,
     ConflictType,
     DimensionDecl,
     FieldSource,
@@ -64,6 +65,7 @@ __all__ = [
     "FieldSource",
     "SourceAnomaly",
     "ForeignKeyRef",
+    "ComputeStep",
     # 枚举
     "AggregationType",
     "ConflictType",

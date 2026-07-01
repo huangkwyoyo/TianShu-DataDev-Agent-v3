@@ -68,11 +68,12 @@ class SparkAggFunction(str, Enum):
 
 
 class SparkWindowFunction(str, Enum):
-    """窗口函数白名单——Phase 3B 已定义的 8 种。"""
+    """窗口函数白名单——Phase 3B 已定义的 9 种。"""
 
     ROW_NUMBER = "ROW_NUMBER"
     RANK = "RANK"
     DENSE_RANK = "DENSE_RANK"
+    NTILE = "NTILE"
     LAG = "LAG"
     LEAD = "LEAD"
     SUM_OVER = "SUM_OVER"

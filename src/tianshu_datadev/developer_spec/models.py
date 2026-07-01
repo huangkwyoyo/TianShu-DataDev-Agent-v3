@@ -266,6 +266,23 @@ class MetricFilterDecl(StrictModel):
     value: str  # 过滤值（统一为字符串，由编译器按列类型决定是否加引号）
 
 
+class MetricVariant(StrictModel):
+    """指标的过滤变体——同一基础聚合逻辑 + 不同 filter 条件。
+
+    用于表达"同一指标在不同条件下的多个版本"，
+    如 COUNT(DISTINCT user_id) 派生出：
+    - total_users（无过滤）
+    - active_users（FILTER WHERE status='active'）
+    - paying_users（FILTER WHERE status='paying'）
+
+    Builder 负责将 variants 展开为独立的 AggregateSpec 条目。
+    """
+
+    variant_name: str  # 变体名称（用于 human-readable 标识）
+    filter: MetricFilterDecl | None = None  # 此变体的过滤条件（None 表示无过滤）
+    alias: str  # 输出列别名（必须唯一）
+
+
 class MetricDecl(StrictModel):
     """程序员声明的指标——支持简单聚合、条件聚合、去重聚合、表达式聚合。
 
@@ -273,6 +290,9 @@ class MetricDecl(StrictModel):
     - 窗口函数 → WindowStep
     - CASE WHEN 聚合 → CaseWhenStep
     - 比率计算 → InferredComputedMetric（聚合后计算）
+
+    variants 字段支持同一基础指标的多条件变体——
+    Builder 将基础指标 + 每个 variant 展开为独立的 AggregateSpec。
     """
 
     metric_name: str
@@ -283,6 +303,8 @@ class MetricDecl(StrictModel):
     filter: MetricFilterDecl | None = None  # 条件聚合（如 FILTER WHERE status='STANDARD'）
     input_expression: str | None = None  # 多字段表达式（如 "quantity * unit_price"）
     distinct: bool = False  # 去重聚合（用于 SUM(DISTINCT col)）
+    # ── Phase 5 新增字段 ──
+    variants: list[MetricVariant] | None = None  # 多条件变体——同一基础聚合 + 不同 filter
 
 
 class InferredWindowMetric(StrictModel):
@@ -354,12 +376,22 @@ class JoinDecl(StrictModel):
 
 
 class TimeRangeDecl(StrictModel):
-    """时间范围声明——可选，缺失时生成 W002 警告。"""
+    """时间范围声明——可选，缺失时生成 W002 警告。
+
+    Phase 5 新增业务日历支持：
+    - calendar_type: 日历类型（默认日历年 / 财年7月起 / 财年4月起）
+    - relative_range: 相对日期范围（"最近N天" / MTD / YTD）——与 start/end 互斥
+    - fiscal_year: 财年编号（仅 calendar_type 非 "calendar" 时有效）
+    """
 
     column_ref: str
-    start: str
-    end: str
+    start: str = ""  # 固定起止日期（与 relative_range 互斥）
+    end: str = ""
     inclusive: bool = True
+    # ── Phase 5 新增字段 ──
+    calendar_type: str = "calendar"  # "calendar" | "fiscal_jul" | "fiscal_apr"
+    relative_range: str | None = None  # "last_7d" | "last_30d" | "last_90d" | "mtd" | "ytd"（互斥 start/end）
+    fiscal_year: int | None = None  # 财年编号（如 2026），仅 fiscal_jul/fiscal_apr 时有效
 
 
 class SortDecl(StrictModel):
@@ -434,6 +466,90 @@ class OutputSpecDecl(StrictModel):
             else:
                 result.append(item)
         return result
+
+
+# ════════════════════════════════════════════
+# CASE WHEN 条件分支声明（Phase 6 Spec Schema 扩展）
+# ════════════════════════════════════════════
+
+
+class CaseWhenBranchDecl(StrictModel):
+    """CASE WHEN 分支声明——合并步骤中单条 WHEN-THEN 规则。
+
+    用于 ComputeStep.case_when 中描述条件选择逻辑：
+    WHEN condition_column condition_operator condition_value THEN result_column
+
+    result_column 引用上游分支步骤的指标 alias（如 "vip_amount"）。
+    """
+
+    condition_column: str  # 条件列名（必须在 _temp 表中存在）
+    condition_operator: str  # "=" | "!=" | ">" | "<" | ">=" | "<=" | "IN"
+    condition_value: str  # 条件值（如 "VIP"）
+    result_column: str  # THEN 取值——引用上游步骤的指标 alias
+
+
+class CaseWhenDecl(StrictModel):
+    """CASE WHEN 声明——合并步骤的条件选择逻辑。
+
+    branches 按顺序求值（短路语义）——首个匹配的 WHEN 返回其 THEN 值。
+    else_value 为 None 时无 ELSE 子句（不匹配任何条件时为 NULL）。
+    """
+
+    branches: list[CaseWhenBranchDecl] = []  # WHEN-THEN 分支列表（至少 1 个）
+    else_value: str | None = None  # ELSE 默认值（None 表示无 ELSE）
+    output_column: str = ""  # 输出列别名（对应 output_spec.columns 中的列名）
+
+
+# ════════════════════════════════════════════
+# 分步计算声明（Phase 5+ Spec Schema 扩展）
+# ════════════════════════════════════════════
+
+
+class ComputeStep(StrictModel):
+    """一次分步计算声明——单步聚合逻辑 + 输入来源 + 输出别名。
+
+    多个 ComputeStep 构成有向无环图（DAG）。每个步骤等价于：
+    SELECT group_by_cols, agg_func(input_column) AS alias
+    FROM <source> GROUP BY group_by_cols
+
+    source 取值：
+    - "input"：从源表计算
+    - "step_name"（字符串）：从前面步骤的 _temp 表读取（线性链）
+    - ["step_a", "step_b"]（列表）：从多个上游步骤的 _temp 表读取（分支合流），
+      Builder 生成 Scan+Join+Aggregate 合并 Plan，Join 键从 spec.joins 中查找
+
+    step_name 在同一个 Spec 内必须唯一。
+    """
+
+    step_name: str  # 步骤唯一名称（Spec 内不重复）
+    source: str | list[str] = "input"  # "input" / step_name / [step_a, step_b]——数据来源
+    group_by: list[str] = []  # GROUP BY 列名列表
+    metrics: list[MetricDecl] = []  # 此步骤的聚合指标（复用已有模型）
+    output_alias: str = ""  # 产出别名——Builder 据此命名 _temp 表（如 "_temp_<alias>"）
+    # ── Phase 6 新增字段 ──
+    case_when: CaseWhenDecl | None = None  # 合并步骤的 CASE WHEN 逻辑——仅合流步骤（source 为列表）有效
+
+    @field_validator("source", mode="before")
+    @classmethod
+    def _normalize_source(cls, v: str | list[str]) -> str | list[str]:
+        """归一化 source 字段——单元素列表自动展开为字符串。
+
+        空列表被拒绝（必须有数据来源），单元素列表等价于标量字符串。
+        """
+        if isinstance(v, list):
+            if len(v) == 0:
+                raise ValueError("compute_step source 列表不能为空——必须至少有 'input' 或一个 step_name")
+            if len(v) == 1:
+                return v[0]  # 单元素列表归一化为字符串
+            # 多元素列表——每个元素必须是字符串
+            for item in v:
+                if not isinstance(item, str):
+                    raise ValueError(f"compute_step source 列表中每个元素必须是字符串，收到: {type(item)}")
+            # 检查列表内无重复
+            if len(set(v)) != len(v):
+                raise ValueError(f"compute_step source 列表中存在重复引用: {v}")
+            return v
+        return v
 
 
 # ════════════════════════════════════════════
@@ -549,6 +665,8 @@ class ParsedDeveloperSpec(StrictModel):
     joins: list[JoinDecl] | None = None
     time_range: TimeRangeDecl | None = None
     output_spec: OutputSpecDecl
+    compute_steps: list[ComputeStep] | None = None  # 分步计算声明——None 时走原路径
+    inferred_window_metrics: list[InferredWindowMetric] = []  # SpecEnricher 推断的窗口指标
     open_questions: list[OpenQuestion] = []
     parse_warnings: list[ParseWarning] = []
 

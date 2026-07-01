@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import pathlib
+
 from tianshu_datadev.developer_spec.models import (
     ManifestColumn,
     ManifestTable,
@@ -715,3 +717,625 @@ class TestMultiHopIntegration:
         # 链级别——单语句无循环且深度=1，应通过
         chain_passed, chain_qs = validator.validate_multi_hop_chain(program)
         assert chain_passed, "单步链应通过链级别校验"
+
+
+# ════════════════════════════════════════════
+# SqlBuildPlanBuilder.build_multi() 集成测试
+# ════════════════════════════════════════════
+
+
+class TestBuildMultiIntegration:
+    """Builder.build_multi()——3 表 2 Join 链的端到端验证。"""
+
+    @staticmethod
+    def _make_three_table_spec(spec_hash: str = "spec_test_3tables"):
+        """构造 3 表（u→o→p）ParsedDeveloperSpec——用于 Builder 集成测试。"""
+        from tianshu_datadev.developer_spec.models import (
+            AggregationType,
+            ColumnDecl,
+            DimensionDecl,
+            InputTableDecl,
+            MetricDecl,
+            OutputColumnDecl,
+            OutputSpecDecl,
+            ParsedDeveloperSpec,
+        )
+
+        u_cols = [
+            ColumnDecl(column_name="user_id", normalized_name="user_id", data_type="bigint"),
+            ColumnDecl(column_name="user_name", normalized_name="user_name", data_type="varchar"),
+        ]
+        o_cols = [
+            ColumnDecl(column_name="order_id", normalized_name="order_id", data_type="bigint"),
+            ColumnDecl(column_name="user_id", normalized_name="user_id", data_type="bigint"),
+            ColumnDecl(column_name="product_id", normalized_name="product_id", data_type="bigint"),
+            ColumnDecl(column_name="amount", normalized_name="amount", data_type="decimal"),
+        ]
+        p_cols = [
+            ColumnDecl(column_name="product_id", normalized_name="product_id", data_type="bigint"),
+            ColumnDecl(column_name="category", normalized_name="category", data_type="varchar"),
+        ]
+
+        tables = [
+            InputTableDecl(
+                table_alias="u", source_table="dim.user",
+                columns=u_cols, role="dim",
+            ),
+            InputTableDecl(
+                table_alias="o", source_table="dwd.order_fact",
+                columns=o_cols, role="fact",
+            ),
+            InputTableDecl(
+                table_alias="p", source_table="dim.product",
+                columns=p_cols, role="dim",
+            ),
+        ]
+
+        metrics = [
+            MetricDecl(
+                metric_name="total_amount", aggregation=AggregationType.SUM,
+                input_column="amount", alias="total_amount",
+            ),
+            MetricDecl(
+                metric_name="order_cnt", aggregation=AggregationType.COUNT,
+                input_column="order_id", alias="order_cnt",
+            ),
+        ]
+
+        dimensions = [
+            DimensionDecl(dimension_name="user_name", column_ref="user_name"),
+            DimensionDecl(dimension_name="category", column_ref="category"),
+        ]
+
+        output_spec = OutputSpecDecl(
+            columns=[
+                OutputColumnDecl(name="user_name", type="varchar"),
+                OutputColumnDecl(name="category", type="varchar"),
+                OutputColumnDecl(name="total_amount", type="decimal"),
+                OutputColumnDecl(name="order_cnt", type="bigint"),
+            ],
+            grain=["user_name", "category"],
+        )
+
+        return ParsedDeveloperSpec(
+            spec_id="spec_3tables",
+            spec_hash=spec_hash,
+            title="三表多跳测试",
+            description="u JOIN o JOIN p",
+            input_tables=tables,
+            metrics=metrics,
+            dimensions=dimensions,
+            joins=None,
+            output_spec=output_spec,
+        )
+
+    @staticmethod
+    def _make_two_candidate_hypothesis(spec_hash: str):
+        """构造 2 候选 RelationshipHypothesis（u→o, o→p）。"""
+        from tianshu_datadev.planning.relationship_hypothesis import (
+            JoinCandidate,
+            RelationshipHypothesis,
+        )
+        from tianshu_datadev.planning.models import JoinType
+
+        c1 = JoinCandidate(
+            candidate_id="cand_u_o",
+            left_table="u", right_table="o",
+            left_key="user_id", right_key="user_id",
+            left_key_normalized="user_id", right_key_normalized="user_id",
+            join_type=JoinType.INNER,
+        )
+        c2 = JoinCandidate(
+            candidate_id="cand_o_p",
+            left_table="o", right_table="p",
+            left_key="product_id", right_key="product_id",
+            left_key_normalized="product_id", right_key_normalized="product_id",
+            join_type=JoinType.INNER,
+        )
+
+        return RelationshipHypothesis(
+            hypothesis_id="hyp_test_3tables",
+            spec_hash=spec_hash,
+            candidates=[c1, c2],
+            multi_table=True,
+        )
+
+    def test_build_multi_produces_two_plans(self):
+        """build_multi() 应为 2 候选链产出 2 个 Plan。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = self._make_three_table_spec()
+        hypothesis = self._make_two_candidate_hypothesis(spec.spec_hash)
+
+        builder = SqlBuildPlanBuilder()
+        plans = builder.build_multi(spec, hypothesis)
+
+        assert len(plans) == 2, f"应为 2 个 Plan，实际 {len(plans)} 个"
+        assert plans[0].multi_table is True
+        assert plans[1].multi_table is True
+
+    def test_chain_plan_topology(self):
+        """链 Plan 应包含两个 ScanStep + 一个 JoinStep。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = self._make_three_table_spec()
+        hypothesis = self._make_two_candidate_hypothesis(spec.spec_hash)
+
+        builder = SqlBuildPlanBuilder()
+        plans = builder.build_multi(spec, hypothesis)
+
+        # Plan 0: Scan(u) + Scan(o) + Join(u,o) + Project(intermediate)
+        step_types_0 = [s.step_type for s in plans[0].steps]
+        assert step_types_0.count("scan") == 2, f"Plan 0 应有 2 scan，实际: {step_types_0}"
+        assert "join" in step_types_0, f"Plan 0 应有 join，实际: {step_types_0}"
+        assert "project" in step_types_0, f"Plan 0 应有 project，实际: {step_types_0}"
+        # 中间步骤不应有 aggregate
+        assert "aggregate" not in step_types_0, (
+            f"Plan 0 不应有 aggregate（中间步骤），实际: {step_types_0}"
+        )
+
+        # Plan 1: Scan(_temp) + Scan(p) + Join(_temp,p) + Aggregate + Project
+        step_types_1 = [s.step_type for s in plans[1].steps]
+        assert step_types_1.count("scan") == 2, f"Plan 1 应有 2 scan，实际: {step_types_1}"
+        assert "join" in step_types_1, f"Plan 1 应有 join，实际: {step_types_1}"
+        assert "aggregate" in step_types_1, f"Plan 1 应有 aggregate（最终步骤），实际: {step_types_1}"
+        assert "project" in step_types_1, f"Plan 1 应有 project，实际: {step_types_1}"
+
+    def test_chain_validates(self):
+        """多跳链 SqlProgram 应通过 validate_multi_hop_chain。"""
+        from tianshu_datadev.api.pipeline import Pipeline
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = self._make_three_table_spec()
+        hypothesis = self._make_two_candidate_hypothesis(spec.spec_hash)
+
+        builder = SqlBuildPlanBuilder()
+        plans = builder.build_multi(spec, hypothesis)
+
+        chain_id = "test_chain"
+        sql_program = Pipeline._build_sql_program_from_chain(
+            plans, spec.spec_hash, chain_id
+        )
+
+        assert len(sql_program.statements) == 2
+        assert sql_program.statements[0].produces == f"_temp_{chain_id}_0"
+        assert sql_program.statements[1].kind.value == "FINAL"
+
+        # 链验证
+        from tianshu_datadev.sql.validator import SqlBuildPlanValidator
+        validator = SqlBuildPlanValidator()
+        passed, questions = validator.validate_multi_hop_chain(sql_program)
+        blocking = [q for q in questions if q.blocking]
+        assert passed, f"链验证应通过，blocking: {[q.description[:80] for q in blocking]}"
+
+    def test_single_candidate_falls_back_to_build(self):
+        """单候选应回退到 build()——输出 1 个 Plan。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = self._make_three_table_spec()
+        # 只有一个候选
+        hypothesis = self._make_two_candidate_hypothesis(spec.spec_hash)
+        hypothesis = hypothesis.model_copy(
+            update={"candidates": [hypothesis.candidates[0]]}
+        )
+
+        builder = SqlBuildPlanBuilder()
+        plans = builder.build_multi(spec, hypothesis)
+
+        assert len(plans) == 1, f"单候选应回退到 build()，实际 {len(plans)} 个 Plan"
+
+
+class TestBuildFromComputeSteps:
+    """Builder.build_from_steps()——ComputeSteps 多步聚合链的端到端验证。"""
+
+    @staticmethod
+    def _make_compute_steps_spec(spec_hash: str = "spec_test_cs"):
+        """构造含 compute_steps 的 ParsedDeveloperSpec——2 步聚合链。"""
+        from tianshu_datadev.developer_spec.models import (
+            AggregationType,
+            ColumnDecl,
+            ComputeStep,
+            InputTableDecl,
+            MetricDecl,
+            OutputColumnDecl,
+            OutputSpecDecl,
+            ParsedDeveloperSpec,
+        )
+
+        table = InputTableDecl(
+            table_alias="o", source_table="dwd.order_fact",
+            columns=[
+                ColumnDecl(column_name="order_id", normalized_name="order_id", data_type="bigint"),
+                ColumnDecl(column_name="user_id", normalized_name="user_id", data_type="bigint"),
+                ColumnDecl(column_name="amount", normalized_name="amount", data_type="decimal"),
+                ColumnDecl(column_name="order_time", normalized_name="order_time", data_type="timestamp"),
+            ],
+            role="fact",
+        )
+
+        daily_metrics = [
+            MetricDecl(
+                metric_name="daily_amount", aggregation=AggregationType.SUM,
+                input_column="amount", alias="daily_amount",
+            ),
+        ]
+        monthly_metrics = [
+            MetricDecl(
+                metric_name="avg_daily_amount", aggregation=AggregationType.AVG,
+                input_column="daily_amount", alias="avg_daily_amount",
+            ),
+        ]
+
+        compute_steps = [
+            ComputeStep(
+                step_name="daily_agg", source="input",
+                group_by=["dt", "user_id"], metrics=daily_metrics,
+                output_alias="daily_summary",
+            ),
+            ComputeStep(
+                step_name="monthly_avg", source="daily_agg",
+                group_by=["month", "user_id"], metrics=monthly_metrics,
+                output_alias="monthly_summary",
+            ),
+        ]
+
+        output_spec = OutputSpecDecl(
+            columns=[
+                OutputColumnDecl(name="month", type="varchar"),
+                OutputColumnDecl(name="user_id", type="bigint"),
+                OutputColumnDecl(name="avg_daily_amount", type="decimal"),
+            ],
+            grain=["month", "user_id"],
+        )
+
+        return ParsedDeveloperSpec(
+            spec_id="spec_cs_test",
+            spec_hash=spec_hash,
+            title="ComputeSteps 测试",
+            description="两步聚合链测试",
+            input_tables=[table],
+            metrics=[],
+            dimensions=[],
+            output_spec=output_spec,
+            compute_steps=compute_steps,
+        )
+
+    def test_build_from_steps_produces_two_plans(self):
+        """build_from_steps() 应为 2 步链产出 2 个 Plan。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = self._make_compute_steps_spec()
+        builder = SqlBuildPlanBuilder()
+        plans = builder.build_from_steps(spec)
+
+        assert len(plans) == 2, f"应有 2 个 Plan，实际 {len(plans)}"
+
+    def test_compute_steps_plan_topology(self):
+        """第一个 Plan 不含 Sort/Limit，第二个 Plan 有 Aggregate + Project。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = self._make_compute_steps_spec()
+        builder = SqlBuildPlanBuilder()
+        plans = builder.build_from_steps(spec)
+
+        # 中间 Plan：有 Aggregate、有 Project、无 Sort、无 Limit
+        intermediate = plans[0]
+        step_types = [s.step_type for s in intermediate.steps]
+        assert "aggregate" in step_types, f"中间 Plan 应有 aggregate，实际: {step_types}"
+        assert "project" in step_types, f"中间 Plan 应有 project，实际: {step_types}"
+        assert "sort" not in step_types, f"中间 Plan 不应有 sort，实际: {step_types}"
+        assert "limit" not in step_types, f"中间 Plan 不应有 limit，实际: {step_types}"
+
+        # 最终 Plan：有 Aggregate、有 Project、无 Sort（spec 未声明排序）
+        final = plans[1]
+        final_types = [s.step_type for s in final.steps]
+        assert "aggregate" in final_types, f"最终 Plan 应有 aggregate，实际: {final_types}"
+        assert "project" in final_types, f"最终 Plan 应有 project，实际: {final_types}"
+
+    def test_compute_steps_deterministic_plan_id(self):
+        """相同 compute_steps 两次 build_from_steps() 应产生相同 plan_id。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = self._make_compute_steps_spec()
+        builder = SqlBuildPlanBuilder()
+        plans1 = builder.build_from_steps(spec)
+        plans2 = builder.build_from_steps(spec)
+
+        for i, (p1, p2) in enumerate(zip(plans1, plans2)):
+            assert p1.plan_id == p2.plan_id, \
+                f"Plan {i}: plan_id 应一致 ({p1.plan_id} vs {p2.plan_id})"
+
+    def test_compute_steps_second_plan_scans_temp(self):
+        """第二个 Plan 的 ScanStep 应引用第一个步骤的 _temp 表。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = self._make_compute_steps_spec()
+        builder = SqlBuildPlanBuilder()
+        plans = builder.build_from_steps(spec)
+
+        # 第二个 Plan 的 ScanStep 应引用 _temp 表
+        final_scan = plans[1].steps[0]
+        assert final_scan.step_type == "scan", \
+            f"第二个 Plan 的第一步应是 scan，实际: {final_scan.step_type}"
+        assert "_temp_" in str(final_scan.table_ref), \
+            f"第二个 Plan 的 ScanStep 应引用 _temp 表，实际: {final_scan.table_ref}"
+
+    def test_compute_steps_raises_on_empty(self):
+        """compute_steps 为空时应抛出 ValueError。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = self._make_compute_steps_spec()
+        spec = spec.model_copy(update={"compute_steps": []})
+        builder = SqlBuildPlanBuilder()
+
+        import pytest
+        with pytest.raises(ValueError, match="compute_steps 为空"):
+            builder.build_from_steps(spec)
+
+    def test_single_compute_step(self):
+        """单步 compute_steps 产出一个 Plan——含 Aggregate + Project。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = self._make_compute_steps_spec()
+        # 只保留第一步
+        spec = spec.model_copy(update={"compute_steps": [spec.compute_steps[0]]})
+        builder = SqlBuildPlanBuilder()
+        plans = builder.build_from_steps(spec)
+
+        assert len(plans) == 1
+        assert plans[0].steps[-1].step_type == "project"
+
+
+    def test_compute_steps_with_metric_variants(self):
+        """compute_steps 中的 MetricDecl.variants → Builder 展开为多个 AggregateSpec。"""
+        from tianshu_datadev.developer_spec.models import MetricFilterDecl, MetricVariant
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = self._make_compute_steps_spec()
+        # 给第一步的指标添加 variants
+        step0 = spec.compute_steps[0]
+        if step0.metrics:
+            step0.metrics[0].variants = [
+                MetricVariant(
+                    variant_name="large_orders",
+                    filter=MetricFilterDecl(column="amount", operator="gt", value="1000"),
+                    alias="large_order_count",
+                ),
+            ]
+
+        builder = SqlBuildPlanBuilder()
+        plans = builder.build_from_steps(spec)
+
+        # 第一个 Plan 的 AggregateStep 应有 2 个 AggregateSpec（基础+变体）
+        first_plan = plans[0]
+        agg_steps = [s for s in first_plan.steps if s.step_type == "aggregate"]
+        assert len(agg_steps) == 1
+        agg_step = agg_steps[0]
+        assert len(agg_step.metrics) >= 2
+        aliases = {m.alias for m in agg_step.metrics}
+        assert "large_order_count" in aliases
+        # variant 带 filter
+        variant = next(m for m in agg_step.metrics if m.alias == "large_order_count")
+        assert variant.filter is not None
+        assert variant.filter.column == "amount"
+
+
+class TestBuildFromStepsBranch:
+    """Builder.build_from_steps()——多分支并行聚合 + Join 合流验证。"""
+
+    @staticmethod
+    def _make_branch_spec(spec_hash: str = "spec_test_branch"):
+        """构造含 3 步分支 DAG 的 ParsedDeveloperSpec——2 分支 + 1 合流。"""
+        from tianshu_datadev.developer_spec.models import (
+            AggregationType,
+            ColumnDecl,
+            ComputeStep,
+            InputTableDecl,
+            JoinDecl,
+            JoinTypeEnum,
+            MetricDecl,
+            OutputColumnDecl,
+            OutputSpecDecl,
+            ParsedDeveloperSpec,
+        )
+
+        table = InputTableDecl(
+            table_alias="o", source_table="dwd.order_fact",
+            columns=[
+                ColumnDecl(column_name="order_id", normalized_name="order_id", data_type="bigint"),
+                ColumnDecl(column_name="user_id", normalized_name="user_id", data_type="bigint"),
+                ColumnDecl(column_name="amount", normalized_name="amount", data_type="decimal"),
+                ColumnDecl(column_name="order_time", normalized_name="order_time", data_type="timestamp"),
+            ],
+            role="fact",
+        )
+
+        amount_metrics = [
+            MetricDecl(
+                metric_name="daily_total_amount", aggregation=AggregationType.SUM,
+                input_column="amount", alias="daily_total_amount",
+            ),
+        ]
+        count_metrics = [
+            MetricDecl(
+                metric_name="daily_order_cnt", aggregation=AggregationType.COUNT,
+                input_column="order_id", alias="daily_order_cnt",
+            ),
+        ]
+        merged_metrics = [
+            MetricDecl(
+                metric_name="avg_order_value", aggregation=AggregationType.AVG,
+                input_column="daily_total_amount", alias="avg_order_value",
+            ),
+        ]
+
+        compute_steps = [
+            ComputeStep(
+                step_name="amount_branch", source="input",
+                group_by=["dt", "user_id"], metrics=amount_metrics,
+                output_alias="amount_summary",
+            ),
+            ComputeStep(
+                step_name="count_branch", source="input",
+                group_by=["dt", "user_id"], metrics=count_metrics,
+                output_alias="count_summary",
+            ),
+            ComputeStep(
+                step_name="merged", source=["amount_branch", "count_branch"],
+                group_by=["dt", "user_id"], metrics=merged_metrics,
+                output_alias="merged_summary",
+            ),
+        ]
+
+        joins = [
+            JoinDecl(
+                left_table="amount_branch", right_table="count_branch",
+                left_key="user_id", right_key="user_id",
+                join_type=JoinTypeEnum.INNER,
+            ),
+        ]
+
+        output_spec = OutputSpecDecl(
+            columns=[
+                OutputColumnDecl(name="dt", type="varchar"),
+                OutputColumnDecl(name="user_id", type="bigint"),
+                OutputColumnDecl(name="avg_order_value", type="decimal"),
+            ],
+            grain=["dt", "user_id"],
+        )
+
+        return ParsedDeveloperSpec(
+            spec_id="spec_branch_test",
+            spec_hash=spec_hash,
+            title="分支合流测试",
+            description="双分支并行聚合 + Join 合流",
+            input_tables=[table],
+            metrics=[],
+            dimensions=[],
+            joins=joins,
+            output_spec=output_spec,
+            compute_steps=compute_steps,
+        )
+
+    def test_branch_produces_three_plans(self):
+        """3 步分支 DAG 应产出 3 个 Plan。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = self._make_branch_spec()
+        builder = SqlBuildPlanBuilder()
+        plans = builder.build_from_steps(spec)
+
+        assert len(plans) == 3, f"应有 3 个 Plan，实际 {len(plans)}"
+
+    def test_branch_merge_plan_has_join(self):
+        """合流 Plan（merged）应包含 JoinStep。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = self._make_branch_spec()
+        builder = SqlBuildPlanBuilder()
+        plans = builder.build_from_steps(spec)
+
+        # 第三个 Plan 是合流步骤
+        merge_plan = plans[2]
+        step_types = [s.step_type for s in merge_plan.steps]
+        assert "join" in step_types, \
+            f"合流 Plan 应包含 join 步骤，实际: {step_types}"
+        assert merge_plan.multi_table is True, \
+            "合流 Plan 应标记 multi_table=True"
+
+    def test_branch_leaf_plans_are_independent(self):
+        """叶节点 Plan（amount_branch + count_branch）各自独立，无 JoinStep。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = self._make_branch_spec()
+        builder = SqlBuildPlanBuilder()
+        plans = builder.build_from_steps(spec)
+
+        # 前两个 Plan 是叶节点
+        for i in range(2):
+            step_types = [s.step_type for s in plans[i].steps]
+            assert "join" not in step_types, \
+                f"叶节点 Plan {i} 不应有 join，实际: {step_types}"
+            assert "scan" in step_types, \
+                f"叶节点 Plan {i} 应有 scan，实际: {step_types}"
+            assert "aggregate" in step_types, \
+                f"叶节点 Plan {i} 应有 aggregate，实际: {step_types}"
+
+    def test_branch_deterministic_plan_ids(self):
+        """相同分支 spec 两次 build 应产生相同 plan_id。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = self._make_branch_spec()
+        builder = SqlBuildPlanBuilder()
+        plans1 = builder.build_from_steps(spec)
+        plans2 = builder.build_from_steps(spec)
+
+        for i, (p1, p2) in enumerate(zip(plans1, plans2)):
+            assert p1.plan_id == p2.plan_id, \
+                f"Plan {i}: plan_id 应一致 ({p1.plan_id} vs {p2.plan_id})"
+
+    def test_branch_merge_scan_multiple_temp_tables(self):
+        """合流 Plan 应从多个 _temp 表扫描。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = self._make_branch_spec()
+        builder = SqlBuildPlanBuilder()
+        plans = builder.build_from_steps(spec)
+
+        merge_plan = plans[2]
+        scan_steps = [s for s in merge_plan.steps if s.step_type == "scan"]
+        assert len(scan_steps) == 2, \
+            f"合流 Plan 应有 2 个 ScanStep，实际: {len(scan_steps)}"
+
+        temp_refs = [str(s.table_ref) for s in scan_steps]
+        for ref in temp_refs:
+            assert "_temp_" in ref, \
+                f"合流 ScanStep 应引用 _temp 表，实际: {ref}"
+
+    def test_branch_sql_program_dag_dependencies(self):
+        """SqlProgram 应正确反映 DAG 依赖——合流步骤依赖两个分支。"""
+        from tianshu_datadev.api.pipeline import Pipeline
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = self._make_branch_spec()
+        builder = SqlBuildPlanBuilder()
+        plans = builder.build_from_steps(spec)
+
+        chain_id = "test_branch"
+        sql_program = Pipeline._build_sql_program_from_compute_steps(
+            plans, spec, chain_id
+        )
+
+        # 合流语句（merged）应依赖两个分支
+        merge_stmt = sql_program.statements[2]
+        assert len(merge_stmt.depends_on) == 2, \
+            f"合流语句应依赖 2 个上游，实际: {len(merge_stmt.depends_on)}"
+        assert merge_stmt.kind.value == "FINAL", \
+            f"合流语句应为 FINAL，实际: {merge_stmt.kind.value}"
+
+        # 两个分支应为 PRODUCER
+        for i in range(2):
+            assert sql_program.statements[i].kind.value == "PRODUCER", \
+                f"分支 {i} 应为 PRODUCER，实际: {sql_program.statements[i].kind.value}"
+            assert sql_program.statements[i].produces is not None, \
+                f"分支 {i} 应有 produces"
+
+    def test_branch_pipeline_build_plan(self):
+        """Pipeline.build_plan() 应对分支 spec 正确产出验证通过的结果。"""
+        from tianshu_datadev.api.pipeline import Pipeline
+
+        # 读取黄金用例
+        import pathlib
+        golden_path = (
+            pathlib.Path(__file__).parent.parent
+            / "fixtures" / "golden" / "golden_compute_steps_branch.md"
+        )
+        markdown_text = golden_path.read_text(encoding="utf-8")
+
+        pipeline = Pipeline()
+        result = pipeline.build_plan(markdown_text)
+
+        assert result["validation_passed"] is True, \
+            f"分支 Spec 应通过验证，实际: {result['validation_passed']}"
+        assert result["open_questions"] == [], \
+            f"不应有 open_questions，实际: {result['open_questions']}"

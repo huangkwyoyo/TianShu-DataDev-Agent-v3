@@ -15,7 +15,7 @@ from tianshu_datadev.planning.relationship_hypothesis import (
     RelationshipEvidence,
     RelationshipHypothesis,
 )
-from tianshu_datadev.planning.relationship_planner import FakeRelationshipPlanner
+from tianshu_datadev.planning.relationship_planner import RelationshipPlanner
 from tianshu_datadev.planning.sql_build_plan import (
     JoinStep,
     SqlBuildPlan,
@@ -222,7 +222,7 @@ class TestSqlBuildPlanValidator:
             tables=tables,
         )
 
-        planner = FakeRelationshipPlanner()
+        planner = RelationshipPlanner()
         hypothesis, _ = planner.plan(spec)
 
         builder = SqlBuildPlanBuilder()
