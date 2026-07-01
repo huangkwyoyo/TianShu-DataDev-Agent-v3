@@ -5,23 +5,23 @@ class TestErrorHandlers:
     """验证所有错误路径返回统一 ErrorDetail 格式。"""
 
     def test_parse_error_structure(self, client):
-        """ParseError → 422 + error_code/message/field_ref。"""
+        """ParseError → 200 + pipeline_error（Pipeline 内部捕获）。"""
         text = "```markdown\n---\ninvalid: [yaml\n---\n```"
         resp = client.post("/api/spec/parse", json={"markdown_text": text})
-        assert resp.status_code == 422
+        assert resp.status_code == 200
         data = resp.json()
-        assert "error_code" in data
-        assert "message" in data
-        # field_ref 可以为 None
-        assert "field_ref" in data
+        assert "pipeline_error" in data
+        assert data["pipeline_error"]["stage"] == "parser"
+        assert "error_type" in data["pipeline_error"]
+        assert "error_message" in data["pipeline_error"]
 
     def test_validation_error_structure(self, client):
-        """Pydantic ValidationError → 422 + VALIDATION_ERROR 错误码。"""
+        """空输入 → 200 + pipeline_error（Pipeline 内部捕获 ParseError）。"""
         resp = client.post("/api/spec/parse", json={"markdown_text": ""})
-        assert resp.status_code == 422
+        assert resp.status_code == 200
         data = resp.json()
-        assert data["error_code"] is not None
-        assert data["message"] is not None
+        assert "pipeline_error" in data
+        assert data["pipeline_error"]["stage"] == "parser"
 
     def test_extra_field_rejected(self, client):
         """请求体含未声明字段 → 422（StrictModel extra="forbid" 行为）。"""

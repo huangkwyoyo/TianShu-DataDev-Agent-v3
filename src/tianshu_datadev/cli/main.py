@@ -15,7 +15,7 @@ import json
 import sys
 from pathlib import Path
 
-from tianshu_datadev.api.pipeline import FakePipeline
+from tianshu_datadev.api.pipeline import Pipeline
 
 
 def _read_file(filepath: str) -> str:
@@ -112,11 +112,11 @@ def handle_parse(args: argparse.Namespace) -> None:
     _current_command = "parse"
 
     markdown_text = _read_file(args.file)
-    pipeline = FakePipeline()
-    try:
-        result = pipeline.parse_only(markdown_text)
-    except Exception as e:
-        _fail("PARSE_ERROR", str(e))
+    pipeline = Pipeline()
+    result = pipeline.parse_only(markdown_text)
+    if "pipeline_error" in result:
+        pe = result["pipeline_error"]
+        _fail(f"PIPELINE_{pe['stage'].upper()}_ERROR", pe["error_message"])
     _output_json({"command": "parse", "status": "success", "result": result})
 
 
@@ -130,11 +130,11 @@ def handle_run(args: argparse.Namespace) -> None:
 
     markdown_text = _read_file(args.file)
     table_paths = _parse_table_paths(args)
-    pipeline = FakePipeline()
-    try:
-        result = pipeline.run_all(markdown_text, table_paths=table_paths)
-    except Exception as e:
-        _fail("RUN_ERROR", str(e))
+    pipeline = Pipeline()
+    result = pipeline.run_all(markdown_text, table_paths=table_paths)
+    if "pipeline_error" in result:
+        pe = result["pipeline_error"]
+        _fail(f"PIPELINE_{pe['stage'].upper()}_ERROR", pe["error_message"])
     _output_json({"command": "run", "status": "success", "result": result})
 
 
@@ -146,7 +146,7 @@ def handle_package(args: argparse.Namespace) -> None:
     global _current_command
     _current_command = "package"
 
-    pipeline = FakePipeline()
+    pipeline = Pipeline()
     result = pipeline.get_package(args.request_id)
     if result is None:
         _fail("NOT_FOUND", f"request_id '{args.request_id}' 对应的 package 不存在", "request_id")

@@ -1,11 +1,13 @@
-"""FakePipeline——确定性串联全部组件的假执行流水线。
+"""Pipeline——确定性串联全部组件的执行流水线。
 
-所有步骤使用 Fake/确定性实现，不需要真实 LLM 或生产数据库。
+所有步骤使用确定性实现，不需要真实 LLM 或生产数据库。
 每次调用独立创建组件实例，无状态泄漏。
 API 只返回 artifact 引用和结构化摘要。
 """
 
 from __future__ import annotations
+
+import hashlib
 
 from tianshu_datadev.artifacts.contract_extractor import DataTransformContractExtractor
 from tianshu_datadev.artifacts.packager import PackageInputs, ReviewPackageBuilder
@@ -18,8 +20,9 @@ from tianshu_datadev.developer_spec.models import (
     SourceManifest,
 )
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
-from tianshu_datadev.planning.relationship_planner import FakeRelationshipPlanner
-from tianshu_datadev.planning.spec_enricher import FakeSpecEnricher
+from tianshu_datadev.planning.cross_validator import cross_validate
+from tianshu_datadev.planning.relationship_planner import RelationshipPlanner
+from tianshu_datadev.planning.spec_enricher import SpecEnricher
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan, SqlBuildPlanBuilder
 from tianshu_datadev.planning.sql_program import (
     SqlProgram,
@@ -29,6 +32,7 @@ from tianshu_datadev.planning.sql_program import (
 )
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
 from tianshu_datadev.sql.executor import DuckDBExecutor
+from tianshu_datadev.sql.models import SqlArtifact
 from tianshu_datadev.sql.validator import SqlBuildPlanValidator
 
 
@@ -150,8 +154,8 @@ def _auto_table_mapping(spec: ParsedDeveloperSpec) -> dict[str, str]:
     return mapping
 
 
-class FakePipeline:
-    """假执行流水线——确定性串联全部 6 个组件。
+class Pipeline:
+    """执行流水线——确定性串联全部 6 个组件。
 
     工作流程：
       parse_only: Parser → 摘要
@@ -647,15 +651,20 @@ class FakePipeline:
         self._base_output_dir = base_output_dir
         self._results: dict[str, dict] = {}  # request_id → 内部产物
         self._packages: dict[str, object] = {}  # request_id → ReviewPackageManifest
-        self._relationship_planner = FakeRelationshipPlanner()  # 多表时生成 Join 推测
-        self._spec_enricher = FakeSpecEnricher()  # 指标推断（规则匹配，Phase 4 替换为 LLM）
+        # 多表时生成 Join 推测——llm_client=None 退化为纯显式声明模式
+        self._relationship_planner = RelationshipPlanner()
+        self._spec_enricher = SpecEnricher()  # 指标推断（LLM 驱动，llm_client=None 退化规则匹配）
 
     @staticmethod
     def _apply_enrichment(spec: ParsedDeveloperSpec, manifest: SourceManifest, enricher) -> ParsedDeveloperSpec:
-        """应用 SpecEnricher 推断——将推断指标合并到 spec.metrics 中。
+        """应用 SpecEnricher 推断——将推断指标合并到 spec 中。
 
         程序员手写的 metrics 优先级最高（不可覆盖），
         仅追加 inferred_metrics 中不与现有 alias 冲突的条目。
+
+        Phase 5 新增：合入跨粒度 compute_steps + JoinDecl——
+        SpecEnricher._detect_cross_grain_dependency 产出放入 enrichment_metadata，
+        此处解码并合并到 spec.compute_steps / spec.joins。
 
         Args:
             spec: 原始 DeveloperSpec
@@ -663,42 +672,190 @@ class FakePipeline:
             enricher: SpecEnricher 实例
 
         Returns:
-            增强后的 ParsedDeveloperSpec（metrics 已合并推断结果）
+            增强后的 ParsedDeveloperSpec
         """
+        from tianshu_datadev.developer_spec.models import ComputeStep, JoinDecl
+
         enriched: EnrichedSpec = enricher.enrich(spec, manifest)
-        if not enriched.inferred_metrics:
-            return spec
-        # 仅合并不与手写 alias 冲突的推断指标
+
+        # ── 合并推断指标 ──
         declared_aliases = {m.alias for m in spec.metrics}
         new_metrics = [
             m for m in enriched.inferred_metrics
             if m.alias not in declared_aliases
         ]
-        if not new_metrics:
+        combined_metrics = list(spec.metrics) + new_metrics
+
+        # ── 合并跨粒度 compute_steps + joins ──
+        meta = enriched.enrichment_metadata
+        generated_steps_data = meta.get("generated_compute_steps", [])
+        generated_joins_data = meta.get("generated_joins", [])
+
+        combined_steps = list(spec.compute_steps) if spec.compute_steps else []
+        combined_joins = list(spec.joins) if spec.joins else []
+
+        if generated_steps_data:
+            for sd in generated_steps_data:
+                combined_steps.append(ComputeStep(**sd))
+        if generated_joins_data:
+            for jd in generated_joins_data:
+                combined_joins.append(JoinDecl(**jd))
+
+        # ── 合并窗口指标 ──
+        new_window_metrics = list(enriched.inferred_window_metrics)
+
+        # 仅当有实际变更时才更新
+        needs_update = bool(
+            new_metrics or generated_steps_data or generated_joins_data
+            or new_window_metrics
+        )
+        if not needs_update:
             return spec
-        combined = list(spec.metrics) + new_metrics
-        return spec.model_copy(update={"metrics": combined})
+
+        update_dict: dict = {"metrics": combined_metrics}
+        if combined_steps:
+            update_dict["compute_steps"] = combined_steps
+        if combined_joins:
+            update_dict["joins"] = combined_joins
+        if new_window_metrics:
+            update_dict["inferred_window_metrics"] = new_window_metrics
+
+        return spec.model_copy(update=update_dict)
 
     @staticmethod
     def _gen_request_id(spec: ParsedDeveloperSpec) -> str:
         """从 spec_hash 生成确定性 request_id。"""
         return f"req_{spec.spec_hash[:12]}"
 
+    def _enrich_and_plan(
+        self,
+        spec: ParsedDeveloperSpec,
+        manifest: SourceManifest,
+        table_mapping: dict | None = None,
+    ) -> tuple[ParsedDeveloperSpec, object | None, list, dict]:
+        """统一入口：SpecEnricher → RelationshipPlanner → 交叉验证。
+
+        消除 5 个入口点中重复的 15 行代码块。
+
+        Args:
+            spec: 已解析的 DeveloperSpec
+            manifest: 源数据清单
+            table_mapping: 表名映射（None 时自动推断）
+
+        Returns:
+            (spec, hypothesis, extra_questions, table_mapping)
+        """
+        # 自动表映射
+        if not table_mapping:
+            table_mapping = _auto_table_mapping(spec)
+
+        # SpecEnricher：从业务描述推断缺失指标
+        spec = self._apply_enrichment(spec, manifest, self._spec_enricher)
+
+        # RelationshipPlanner：多表时生成 Join 推测
+        extra_questions: list = []
+        hypothesis = None
+        if len(spec.input_tables) > 1:
+            hypothesis, extra_questions = self._relationship_planner.plan(spec, manifest)
+
+        # 交叉验证——指标推断 vs Join 推断一致性检查
+        if hypothesis:
+            xv_questions = cross_validate(spec, hypothesis, manifest)
+            extra_questions.extend(xv_questions)
+
+        return spec, hypothesis, extra_questions, table_mapping or {}
+
+    # ── 错误处理辅助方法 ─────────────────────────────────
+
+    @staticmethod
+    def _capture_error(stage: str, exc: Exception) -> dict:
+        """将异常封装为结构化错误信息。
+
+        Args:
+            stage: 失败阶段标识（parser/enrich/build/compile/execute）
+            exc: 捕获的异常
+
+        Returns:
+            含 stage、error_type、error_message 的 dict
+        """
+        return {
+            "stage": stage,
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+        }
+
+    @staticmethod
+    def _build_pipeline_stages(
+        failed_stage: str,
+        error_info: dict | None = None,
+        all_stages: list[str] | None = None,
+    ) -> list[dict]:
+        """构建流水线阶段状态列表——失败阶段之前为 ok，自身为 failed，之后为 skipped。
+
+        Args:
+            failed_stage: 失败的阶段标识
+            error_info: 失败阶段的错误详情（可选，合并到 failed 条目）
+            all_stages: 完整阶段列表（默认 5 阶段，run_all 用 7 阶段）
+
+        Returns:
+            阶段状态列表，前端据此渲染指示灯
+        """
+        if all_stages is None:
+            all_stages = ["parser", "enrich", "build", "compile", "execute"]
+        stages = []
+        for s in all_stages:
+            if s == failed_stage:
+                entry: dict = {"stage": s, "status": "failed"}
+                if error_info:
+                    entry.update(error_info)
+                stages.append(entry)
+            elif all_stages.index(s) < all_stages.index(failed_stage):
+                stages.append({"stage": s, "status": "ok"})
+            else:
+                stages.append({"stage": s, "status": "skipped"})
+        return stages
+
+    @staticmethod
+    def _stage_name_cn(stage: str) -> str:
+        """返回阶段的中文名称。"""
+        _names = {
+            "parser": "解析",
+            "enrich": "增强",
+            "build": "构建",
+            "compile": "编译",
+            "execute": "执行",
+            "contract": "契约",
+            "package": "打包",
+        }
+        return _names.get(stage, stage)
+
     # ── 公共方法 ──────────────────────────────────────────
 
     def parse_only(self, markdown_text: str) -> dict:
         """仅解析 DeveloperSpec——返回 SpecParseResponse 的 dict。
 
+        解析失败时返回 200 + pipeline_error，保留错误信息供前端展示。
+
         Args:
             markdown_text: DeveloperSpec Markdown 全文
 
         Returns:
-            符合 SpecParseResponse 结构的 dict
+            符合 SpecParseResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
         """
-        parser = DeveloperSpecParser()
-        spec = parser.parse(markdown_text)
+        # ── Stage: parser ──
+        try:
+            parser = DeveloperSpecParser()
+            spec = parser.parse(markdown_text)
+        except Exception as e:
+            print(f"[Pipeline] parse_only: parser 阶段失败 - {type(e).__name__}: {e}")
+            error_info = self._capture_error("parser", e)
+            return {
+                "request_id": "",
+                "pipeline_error": error_info,
+                "pipeline_stages": self._build_pipeline_stages("parser", error_info),
+            }
+
         request_id = self._gen_request_id(spec)
-        # 存储完整产物供后续步骤使用
         self._results[request_id] = {"parsed_spec": spec}
 
         return {
@@ -720,35 +877,99 @@ class FakePipeline:
     def build_plan(self, markdown_text: str, table_mapping: dict[str, str] | None = None) -> dict:
         """解析 + 构建 SqlBuildPlan + Validator 验证——返回 PlanResponse 的 dict。
 
+        失败时保留已完成产物到 self._results，返回含 pipeline_error 的部分结果。
+
         Args:
             markdown_text: DeveloperSpec Markdown 全文
             table_mapping: table_ref → 物理表名（可选）
 
         Returns:
-            符合 PlanResponse 结构的 dict
+            符合 PlanResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
         """
-        parser = DeveloperSpecParser()
-        spec = parser.parse(markdown_text)
-        manifest = _build_manifest(spec)
+        # ── Stage 1: Parser ──
+        try:
+            parser = DeveloperSpecParser()
+            spec = parser.parse(markdown_text)
+            manifest = _build_manifest(spec)
+        except Exception as e:
+            print(f"[Pipeline] build_plan: parser 阶段失败 - {type(e).__name__}: {e}")
+            error_info = self._capture_error("parser", e)
+            return {
+                "request_id": "",
+                "pipeline_error": error_info,
+                "pipeline_stages": self._build_pipeline_stages("parser", error_info),
+            }
 
-        # 未显式提供 table_mapping 时，自动从 spec 的 source_tables 推断
-        if not table_mapping:
-            table_mapping = _auto_table_mapping(spec)
+        # ── Stage 2: Enrich + Plan ──
+        try:
+            spec, hypothesis, extra_questions, table_mapping = self._enrich_and_plan(
+                spec, manifest, table_mapping,
+            )
+        except Exception as e:
+            print(f"[Pipeline] build_plan: enrich 阶段失败 - {type(e).__name__}: {e}")
+            request_id = self._gen_request_id(spec)
+            self._results[request_id] = {"parsed_spec": spec, "manifest": manifest}
+            error_info = self._capture_error("enrich", e)
+            return {
+                "request_id": request_id,
+                "spec_id": spec.spec_id,
+                "pipeline_error": error_info,
+                "pipeline_stages": self._build_pipeline_stages("enrich", error_info),
+            }
 
-        # SpecEnricher：从业务描述推断缺失指标（Phase 4D）
-        spec = self._apply_enrichment(spec, manifest, self._spec_enricher)
+        # ── Stage 3: Build + Validate ──
+        plan = None
+        plan_questions: list = []
+        try:
+            builder = SqlBuildPlanBuilder()
 
-        # 多表时通过 FakeRelationshipPlanner 生成 Join 推测
-        extra_questions = []
-        hypothesis = None
-        if len(spec.input_tables) > 1:
-            hypothesis, extra_questions = self._relationship_planner.plan(spec, manifest)
+            if spec.compute_steps and len(spec.compute_steps) > 0:
+                # ── ComputeSteps 路径：每步独立聚合 Plan，_temp 串联 ──
+                plans = builder.build_from_steps(spec, hypothesis)
+                chain_id = hashlib.md5(
+                    "|".join(s.step_name for s in spec.compute_steps).encode()
+                ).hexdigest()[:8]
+                sql_program = self._build_sql_program_from_compute_steps(
+                    plans, spec, chain_id
+                )
+                validator = SqlBuildPlanValidator()
+                passed, val_questions = validator.validate_multi_hop_chain(sql_program)
+                plan = plans[-1]
+                plan_questions = []
+            elif hypothesis and len(hypothesis.candidates) > 1:
+                # ── 多跳链路径：每对候选独立 Plan，_temp 串联 ──
+                plans = builder.build_multi(spec, hypothesis)
+                chain_id = hashlib.md5(
+                    "|".join(c.candidate_id for c in hypothesis.candidates).encode()
+                ).hexdigest()[:8]
+                sql_program = self._build_sql_program_from_chain(
+                    plans, spec.spec_hash, chain_id
+                )
+                validator = SqlBuildPlanValidator()
+                passed, val_questions = validator.validate_multi_hop_chain(sql_program)
+                plan = plans[-1]
+                plan_questions = []
+            else:
+                plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
+                validator = SqlBuildPlanValidator()
+                passed, val_questions = validator.validate(plan, manifest)
+                sql_program = self._build_sql_program(plan, spec.spec_hash)
 
-        builder = SqlBuildPlanBuilder()
-        plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
-
-        validator = SqlBuildPlanValidator()
-        passed, val_questions = validator.validate(plan, manifest)
+        except Exception as e:
+            print(f"[Pipeline] build_plan: build 阶段失败 - {type(e).__name__}: {e}")
+            request_id = self._gen_request_id(spec)
+            partial: dict = {"parsed_spec": spec, "manifest": manifest}
+            if plan is not None:
+                partial["plan"] = plan
+            self._results[request_id] = partial
+            error_info = self._capture_error("build", e)
+            return {
+                "request_id": request_id,
+                "spec_id": spec.spec_id,
+                "plan_id": plan.plan_id if plan is not None else "",
+                "pipeline_error": error_info,
+                "pipeline_stages": self._build_pipeline_stages("build", error_info),
+            }
 
         request_id = self._gen_request_id(spec)
         self._results[request_id] = {
@@ -777,45 +998,178 @@ class FakePipeline:
     ) -> dict:
         """全流程：解析 → 构建 → 验证 → 编译 → 执行——返回 ExecuteResponse 的 dict。
 
+        失败时保留已完成产物到 self._results，返回含 pipeline_error 的部分结果。
+        成功路径返回值结构不变。
+
         Args:
             markdown_text: DeveloperSpec Markdown 全文
             table_mapping: table_ref → 物理表名（传给 Compiler）
             table_paths: 物理表名 → CSV 文件路径（传给 Executor）
 
         Returns:
-            符合 ExecuteResponse 结构的 dict
+            符合 ExecuteResponse 结构的 dict，失败时额外含 pipeline_error + pipeline_stages
         """
-        parser = DeveloperSpecParser()
-        spec = parser.parse(markdown_text)
-        manifest = _build_manifest(spec)
+        # ── Stage 1: Parser ──
+        try:
+            parser = DeveloperSpecParser()
+            spec = parser.parse(markdown_text)
+            manifest = _build_manifest(spec)
+        except Exception as e:
+            print(f"[Pipeline] execute: parser 阶段失败 - {type(e).__name__}: {e}")
+            error_info = self._capture_error("parser", e)
+            return {
+                "request_id": "",
+                "pipeline_error": error_info,
+                "pipeline_stages": self._build_pipeline_stages("parser", error_info),
+            }
 
-        # 未显式提供 table_mapping 时，自动从 spec 的 source_tables 推断
-        if not table_mapping:
-            table_mapping = _auto_table_mapping(spec)
+        # ── Stage 2: Enrich + Plan ──
+        try:
+            spec, hypothesis, extra_questions, table_mapping = self._enrich_and_plan(
+                spec, manifest, table_mapping,
+            )
+        except Exception as e:
+            print(f"[Pipeline] execute: enrich 阶段失败 - {type(e).__name__}: {e}")
+            request_id = self._gen_request_id(spec)
+            self._results[request_id] = {"parsed_spec": spec, "manifest": manifest}
+            error_info = self._capture_error("enrich", e)
+            return {
+                "request_id": request_id,
+                "spec_id": spec.spec_id,
+                "pipeline_error": error_info,
+                "pipeline_stages": self._build_pipeline_stages("enrich", error_info),
+            }
 
-        # SpecEnricher：从业务描述推断缺失指标（Phase 4D）
-        spec = self._apply_enrichment(spec, manifest, self._spec_enricher)
+        # ── Stage 3-5: Build → Compile → Execute（按分支） ──
+        # 跨阶段变量——初始化为 None，按阶段赋值
+        plan = None
+        compiled = None
+        program_artifact = None
+        all_questions: list = []
+        stage = "build"
 
-        # 多表时通过 FakeRelationshipPlanner 生成 Join 推测
-        extra_questions = []
-        hypothesis = None
-        if len(spec.input_tables) > 1:
-            hypothesis, extra_questions = self._relationship_planner.plan(spec, manifest)
+        try:
+            builder = SqlBuildPlanBuilder()
 
-        builder = SqlBuildPlanBuilder()
-        plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
+            if spec.compute_steps and len(spec.compute_steps) > 0:
+                # ── ComputeSteps 路径 ──
+                plans = builder.build_from_steps(spec, hypothesis)
+                chain_id = hashlib.md5(
+                    "|".join(s.step_name for s in spec.compute_steps).encode()
+                ).hexdigest()[:8]
+                sql_program = self._build_sql_program_from_compute_steps(
+                    plans, spec, chain_id
+                )
+                validator = SqlBuildPlanValidator()
+                _chain_passed, val_questions = validator.validate_multi_hop_chain(sql_program)
+                plan = plans[-1]
+                plan_questions: list = []
+                all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
 
-        # Validator 验证（非阻断——记录问题供排查）
-        validator = SqlBuildPlanValidator()
-        _passed, val_questions = validator.validate(plan, manifest)
-        all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
+                stage = "compile"
+                compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
+                program_artifact = compiler.compile_program(sql_program)
 
-        compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
-        compiled = compiler.compile(plan)
+                stage = "execute"
+                execute_executor = DuckDBExecutor(table_paths=table_paths or {})
+                program_result = execute_executor.execute_program(
+                    program_artifact.compiled
+                )
+                last_result = program_result.results[-1]
+                trace = last_result.trace
+                summary = last_result.summary
+                compiled = program_artifact.compiled.statements[-1]
+            elif hypothesis and len(hypothesis.candidates) > 1:
+                # ── 多跳链路径 ──
+                plans = builder.build_multi(spec, hypothesis)
+                chain_id = hashlib.md5(
+                    "|".join(c.candidate_id for c in hypothesis.candidates).encode()
+                ).hexdigest()[:8]
+                sql_program = self._build_sql_program_from_chain(
+                    plans, spec.spec_hash, chain_id
+                )
+                validator = SqlBuildPlanValidator()
+                _chain_passed, val_questions = validator.validate_multi_hop_chain(sql_program)
+                plan = plans[-1]
+                plan_questions: list = []
+                all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
 
-        executor = DuckDBExecutor(table_paths=table_paths or {})
-        trace, summary = executor.execute(compiled)
+                stage = "compile"
+                compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
+                program_artifact = compiler.compile_program(sql_program)
 
+                stage = "execute"
+                execute_executor = DuckDBExecutor(table_paths=table_paths or {})
+                program_result = execute_executor.execute_program(
+                    program_artifact.compiled
+                )
+                last_result = program_result.results[-1]
+                trace = last_result.trace
+                summary = last_result.summary
+                compiled = program_artifact.compiled.statements[-1]
+            else:
+                plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
+
+                # Validator 验证（非阻断——记录问题供排查）
+                validator = SqlBuildPlanValidator()
+                _passed, val_questions = validator.validate(plan, manifest)
+                all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
+
+                stage = "compile"
+                compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
+                compiled = compiler.compile(plan)
+
+                stage = "execute"
+                execute_executor = DuckDBExecutor(table_paths=table_paths or {})
+                trace, summary = execute_executor.execute(compiled)
+
+        except Exception as e:
+            # ── 错误处理：日志 + 保留已完成产物 + 返回部分结果 ──
+            print(f"[Pipeline] execute: {stage} 阶段失败 - {type(e).__name__}: {e}")
+            request_id = self._gen_request_id(spec)
+            # 保存已完成产物供事后查询
+            partial: dict = {
+                "parsed_spec": spec,
+                "manifest": manifest,
+            }
+            if plan is not None:
+                partial["plan"] = plan
+            if compiled is not None:
+                partial["compiled"] = compiled
+            elif program_artifact is not None:
+                partial["program_artifact"] = program_artifact
+            partial["table_mapping"] = table_mapping or {}
+            self._results[request_id] = partial
+
+            # 提取部分可用字段——根据已完成的阶段
+            _plan_id = plan.plan_id if plan is not None else ""
+            _sql_sha256 = ""
+            _compiler_ver = ""
+            if compiled is not None:
+                _sql_sha256 = getattr(compiled, "sql_sha256", "")
+                _compiler_ver = getattr(compiled, "compiler_version", "")
+            elif program_artifact is not None:
+                try:
+                    _sql_sha256 = program_artifact.compiled.statements[-1].sql_sha256
+                except (IndexError, AttributeError):
+                    pass
+                _compiler_ver = getattr(program_artifact, "compiler_version", "")
+
+            error_info = self._capture_error(stage, e)
+            return {
+                "request_id": request_id,
+                "spec_id": spec.spec_id,
+                "plan_id": _plan_id,
+                "sql_sha256": _sql_sha256,
+                "compiler_version": _compiler_ver,
+                "execution_trace": None,
+                "result_summary": None,
+                "open_questions": [],
+                "pipeline_error": error_info,
+                "pipeline_stages": self._build_pipeline_stages(stage, error_info),
+            }
+
+        # ── 成功路径——现有逻辑不变 ──
         request_id = self._gen_request_id(spec)
         self._results[request_id] = {
             "parsed_spec": spec,
@@ -878,6 +1232,104 @@ class FakePipeline:
             final_output=plan.plan_id,
         )
 
+    @staticmethod
+    def _build_sql_program_from_chain(
+        plans: list[SqlBuildPlan], spec_hash: str, chain_id: str
+    ) -> SqlProgram:
+        """从多 Plan 链构建 SqlProgram——每步 PRODUCER/FINAL，通过 _temp 串联。
+
+        中间 Plan 标记为 PRODUCER，产生 _temp 中间表供下游消费。
+        最终 Plan 标记为 FINAL，产生最终输出。
+        """
+        statements: list[SqlStatement] = []
+        for idx, plan in enumerate(plans):
+            is_final = (idx == len(plans) - 1)
+            produces = None if is_final else f"_temp_{chain_id}_{idx}"
+            depends_on = [plans[idx - 1].plan_id] if idx > 0 else []
+
+            stmt = SqlStatement(
+                statement_id=plan.plan_id,
+                plan=plan,
+                kind=StatementKind.FINAL if is_final else StatementKind.PRODUCER,
+                depends_on=depends_on,
+                produces=produces,
+            )
+            statements.append(stmt)
+
+        builder = SqlProgramBuilder()
+        return builder.build_from_statements(
+            statements=statements,
+            spec_hash=spec_hash,
+            final_output=plans[-1].plan_id,
+        )
+
+    @staticmethod
+    def _build_sql_program_from_compute_steps(
+        plans: list[SqlBuildPlan],
+        spec,  # ParsedDeveloperSpec（含 compute_steps）
+        chain_id: str,
+    ) -> SqlProgram:
+        """从 ComputeSteps Plan 链构建 SqlProgram——使用 step_name 命名 _temp 表。
+
+        与 _build_sql_program_from_chain 的区别：
+        - 使用 spec.compute_steps 的 step_name 命名 _temp 表（而非 idx）
+        - 确保 produces 与 Builder 中 ScanStep 的 table_ref 一致
+        - 支持 DAG 依赖——合流步骤 depends_on 包含所有上游 plan_id
+        """
+        steps = spec.compute_steps or []
+        # 构建 step_name → plan 映射（含 plan_id）
+        step_plan_map: dict[str, SqlBuildPlan] = {}
+        for cs, plan in zip(steps, plans):
+            step_plan_map[cs.step_name] = plan
+
+        statements: list[SqlStatement] = []
+        # 跟踪哪些步骤被其他步骤依赖——不被依赖的为 FINAL
+        consumed: set[str] = set()
+        for cs in steps:
+            src_list = cs.source if isinstance(cs.source, list) else [cs.source]
+            for src in src_list:
+                if src != "input" and src in step_plan_map:
+                    consumed.add(src)
+
+        for cs, plan in zip(steps, plans):
+            is_final = cs.step_name not in consumed
+            src_list = cs.source if isinstance(cs.source, list) else [cs.source]
+
+            # 计算依赖——所有非 input 的上游 step
+            depends_on: list[str] = []
+            for src in src_list:
+                if src != "input" and src in step_plan_map:
+                    depends_on.append(step_plan_map[src].plan_id)
+
+            # 使用 step_name 命名 _temp 表——与 Builder 中 ScanStep.table_ref 一致
+            produces = (
+                None
+                if is_final
+                else f"_temp_{chain_id}_{cs.step_name}"
+            )
+
+            stmt = SqlStatement(
+                statement_id=plan.plan_id,
+                plan=plan,
+                kind=StatementKind.FINAL if is_final else StatementKind.PRODUCER,
+                depends_on=depends_on,
+                produces=produces,
+            )
+            statements.append(stmt)
+
+        # final_output 为所有 FINAL 语句的最后一个
+        final_plans = [
+            s for s in statements if s.kind == StatementKind.FINAL
+        ]
+        final_output = final_plans[-1].statement_id if final_plans else statements[-1].statement_id
+
+        builder = SqlProgramBuilder()
+        return builder.build_from_statements(
+            statements=statements,
+            spec_hash=spec.spec_hash,
+            final_output=final_output,
+        )
+
     def run_all(
         self, markdown_text: str,
         table_mapping: dict[str, str] | None = None,
@@ -885,86 +1337,268 @@ class FakePipeline:
     ) -> dict:
         """全流程 + ReviewPackage 打包——返回 RunAllResponse 的 dict。
 
+        失败时保留已完成产物到 self._results，返回含 pipeline_error 的部分结果。
+        7 阶段：parser → enrich → build → compile → execute → contract → package。
+
         Args:
             markdown_text: DeveloperSpec Markdown 全文
             table_mapping: table_ref → 物理表名
             table_paths: 物理表名 → CSV 文件路径
 
         Returns:
-            符合 RunAllResponse 结构的 dict
+            符合 RunAllResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
         """
-        # 1. 解析
-        parser = DeveloperSpecParser()
-        spec = parser.parse(markdown_text)
+        _RUN_ALL_STAGES = ["parser", "enrich", "build", "compile", "execute", "contract", "package"]
 
-        # 2. 构建 SourceManifest
-        manifest = _build_manifest(spec)
+        # ── Stage 1: Parser ──
+        try:
+            parser = DeveloperSpecParser()
+            spec = parser.parse(markdown_text)
+            manifest = _build_manifest(spec)
+        except Exception as e:
+            print(f"[Pipeline] run_all: parser 阶段失败 - {type(e).__name__}: {e}")
+            error_info = self._capture_error("parser", e)
+            return {
+                "request_id": "",
+                "pipeline_error": error_info,
+                "pipeline_stages": self._build_pipeline_stages("parser", error_info, _RUN_ALL_STAGES),
+            }
 
-        # 未显式提供 table_mapping 时，自动从 spec 的 source_tables 推断
-        if not table_mapping:
-            table_mapping = _auto_table_mapping(spec)
+        # ── Stage 2: Enrich + Plan ──
+        try:
+            spec, hypothesis, extra_questions, table_mapping = self._enrich_and_plan(
+                spec, manifest, table_mapping,
+            )
+        except Exception as e:
+            print(f"[Pipeline] run_all: enrich 阶段失败 - {type(e).__name__}: {e}")
+            request_id = self._gen_request_id(spec)
+            self._results[request_id] = {"parsed_spec": spec, "manifest": manifest}
+            error_info = self._capture_error("enrich", e)
+            return {
+                "request_id": request_id,
+                "spec_id": spec.spec_id,
+                "pipeline_error": error_info,
+                "pipeline_stages": self._build_pipeline_stages("enrich", error_info, _RUN_ALL_STAGES),
+            }
 
-        # 2.5 SpecEnricher：从业务描述推断缺失指标（Phase 4D）
-        spec = self._apply_enrichment(spec, manifest, self._spec_enricher)
+        # ── Stage 3-7: Build → Compile → Execute → Contract → Package ──
+        plan = None
+        compiled_sql = None
+        program_artifact = None
+        artifact = None
+        contract = None
+        package_manifest = None
+        trace = None
+        summary = None
+        execution_trace = None
+        plan_questions: list = []
+        val_questions: list = []
+        passed = False
+        stage = "build"
 
-        # 2.6 多表时通过 FakeRelationshipPlanner 生成 Join 推测
-        extra_questions = []
-        hypothesis = None
-        if len(spec.input_tables) > 1:
-            hypothesis, extra_questions = self._relationship_planner.plan(spec, manifest)
+        try:
+            builder = SqlBuildPlanBuilder()
 
-        # 3. 构建 SqlBuildPlan
-        builder = SqlBuildPlanBuilder()
-        plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
+            if spec.compute_steps and len(spec.compute_steps) > 0:
+                # ── ComputeSteps 路径 ──
+                plans = builder.build_from_steps(spec, hypothesis)
+                chain_id = hashlib.md5(
+                    "|".join(s.step_name for s in spec.compute_steps).encode()
+                ).hexdigest()[:8]
+                sql_program = self._build_sql_program_from_compute_steps(
+                    plans, spec, chain_id
+                )
+                plan = plans[-1]
+                plan_questions = []
 
-        # 4. Validator 验证
-        validator = SqlBuildPlanValidator()
-        passed, val_questions = validator.validate(plan, manifest)
+                validator = SqlBuildPlanValidator()
+                passed, val_questions = validator.validate_multi_hop_chain(sql_program)
 
-        # 5. 编译
-        compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
-        artifact = compiler.compile_to_artifact(plan, spec.spec_hash)
+                stage = "compile"
+                compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
+                program_artifact = compiler.compile_program(sql_program)
+                compiled_sql = program_artifact.compiled.statements[-1]
 
-        # 6. 执行（dry_run）
-        executor = DuckDBExecutor(table_paths=table_paths or {})
-        trace, summary = executor.execute(artifact.compiled_sql)
+                stage = "execute"
+                executor = DuckDBExecutor()
+                program_result = executor.execute_program(
+                    program_artifact, table_paths=table_paths or {}
+                )
+                execution_trace = program_result.statements[-1].trace if program_result.statements else None
 
-        # 7. 构建 SqlProgram + 条件选择 Contract 版本
-        #    多语句 SqlProgram → extract_v1()（含 step_dag / temp_tables 等 v1 字段）
-        #    单语句 SqlProgram → extract()（lite，Phase 2 兼容）
-        sql_program = self._build_sql_program(plan, spec.spec_hash)
-        contract_extractor = DataTransformContractExtractor()
-        if len(sql_program.statements) > 1:
-            contract = contract_extractor.extract_v1(sql_program)
-        else:
-            contract = contract_extractor.extract(plan)
+                stage = "contract"
+                extractor = DataTransformContractExtractor()
+                contract = extractor.extract_v1(sql_program)
 
-        # 8. 打包 ReviewPackage
-        request_id = self._gen_request_id(spec)
-        packager = ReviewPackageBuilder(self._base_output_dir)
-        package_inputs = PackageInputs(
-            request_id=request_id,
-            original_spec_md=markdown_text,
-            parsed_spec=spec.model_dump(),
-            source_manifest=manifest.model_dump(),
-            sql_build_plan=plan.model_dump(),
-            sql_artifact=artifact.model_dump(),
-            execution_trace=trace.model_dump(),
-            result_summary=summary.model_dump(),
-            data_transform_contract=contract.model_dump(),
-            open_questions=[q.model_dump() for q in spec.open_questions + plan_questions + extra_questions],
-            validation_questions=[q.model_dump() for q in val_questions],
-            perf_results=[],
-            retry_count=0,
-        )
-        package_manifest = packager.build(package_inputs)
+                stage = "package"
+                request_id = self._gen_request_id(spec)
+                package_inputs = PackageInputs(
+                    developer_spec_text=markdown_text,
+                    parsed_spec=spec,
+                    source_manifest=manifest,
+                    sql_artifact=SqlArtifact(
+                        compiled=compiled_sql,
+                        execution_trace=execution_trace,
+                    ),
+                    contract=contract,
+                    request_id=request_id,
+                    spec_id=spec.spec_id,
+                )
+                packager = ReviewPackageBuilder()
+                package_manifest = packager.build(package_inputs)
+                self._results[request_id] = {
+                    "package": package_manifest,
+                    "sql_artifact": SqlArtifact(compiled=compiled_sql, execution_trace=execution_trace),
+                    "contract": contract,
+                    "plan": plan,
+                    "parsed_spec": spec,
+                    "manifest": manifest,
+                    "table_mapping": table_mapping or {},
+                }
 
-        # 存储
+                # ComputeSteps 路径独立返回
+                return {
+                    "request_id": request_id,
+                    "spec_id": spec.spec_id,
+                    "plan_id": plan.plan_id,
+                    "validation_passed": passed,
+                    "execution_status": execution_trace.status if execution_trace else "not_executed",
+                    "row_count": execution_trace.row_count if execution_trace else 0,
+                    "elapsed_ms": execution_trace.elapsed_ms if execution_trace else 0,
+                    "open_questions": _summarize_open_questions(
+                        list(plan_questions) + list(val_questions) + list(extra_questions)
+                    ),
+                    "contract_id": contract.contract_id,
+                    "package_id": package_manifest.package_id,
+                    "contract": contract.model_dump() if hasattr(contract, "model_dump") else {},
+                    "compiled": compiled_sql,
+                    "package_manifest": package_manifest.model_dump(
+                        exclude_none=True
+                    ) if hasattr(package_manifest, "model_dump") else {},
+                }
+
+            elif hypothesis and len(hypothesis.candidates) > 1:
+                # ── 多跳链路径 ──
+                plans = builder.build_multi(spec, hypothesis)
+                chain_id = hashlib.md5(
+                    "|".join(c.candidate_id for c in hypothesis.candidates).encode()
+                ).hexdigest()[:8]
+                sql_program = self._build_sql_program_from_chain(
+                    plans, spec.spec_hash, chain_id
+                )
+                plan = plans[-1]
+                plan_questions = []
+
+                validator = SqlBuildPlanValidator()
+                passed, val_questions = validator.validate_multi_hop_chain(sql_program)
+
+                stage = "compile"
+                compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
+                program_artifact = compiler.compile_program(sql_program)
+                compiled_sql = program_artifact.compiled.statements[-1]
+
+                stage = "execute"
+                execute_executor = DuckDBExecutor(table_paths=table_paths or {})
+                program_result = execute_executor.execute_program(
+                    program_artifact.compiled
+                )
+                trace = program_result.results[-1].trace
+                summary = program_result.results[-1].summary
+            else:
+                plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
+
+                validator = SqlBuildPlanValidator()
+                passed, val_questions = validator.validate(plan, manifest)
+
+                stage = "compile"
+                compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
+                artifact = compiler.compile_to_artifact(plan, spec.spec_hash)
+                compiled_sql = artifact.compiled_sql
+
+                stage = "execute"
+                execute_executor = DuckDBExecutor(table_paths=table_paths or {})
+                trace, summary = execute_executor.execute(compiled_sql)
+
+                sql_program = self._build_sql_program(plan, spec.spec_hash)
+
+            # ── 公共阶段：Contract + Package（非 ComputeSteps 路径） ──
+            stage = "contract"
+            contract_extractor = DataTransformContractExtractor()
+            if len(sql_program.statements) > 1:
+                contract = contract_extractor.extract_v1(sql_program)
+            else:
+                contract = contract_extractor.extract(plan)
+
+            stage = "package"
+            request_id = self._gen_request_id(spec)
+            packager = ReviewPackageBuilder(self._base_output_dir)
+            package_inputs = PackageInputs(
+                request_id=request_id,
+                original_spec_md=markdown_text,
+                parsed_spec=spec.model_dump(),
+                source_manifest=manifest.model_dump(),
+                sql_build_plan=plan.model_dump(),
+                sql_artifact=(
+                    artifact.model_dump()
+                    if artifact is not None
+                    else program_artifact.model_dump()
+                ),
+                execution_trace=trace.model_dump(),
+                result_summary=summary.model_dump(),
+                data_transform_contract=contract.model_dump(),
+                open_questions=[q.model_dump() for q in spec.open_questions + plan_questions + extra_questions],
+                validation_questions=[q.model_dump() for q in val_questions],
+                perf_results=[],
+                retry_count=0,
+            )
+            package_manifest = packager.build(package_inputs)
+
+        except Exception as e:
+            print(f"[Pipeline] run_all: {stage} 阶段失败 - {type(e).__name__}: {e}")
+            request_id = self._gen_request_id(spec)
+            # 保存已完成产物
+            partial: dict = {"parsed_spec": spec, "manifest": manifest}
+            if plan is not None:
+                partial["plan"] = plan
+            if compiled_sql is not None:
+                partial["compiled"] = compiled_sql
+            elif program_artifact is not None:
+                partial["program_artifact"] = program_artifact
+            elif artifact is not None:
+                partial["artifact"] = artifact
+            if contract is not None:
+                partial["contract"] = contract
+            partial["table_mapping"] = table_mapping or {}
+            self._results[request_id] = partial
+
+            _plan_id = plan.plan_id if plan is not None else ""
+            _contract_id = contract.contract_id if contract is not None else ""
+            _package_id = package_manifest.package_id if package_manifest is not None else ""
+
+            error_info = self._capture_error(stage, e)
+            return {
+                "request_id": request_id,
+                "spec_id": spec.spec_id,
+                "plan_id": _plan_id,
+                "validation_passed": passed,
+                "execution_status": "not_executed",
+                "row_count": 0,
+                "elapsed_ms": 0,
+                "open_questions": [],
+                "contract_id": _contract_id,
+                "package_id": _package_id,
+                "contract": contract.model_dump() if contract is not None and hasattr(contract, "model_dump") else {},
+                "compiled": compiled_sql,
+                "pipeline_error": error_info,
+                "pipeline_stages": self._build_pipeline_stages(stage, error_info, _RUN_ALL_STAGES),
+            }
+
+        # ── 成功路径（非 ComputeSteps） ──
         self._results[request_id] = {
             "parsed_spec": spec,
             "manifest": manifest,
             "plan": plan,
-            "compiled": artifact.compiled_sql,
+            "compiled": compiled_sql,
             "trace": trace,
             "summary": summary,
             "table_mapping": table_mapping or {},
@@ -992,6 +1626,9 @@ class FakePipeline:
                 "null_counts": summary.null_counts,
                 "numeric_sums": summary.numeric_sums,
             },
+            "open_questions": _summarize_open_questions(
+                list(plan_questions) + list(val_questions) + list(extra_questions)
+            ),
             "artifact_count": len(package_manifest.artifacts),
         }
 
@@ -1178,15 +1815,27 @@ class FakePipeline:
         """前端专用：完整解析 DeveloperSpec——返回 SpecRichResponse dict。
 
         包含全部结构化解析结果：表、字段、指标、维度、Join、时间范围等。
+        解析失败时返回 200 + pipeline_error。
 
         Args:
             markdown_text: DeveloperSpec Markdown 全文
 
         Returns:
-            符合 SpecRichResponse 结构的 dict
+            符合 SpecRichResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
         """
-        parser = DeveloperSpecParser()
-        spec = parser.parse(markdown_text)
+        # ── Stage: parser ──
+        try:
+            parser = DeveloperSpecParser()
+            spec = parser.parse(markdown_text)
+        except Exception as e:
+            print(f"[Pipeline] parse_rich: parser 阶段失败 - {type(e).__name__}: {e}")
+            error_info = self._capture_error("parser", e)
+            return {
+                "request_id": "",
+                "pipeline_error": error_info,
+                "pipeline_stages": self._build_pipeline_stages("parser", error_info),
+            }
+
         request_id = self._gen_request_id(spec)
         self._results[request_id] = {"parsed_spec": spec}
 
@@ -1257,35 +1906,69 @@ class FakePipeline:
     ) -> dict:
         """前端专用：解析 + 构建 Plan + 提取 Join 证据——返回 PlanRichResponse dict。
 
+        失败时保留已完成产物到 self._results，返回含 pipeline_error 的部分结果。
+
         Args:
             markdown_text: DeveloperSpec Markdown 全文
             table_mapping: table_ref → 物理表名（可选）
 
         Returns:
-            符合 PlanRichResponse 结构的 dict
+            符合 PlanRichResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
         """
-        parser = DeveloperSpecParser()
-        spec = parser.parse(markdown_text)
-        manifest = _build_manifest(spec)
+        # ── Stage 1: Parser ──
+        try:
+            parser = DeveloperSpecParser()
+            spec = parser.parse(markdown_text)
+            manifest = _build_manifest(spec)
+        except Exception as e:
+            print(f"[Pipeline] build_plan_rich: parser 阶段失败 - {type(e).__name__}: {e}")
+            error_info = self._capture_error("parser", e)
+            return {
+                "request_id": "",
+                "pipeline_error": error_info,
+                "pipeline_stages": self._build_pipeline_stages("parser", error_info),
+            }
 
-        # 未显式提供 table_mapping 时，自动从 spec 的 source_tables 推断
-        if not table_mapping:
-            table_mapping = _auto_table_mapping(spec)
+        # ── Stage 2: Enrich + Plan ──
+        try:
+            spec, hypothesis, extra_questions, table_mapping = self._enrich_and_plan(
+                spec, manifest, table_mapping,
+            )
+        except Exception as e:
+            print(f"[Pipeline] build_plan_rich: enrich 阶段失败 - {type(e).__name__}: {e}")
+            request_id = self._gen_request_id(spec)
+            self._results[request_id] = {"parsed_spec": spec, "manifest": manifest}
+            error_info = self._capture_error("enrich", e)
+            return {
+                "request_id": request_id,
+                "spec_id": spec.spec_id,
+                "pipeline_error": error_info,
+                "pipeline_stages": self._build_pipeline_stages("enrich", error_info),
+            }
 
-        # SpecEnricher：从业务描述推断缺失指标（Phase 4D）
-        spec = self._apply_enrichment(spec, manifest, self._spec_enricher)
+        # ── Stage 3: Build + Validate ──
+        plan = None
+        try:
+            builder = SqlBuildPlanBuilder()
+            plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
 
-        # 多表时通过 FakeRelationshipPlanner 生成 Join 推测
-        extra_questions = []
-        hypothesis = None
-        if len(spec.input_tables) > 1:
-            hypothesis, extra_questions = self._relationship_planner.plan(spec, manifest)
-
-        builder = SqlBuildPlanBuilder()
-        plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
-
-        validator = SqlBuildPlanValidator()
-        passed, val_questions = validator.validate(plan, manifest)
+            validator = SqlBuildPlanValidator()
+            passed, val_questions = validator.validate(plan, manifest)
+        except Exception as e:
+            print(f"[Pipeline] build_plan_rich: build 阶段失败 - {type(e).__name__}: {e}")
+            request_id = self._gen_request_id(spec)
+            partial: dict = {"parsed_spec": spec, "manifest": manifest}
+            if plan is not None:
+                partial["plan"] = plan
+            self._results[request_id] = partial
+            error_info = self._capture_error("build", e)
+            return {
+                "request_id": request_id,
+                "spec_id": spec.spec_id,
+                "plan_id": plan.plan_id if plan is not None else "",
+                "pipeline_error": error_info,
+                "pipeline_stages": self._build_pipeline_stages("build", error_info),
+            }
 
         request_id = self._gen_request_id(spec)
         self._results[request_id] = {
@@ -1321,43 +2004,98 @@ class FakePipeline:
     ) -> dict:
         """前端专用：全流程编译+执行——返回 ExecuteRichResponse dict（含 SQL 文本）。
 
+        失败时保留已完成产物到 self._results，返回含 pipeline_error 的部分结果。
+
         Args:
             markdown_text: DeveloperSpec Markdown 全文
             table_mapping: table_ref → 物理表名
             table_paths: 物理表名 → CSV 文件路径
 
         Returns:
-            符合 ExecuteRichResponse 结构的 dict
+            符合 ExecuteRichResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
         """
-        parser = DeveloperSpecParser()
-        spec = parser.parse(markdown_text)
-        manifest = _build_manifest(spec)
+        # ── Stage 1: Parser ──
+        try:
+            parser = DeveloperSpecParser()
+            spec = parser.parse(markdown_text)
+            manifest = _build_manifest(spec)
+        except Exception as e:
+            print(f"[Pipeline] execute_rich: parser 阶段失败 - {type(e).__name__}: {e}")
+            error_info = self._capture_error("parser", e)
+            return {
+                "request_id": "",
+                "pipeline_error": error_info,
+                "pipeline_stages": self._build_pipeline_stages("parser", error_info),
+            }
 
-        # 未显式提供 table_mapping 时，自动从 spec 的 source_tables 推断
-        if not table_mapping:
-            table_mapping = _auto_table_mapping(spec)
+        # ── Stage 2: Enrich + Plan ──
+        try:
+            spec, hypothesis, extra_questions, table_mapping = self._enrich_and_plan(
+                spec, manifest, table_mapping,
+            )
+        except Exception as e:
+            print(f"[Pipeline] execute_rich: enrich 阶段失败 - {type(e).__name__}: {e}")
+            request_id = self._gen_request_id(spec)
+            self._results[request_id] = {"parsed_spec": spec, "manifest": manifest}
+            error_info = self._capture_error("enrich", e)
+            return {
+                "request_id": request_id,
+                "spec_id": spec.spec_id,
+                "pipeline_error": error_info,
+                "pipeline_stages": self._build_pipeline_stages("enrich", error_info),
+            }
 
-        # SpecEnricher：从业务描述推断缺失指标（Phase 4D）
-        spec = self._apply_enrichment(spec, manifest, self._spec_enricher)
+        # ── Stage 3-5: Build → Compile → Execute ──
+        plan = None
+        compiled = None
+        all_questions: list = []
+        stage = "build"
 
-        # 多表时通过 FakeRelationshipPlanner 生成 Join 推测
-        extra_questions = []
-        hypothesis = None
-        if len(spec.input_tables) > 1:
-            hypothesis, extra_questions = self._relationship_planner.plan(spec, manifest)
+        try:
+            builder = SqlBuildPlanBuilder()
+            plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
 
-        builder = SqlBuildPlanBuilder()
-        plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
+            validator = SqlBuildPlanValidator()
+            _passed, val_questions = validator.validate(plan, manifest)
+            all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
 
-        validator = SqlBuildPlanValidator()
-        _passed, val_questions = validator.validate(plan, manifest)
-        all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
+            stage = "compile"
+            compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
+            compiled = compiler.compile(plan)
 
-        compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
-        compiled = compiler.compile(plan)
+            stage = "execute"
+            executor = DuckDBExecutor(table_paths=table_paths or {})
+            trace, summary = executor.execute(compiled)
 
-        executor = DuckDBExecutor(table_paths=table_paths or {})
-        trace, summary = executor.execute(compiled)
+        except Exception as e:
+            print(f"[Pipeline] execute_rich: {stage} 阶段失败 - {type(e).__name__}: {e}")
+            request_id = self._gen_request_id(spec)
+            partial: dict = {"parsed_spec": spec, "manifest": manifest}
+            if plan is not None:
+                partial["plan"] = plan
+            if compiled is not None:
+                partial["compiled"] = compiled
+            partial["table_mapping"] = table_mapping or {}
+            self._results[request_id] = partial
+
+            _plan_id = plan.plan_id if plan is not None else ""
+            _sql_sha256 = getattr(compiled, "sql_sha256", "") if compiled is not None else ""
+            _compiler_ver = getattr(compiled, "compiler_version", "") if compiled is not None else ""
+
+            error_info = self._capture_error(stage, e)
+            return {
+                "request_id": request_id,
+                "spec_id": spec.spec_id,
+                "plan_id": _plan_id,
+                "generated_sql": getattr(compiled, "sql", "") if compiled is not None else "",
+                "sql_sha256": _sql_sha256,
+                "compiler_version": _compiler_ver,
+                "execution_trace": None,
+                "result_summary": None,
+                "open_questions": [],
+                "pipeline_error": error_info,
+                "pipeline_stages": self._build_pipeline_stages(stage, error_info),
+            }
 
         request_id = self._gen_request_id(spec)
         self._results[request_id] = {

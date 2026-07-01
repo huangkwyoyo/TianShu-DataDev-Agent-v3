@@ -58,6 +58,12 @@ body {
   color: var(--text-muted);
 }
 
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
 /* ── 主体布局 ── */
 
 .app-body {
@@ -659,6 +665,127 @@ body {
   text-transform: uppercase;
   margin: 12px 0 6px;
   letter-spacing: 0.5px;
+}
+
+/* ── 流水线阶段指示灯 ── */
+
+.pipeline-indicator {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.pipeline-trigger {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+  transition: border-color 0.15s;
+}
+
+.pipeline-trigger:hover {
+  border-color: var(--accent);
+}
+
+.pipeline-summary-text {
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.pipeline-chevron {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.pipeline-dropdown {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 6px;
+  min-width: 260px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  z-index: 100;
+  overflow: hidden;
+}
+
+.pipeline-dropdown-header {
+  padding: 8px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid var(--border);
+}
+
+.pipeline-stage-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  border-bottom: 1px solid var(--border);
+}
+
+.pipeline-stage-row:last-of-type {
+  border-bottom: none;
+}
+
+.pipeline-stage-row.stage-failed {
+  background: var(--red-bg);
+}
+
+.pipeline-stage-row.stage-skipped {
+  opacity: 0.4;
+}
+
+.stage-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.stage-name {
+  flex: 1;
+  font-weight: 500;
+}
+
+.stage-error-type {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--red-bg);
+  color: var(--red);
+  font-family: monospace;
+}
+
+.pipeline-error-detail {
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-input);
+}
+
+.error-detail-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+  text-transform: uppercase;
+}
+
+.error-detail-text {
+  font-size: 12px;
+  color: var(--red);
+  font-family: monospace;
+  word-break: break-all;
+  line-height: 1.5;
 }
 
 /* ── 禁止生产入口提示 ── */

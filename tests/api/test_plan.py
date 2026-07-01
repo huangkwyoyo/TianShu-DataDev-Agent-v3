@@ -23,13 +23,43 @@ class TestPlan:
         assert resp.status_code == 200, f"期望 200，实际 {resp.status_code}: {resp.text}"
 
     def test_plan_invalid_spec(self, client):
-        """无效输入 → 422 + 结构化错误。"""
+        """无效输入 → 200 + pipeline_error（Pipeline 内部捕获）。"""
         resp = client.post("/api/plan", json={"markdown_text": "无 fenced block 的内容"})
-        assert resp.status_code == 422, f"期望 422，实际 {resp.status_code}: {resp.text}"
+        assert resp.status_code == 200, f"期望 200，实际 {resp.status_code}: {resp.text}"
         data = resp.json()
-        assert data["error_code"] is not None
+        assert "pipeline_error" in data
+        assert data["pipeline_error"]["stage"] == "parser"
 
     def test_plan_empty_text(self, client):
-        """空输入 → 422。"""
+        """空输入 → 200 + pipeline_error。"""
         resp = client.post("/api/plan", json={"markdown_text": ""})
-        assert resp.status_code == 422
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "pipeline_error" in data
+        assert data["pipeline_error"]["stage"] == "parser"
+
+    def test_plan_success_no_pipeline_error(self, client, golden_spec):
+        """成功构建 → 不含 pipeline_error 字段。"""
+        resp = client.post("/api/plan", json={"markdown_text": golden_spec})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "pipeline_error" not in data
+        assert "pipeline_stages" not in data
+        assert data["plan_id"].startswith("plan_")
+
+    def test_plan_rich_success(self, client, golden_spec):
+        """build_plan_rich 成功 → 含 join_evidence。"""
+        resp = client.post("/api/plan-rich", json={"markdown_text": golden_spec})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "pipeline_error" not in data
+        assert "join_evidence" in data
+        assert data["plan_id"].startswith("plan_")
+
+    def test_plan_rich_parser_failure(self, client):
+        """build_plan_rich 空输入 → 200 + pipeline_error。"""
+        resp = client.post("/api/plan-rich", json={"markdown_text": ""})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "pipeline_error" in data
+        assert data["pipeline_error"]["stage"] == "parser"

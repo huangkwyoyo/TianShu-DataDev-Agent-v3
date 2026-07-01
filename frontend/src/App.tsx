@@ -10,6 +10,11 @@ import { PackageTree } from './components/PackageTree';
 import { ErrorDisplay } from './components/ErrorDisplay';
 import { StatusBar } from './components/StatusBar';
 import {
+  PipelineStageIndicator,
+  type StageInfo,
+  type PipelineError,
+} from './components/PipelineStageIndicator';
+import {
   parseSpecRich,
   buildPlanRich,
   executeRich,
@@ -35,6 +40,10 @@ interface AppState {
   error: ApiError | null;
   activePanel: Panel | null;
 
+  // 流水线阶段状态（执行后更新）
+  pipelineStages: StageInfo[];
+  pipelineError: PipelineError | null;
+
   // 各阶段产物
   specResult: SpecRichResponse | null;
   planResult: PlanRichResponse | null;
@@ -49,6 +58,8 @@ export default function App() {
     isLoading: false,
     error: null,
     activePanel: null,
+    pipelineStages: [],
+    pipelineError: null,
     specResult: null,
     planResult: null,
     executeResult: null,
@@ -77,10 +88,11 @@ export default function App() {
     }
   };
 
-  /** 清除错误 */
-  const clearError = () => update({ error: null });
+  /** 清除错误和流水线阶段状态 */
+  const clearError = () => update({ error: null, pipelineError: null, pipelineStages: [] });
 
-  /** 通用 API 调用包装——支持同步和异步回调 */
+  /** 通用 API 调用包装——支持同步和异步回调。
+   *  自动从响应中提取 pipeline_error / pipeline_stages 用于阶段指示灯。 */
   const runAction = async <T,>(
     fn: () => Promise<T>,
     onSuccess: (result: T) => Partial<AppState> | Promise<Partial<AppState>>,
@@ -88,8 +100,17 @@ export default function App() {
     update({ isLoading: true, error: null });
     try {
       const result = await fn();
+      // 提取流水线阶段信息（200 响应中可能包含 pipeline_error）
+      const resultAny = result as Record<string, unknown>;
+      const plError = (resultAny.pipeline_error as PipelineError | undefined) || null;
+      const plStages = (resultAny.pipeline_stages as StageInfo[] | undefined) || [];
       const partial = await onSuccess(result);
-      update({ isLoading: false, ...partial });
+      update({
+        isLoading: false,
+        ...partial,
+        pipelineError: plError,
+        pipelineStages: plStages,
+      });
     } catch (err) {
       const apiErr: ApiError =
         err && typeof err === 'object' && 'error_code' in err
@@ -202,7 +223,13 @@ export default function App() {
     <div className="app">
       <header className="app-header">
         <h1>TianShu DataDev Agent — 内部工作台</h1>
-        <span className="app-version">v0.1.0 | dry_run 模式 | 不做生产执行</span>
+        <div className="header-right">
+          <PipelineStageIndicator
+            stages={state.pipelineStages}
+            error={state.pipelineError}
+          />
+          <span className="app-version">v0.1.0 | dry_run 模式 | 不做生产执行</span>
+        </div>
       </header>
 
       <div className="app-body">
