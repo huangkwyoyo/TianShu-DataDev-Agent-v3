@@ -1,0 +1,13 @@
+{
+  "inferred_joins": [
+    {
+      "left_table": "orders",
+      "right_table": "users",
+      "left_key": "user_id",
+      "right_key": "id",
+      "join_type": "CROSS",
+      "confidence": "high",
+      "reasoning": "LLM 输出了非法 join_type CROSS——应降级为 INNER"
+    }
+  ]
+}

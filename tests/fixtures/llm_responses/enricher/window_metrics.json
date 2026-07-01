@@ -1,0 +1,26 @@
+{
+  "inferred_metrics": [],
+  "inferred_window_metrics": [
+    {
+      "metric_name": "user_rank",
+      "window_function": "ROW_NUMBER",
+      "input_column": "amount",
+      "partition_by": ["user_id"],
+      "order_by": ["amount DESC"],
+      "alias": "user_rank",
+      "confidence": "high",
+      "reasoning": "业务提到'每个用户按金额排名'"
+    },
+    {
+      "metric_name": "prev_amount",
+      "window_function": "LAG",
+      "input_column": "amount",
+      "partition_by": ["user_id"],
+      "order_by": ["order_date"],
+      "alias": "prev_amount",
+      "confidence": "medium",
+      "reasoning": "业务提到'与上一笔订单金额比较'"
+    }
+  ],
+  "inferred_computed_metrics": []
+}

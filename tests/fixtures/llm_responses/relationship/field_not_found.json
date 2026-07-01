@@ -1,0 +1,13 @@
+{
+  "inferred_joins": [
+    {
+      "left_table": "orders",
+      "right_table": "users",
+      "left_key": "nonexistent_field",
+      "right_key": "id",
+      "join_type": "INNER",
+      "confidence": "high",
+      "reasoning": "LLM 编造了不存在的字段名 nonexistent_field——应被丢弃"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "inferred_joins": [
+    {
+      "left_table": "orders",
+      "right_table": "users",
+      "left_key": "user_id",
+      "right_key": "id",
+      "join_type": "INNER",
+      "confidence": "high",
+      "reasoning": "orders.user_id 是 users.id 的外键，FK 命名模式明确"
+    },
+    {
+      "left_table": "orders",
+      "right_table": "products",
+      "left_key": "product_id",
+      "right_key": "id",
+      "join_type": "LEFT",
+      "confidence": "medium",
+      "reasoning": "订单可能无产品关联，使用 LEFT JOIN 保留所有订单"
+    }
+  ]
+}

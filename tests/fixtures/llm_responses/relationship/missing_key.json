@@ -1,0 +1,3 @@
+{
+  "note": "此 JSON 不含 inferred_joins 键——模拟 LLM 未输出该字段"
+}

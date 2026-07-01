@@ -1,0 +1,22 @@
+{
+  "inferred_metrics": [],
+  "inferred_window_metrics": [],
+  "inferred_computed_metrics": [
+    {
+      "metric_name": "avg_order_amount",
+      "expression": "total_amount / order_count",
+      "depends_on": ["total_amount", "order_count"],
+      "alias": "avg_order_amount",
+      "confidence": "high",
+      "reasoning": "业务提到'客单价'——总金额/订单数"
+    },
+    {
+      "metric_name": "active_ratio",
+      "expression": "active_count / total_count",
+      "depends_on": ["active_count", "total_count"],
+      "alias": "active_ratio",
+      "confidence": "medium",
+      "reasoning": "业务提到'活跃用户占比'"
+    }
+  ]
+}

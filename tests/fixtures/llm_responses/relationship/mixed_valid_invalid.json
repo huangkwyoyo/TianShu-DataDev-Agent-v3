@@ -1,0 +1,40 @@
+{
+  "inferred_joins": [
+    {
+      "left_table": "orders",
+      "right_table": "users",
+      "left_key": "user_id",
+      "right_key": "id",
+      "join_type": "INNER",
+      "confidence": "high",
+      "reasoning": "合法候选 1：orders.user_id ↔ users.id"
+    },
+    {
+      "left_table": "orders",
+      "right_table": "products",
+      "left_key": "fake_column",
+      "right_key": "id",
+      "join_type": "LEFT",
+      "confidence": "medium",
+      "reasoning": "非法候选：fake_column 不存在——应被丢弃"
+    },
+    {
+      "left_table": "orders",
+      "right_table": "users",
+      "left_key": "amount",
+      "right_key": "name",
+      "join_type": "INNER",
+      "confidence": "low",
+      "reasoning": "合法候选 2：amount 和 name 都是真实字段"
+    },
+    {
+      "left_table": "orders",
+      "right_table": "orders",
+      "left_key": "user_id",
+      "right_key": "user_id",
+      "join_type": "INNER",
+      "confidence": "low",
+      "reasoning": "非法候选：自引用——应被丢弃"
+    }
+  ]
+}

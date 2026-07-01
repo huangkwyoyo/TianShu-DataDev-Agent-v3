@@ -1,0 +1,13 @@
+{
+  "inferred_joins": [
+    {
+      "left_table": "orders",
+      "right_table": "orders",
+      "left_key": "user_id",
+      "right_key": "user_id",
+      "join_type": "INNER",
+      "confidence": "low",
+      "reasoning": "LLM 输出了自引用 Join——应被丢弃"
+    }
+  ]
+}

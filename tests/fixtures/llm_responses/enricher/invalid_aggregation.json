@@ -1,0 +1,28 @@
+{
+  "inferred_metrics": [
+    {
+      "metric_name": "median_amount",
+      "aggregation": "MEDIAN",
+      "input_column": "amount",
+      "alias": "median_amount",
+      "filter": null,
+      "input_expression": null,
+      "distinct": false,
+      "confidence": "medium",
+      "reasoning": "LLM 输出了不支持的聚合函数 MEDIAN——应被丢弃"
+    },
+    {
+      "metric_name": "total_amount",
+      "aggregation": "SUM",
+      "input_column": "amount",
+      "alias": "total_amount",
+      "filter": null,
+      "input_expression": null,
+      "distinct": false,
+      "confidence": "high",
+      "reasoning": "合法指标——SUM 是允许的聚合函数"
+    }
+  ],
+  "inferred_window_metrics": [],
+  "inferred_computed_metrics": []
+}

@@ -1,0 +1,87 @@
+{
+  "inferred_metrics": [
+    {
+      "metric_name": "total_amount",
+      "aggregation": "SUM",
+      "input_column": "amount",
+      "alias": "total_amount",
+      "filter": null,
+      "input_expression": null,
+      "distinct": false,
+      "confidence": "high",
+      "reasoning": "合法：SUM(amount)"
+    },
+    {
+      "metric_name": "invalid_agg",
+      "aggregation": "PERCENTILE",
+      "input_column": "amount",
+      "alias": "invalid_agg",
+      "filter": null,
+      "input_expression": null,
+      "distinct": false,
+      "confidence": "low",
+      "reasoning": "非法：PERCENTILE 不在允许列表中——应被丢弃"
+    },
+    {
+      "metric_name": "order_count",
+      "aggregation": "COUNT",
+      "input_column": null,
+      "alias": "order_count",
+      "filter": null,
+      "input_expression": null,
+      "distinct": false,
+      "confidence": "high",
+      "reasoning": "合法：COUNT(*)"
+    }
+  ],
+  "inferred_window_metrics": [
+    {
+      "metric_name": "valid_rank",
+      "window_function": "DENSE_RANK",
+      "input_column": "amount",
+      "partition_by": ["user_id"],
+      "order_by": ["amount DESC"],
+      "alias": "valid_rank",
+      "confidence": "medium",
+      "reasoning": "合法窗口指标"
+    },
+    {
+      "metric_name": "legacy_sum",
+      "window_function": "SUM",
+      "input_column": "amount",
+      "partition_by": ["user_id"],
+      "order_by": [],
+      "alias": "legacy_sum",
+      "confidence": "medium",
+      "reasoning": "旧名 SUM——应映射为 SUM_OVER"
+    },
+    {
+      "metric_name": "invalid_window_func",
+      "window_function": "PERCENT_RANK",
+      "input_column": "amount",
+      "partition_by": [],
+      "order_by": [],
+      "alias": "invalid_window_func",
+      "confidence": "low",
+      "reasoning": "非法窗口函数——PERCENT_RANK 不在白名单中，应被丢弃"
+    }
+  ],
+  "inferred_computed_metrics": [
+    {
+      "metric_name": "conversion_rate",
+      "expression": "paid_count / total_count",
+      "depends_on": ["paid_count", "total_count"],
+      "alias": "conversion_rate",
+      "confidence": "low",
+      "reasoning": "合法计算指标"
+    },
+    {
+      "metric_name": "sql_injection_metric",
+      "expression": "1; DROP TABLE users; --",
+      "depends_on": [],
+      "alias": "injected",
+      "confidence": "low",
+      "reasoning": "含 SQL 注入字符——应被丢弃"
+    }
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "inferred_metrics": [
+    {
+      "metric_name": "active_orders",
+      "aggregation": "COUNT",
+      "input_column": "id",
+      "alias": "active_orders",
+      "filter": {
+        "column": "status",
+        "operator": "eq",
+        "value": "active"
+      },
+      "input_expression": null,
+      "distinct": false,
+      "confidence": "high",
+      "reasoning": "合法 filter——status 是真实字段"
+    },
+    {
+      "metric_name": "ghost_filter_orders",
+      "aggregation": "COUNT",
+      "input_column": "id",
+      "alias": "ghost_filter_orders",
+      "filter": {
+        "column": "ghost_column",
+        "operator": "eq",
+        "value": "x"
+      },
+      "input_expression": null,
+      "distinct": false,
+      "confidence": "low",
+      "reasoning": "非法 filter——ghost_column 不存在，filter 应被丢弃"
+    },
+    {
+      "metric_name": "malformed_filter",
+      "aggregation": "SUM",
+      "input_column": "amount",
+      "alias": "malformed_filter",
+      "filter": {
+        "column": "status"
+      },
+      "input_expression": null,
+      "distinct": false,
+      "confidence": "low",
+      "reasoning": "filter 缺少 operator 和 value——应被丢弃 filter"
+    }
+  ],
+  "inferred_window_metrics": [],
+  "inferred_computed_metrics": []
+}

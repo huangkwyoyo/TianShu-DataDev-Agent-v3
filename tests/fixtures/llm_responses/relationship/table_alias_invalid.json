@@ -1,0 +1,13 @@
+{
+  "inferred_joins": [
+    {
+      "left_table": "ghost_table",
+      "right_table": "users",
+      "left_key": "user_id",
+      "right_key": "id",
+      "join_type": "INNER",
+      "confidence": "medium",
+      "reasoning": "LLM 引用了不存在的表别名 ghost_table——应被丢弃"
+    }
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "inferred_metrics": [
+    {
+      "metric_name": "total_amount",
+      "aggregation": "SUM",
+      "input_column": "amount",
+      "alias": "total_amount",
+      "filter": null,
+      "input_expression": null,
+      "distinct": false,
+      "confidence": "high",
+      "reasoning": "业务描述提到'总金额'"
+    },
+    {
+      "metric_name": "order_count",
+      "aggregation": "COUNT",
+      "input_column": null,
+      "alias": "order_count",
+      "filter": null,
+      "input_expression": null,
+      "distinct": false,
+      "confidence": "high",
+      "reasoning": "COUNT(*) 无需指定 input_column"
+    }
+  ],
+  "inferred_window_metrics": [
+    {
+      "metric_name": "amount_rank",
+      "window_function": "RANK",
+      "input_column": "amount",
+      "partition_by": ["user_id"],
+      "order_by": ["amount DESC"],
+      "alias": "amount_rank",
+      "confidence": "medium",
+      "reasoning": "业务描述提到'排名'"
+    }
+  ],
+  "inferred_computed_metrics": [
+    {
+      "metric_name": "conversion_rate",
+      "expression": "paid_count / total_count",
+      "depends_on": ["paid_count", "total_count"],
+      "alias": "conversion_rate",
+      "confidence": "low",
+      "reasoning": "业务描述提到'转化率'"
+    }
+  ]
+}
