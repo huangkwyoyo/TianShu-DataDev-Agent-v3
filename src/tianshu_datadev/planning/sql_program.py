@@ -19,6 +19,7 @@ from enum import Enum
 
 from tianshu_datadev.developer_spec.models import (
     OpenQuestion,
+    ParsedDeveloperSpec,
     StrictModel,
 )
 
@@ -30,6 +31,7 @@ from .sql_build_plan import (
 )
 from .temp_table import (
     TempTableSpec,
+    make_temp_name,
     validate_consumer_is_declared,
     validate_temp_table_naming,
     validate_temp_table_refs,
@@ -156,6 +158,7 @@ class SqlStatement(StrictModel):
     kind: StatementKind  # DAG 角色
     depends_on: list[str] = []  # 依赖的 statement_id 列表
     produces: str | None = None  # 产生的 _temp 表名
+    intent: str | None = None  # Builder 填写的业务意图描述——供注释渲染和 ReviewPackage 使用
 
 
 # ════════════════════════════════════════════
@@ -176,6 +179,7 @@ class SqlProgram(StrictModel):
     temp_tables: list[TempTableSpec] = []  # _temp 中间表声明
     topological_order: list[str] = []  # 确定性拓扑排序结果
     final_output: str | None = None  # 最终输出的 statement_id
+    final_output_target: str | None = None  # FINAL 的真实输出目标（表名+分区等）——仅 build_from_compute_steps 填写
 
     @staticmethod
     def generate_program_id(spec_hash: str) -> str:
@@ -545,14 +549,189 @@ def validate_program_dag(program: SqlProgram) -> list[OpenQuestion]:
 
 
 class SqlProgramBuilder:
-    """Phase 3A 确定性 SqlProgram 构建器。
+    """SqlProgram 确定性构建器——消费显式依赖，确定性组装。
 
-    构建策略：
-    - 单语句：STANDALONE 语句，无 DAG 依赖
-    - 多语句通过外部代码组装（Phase 3A 不自动化拆分单表计划为多步）
+    三种构建策略：
+    - build_single()：单 Plan → STANDALONE SqlProgram（无 DAG）
+    - build_chain()：多 Plan 线性链 → PRODUCER→…→FINAL，按列表顺序推导依赖
+    - build_from_compute_steps()：ComputeSteps DAG → 按 source 显式依赖推导 depends_on
+    - build_from_statements()：低级入口——预构建 Statement 列表的直接组装
 
-    当前实现为占位——外部代码构造 SqlStatement 列表后调用 build_from_statements()。
+    能力边界（显式标注）：
+    ✅ 从 SqlBuildPlanBuilder 产出的 Plan 列表确定性组装 SqlProgram
+    ✅ 根据调用方提供的 plan 顺序（build_chain）或 compute_steps.source 声明
+       （build_from_compute_steps）推导 StatementKind + depends_on + produces
+    ✅ DAG 合流步骤（多源 fan-in）的依赖正确计算
+    ❌ 不自动拆分单个平面 spec 为多步 ComputeSteps——需用户在 DeveloperSpec 中预声明
+    ❌ 不推断隐式 _temp 依赖——依赖关系必须通过 Plan 引用或 ComputeSteps.source 显式表达
+
+    SqlProgramBuilder 保持确定性组装器定位，不承担推理职责。
+    ComputeSteps 自动推导（即将平面 spec 拆分为多步 DAG）属于
+    Planner / SpecEnricher / SqlBuildPlanBuilder 的职责——
+    SqlProgramBuilder 只消费它们产出的 Plan 列表，按显式依赖组装为 SqlProgram。
     """
+
+    # ── 高级构建方法 ──
+
+    def build_single(
+        self, plan: SqlBuildPlan, spec_hash: str,
+    ) -> SqlProgram:
+        """从单个 SqlBuildPlan 构建最小 SqlProgram（单语句 STANDALONE）。
+
+        将单个 Plan 包装为 STANDALONE SqlProgram——不涉及 DAG 或依赖推导。
+        多语句场景使用 build_chain() 或 build_from_compute_steps()。
+
+        Args:
+            plan: SqlBuildPlan 实例
+            spec_hash: 对应 DeveloperSpec 的 SHA-256
+
+        Returns:
+            含单个 STANDALONE 语句的 SqlProgram
+        """
+        stmt = SqlStatement(
+            statement_id=plan.plan_id,
+            plan=plan,
+            kind=StatementKind.STANDALONE,
+        )
+        return self.build_from_statements(
+            statements=[stmt],
+            spec_hash=spec_hash,
+            final_output=plan.plan_id,
+        )
+
+    def build_chain(
+        self, plans: list[SqlBuildPlan], spec_hash: str, chain_id: str,
+    ) -> SqlProgram:
+        """从多 Plan 线性链构建 SqlProgram——每步 PRODUCER/FINAL，通过 _temp 串联。
+
+        中间 Plan 标记为 PRODUCER，产生 _temp 中间表供下游消费。
+        最终 Plan 标记为 FINAL，产生最终输出。
+        依赖关系按 plans 列表顺序自动推导——plan[i] depends_on plan[i-1]。
+
+        Args:
+            plans: 按依赖顺序排列的 SqlBuildPlan 列表
+            spec_hash: 对应 DeveloperSpec 的 SHA-256
+            chain_id: 链标识——用于确定性 _temp 表命名
+
+        Returns:
+            含 PRODUCER→…→FINAL 链的 SqlProgram
+        """
+        if not plans:
+            raise ValueError("plans 不能为空——至少需要一个 SqlBuildPlan 构建链")
+
+        statements: list[SqlStatement] = []
+        for idx, plan in enumerate(plans):
+            is_final = (idx == len(plans) - 1)
+            produces = None if is_final else make_temp_name(chain_id, str(idx))
+            depends_on = [plans[idx - 1].plan_id] if idx > 0 else []
+
+            stmt = SqlStatement(
+                statement_id=plan.plan_id,
+                plan=plan,
+                kind=StatementKind.FINAL if is_final else StatementKind.PRODUCER,
+                depends_on=depends_on,
+                produces=produces,
+            )
+            statements.append(stmt)
+
+        return self.build_from_statements(
+            statements=statements,
+            spec_hash=spec_hash,
+            final_output=plans[-1].plan_id,
+        )
+
+    def build_from_compute_steps(
+        self,
+        plans: list[SqlBuildPlan],
+        spec: ParsedDeveloperSpec,
+        chain_id: str,
+    ) -> SqlProgram:
+        """从 ComputeSteps Plan 链构建 SqlProgram——使用 step_name 命名 _temp 表。
+
+        与 build_chain() 的区别：
+        - 使用 spec.compute_steps 的 step_name 命名 _temp 表（而非 idx）
+        - 确保 produces 与 SqlBuildPlanBuilder 中 ScanStep 的 table_ref 一致
+        - 支持 DAG 依赖——合流步骤 depends_on 包含所有上游 plan_id
+        - FINAL 判定基于"是否被其他步骤依赖"（而非列表位置）
+
+        Args:
+            plans: 按原始声明顺序排列的 SqlBuildPlan 列表
+            spec: 已解析的 DeveloperSpec（compute_steps 必须非空）
+            chain_id: 链标识——用于确定性 _temp 表命名
+
+        Returns:
+            含 DAG 依赖关系的 SqlProgram
+
+        Raises:
+            ValueError: spec.compute_steps 为空或与 plans 长度不匹配
+        """
+        steps = spec.compute_steps or []
+        if not steps:
+            raise ValueError(
+                "spec.compute_steps 不能为空——"
+                "至少需要一个 ComputeStep 声明才能构建多步 DAG"
+            )
+        if not plans:
+            raise ValueError("plans 不能为空——至少需要一个 SqlBuildPlan")
+        if len(steps) != len(plans):
+            raise ValueError(
+                f"spec.compute_steps 长度 ({len(steps)}) 与 plans 长度 "
+                f"({len(plans)}) 不匹配——无法正确配对"
+            )
+
+        # 构建 step_name → plan 映射（含 plan_id）
+        step_plan_map: dict[str, SqlBuildPlan] = {}
+        for cs, plan in zip(steps, plans):
+            step_plan_map[cs.step_name] = plan
+
+        # 判定 FINAL——不被任何其他步骤依赖的步骤为 FINAL
+        consumed: set[str] = set()
+        for cs in steps:
+            src_list = cs.source if isinstance(cs.source, list) else [cs.source]
+            for src in src_list:
+                if src != "input" and src in step_plan_map:
+                    consumed.add(src)
+
+        statements: list[SqlStatement] = []
+        for cs, plan in zip(steps, plans):
+            is_final = cs.step_name not in consumed
+            src_list = cs.source if isinstance(cs.source, list) else [cs.source]
+
+            # 计算依赖——所有非 input 的上游 step
+            depends_on: list[str] = []
+            for src in src_list:
+                if src != "input" and src in step_plan_map:
+                    depends_on.append(step_plan_map[src].plan_id)
+
+            # 使用 step_name 命名 _temp 表——与 SqlBuildPlanBuilder 中 ScanStep.table_ref 一致
+            produces = (
+                None
+                if is_final
+                else make_temp_name(chain_id, cs.step_name)
+            )
+
+            stmt = SqlStatement(
+                statement_id=plan.plan_id,
+                plan=plan,
+                kind=StatementKind.FINAL if is_final else StatementKind.PRODUCER,
+                depends_on=depends_on,
+                produces=produces,
+            )
+            statements.append(stmt)
+
+        # final_output 为所有 FINAL 语句的最后一个
+        final_plans = [
+            s for s in statements if s.kind == StatementKind.FINAL
+        ]
+        final_output = final_plans[-1].statement_id if final_plans else statements[-1].statement_id
+
+        return self.build_from_statements(
+            statements=statements,
+            spec_hash=spec.spec_hash,
+            final_output=final_output,
+        )
+
+    # ── 低级组装方法 ──
 
     def build_from_statements(
         self,
@@ -561,11 +740,16 @@ class SqlProgramBuilder:
         spec_hash: str = "",
         final_output: str | None = None,
     ) -> SqlProgram:
-        """从预构建的语句列表创建 SqlProgram。
+        """从预构建的语句列表创建 SqlProgram——低级入口。
+
+        高级构建方法（build_single / build_chain / build_from_compute_steps）
+        内部最终调用此方法完成 SqlProgram 组装。直接调用此方法意味着调用方
+        自行负责 StatementKind 分类、depends_on 计算和 _temp 命名——
+        仅当上述高级方法无法满足需求时使用。
 
         Args:
-            statements: SqlStatement 列表
-            temp_tables: _temp 中间表声明
+            statements: SqlStatement 列表（调用方负责 DAG 元数据正确性）
+            temp_tables: _temp 中间表声明（None 时从 statements 自动推导）
             spec_hash: 对应 spec 的 hash
             final_output: 最终输出的 statement_id
 
