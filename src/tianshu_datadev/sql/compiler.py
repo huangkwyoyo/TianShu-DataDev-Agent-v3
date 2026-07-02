@@ -206,24 +206,28 @@ class DuckDbSqlCompiler:
         )
 
     def compile(self, plan: SqlBuildPlan) -> CompiledSql:
-        """编译 SqlBuildPlan 为 CompiledSql。
+        """编译 SqlBuildPlan 为 CompiledSql——单语句 STANDALONE 注释。
 
         Args:
             plan: 经 Validator 验证通过的 SqlBuildPlan
 
         Returns:
-            CompiledSql——含 SQL 文本、SHA-256、优化记录
+            CompiledSql——含 SQL 文本（以注释块开头）、SHA-256、优化记录
 
         Raises:
             ValueError: plan.steps 为空
         """
         core = self._compile_core(plan)
 
-        # ── 确定性 hash ──
-        sql_sha256 = CompiledSql.compute_sql_hash(core.raw_sql, COMPILER_VERSION)
+        # ── 生成 STANDALONE 注释 ──
+        comment = self._render_standalone_comment(plan, core.optimized_plan)
+        final_sql = f"{comment}\n\n{core.raw_sql}"
+
+        # ── 确定性 hash（基于最终 SQL，含注释） ──
+        sql_sha256 = CompiledSql.compute_sql_hash(final_sql, COMPILER_VERSION)
 
         return CompiledSql(
-            sql=core.raw_sql,
+            sql=final_sql,
             sql_sha256=sql_sha256,
             optimized_plan=core.optimized_sql_plan,
             compiler_version=COMPILER_VERSION,
