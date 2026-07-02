@@ -11,6 +11,8 @@
 - empty: 自定义空模板——从零开始编写
 """
 
+# ruff: noqa: E501 — 模板内容为长 markdown 字符串，换行破坏可读性
+
 TEMPLATES: list[dict] = [
     {
         "template_id": "tpl_aggregation",

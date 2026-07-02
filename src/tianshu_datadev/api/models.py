@@ -135,16 +135,24 @@ class ResultSummarySummary(StrictModel):
 
 
 class ExecuteResponse(StrictModel):
-    """POST /api/execute 响应——编译+执行摘要。"""
+    """POST /api/execute 响应——编译+执行摘要。
+
+    成功路径返回 execution_trace + result_summary；
+    失败路径（Validator 阻断 / 编译失败 / RUNTIME_FAIL）返回 pipeline_error + pipeline_stages，
+    且 execution_trace / result_summary 为 None。
+    """
 
     request_id: str  # 请求唯一标识
     spec_id: str  # DeveloperSpec 标识
     plan_id: str  # SqlBuildPlan 标识
-    execution_trace: ExecutionTraceSummary  # 执行追踪摘要
-    result_summary: ResultSummarySummary  # 结果摘要
+    execution_trace: ExecutionTraceSummary | None = None  # 执行追踪摘要（失败时为 None）
+    result_summary: ResultSummarySummary | None = None  # 结果摘要（失败时为 None）
     sql_sha256: str  # 生成的 SQL 哈希（确定性校验用）
     compiler_version: str  # Compiler 版本
+    validation_passed: bool = False  # Validator 是否通过（透传给调用方判断链路状态）
     open_questions: list[OpenQuestionSummary] = []  # Builder/Validator 问题摘要
+    pipeline_error: dict | None = None  # 失败时的错误信息（stage + error_type + error_message）
+    pipeline_stages: list[dict] = []  # 失败时的各阶段状态标记
 
 
 class PackageResponse(StrictModel):
@@ -160,16 +168,25 @@ class PackageResponse(StrictModel):
 
 
 class RunAllResponse(StrictModel):
-    """POST /api/run-all 响应——全流程一键执行结果摘要。"""
+    """POST /api/run-all 响应——全流程一键执行结果摘要。
+
+    成功路径返回 execution_trace + result_summary + package_id；
+    失败路径（Validator 阻断 / RUNTIME_FAIL / 编译失败）返回 pipeline_error + pipeline_stages，
+    且 execution_trace / result_summary 为 None、package_id 为空字符串。
+    """
 
     request_id: str  # 请求唯一标识
     spec_id: str  # DeveloperSpec 标识
     plan_id: str  # SqlBuildPlan 标识
-    package_id: str  # ReviewPackage 标识
-    package_dir: str  # Package 输出目录
-    execution_trace: ExecutionTraceSummary  # 执行追踪摘要
-    result_summary: ResultSummarySummary  # 结果摘要
-    artifact_count: int  # Package 中 artifact 总数
+    package_id: str = ""  # ReviewPackage 标识（失败时为空字符串）
+    package_dir: str = ""  # Package 输出目录（失败时为空字符串）
+    execution_trace: ExecutionTraceSummary | None = None  # 执行追踪摘要（失败时为 None）
+    result_summary: ResultSummarySummary | None = None  # 结果摘要（失败时为 None）
+    artifact_count: int = 0  # Package 中 artifact 总数
+    validation_passed: bool = False  # Validator 是否通过（透传给调用方判断链路状态）
+    open_questions: list[OpenQuestionSummary] = []  # Builder/Validator 问题摘要
+    pipeline_error: dict | None = None  # 失败时的错误信息（stage + error_type + error_message）
+    pipeline_stages: list[dict] = []  # 失败时的各阶段状态标记
 
 
 # ════════════════════════════════════════════

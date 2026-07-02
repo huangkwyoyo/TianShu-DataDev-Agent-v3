@@ -9,6 +9,8 @@ Phase 1B 实现：
 """
 
 # ── IR 基础类型 ──
+# ── 交叉验证（Phase 4E 指标↔Join 一致性） ──
+from .cross_validator import cross_validate
 from .models import (
     AggregateSpec,
     AliasExpr,
@@ -29,6 +31,13 @@ from .models import (
     WindowFunction,
 )
 
+# ── SqlProgram 工厂（从 Pipeline 提取——供编排器复用） ──
+from .program_factory import (
+    build_sql_program,
+    build_sql_program_from_chain,
+    build_sql_program_from_compute_steps,
+)
+
 # ── Join 推测模型 ──
 from .relationship_hypothesis import (
     EvidenceAction,
@@ -43,6 +52,9 @@ from .relationship_planner import FakeRelationshipPlanner, RelationshipPlanner
 
 # ── 证据评级器 ──
 from .relationship_validator import RelationshipValidator
+
+# ── SpecEnricher（Phase 4D 指标推断） ──
+from .spec_enricher import FakeSpecEnricher, SpecEnricher
 
 # ── SqlBuildPlan ──
 from .sql_build_plan import (
@@ -76,19 +88,6 @@ from .temp_table import (
     validate_consumer_is_declared,
     validate_temp_table_naming,
     validate_temp_table_refs,
-)
-
-# ── SpecEnricher（Phase 4D 指标推断） ──
-from .spec_enricher import FakeSpecEnricher, SpecEnricher
-
-# ── 交叉验证（Phase 4E 指标↔Join 一致性） ──
-from .cross_validator import cross_validate
-
-# ── SqlProgram 工厂（从 Pipeline 提取——供编排器复用） ──
-from .program_factory import (
-    build_sql_program,
-    build_sql_program_from_chain,
-    build_sql_program_from_compute_steps,
 )
 
 __all__ = [

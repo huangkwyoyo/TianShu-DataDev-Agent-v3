@@ -15,7 +15,7 @@ def _parse_error_json(stderr: str) -> dict:
     pipeline 内部可能通过 logging 输出诊断信息到 stderr，
     _fail() 输出的 JSON 始终在最后一行——取最后一行解析。
     """
-    lines = [l for l in stderr.strip().split("\n") if l.strip()]
+    lines = [line for line in stderr.strip().split("\n") if line.strip()]
     if not lines:
         raise ValueError("stderr 为空，无法提取 JSON 错误响应")
     return json.loads(lines[-1])

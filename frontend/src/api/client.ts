@@ -230,9 +230,13 @@ export interface RunAllResponse {
   plan_id: string;
   package_id: string;
   package_dir: string;
-  execution_trace: ExecutionTraceSummary;
-  result_summary: ResultSummarySummary;
+  execution_trace: ExecutionTraceSummary | null;
+  result_summary: ResultSummarySummary | null;
   artifact_count: number;
+  validation_passed: boolean;
+  open_questions: OpenQuestionSummary[];
+  pipeline_error?: { stage: string; error_type: string; error_message: string } | null;
+  pipeline_stages?: { stage: string; status: string; error_type?: string; error_message?: string }[];
 }
 
 /** 通用错误：提取 API 错误信息 */

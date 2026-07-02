@@ -9,6 +9,7 @@ from tianshu_datadev.developer_spec.models import (
     SourceManifest,
 )
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
+from tianshu_datadev.planning.cross_validator import cross_validate
 from tianshu_datadev.planning.relationship_hypothesis import (
     JoinCandidate,
     JoinEvidenceLevel,
@@ -22,7 +23,6 @@ from tianshu_datadev.planning.relationship_planner import (
 from tianshu_datadev.planning.sql_build_plan import (
     SqlBuildPlanBuilder,
 )
-from tianshu_datadev.planning.cross_validator import cross_validate
 
 # ── 辅助 ──
 
@@ -236,7 +236,8 @@ def _build_test_manifest(
     """构建测试用的 SourceManifest——基于 tables_data 字典列表。
 
     Args:
-        tables_data: [{"table_ref": "tf", "source_table": "dwd.fact", "columns": [("col", "bigint"), ...]}, ...]
+        tables_data: [{"table_ref": "tf", "source_table": "dwd.fact",
+                       "columns": [("col", "bigint"), ...]}, ...]
         spec_hash: 关联的 spec hash
 
     Returns:

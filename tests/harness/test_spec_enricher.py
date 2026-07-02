@@ -22,15 +22,14 @@ from tianshu_datadev.developer_spec.models import (
     ParsedDeveloperSpec,
 )
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
+from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
 from tianshu_datadev.planning.spec_enricher import (
-    SpecEnricher,
     _METRIC_INFERENCE_SYSTEM_PROMPT,
+    SpecEnricher,
     _infer_aggregation_type,
 )
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
-from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
-
 
 # ============================================================
 # Fixtures
@@ -614,7 +613,6 @@ class TestApplyEnrichment:
 
     def test_applies_enrichment_to_spec(self, sample_spec, sample_manifest):
         """Should add inferred 'uv' metric to spec."""
-        from tianshu_datadev.api.pipeline import Pipeline
         enricher = SpecEnricher()
         result = enricher.apply_enrichment(
             sample_spec, sample_manifest
@@ -623,7 +621,6 @@ class TestApplyEnrichment:
 
     def test_no_duplicate_alias(self, sample_spec, sample_manifest):
         """Inferred metrics with conflicting aliases should not duplicate."""
-        from tianshu_datadev.api.pipeline import Pipeline
         enricher = SpecEnricher()
         result = enricher.apply_enrichment(
             sample_spec, sample_manifest
@@ -681,7 +678,6 @@ class TestCrossGrainDependency:
         self, cross_grain_spec, cross_grain_manifest
     ):
         """Pipeline._apply_enrichment 将 compute_steps 合并到 spec。"""
-        from tianshu_datadev.api.pipeline import Pipeline
         enricher = SpecEnricher()
         result = enricher.apply_enrichment(
             cross_grain_spec, cross_grain_manifest
@@ -728,7 +724,6 @@ class TestCrossGrainE2E:
         self, cross_grain_spec, cross_grain_manifest
     ):
         """跨粒度 Spec 经完整 Pipeline 可编译为合法 SQL。"""
-        from tianshu_datadev.api.pipeline import Pipeline
         from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
         from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
 
@@ -762,7 +757,6 @@ class TestCrossGrainE2E:
         self, cross_grain_spec, cross_grain_manifest
     ):
         """跨粒度 SQL 在 DuckDB 中执行正确——占比值域 [0, 1]。"""
-        from tianshu_datadev.api.pipeline import Pipeline
         from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
         from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
 
@@ -996,7 +990,6 @@ class TestScalarSubquery:
         """标量子查询 DuckDB 端到端——罚款率在 [0, 1] 范围。"""
         import duckdb
 
-        from tianshu_datadev.api.pipeline import Pipeline
         from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
         from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
         from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
@@ -1004,7 +997,6 @@ class TestScalarSubquery:
         spec = self._make_scalar_subquery_spec()
         manifest = build_manifest_from_spec(spec)
         enricher = SpecEnricher()
-        enriched = enricher.enrich(spec, manifest)
 
         # 应用 Enricher 推断——合入 compute_steps
         enriched_spec = enricher.apply_enrichment(spec, manifest)
@@ -1037,7 +1029,6 @@ class TestScalarSubquery:
             """)
 
             # 提取 chain_id 并执行 _temp 管道
-            import re
             import hashlib
 
             chain_id = hashlib.md5(

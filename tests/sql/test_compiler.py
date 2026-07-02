@@ -2,8 +2,6 @@
 
 import os
 
-import pytest
-
 from tianshu_datadev.developer_spec.models import (
     AggregationType,
     InferredWindowMetric,
@@ -12,7 +10,7 @@ from tianshu_datadev.developer_spec.models import (
     MetricVariant,
 )
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
-from tianshu_datadev.planning.models import AggregateSpec, ColumnRef, SafeIdentifier
+from tianshu_datadev.planning.models import AggregateSpec, ColumnRef
 from tianshu_datadev.planning.relationship_planner import RelationshipPlanner
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder, WindowStep
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
@@ -403,7 +401,6 @@ class TestMetricVariantsInCompiler:
 
     def test_variants_no_filter_null_base(self):
         """基础指标无 filter, variants 各有 filter——各自独立渲染。"""
-        from tianshu_datadev.planning.models import AggregateSpec as AggSpec
 
         builder = SqlBuildPlanBuilder()
         m = MetricDecl(
@@ -680,11 +677,14 @@ class TestWindowFilterWrapping:
 
         Plan 结构：Scan → Aggregate → Window → Filter(refs window col) → Sort → Limit
         """
+        from tianshu_datadev.developer_spec.models import (
+            AggregationType,
+            SortDirection,
+        )
         from tianshu_datadev.planning.models import (
             ColumnRef,
             Predicate,
             PredicateOperator,
-            SafeIdentifier,
             SortSpec,
             SqlLiteral,
             WindowExpr,
@@ -698,10 +698,6 @@ class TestWindowFilterWrapping:
             SortStep,
             SqlBuildPlan,
             WindowStep,
-        )
-        from tianshu_datadev.developer_spec.models import (
-            AggregationType,
-            SortDirection,
         )
 
         scan = ScanStep(
@@ -942,7 +938,6 @@ class TestWindowFilterWrapping:
         """_collect_window_aliases 正确收集所有 WindowStep 的别名。"""
         from tianshu_datadev.planning.models import (
             ColumnRef,
-            SortSpec,
             WindowExpr,
             WindowFunction,
         )
@@ -995,6 +990,7 @@ class TestSelfJoinCompile:
     @staticmethod
     def _build_self_join_spec():
         """构造员工自引用测试 Spec——emp 表通过 mgr_id → id 连接自身。"""
+        from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer
         from tianshu_datadev.developer_spec.models import (
             ColumnDecl,
             DimensionDecl,
@@ -1005,7 +1001,6 @@ class TestSelfJoinCompile:
             OutputSpecDecl,
             ParsedDeveloperSpec,
         )
-        from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer
 
         normalizer = FieldNormalizer()
 
@@ -1199,6 +1194,7 @@ class TestBusinessCalendar:
     @staticmethod
     def _build_time_range_spec(time_range_cfg: dict):
         """构造含 time_range 的简单单表 Spec——用于 Builder + Compiler 测试。"""
+        from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer
         from tianshu_datadev.developer_spec.models import (
             ColumnDecl,
             DimensionDecl,
@@ -1208,7 +1204,6 @@ class TestBusinessCalendar:
             ParsedDeveloperSpec,
             TimeRangeDecl,
         )
-        from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer
 
         normalizer = FieldNormalizer()
 
@@ -1692,8 +1687,8 @@ class TestConditionalBranch:
             chain_id = temp_match.group(1)
 
             # 直接用正确名称创建 temp 表
-            con.execute(f"DROP TABLE IF EXISTS _temp_test_branch_vip")
-            con.execute(f"DROP TABLE IF EXISTS _temp_test_branch_normal")
+            con.execute("DROP TABLE IF EXISTS _temp_test_branch_vip")
+            con.execute("DROP TABLE IF EXISTS _temp_test_branch_normal")
             # 按 Builder 生成的 _temp 表名重建
             con.execute(
                 f"CREATE TEMP TABLE \"_temp_c{chain_id}_branch_vip\" AS {plan_sqls[0]}"
@@ -1725,9 +1720,16 @@ class TestConditionalBranch:
     def test_conditional_branch_no_case_when_without_decl(self):
         """无 case_when 声明的普通合流步骤不应产生 CaseWhenStep。"""
         from tianshu_datadev.developer_spec.models import (
-            AggregationType, ColumnDecl, ComputeStep, InputTableDecl,
-            JoinDecl, JoinTypeEnum, MetricDecl, OutputColumnDecl,
-            OutputSpecDecl, ParsedDeveloperSpec,
+            AggregationType,
+            ColumnDecl,
+            ComputeStep,
+            InputTableDecl,
+            JoinDecl,
+            JoinTypeEnum,
+            MetricDecl,
+            OutputColumnDecl,
+            OutputSpecDecl,
+            ParsedDeveloperSpec,
         )
 
         table = InputTableDecl(
@@ -1780,12 +1782,18 @@ class TestConditionalBranch:
     def test_spec_enricher_detects_conditional_branch(self):
         """SpecEnricher 检测含 variants 的指标 → 生成条件分支 compute_steps。"""
         from tianshu_datadev.developer_spec.models import (
-            AggregationType, ColumnDecl, InputTableDecl, MetricDecl,
-            MetricFilterDecl, MetricVariant, OutputColumnDecl,
-            OutputSpecDecl, ParsedDeveloperSpec,
+            AggregationType,
+            ColumnDecl,
+            InputTableDecl,
+            MetricDecl,
+            MetricFilterDecl,
+            MetricVariant,
+            OutputColumnDecl,
+            OutputSpecDecl,
+            ParsedDeveloperSpec,
         )
-        from tianshu_datadev.planning.spec_enricher import SpecEnricher
         from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
+        from tianshu_datadev.planning.spec_enricher import SpecEnricher
 
         metrics = [
             MetricDecl(
@@ -1960,8 +1968,8 @@ class TestWindowStepBuilder:
         """无窗口指标时 _build_window_step 返回 None。"""
         from tianshu_datadev.developer_spec.models import (
             InputTableDecl,
-            OutputSpecDecl,
             OutputColumnDecl,
+            OutputSpecDecl,
             ParsedDeveloperSpec,
         )
         spec = ParsedDeveloperSpec(
@@ -1992,8 +2000,8 @@ class TestWindowStepBuilder:
         metrics = self._make_window_metrics("rn", "rk")
         from tianshu_datadev.developer_spec.models import (
             InputTableDecl,
-            OutputSpecDecl,
             OutputColumnDecl,
+            OutputSpecDecl,
             ParsedDeveloperSpec,
         )
         spec = ParsedDeveloperSpec(
@@ -2027,8 +2035,8 @@ class TestWindowStepBuilder:
         metrics = self._make_window_metrics("nt")
         from tianshu_datadev.developer_spec.models import (
             InputTableDecl,
-            OutputSpecDecl,
             OutputColumnDecl,
+            OutputSpecDecl,
             ParsedDeveloperSpec,
         )
         spec = ParsedDeveloperSpec(
@@ -2068,8 +2076,8 @@ class TestWindowStepBuilder:
         metrics = self._make_window_metrics(*all_aliases)
         from tianshu_datadev.developer_spec.models import (
             InputTableDecl,
-            OutputSpecDecl,
             OutputColumnDecl,
+            OutputSpecDecl,
             ParsedDeveloperSpec,
         )
         spec = ParsedDeveloperSpec(
@@ -2153,17 +2161,18 @@ class TestWindowStepBuilder:
     @staticmethod
     def _run_window_execution_test(metrics, expected_col: str):
         """通用窗口函数执行测试——创建测试数据 + 编译 + 执行。"""
+        import duckdb
+
         from tianshu_datadev.developer_spec.models import (
             InputTableDecl,
-            OutputSpecDecl,
             OutputColumnDecl,
+            OutputSpecDecl,
             ParsedDeveloperSpec,
         )
         from tianshu_datadev.planning.sql_build_plan import (
             ScanStep,
             SqlBuildPlan,
         )
-        import duckdb
 
         spec = ParsedDeveloperSpec(
             spec_id="test",
@@ -2230,15 +2239,14 @@ class TestWindowPipelineE2E:
 
     def test_pipeline_merges_window_metrics_into_spec(self):
         """Pipeline._apply_enrichment 将窗口指标合入 ParsedDeveloperSpec。"""
-        from tianshu_datadev.api.pipeline import Pipeline
-        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
-        from tianshu_datadev.planning.spec_enricher import SpecEnricher
         from tianshu_datadev.developer_spec.models import (
             InputTableDecl,
             OutputColumnDecl,
             OutputSpecDecl,
             ParsedDeveloperSpec,
         )
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
+        from tianshu_datadev.planning.spec_enricher import SpecEnricher
 
         # 窗口函数描述必须写在具体输出列的 description 中——SpecEnricher 逐列检测
         spec = ParsedDeveloperSpec(
@@ -2281,14 +2289,13 @@ class TestWindowPipelineE2E:
 
     def test_builder_includes_window_step_in_single_table_plan(self):
         """单表路径：Builder 将 WindowStep 插入聚合后、投影前。"""
-        from tianshu_datadev.api.pipeline import Pipeline
-        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
         from tianshu_datadev.developer_spec.models import (
             InputTableDecl,
             OutputColumnDecl,
             OutputSpecDecl,
             ParsedDeveloperSpec,
         )
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
         from tianshu_datadev.planning.spec_enricher import SpecEnricher
 
         spec = ParsedDeveloperSpec(
@@ -2340,14 +2347,13 @@ class TestWindowPipelineE2E:
 
     def test_window_deterministic_compilation(self):
         """相同窗口指标产生确定性 WindowStep 和 SQL。"""
-        from tianshu_datadev.api.pipeline import Pipeline
-        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
         from tianshu_datadev.developer_spec.models import (
             InputTableDecl,
             OutputColumnDecl,
             OutputSpecDecl,
             ParsedDeveloperSpec,
         )
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
         from tianshu_datadev.planning.spec_enricher import SpecEnricher
 
         spec = ParsedDeveloperSpec(

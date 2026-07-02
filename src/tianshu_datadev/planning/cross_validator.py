@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 from tianshu_datadev.developer_spec.models import (
-    MetricDecl,
     OpenQuestion,
     ParsedDeveloperSpec,
     SourceManifest,

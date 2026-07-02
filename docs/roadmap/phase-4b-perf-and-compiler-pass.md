@@ -1,7 +1,7 @@
 # Phase 4B：PerfValidator + Compiler Pass
 
-> 状态：待实施
-> 前置依赖：Phase 4A 退出（真实 LLM 结构化输出可测量）
+> 状态：**已完成 ✅**（2026-07-02 核销——代码已全部落地，文档补更新）
+> 前置依赖：Phase 4A 退出（真实 LLM 结构化输出可测量）✅
 
 ## 执行前必须阅读
 
@@ -89,14 +89,28 @@ git diff --check
 - Compiler Pass 的优化行为在真实 LLM 生成的 SqlBuildPlan 上出现非幂等
 - EXPLAIN 输出格式因 DuckDB 版本差异导致解析失败
 
-## 退出条件（4B → 4C 门禁）
+## 退出条件（4B → 4C 门禁）（核销结果）
 
-1. 15 条 PERF 规则全部实现
-2. REJECT / WARN / PERF_FEEDBACK 分流正确
-3. Compiler Pass 在真实 LLM 生成的 SqlBuildPlan 上幂等
-4. 慢 SQL 可生成执行计划反馈
-5. Phase 1A-4A 测试保持通过
+| # | 条件 | 状态 | 核销依据 |
+|---|------|------|---------|
+| 1 | 15 条 PERF 规则全部实现 | ✅ | `perf_validator.py`（1122 行）——PERF-001~015 全部实现，REJECT/WARN/PERF_FEEDBACK 三分流 |
+| 2 | REJECT / WARN / PERF_FEEDBACK 分流正确 | ✅ | `PerfValidator.validate()` 返回 `PerfValidationResult`，含 `reject_violations`/`warnings`/`feedbacks` 分类 |
+| 3 | Compiler Pass 幂等 | ✅ | `compiler_passes.py`（653 行）——`verify_all_passes_idempotent()` 验证 4 Pass 全部幂等 |
+| 4 | 慢 SQL 可生成执行计划反馈 | ✅ | `_check_perf015()`——基于 `execution_stats` 触发 PERF_FEEDBACK，建议 EXPLAIN ANALYZE |
+| 5 | Phase 1A-4A 测试保持通过 | ✅ | 全量 1487 测试通过 |
+
+### 代码文件清单
+
+| 文件 | 行数 | 说明 |
+|------|------|------|
+| `sql/perf_validator.py` | ~1122 | 15 条 PERF 规则 + PerfValidator + Predicate 辅助函数 |
+| `sql/compiler_passes.py` | ~653 | 4 Compiler Pass + 幂等验证函数 |
+| `sql/models.py` | — | PerfCheckResult/PerfRule/PerfSeverity/PerfValidationResult/CompilerPassRecord 等模型 |
+
+### 实施说明（2026-07-02 补文档）
+
+Phase 4B 代码在 Phase 4C/4D 之前已实际完成（4C 文档中提及"Phase 4B 已就绪"可作为佐证），但本 roadmap 文档未及时更新。本次补更新确认全部 5 项退出条件满足。
 
 ---
 
-> Phase 4B | 待实施 | 前置：Phase 4A 退出 | 下一阶段：Phase 4C
+> Phase 4B | **已完成 ✅** | 前置：Phase 4A 退出 | 下一阶段：Phase 4C

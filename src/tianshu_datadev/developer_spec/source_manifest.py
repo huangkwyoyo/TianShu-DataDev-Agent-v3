@@ -21,11 +21,11 @@ from .models import (
     ConflictType,
     FieldSource,
     ForeignKeyRef,
+    ManifestAnomaly,
     ManifestColumn,
     ManifestTable,
     OpenQuestion,
     ParsedDeveloperSpec,
-    ManifestAnomaly,
     SourceConflict,
     SourceManifest,
 )

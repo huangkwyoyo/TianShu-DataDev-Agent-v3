@@ -16,7 +16,6 @@ from pydantic import Field
 
 from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer
 from tianshu_datadev.developer_spec.models import (
-    InferredWindowMetric,
     OpenQuestion,
     ParsedDeveloperSpec,
     StrictModel,
@@ -1049,11 +1048,11 @@ class SqlBuildPlanBuilder:
             return None
 
         # 无需参数的窗口函数集合
-        _NO_ARG_FUNCTIONS = frozenset({
+        _no_arg_functions = frozenset({
             "ROW_NUMBER", "RANK", "DENSE_RANK",
         })
         # NTILE 的 input 为整数 SqlLiteral 而非列引用
-        _NTILE_FUNCTIONS = frozenset({"NTILE"})
+        _ntile_functions = frozenset({"NTILE"})
 
         window_exprs: list[WindowExpr] = []
         for iwm in spec.inferred_window_metrics:
@@ -1090,7 +1089,7 @@ class SqlBuildPlanBuilder:
 
             # 构建 input——根据函数类型选择 ColumnRef 或 SqlLiteral
             win_input: ColumnRef | SqlLiteral | None = None
-            if func_name in _NTILE_FUNCTIONS:
+            if func_name in _ntile_functions:
                 # NTILE(n)——桶数为整数 SqlLiteral
                 if iwm.input_column:
                     try:
@@ -1098,7 +1097,7 @@ class SqlBuildPlanBuilder:
                     except ValueError:
                         n_buckets = 0
                     win_input = SqlLiteral(value=n_buckets)
-            elif func_name not in _NO_ARG_FUNCTIONS and iwm.input_column:
+            elif func_name not in _no_arg_functions and iwm.input_column:
                 # LAG/LEAD/SUM_OVER/AVG_OVER/COUNT_OVER——列引用
                 win_input = ColumnRef(
                     table_ref=table_ref,
@@ -1209,7 +1208,7 @@ class SqlBuildPlanBuilder:
         spec: ParsedDeveloperSpec,
         hypothesis: RelationshipHypothesis,
     ) -> list[StepNode]:
-        """两表构建：Scan(L) → Scan(R) → (Filter*) → Join → (Aggregate) → (Window) → Project → (Sort) → (Limit)。
+        """两表构建管线：Scan→(Filter)→Join→(Aggregate)→(Window)→Project→(Sort)→(Limit)。
 
         Phase 1B 仅处理第一个 Join 候选的两表场景。
         Phase 5 新增：自引用检测——left_table == right_table 时自动生成不同别名。

@@ -11,7 +11,7 @@ spec:
   summary: "测试基础聚合流程——事实表行数低于阈值，可通过全链路校验"
 
   source_tables:
-    - name: dwd.test_fact
+    - name: test_fact
       alias: tf
       row_count: ~10万
       role: fact

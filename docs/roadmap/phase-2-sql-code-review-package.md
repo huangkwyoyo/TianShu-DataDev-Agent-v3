@@ -1,7 +1,7 @@
 # Phase 2：SQL Code Review Package v1 + DataTransformContract-lite
 
-> 状态：待实施
-> 前置依赖：Phase 1C 退出条件全部满足
+> 状态：**已完成 ✅**（2026-06-29 核销，见 Phase 3 Exit Report）
+> 前置依赖：Phase 1C 退出条件全部满足 ✅
 
 ## 执行前必须阅读
 
@@ -178,4 +178,4 @@ git diff --check
 
 ---
 
-> Phase 2 | 待实施 | 前置：Phase 1C 退出
+> Phase 2 | **已完成 ✅** | 核销依据：Phase 3 Exit HarnessReport（2026-06-29，GO） | 下一阶段：Phase 3A

@@ -1,6 +1,6 @@
 ﻿# Phase 4.6：复杂 SQL 模式渐进开放（多跳 Join + 子查询）
 
-> 状态：**规划就绪**
+> 状态：**已完成 ✅**（2026-07-02 核销——Step 1 + Step 2 全部实施并验证通过）
 > 前置依赖：Phase 3 Exit 满足全部退出条件 ✅ | Phase 4.5（内部交互验证口）✅
 > 关联文档：[[subquery-multihop-join-boundary_20260629_1500]] | [[03-sql-ir-and-compiler-plan]] §7.3 | [[AGENTS.md]] §2
 
@@ -160,17 +160,35 @@ git diff --check
 | 任一测试在 DuckDB 上行为与预期不符 | 暂停，验证 DuckDB 子查询语法限制 |
 | 发现 7 项交付规则未覆盖的合法场景边界 | 暂停，补充缺失规则 |
 
-### 退出条件（Step 1 + Step 2 全部满足）
+### 退出条件（Step 1 + Step 2 全部满足）（核销结果）
 
-1. ✅ **多跳 3 表 Join 端到端通过** — 三表关联（u→o→p）通过 Parser → Planner → Validator → Compiler → Executor
-2. ✅ **菱形 Join、超过 5 跳、单步内多 JoinStep 被 Validator 拒绝**
-3. ✅ **WEAK/NONE Join 多跳阻断** — 任意一步证据不足阻断整条链路
-4. ✅ **FROM 子查询端到端通过** — 派生表子查询通过完整链路
-5. ✅ **嵌套超 2 层子查询被拒绝**
-6. ✅ **子查询内窗口函数被拒绝**
-7. ✅ **相同 SqlBuildPlan 两次编译一致（含子查询/多跳场景）**
-8. ✅ **Phase 1A-4.5 测试保持通过（无回归）**
+| # | 条件 | 状态 | 核销依据 |
+|---|------|------|---------|
+| 1 | 多跳 3 表 Join 端到端通过 | ✅ | `test_multihop_chain.py` — 三表关联（u→o→p）通过 Parser → Planner → Validator → Compiler → Executor |
+| 2 | 菱形 Join、超过 5 跳、单步内多 JoinStep 被 Validator 拒绝 | ✅ | `test_subquery_multihop_reject.py` — V-009b/V-009c/V-009d 全部拦截 |
+| 3 | WEAK/NONE Join 多跳阻断 | ✅ | `validate_multi_hop_chain()` + `_validate_join_evidence_gate()` 二次确认 |
+| 4 | FROM 子查询端到端通过 | ✅ | `test_subquery.py` — 派生表子查询通过完整链路 |
+| 5 | 嵌套超 2 层子查询被拒绝 | ✅ | V-010a SUBQUERY_NESTING_TOO_DEEP — `_validate_subquery_steps()` 递归深度检查 |
+| 6 | 子查询内窗口函数被拒绝 | ✅ | V-010d SUBQUERY_WINDOW_FORBIDDEN |
+| 7 | 相同 SqlBuildPlan 两次编译一致 | ✅ | `test_subquery.py` — 确定性 hash 测试通过 |
+| 8 | Phase 1A-4.5 测试保持通过（无回归） | ✅ | 全量 1487 测试通过，60 个 multihop/subquery 专项测试全部通过 |
+
+### 实施代码文件清单
+
+| 文件 | 变更 | 说明 |
+|------|------|------|
+| `planning/sql_build_plan.py` | 新增 `SubqueryStep` | 子查询步骤模型（支持递归引用内层 SqlBuildPlan） |
+| `sql/validator.py` | 新增 V-009a~d + V-010a~e | 多跳 Join 四规则 + 子查询五规则 + `validate_multi_hop_chain()` |
+| `sql/compiler.py` | 新增 `_render_subquery_step()` | V-010 兼容渲染——递归编译内层 SqlBuildPlan 为派生表 |
+| `api/pipeline.py` | 集成 `validate_multi_hop_chain()` | Pipeline 中跨 SqlProgram 链级别校验 |
+| `tests/sql/test_multihop_chain.py` | 新增 | 多跳 Join 黄金路径 + 拒绝路径测试 |
+| `tests/sql/test_subquery.py` | 新增 | 子查询黄金路径 + 确定性测试 |
+| `tests/sql/test_subquery_multihop_reject.py` | 新增 | 菱形 Join / 超 5 跳 / 单步多 Join / 嵌套超深 / 窗口嵌套 拒绝测试 |
+
+### 实施说明（2026-07-02 补文档）
+
+Phase 4.6 的 Step 1（多跳 Join）和 Step 2（子查询）代码已全部落地，60 个专项测试通过，全量 1487 测试无回归。本 roadmap 文档此前标注"规划就绪"，实际代码已完成——本次更新将文档状态与代码实际状态对齐。
 
 ---
 
-> Phase 4.6 | 规划就绪 | Step 1 前置：Phase 3 Exit + Phase 4.5 | Step 2 前置：Step 1 退出
+> Phase 4.6 | **已完成 ✅** | Step 1 + Step 2 全部退出条件满足 | 下一阶段：Phase 5（Spark Ready Contract + SparkPlan）

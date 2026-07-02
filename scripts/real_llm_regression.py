@@ -24,10 +24,10 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
-from tianshu_datadev.config import load_dotenv
-from tianshu_datadev.llm.adapters.anthropic_adapter import AnthropicAdapter
-from tianshu_datadev.llm.gateway import _format_validation_errors, _import_pydantic_model
-from tianshu_datadev.prompts.manager import PromptManager
+from tianshu_datadev.config import load_dotenv  # noqa: E402
+from tianshu_datadev.llm.adapters.anthropic_adapter import AnthropicAdapter  # noqa: E402
+from tianshu_datadev.llm.gateway import _format_validation_errors, _import_pydantic_model  # noqa: E402
+from tianshu_datadev.prompts.manager import PromptManager  # noqa: E402
 
 # ════════════════════════════════════════════
 # 样本输入数据——覆盖 4 个任务 × 2-3 个场景

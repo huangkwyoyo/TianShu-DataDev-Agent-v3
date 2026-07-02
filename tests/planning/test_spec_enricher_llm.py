@@ -12,24 +12,18 @@ from __future__ import annotations
 import json
 import os
 
-import pytest
-
 from tianshu_datadev.developer_spec.models import (
     AggregationType,
     ColumnDecl,
     DimensionDecl,
     EnrichedSpec,
-    InferredComputedMetric,
-    InferredWindowMetric,
     InputTableDecl,
     MetricDecl,
-    MetricFilterDecl,
     OutputColumnDecl,
     OutputSpecDecl,
     ParsedDeveloperSpec,
 )
 from tianshu_datadev.planning.spec_enricher import SpecEnricher
-
 
 # ════════════════════════════════════════════
 # 辅助函数

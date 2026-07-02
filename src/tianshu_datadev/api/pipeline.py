@@ -12,8 +12,7 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
-logger = logging.getLogger(__name__)
-
+from tianshu_datadev.api.templates import TEMPLATES
 from tianshu_datadev.artifacts.contract_extractor import DataTransformContractExtractor
 from tianshu_datadev.artifacts.packager import PackageInputs, ReviewPackageBuilder
 from tianshu_datadev.developer_spec.models import (
@@ -22,18 +21,17 @@ from tianshu_datadev.developer_spec.models import (
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
 from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
 from tianshu_datadev.planning.cross_validator import cross_validate
-from tianshu_datadev.planning.relationship_planner import RelationshipPlanner
-from tianshu_datadev.planning.spec_enricher import SpecEnricher
-from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan, SqlBuildPlanBuilder
-from tianshu_datadev.api.templates import TEMPLATES
 from tianshu_datadev.planning.program_factory import (
     build_sql_program,
     build_sql_program_from_chain,
     build_sql_program_from_compute_steps,
 )
+from tianshu_datadev.planning.relationship_planner import RelationshipPlanner
+from tianshu_datadev.planning.spec_enricher import SpecEnricher
+from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan, SqlBuildPlanBuilder
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
 from tianshu_datadev.sql.executor import DuckDBExecutor
-from tianshu_datadev.sql.models import SqlArtifact
+from tianshu_datadev.sql.models import ExecutionStatus, SqlArtifact
 from tianshu_datadev.sql.validator import SqlBuildPlanValidator
 
 if TYPE_CHECKING:
@@ -41,6 +39,8 @@ if TYPE_CHECKING:
     from tianshu_datadev.llm.adapters.base import ProviderAdapter
     from tianshu_datadev.planning.relationship_hypothesis import RelationshipHypothesis
     from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan
+
+logger = logging.getLogger(__name__)
 
 
 def _summarize_open_questions(
@@ -660,6 +660,7 @@ class Pipeline:
         compiled = None
         program_artifact = None
         all_questions: list = []
+        validation_passed = False
         stage = "build"
 
         try:
@@ -676,6 +677,7 @@ class Pipeline:
                 )
                 validator = SqlBuildPlanValidator()
                 _chain_passed, val_questions = validator.validate_multi_hop_chain(sql_program)
+                validation_passed = _chain_passed
                 plan = plans[-1]
                 plan_questions: list = []
                 all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
@@ -717,6 +719,7 @@ class Pipeline:
                 )
                 validator = SqlBuildPlanValidator()
                 _chain_passed, val_questions = validator.validate_multi_hop_chain(sql_program)
+                validation_passed = _chain_passed
                 plan = plans[-1]
                 plan_questions: list = []
                 all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
@@ -753,6 +756,7 @@ class Pipeline:
                 # Validator 验证——blocking 问题阻断编译，非 blocking 记录供排查
                 validator = SqlBuildPlanValidator()
                 _passed, val_questions = validator.validate(plan, manifest)
+                validation_passed = _passed
                 all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
 
                 if not _passed:
@@ -775,6 +779,40 @@ class Pipeline:
                 stage = "execute"
                 execute_executor = DuckDBExecutor(table_paths=table_paths or {})
                 trace, summary = execute_executor.execute(compiled)
+
+            # ── 执行状态检查——RUNTIME_FAIL 阻断，不进入成功路径 ──
+            if isinstance(trace.status, ExecutionStatus) and trace.status == ExecutionStatus.RUNTIME_FAIL:
+                _plan_id = plan.plan_id if plan is not None else ""
+                _sql_sha256 = compiled.sql_sha256 if compiled is not None else ""
+                _compiler_ver = compiled.compiler_version if compiled is not None else ""
+                request_id = self._gen_request_id(spec)
+                self._store_result(request_id, {
+                    "parsed_spec": spec,
+                    "manifest": manifest,
+                    "plan": plan,
+                    "compiled": compiled,
+                    "trace": trace,
+                    "summary": summary,
+                    "table_mapping": table_mapping or {},
+                })
+                error_info = {
+                    "stage": "execute",
+                    "error_type": "ExecutionFailed",
+                    "error_message": trace.error_message or "SQL 执行失败",
+                }
+                return {
+                    "request_id": request_id,
+                    "spec_id": spec.spec_id,
+                    "plan_id": _plan_id,
+                    "sql_sha256": _sql_sha256,
+                    "compiler_version": _compiler_ver,
+                    "execution_trace": None,
+                    "result_summary": None,
+                    "validation_passed": validation_passed,
+                    "open_questions": _summarize_open_questions(all_questions),
+                    "pipeline_error": error_info,
+                    "pipeline_stages": self._build_pipeline_stages("execute", error_info),
+                }
 
         except Exception as e:
             # ── 错误处理：日志 + 保留已完成产物 + 返回部分结果 ──
@@ -817,6 +855,7 @@ class Pipeline:
                 "compiler_version": _compiler_ver,
                 "execution_trace": None,
                 "result_summary": None,
+                "validation_passed": validation_passed,
                 "open_questions": [],
                 "pipeline_error": error_info,
                 "pipeline_stages": self._build_pipeline_stages(stage, error_info),
@@ -855,6 +894,7 @@ class Pipeline:
             },
             "sql_sha256": compiled.sql_sha256,
             "compiler_version": compiled.compiler_version,
+            "validation_passed": validation_passed,
             "open_questions": _summarize_open_questions(all_questions),
         }
 
@@ -879,7 +919,7 @@ class Pipeline:
             符合 RunAllResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
         """
         self._purge_expired()
-        _RUN_ALL_STAGES = [
+        _run_all_stages = [
             "parser", "enrich", "build", "validate",
             "compile", "execute", "contract", "package",
         ]
@@ -887,7 +927,7 @@ class Pipeline:
         # ── Stage 1-2: Parser + Enrich ──
         parsed = self._parse_and_enrich(
             "run_all", markdown_text, table_mapping,
-            pipeline_stages=_RUN_ALL_STAGES,
+            pipeline_stages=_run_all_stages,
         )
         if not parsed["ok"]:
             return parsed["error_response"]
@@ -934,7 +974,7 @@ class Pipeline:
                     all_qs = list(plan_questions) + list(val_questions) + list(extra_questions)
                     blocked = self._build_validation_blocked_response(
                         spec, manifest, plan, all_qs,
-                        table_mapping=table_mapping, all_stages=_RUN_ALL_STAGES,
+                        table_mapping=table_mapping, all_stages=_run_all_stages,
                     )
                     blocked.update({
                         "execution_status": "not_executed",
@@ -954,6 +994,48 @@ class Pipeline:
                     program_artifact.compiled
                 )
                 execution_trace = program_result.results[-1].trace if program_result.results else None
+                execution_summary = (
+                    program_result.results[-1].summary
+                    if program_result and program_result.results else None
+                )
+
+                # ── 执行状态检查——RUNTIME_FAIL 阻断 ──
+                if execution_trace is not None \
+                        and isinstance(execution_trace.status, ExecutionStatus) \
+                        and execution_trace.status == ExecutionStatus.RUNTIME_FAIL:
+                    request_id = self._gen_request_id(spec)
+                    self._store_result(request_id, {
+                        "parsed_spec": spec,
+                        "manifest": manifest,
+                        "plan": plan,
+                        "compiled": program_artifact,
+                        "table_mapping": table_mapping or {},
+                    })
+                    error_info = {
+                        "stage": "execute",
+                        "error_type": "ExecutionFailed",
+                        "error_message": execution_trace.error_message or "SQL 执行失败",
+                    }
+                    return {
+                        "request_id": request_id,
+                        "spec_id": spec.spec_id,
+                        "plan_id": plan.plan_id,
+                        "validation_passed": passed,
+                        "execution_status": "not_executed",
+                        "row_count": 0,
+                        "elapsed_ms": 0,
+                        "open_questions": _summarize_open_questions(
+                            list(plan_questions) + list(val_questions) + list(extra_questions)
+                        ),
+                        "contract_id": "",
+                        "package_id": "",
+                        "contract": {},
+                        "compiled": compiled_sql,
+                        "pipeline_error": error_info,
+                        "pipeline_stages": self._build_pipeline_stages(
+                            "execute", error_info, _run_all_stages,
+                        ),
+                    }
 
                 stage = "contract"
                 extractor = DataTransformContractExtractor()
@@ -1019,6 +1101,27 @@ class Pipeline:
                     ),
                     "contract_id": contract.contract_id,
                     "package_id": package_manifest.package_id,
+                    "package_dir": f"{self._base_output_dir}/{request_id}",
+                    "execution_trace": {
+                        "trace_id": execution_trace.trace_id,
+                        "status": (
+                            execution_trace.status.value
+                            if hasattr(execution_trace.status, "value")
+                            else str(execution_trace.status)
+                        ),
+                        "row_count": execution_trace.row_count,
+                        "execution_time_ms": execution_trace.execution_time_ms,
+                        "error_message": execution_trace.error_message,
+                    } if execution_trace else None,
+                    "result_summary": {
+                        "summary_id": execution_summary.summary_id,
+                        "columns": execution_summary.columns,
+                        "column_types": execution_summary.column_types,
+                        "row_count": execution_summary.row_count,
+                        "null_counts": execution_summary.null_counts,
+                        "numeric_sums": execution_summary.numeric_sums,
+                    } if execution_summary else None,
+                    "artifact_count": len(package_manifest.artifacts),
                     "contract": contract.model_dump() if hasattr(contract, "model_dump") else {},
                     "compiled": compiled_sql,
                     "package_manifest": package_manifest.model_dump(
@@ -1045,7 +1148,7 @@ class Pipeline:
                     all_qs = list(plan_questions) + list(val_questions) + list(extra_questions)
                     blocked = self._build_validation_blocked_response(
                         spec, manifest, plan, all_qs,
-                        table_mapping=table_mapping, all_stages=_RUN_ALL_STAGES,
+                        table_mapping=table_mapping, all_stages=_run_all_stages,
                     )
                     blocked.update({
                         "execution_status": "not_executed",
@@ -1076,7 +1179,7 @@ class Pipeline:
                     all_qs = list(plan_questions) + list(val_questions) + list(extra_questions)
                     blocked = self._build_validation_blocked_response(
                         spec, manifest, plan, all_qs,
-                        table_mapping=table_mapping, all_stages=_RUN_ALL_STAGES,
+                        table_mapping=table_mapping, all_stages=_run_all_stages,
                     )
                     blocked.update({
                         "execution_status": "not_executed",
@@ -1095,6 +1198,44 @@ class Pipeline:
                 trace, summary = execute_executor.execute(compiled_sql)
 
                 sql_program = build_sql_program(plan, spec.spec_hash)
+
+            # ── 执行状态检查——RUNTIME_FAIL 阻断，不进入 Contract + Package ──
+            if isinstance(trace.status, ExecutionStatus) and trace.status == ExecutionStatus.RUNTIME_FAIL:
+                request_id = self._gen_request_id(spec)
+                self._store_result(request_id, {
+                    "parsed_spec": spec,
+                    "manifest": manifest,
+                    "plan": plan,
+                    "compiled": compiled_sql,
+                    "trace": trace,
+                    "summary": summary,
+                    "table_mapping": table_mapping or {},
+                })
+                error_info = {
+                    "stage": "execute",
+                    "error_type": "ExecutionFailed",
+                    "error_message": trace.error_message or "SQL 执行失败",
+                }
+                return {
+                    "request_id": request_id,
+                    "spec_id": spec.spec_id,
+                    "plan_id": plan.plan_id,
+                    "validation_passed": passed,
+                    "execution_status": "not_executed",
+                    "row_count": 0,
+                    "elapsed_ms": 0,
+                    "open_questions": _summarize_open_questions(
+                        list(plan_questions) + list(val_questions) + list(extra_questions)
+                    ),
+                    "contract_id": "",
+                    "package_id": "",
+                    "contract": {},
+                    "compiled": compiled_sql,
+                    "pipeline_error": error_info,
+                    "pipeline_stages": self._build_pipeline_stages(
+                        "execute", error_info, _run_all_stages,
+                    ),
+                }
 
             # ── 公共阶段：Contract + Package（非 ComputeSteps 路径） ──
             stage = "contract"
@@ -1121,7 +1262,10 @@ class Pipeline:
                 execution_trace=trace.model_dump(),
                 result_summary=summary.model_dump(),
                 data_transform_contract=contract.model_dump(),
-                open_questions=[q.model_dump() for q in spec.open_questions + plan_questions + extra_questions],
+                open_questions=[
+                    q.model_dump()
+                    for q in spec.open_questions + plan_questions + extra_questions
+                ],
                 validation_questions=[q.model_dump() for q in val_questions],
                 perf_results=[],
                 retry_count=0,
@@ -1162,10 +1306,14 @@ class Pipeline:
                 "open_questions": [],
                 "contract_id": _contract_id,
                 "package_id": _package_id,
-                "contract": contract.model_dump() if contract is not None and hasattr(contract, "model_dump") else {},
+                "contract": (
+                    contract.model_dump()
+                    if contract is not None and hasattr(contract, "model_dump")
+                    else {}
+                ),
                 "compiled": compiled_sql,
                 "pipeline_error": error_info,
-                "pipeline_stages": self._build_pipeline_stages(stage, error_info, _RUN_ALL_STAGES),
+                "pipeline_stages": self._build_pipeline_stages(stage, error_info, _run_all_stages),
             }
 
         # ── 成功路径（非 ComputeSteps） ──
@@ -1186,6 +1334,7 @@ class Pipeline:
             "plan_id": plan.plan_id,
             "package_id": package_manifest.package_id,
             "package_dir": f"{self._base_output_dir}/{request_id}",
+            "validation_passed": passed,
             "execution_trace": {
                 "trace_id": trace.trace_id,
                 "status": trace.status.value if hasattr(trace.status, "value") else str(trace.status),

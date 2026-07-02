@@ -1,7 +1,7 @@
 # Phase 1A：DeveloperSpec Parser + SourceManifest
 
-> 状态：待实施
-> 前置依赖：Phase 0.5 文档迁移完成
+> 状态：**已完成 ✅**（2026-06-29 核销，见 Phase 3 Exit Report）
+> 前置依赖：Phase 0.5 文档迁移完成 ✅
 
 ## 执行前必须阅读
 
@@ -251,4 +251,4 @@ git diff --check
 
 ---
 
-> Phase 1A | 待实施 | 前置：Phase 0.5 完成
+> Phase 1A | **已完成 ✅** | 核销依据：Phase 3 Exit HarnessReport（2026-06-29，GO） | 下一阶段：Phase 1B

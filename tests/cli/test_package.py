@@ -21,11 +21,12 @@ class TestCliPackage:
         assert data["status"] == "error"
         assert data["error"]["error_code"] == "NOT_FOUND"
 
-    def test_package_after_run(self, temp_spec_file):
+    def test_package_after_run(self, temp_spec_file, test_fact_csv_path):
         """先 run 再 package——顺序依赖成功。"""
         # 先执行 run
         result = subprocess.run(
-            [sys.executable, "-m", "tianshu_datadev.cli.main", "run", temp_spec_file],
+            [sys.executable, "-m", "tianshu_datadev.cli.main", "run", temp_spec_file,
+             "--table-path", f"test_fact={test_fact_csv_path}"],
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0 and "DuckDB" in result.stderr:

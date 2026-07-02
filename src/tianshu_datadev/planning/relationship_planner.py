@@ -517,7 +517,11 @@ class RelationshipPlanner:
                     "right_table": j.right_table,
                     "left_key": j.left_key,
                     "right_key": j.right_key,
-                    "join_type": str(j.join_type.value) if hasattr(j.join_type, "value") else str(j.join_type),
+                    "join_type": (
+                        str(j.join_type.value)
+                        if hasattr(j.join_type, "value")
+                        else str(j.join_type)
+                    ),
                 })
 
         return {

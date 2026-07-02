@@ -30,3 +30,9 @@ def temp_empty_file(tmp_path):
     f = tmp_path / "empty.md"
     f.write_text("", encoding="utf-8")
     return str(f)
+
+
+@pytest.fixture
+def test_fact_csv_path():
+    """返回 test_fact.csv 的绝对路径。"""
+    return os.path.join(_ROOT, "tests", "fixtures", "sql", "test_fact.csv")

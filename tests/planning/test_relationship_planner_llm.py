@@ -6,12 +6,12 @@
 所有测试使用 JSON fixture 文件模拟 LLM 输出，不依赖网络或 API Key。
 """
 
+# ruff: noqa: E501 — ManifestColumn 构造函数参数多，换行破坏可读性
+
 from __future__ import annotations
 
 import json
 import os
-
-import pytest
 
 from tianshu_datadev.developer_spec.models import (
     FieldSource,
@@ -20,7 +20,6 @@ from tianshu_datadev.developer_spec.models import (
     SourceManifest,
 )
 from tianshu_datadev.planning.relationship_planner import RelationshipPlanner
-
 
 # ════════════════════════════════════════════
 # 辅助函数

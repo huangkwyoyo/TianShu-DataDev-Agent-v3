@@ -12,7 +12,9 @@ class TestPackage:
         )
         # 通过 pipeline 直接执行 run_all（不经过 HTTP 层）
         result = pipeline.run_all(
-            golden_spec_passing, table_paths={"test_fact": csv_path}
+            golden_spec_passing,
+            table_mapping={"tf": "test_fact"},
+            table_paths={"test_fact": csv_path},
         )
         request_id = result["request_id"]
         # 通过 HTTP 层获取 package

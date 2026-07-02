@@ -5,12 +5,12 @@
   2. 已完成产物保留在 self._results 中
   3. pipeline_stages 正确标记各阶段状态
   4. 成功路径不含 pipeline_error 字段
+  5. RUNTIME_FAIL 执行阻断——不返回 execution_trace，不含 package_id
 """
 
 import pytest
 
-from tianshu_datadev.api.pipeline import Pipeline
-
+from tianshu_datadev.sql.models import ExecutionStatus, ExecutionTrace, ResultSummary
 
 # ── 阶段中文名映射 ──
 
@@ -98,7 +98,15 @@ class TestPipelineErrorHandling:
             import duckdb  # noqa: F401
         except ImportError:
             pytest.skip("DuckDB 未安装")
-        result = pipeline.execute(golden_spec_passing)
+        import os
+        csv_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv")
+        )
+        result = pipeline.execute(
+            golden_spec_passing,
+            table_mapping={"tf": "test_fact"},
+            table_paths={"test_fact": csv_path},
+        )
         assert "pipeline_error" not in result
         assert "request_id" in result
         assert "execution_trace" in result
@@ -111,7 +119,15 @@ class TestPipelineErrorHandling:
             import duckdb  # noqa: F401
         except ImportError:
             pytest.skip("DuckDB 未安装")
-        result = pipeline.execute(golden_spec_passing)
+        import os
+        csv_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv")
+        )
+        result = pipeline.execute(
+            golden_spec_passing,
+            table_mapping={"tf": "test_fact"},
+            table_paths={"test_fact": csv_path},
+        )
         # 成功路径不含 pipeline_error / pipeline_stages
         assert "pipeline_error" not in result
         assert "pipeline_stages" not in result
@@ -199,6 +215,89 @@ class TestPipelineErrorHandling:
         # enrich 失败时 request_id 非空
         assert result2["request_id"] != ""
         assert result2["request_id"].startswith("req_")
+
+    # ── Phase 4.7: Execute 阶段 RUNTIME_FAIL 阻断 ──
+
+    def test_execute_failure_blocks_on_runtime_fail(self, pipeline, golden_spec_passing):
+        """execute() 在 Executor 返回 RUNTIME_FAIL 时阻断——不返回 execution_trace。"""
+        import tianshu_datadev.api.pipeline as pipeline_mod
+
+        class FailingExecutor:
+            """模拟执行失败——返回 RUNTIME_FAIL 而非抛异常。"""
+            def execute(self, compiled):
+                trace = ExecutionTrace(
+                    trace_id="trace_fail_e",
+                    plan_id=compiled.input_plan_hash,
+                    engine="duckdb", generated_sql=compiled.sql,
+                    status=ExecutionStatus.RUNTIME_FAIL,
+                    row_count=0, execution_time_ms=10.0,
+                    error_message="模拟执行失败",
+                )
+                summary = ResultSummary(
+                    summary_id="summary_fail_e",
+                    trace_id="trace_fail_e",
+                    engine="duckdb", columns=[], column_types=[],
+                    row_count=0, null_counts={}, numeric_sums={}, sample_rows=[],
+                )
+                return trace, summary
+
+        original = pipeline_mod.DuckDBExecutor
+        pipeline_mod.DuckDBExecutor = lambda **kw: FailingExecutor()
+        try:
+            result = pipeline.execute(golden_spec_passing)
+        finally:
+            pipeline_mod.DuckDBExecutor = original
+
+        # 阻断：返回 pipeline_error
+        assert "pipeline_error" in result
+        assert result["pipeline_error"]["stage"] == "execute"
+        assert result["pipeline_error"]["error_type"] == "ExecutionFailed"
+        # 编译已成功→sql_sha256 非空（compile 阶段已完成）
+        assert result["sql_sha256"] != ""
+        # 不应有 execution_trace 和 result_summary（阻断不返回）
+        assert result["execution_trace"] is None
+        assert result["result_summary"] is None
+        # pipeline_stages 标记 execute=failed
+        stages = {s["stage"]: s["status"] for s in result["pipeline_stages"]}
+        assert stages["execute"] == "failed"
+
+    def test_execute_failure_preserves_intermediate_artifacts(self, pipeline, golden_spec_passing):
+        """execute() RUNTIME_FAIL → 中间产物保留到 _results 供事后检索。"""
+        import tianshu_datadev.api.pipeline as pipeline_mod
+
+        class FailingExecutor:
+            def execute(self, compiled):
+                trace = ExecutionTrace(
+                    trace_id="trace_fail_p",
+                    plan_id=compiled.input_plan_hash,
+                    engine="duckdb", generated_sql=compiled.sql,
+                    status=ExecutionStatus.RUNTIME_FAIL,
+                    row_count=0, execution_time_ms=5.0,
+                    error_message="simulated",
+                )
+                summary = ResultSummary(
+                    summary_id="summary_fail_p",
+                    trace_id="trace_fail_p",
+                    engine="duckdb", columns=[], column_types=[],
+                    row_count=0, null_counts={}, numeric_sums={}, sample_rows=[],
+                )
+                return trace, summary
+
+        original = pipeline_mod.DuckDBExecutor
+        pipeline_mod.DuckDBExecutor = lambda **kw: FailingExecutor()
+        try:
+            result = pipeline.execute(golden_spec_passing)
+        finally:
+            pipeline_mod.DuckDBExecutor = original
+
+        # 产物保留到 _results
+        request_id = result["request_id"]
+        assert request_id in pipeline._results
+        saved = pipeline._results[request_id]
+        assert "parsed_spec" in saved
+        assert "plan" in saved
+        assert "trace" in saved
+        assert saved["trace"].error_message == "simulated"
 
 
 class TestPipelineStagesHelper:

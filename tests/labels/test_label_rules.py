@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from tianshu_datadev.developer_spec.models import (
     ColumnDecl,
     InputTableDecl,
@@ -26,6 +28,12 @@ from tianshu_datadev.planning.sql_build_plan import (
     CaseWhenStep,
     ScanStep,
     SqlBuildPlan,
+)
+from tianshu_datadev.profiling.enum_profiler import ColumnSample, EnumProfiler
+from tianshu_datadev.profiling.models import (
+    EnumConfidenceTier,
+    EnumFieldClass,
+    EnumProfile,
 )
 from tianshu_datadev.validation.label_validator import validate_label_enums
 
@@ -332,16 +340,6 @@ class TestLabelEnumEdgeCases:
 # ════════════════════════════════════════════
 # Phase 3B.1：EnumProfiler 测试
 # ════════════════════════════════════════════
-
-
-import pytest
-
-from tianshu_datadev.profiling.enum_profiler import ColumnSample, EnumProfiler
-from tianshu_datadev.profiling.models import (
-    EnumConfidenceTier,
-    EnumFieldClass,
-    EnumProfile,
-)
 
 
 class TestEnumProfilerFlag:

@@ -10,10 +10,11 @@ import pytest
 class TestCliRun:
     """tianshu run <file>——全流程执行+打包。"""
 
-    def test_run_success(self, temp_spec_file):
+    def test_run_success(self, temp_spec_file, test_fact_csv_path):
         """全流程执行成功 → JSON + 退出码 0。"""
         result = subprocess.run(
-            [sys.executable, "-m", "tianshu_datadev.cli.main", "run", temp_spec_file],
+            [sys.executable, "-m", "tianshu_datadev.cli.main", "run", temp_spec_file,
+             "--table-path", f"test_fact={test_fact_csv_path}"],
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0 and "DuckDB" in result.stderr:
