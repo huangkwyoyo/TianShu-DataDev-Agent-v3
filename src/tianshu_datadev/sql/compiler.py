@@ -216,90 +216,17 @@ class DuckDbSqlCompiler:
         Raises:
             ValueError: plan.steps 为空
         """
-        if not plan.steps:
-            raise ValueError("SqlBuildPlan.steps 为空——无法编译")
-
-        # 最小安全网：确认所有 step 都有 step_id（Validator 通过的基本条件）
-        for step in plan.steps:
-            if not step.step_id:
-                raise ValueError(
-                    f"Step 类型 {step.step_type} 缺少 step_id——"
-                    f"SqlBuildPlan 可能未经过 Validator 验证"
-                )
-
-        # 计算输入 plan hash
-        input_plan_hash = SqlBuildPlan.generate_plan_hash(plan)
-
-        # ── Compiler Pass 阶段 ──
-        pass_records: list[CompilerPassRecord] = []
-        norm_records: list[PredicateNormRecord] = []
-        fold_records: list[ConstantFoldRecord] = []
-        pruned_cols: list[str] = []
-        eliminated_sorts: list[str] = []
-
-        # Pass 1: 列裁剪
-        plan, prune_record, pruned_cols = column_pruning(plan)
-        pass_records.append(prune_record)
-
-        # Pass 2: 谓词规范化
-        plan, norm_records = predicate_normalization(plan)
-        if norm_records:
-            pass_records.append(
-                CompilerPassRecord(
-                    pass_name="predicate_normalization",
-                    pass_version="1.0.0",
-                    applied=True,
-                    changes_count=len(norm_records),
-                    input_ast_snippet="see predicate_normalizations",
-                    output_ast_snippet=f"{len(norm_records)} changes",
-                )
-            )
-
-        # Pass 3: 无用排序消除
-        plan, sort_record, eliminated_sorts = sort_elimination(plan)
-        pass_records.append(sort_record)
-
-        # Pass 4: 常量折叠
-        plan, fold_records = constant_folding(plan)
-        if fold_records:
-            pass_records.append(
-                CompilerPassRecord(
-                    pass_name="constant_folding",
-                    pass_version="1.0.0",
-                    applied=True,
-                    changes_count=len(fold_records),
-                    input_ast_snippet="see constant_folds",
-                    output_ast_snippet=f"{len(fold_records)} folds",
-                )
-            )
-
-        # 计算优化后 plan hash
-        output_plan_hash = SqlBuildPlan.generate_plan_hash(plan)
-
-        # ── SQL 渲染阶段 ──
-        sql = self._render_sql(plan)
+        core = self._compile_core(plan)
 
         # ── 确定性 hash ──
-        sql_sha256 = CompiledSql.compute_sql_hash(sql, COMPILER_VERSION)
-
-        # ── 构建 OptimizedSQLPlan ──
-        optimized_plan = OptimizedSQLPlan(
-            input_plan_hash=input_plan_hash,
-            output_plan_hash=output_plan_hash,
-            applied_passes=pass_records,
-            rejected_directives=[],
-            column_pruning_removed=pruned_cols,
-            predicate_normalizations=norm_records,
-            eliminated_sorts=eliminated_sorts,
-            constant_folds=fold_records,
-        )
+        sql_sha256 = CompiledSql.compute_sql_hash(core.raw_sql, COMPILER_VERSION)
 
         return CompiledSql(
-            sql=sql,
+            sql=core.raw_sql,
             sql_sha256=sql_sha256,
-            optimized_plan=optimized_plan,
+            optimized_plan=core.optimized_sql_plan,
             compiler_version=COMPILER_VERSION,
-            input_plan_hash=input_plan_hash,
+            input_plan_hash=core.input_plan_hash,
         )
 
     def compile_to_artifact(
