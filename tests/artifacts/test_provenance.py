@@ -95,6 +95,8 @@ class TestProvenance:
             "source_manifest_hash:",
             "sql_build_plan_hash:",
             "compiled_sql_sha256:",
+            "compiled_program_sha256:",
+            "statement_sql_sha256:",
             "optimized_plan_hash:",
             "data_transform_contract_hash:",
             "execution_trace_hash:",
@@ -107,8 +109,8 @@ class TestProvenance:
         for field in required_fields:
             assert field in yml, f"provenance.yml 缺少字段: {field}"
 
-        # 验证版本
-        assert "compiler_version: \"1.0.0\"" in yml
+        # 验证版本（与 provenance.py 中的常量一致）
+        assert "compiler_version: \"1.1.0\"" in yml
         assert "validator_version: \"1.0.0\"" in yml
 
     def test_provenance_records_retry_count(self):

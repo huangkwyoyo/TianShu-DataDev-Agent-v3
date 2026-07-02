@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import platform
 import sys
 
@@ -44,6 +45,28 @@ def generate_provenance(
         artifact_sql_sha256 = _safe_get(
             inputs.sql_artifact["compiled_sql"], "sql_sha256", ""
         )
+
+    # ── 多语句 hash（新增） ──
+    compiled_program_sha256 = ""
+    statement_sql_sha256_entries: list[dict] = []
+    if inputs.sql_program_artifact:
+        from tianshu_datadev.artifacts.packager import ReviewPackageBuilder
+
+        full_sql = ReviewPackageBuilder._assemble_full_sql(
+            inputs.sql_program_artifact, inputs.sql_artifact
+        )
+        compiled_program_sha256 = hashlib.sha256(
+            full_sql.encode("utf-8")
+        ).hexdigest()
+        # 逐语句 hash
+        compiled = inputs.sql_program_artifact.get("compiled", {})
+        for cs in compiled.get("statements", []):
+            stmt_sql = cs.get("sql", "")
+            stmt_hash = hashlib.sha256(stmt_sql.encode("utf-8")).hexdigest()
+            statement_sql_sha256_entries.append({
+                "sql_sha256": stmt_hash,
+            })
+
     contract_id = _safe_get(inputs.data_transform_contract, "contract_id", "")
     trace_id = _safe_get(inputs.execution_trace, "trace_id", "") if inputs.execution_trace else ""
 
@@ -72,6 +95,9 @@ source_manifest_hash: "{source_manifest_hash}"
 relationship_hypothesis_hash: "{hypothesis_hash}"
 sql_build_plan_hash: "{sql_build_plan_hash}"
 compiled_sql_sha256: "{artifact_sql_sha256}"
+# ── 多语句 hash（单语句时为空） ──
+compiled_program_sha256: "{compiled_program_sha256}"
+statement_sql_sha256: {json.dumps(statement_sql_sha256_entries, ensure_ascii=False)}
 optimized_plan_hash: "{sql_build_plan_hash}"
 data_transform_contract_hash: "{data_transform_contract_hash}"
 snapshot_manifest_hash: "{snapshot_manifest_hash}"

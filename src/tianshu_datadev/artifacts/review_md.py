@@ -161,6 +161,31 @@ def generate_review_md(
         lines.append("本项目为单表查询，无 Join 关系。")
         lines.append("")
 
+    # 3.5 处理步骤说明（从 SqlProgram.statements[].intent 读取）
+    sql_program = inputs.sql_program
+    if sql_program:
+        statements = sql_program.get("statements", [])
+        if len(statements) > 1:
+            lines.append("## 3.5 处理步骤说明")
+            lines.append("")
+            for stmt in statements:
+                sid = stmt.get("statement_id", "")
+                intent = stmt.get("intent", "")
+                kind = stmt.get("kind", "")
+                produces = stmt.get("produces", "")
+                if intent:
+                    kind_label = {
+                        "PRODUCER": "中间步骤",
+                        "CONSUMER": "中间步骤",
+                        "FINAL": "最终输出",
+                        "STANDALONE": "单步查询",
+                    }.get(kind, kind)
+                    produce_info = f" → `{produces}`" if produces else ""
+                    lines.append(
+                        f"- **[{kind_label}]** `{sid}`{produce_info}：{intent}"
+                    )
+            lines.append("")
+
     # 4. SQL
     lines.append("## 4. SQL（编译产物）")
     lines.append("")
