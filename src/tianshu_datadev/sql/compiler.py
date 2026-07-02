@@ -16,11 +16,13 @@ from __future__ import annotations
 
 from tianshu_datadev.developer_spec.models import AggregationType
 from tianshu_datadev.planning.models import (
+    AggregateSpec,
     Predicate,
     PredicateOperator,
     SqlLiteral,
     WindowExpr,
 )
+from tianshu_datadev.sql.expression_guard import validate_input_expression
 from tianshu_datadev.planning.sql_build_plan import (
     AggregateStep,
     CaseWhenStep,
@@ -59,6 +61,22 @@ from .models import (
 
 COMPILER_VERSION = "1.0.0"
 
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class CoreCompileResult:
+    """_compile_core() 的返回值——纯编译产物，不含注释和 CREATE TEMP TABLE 包装。
+
+    将编译核心与注释渲染解耦：compile() 和 compile_program()
+    各自在 CoreCompileResult 之上添加自己的注释策略。
+    """
+
+    raw_sql: str                      # 优化后的裸 SQL（无注释，无 CREATE TEMP TABLE 包装）
+    optimized_plan: SqlBuildPlan      # 优化后的 SqlBuildPlan（供注释渲染使用）
+    optimized_sql_plan: OptimizedSQLPlan  # 优化 Pass 记录（供调试/审计）
+    input_plan_hash: str              # 优化前 SqlBuildPlan 的 hash
+
 
 class DuckDbSqlCompiler:
     """确定性 DuckDB SQL 编译器。
@@ -89,6 +107,104 @@ class DuckDbSqlCompiler:
         if table_mapping:
             self._validate_table_mapping(table_mapping)
         self._table_mapping = table_mapping or {}
+
+    def _compile_core(self, plan: SqlBuildPlan) -> CoreCompileResult:
+        """纯编译核心——运行 Pass + 渲染 SQL，不添加注释。
+
+        将当前 compile() 中的校验 → Pass → 渲染逻辑抽取到此方法。
+        compile() 和 compile_program() 后续重构为调用
+        _compile_core() 后再添加各自的注释策略。
+
+        Args:
+            plan: 经 Validator 验证通过的 SqlBuildPlan
+
+        Returns:
+            CoreCompileResult——含 raw_sql、优化后 plan、Pass 记录、input_plan_hash
+
+        Raises:
+            ValueError: plan.steps 为空或 step 缺少 step_id
+        """
+        if not plan.steps:
+            raise ValueError("SqlBuildPlan.steps 为空——无法编译")
+
+        # 最小安全网：确认所有 step 都有 step_id
+        for step in plan.steps:
+            if not step.step_id:
+                raise ValueError(
+                    f"Step 类型 {step.step_type} 缺少 step_id——"
+                    f"SqlBuildPlan 可能未经过 Validator 验证"
+                )
+
+        # 计算输入 plan hash
+        input_plan_hash = SqlBuildPlan.generate_plan_hash(plan)
+
+        # ── Compiler Pass 阶段 ──
+        pass_records: list[CompilerPassRecord] = []
+        norm_records: list[PredicateNormRecord] = []
+        fold_records: list[ConstantFoldRecord] = []
+        pruned_cols: list[str] = []
+        eliminated_sorts: list[str] = []
+
+        # Pass 1: 列裁剪
+        plan, prune_record, pruned_cols = column_pruning(plan)
+        pass_records.append(prune_record)
+
+        # Pass 2: 谓词规范化
+        plan, norm_records = predicate_normalization(plan)
+        if norm_records:
+            pass_records.append(
+                CompilerPassRecord(
+                    pass_name="predicate_normalization",
+                    pass_version="1.0.0",
+                    applied=True,
+                    changes_count=len(norm_records),
+                    input_ast_snippet="see predicate_normalizations",
+                    output_ast_snippet=f"{len(norm_records)} changes",
+                )
+            )
+
+        # Pass 3: 无用排序消除
+        plan, sort_record, eliminated_sorts = sort_elimination(plan)
+        pass_records.append(sort_record)
+
+        # Pass 4: 常量折叠
+        plan, fold_records = constant_folding(plan)
+        if fold_records:
+            pass_records.append(
+                CompilerPassRecord(
+                    pass_name="constant_folding",
+                    pass_version="1.0.0",
+                    applied=True,
+                    changes_count=len(fold_records),
+                    input_ast_snippet="see constant_folds",
+                    output_ast_snippet=f"{len(fold_records)} folds",
+                )
+            )
+
+        # 计算优化后 plan hash
+        output_plan_hash = SqlBuildPlan.generate_plan_hash(plan)
+
+        # ── SQL 渲染阶段 ──
+        raw_sql = self._render_sql(plan)
+
+        # ── 构建 OptimizedSQLPlan ──
+        optimized_sql_plan = OptimizedSQLPlan(
+            input_plan_hash=input_plan_hash,
+            output_plan_hash=output_plan_hash,
+            applied_passes=pass_records,
+            rejected_directives=[],
+            column_pruning_removed=pruned_cols,
+            predicate_normalizations=norm_records,
+            eliminated_sorts=eliminated_sorts,
+            constant_folds=fold_records,
+        )
+
+        return CoreCompileResult(
+            raw_sql=raw_sql,
+            optimized_plan=plan,
+            optimized_sql_plan=optimized_sql_plan,
+            input_plan_hash=input_plan_hash,
+        )
 
     def compile(self, plan: SqlBuildPlan) -> CompiledSql:
         """编译 SqlBuildPlan 为 CompiledSql。
@@ -689,6 +805,14 @@ class DuckDbSqlCompiler:
             # 确定聚合输入：
             #   优先级：input_expression > input_column > "*"
             if m.input_expression:
+                # ── 编译器侧最终防线：白名单正则 + SQL 关键字检查 ──
+                is_valid, err_msg = validate_input_expression(
+                    m.input_expression, mode="compiler"
+                )
+                if not is_valid:
+                    raise ValueError(
+                        f"AggregateSpec '{m.alias}' 的 input_expression 不安全——{err_msg}"
+                    )
                 # 多字段表达式——如 "quantity * unit_price"（不加前缀，已是完整表达式）
                 input_part = m.input_expression
             elif m.input_column:
