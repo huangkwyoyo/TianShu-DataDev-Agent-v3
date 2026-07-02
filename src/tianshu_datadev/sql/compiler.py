@@ -1191,6 +1191,88 @@ class DuckDbSqlCompiler:
         cleaned = cleaned.strip()
         return f"-- {label}: {cleaned}"
 
+    # ── 注释块渲染 ──
+
+    def _render_statement_comment(
+        self,
+        stmt: SqlStatement,
+        program: SqlProgram,
+        optimized_plan: SqlBuildPlan,
+    ) -> str:
+        """从 intent + 优化后 plan 生成 5 行注释块。
+
+        Args:
+            stmt: 当前语句（含 intent）
+            program: 所属 SqlProgram（取 final_output_target）
+            optimized_plan: 优化后的 SqlBuildPlan（保证注释与最终 SQL 一致）
+
+        Returns:
+            完整的 5 行注释块字符串
+        """
+        # ── Step 标签 ──
+        if stmt.kind == StatementKind.STANDALONE:
+            step_label = f"Standalone Query: {stmt.plan.plan_id[:8]}"
+        elif stmt.kind == StatementKind.FINAL:
+            step_label = f"Final Output: {program.final_output_target or 'result'}"
+        else:
+            step_label = stmt.produces or stmt.statement_id
+
+        # ── Intent ──
+        intent = stmt.intent or "（无描述）"
+
+        # ── Operation ──
+        operation = self._derive_operation_description(optimized_plan)
+
+        # ── Inputs ──
+        inputs = self._derive_input_tables(optimized_plan)
+
+        # ── Output ──
+        if stmt.kind == StatementKind.FINAL:
+            output_str = program.final_output_target or "(最终结果集)"
+        elif stmt.kind == StatementKind.STANDALONE:
+            output_str = "(直接返回)"
+        else:
+            output_str = stmt.produces or "(中间结果)"
+
+        lines = [
+            self._render_comment_line("Step", step_label),
+            self._render_comment_line("Intent", intent),
+            self._render_comment_line("Operation", operation),
+            self._render_comment_line("Inputs", inputs),
+            self._render_comment_line("Output", output_str),
+        ]
+        return "\n".join(lines)
+
+    def _render_standalone_comment(
+        self, plan: SqlBuildPlan, optimized_plan: SqlBuildPlan,
+    ) -> str:
+        """为 compile() 单语句生成 STANDALONE 注释块。
+
+        与 _render_statement_comment() 不同——compile() 没有 SqlStatement 和
+        SqlProgram 上下文。此方法内部构造 transient 对象驱动渲染，不暴露到 artifact。
+
+        Args:
+            plan: 原始 SqlBuildPlan（取 plan_id）
+            optimized_plan: 优化后的 SqlBuildPlan
+
+        Returns:
+            完整 5 行注释块字符串
+        """
+        transient_stmt = SqlStatement(
+            statement_id=plan.plan_id,
+            plan=optimized_plan,
+            kind=StatementKind.STANDALONE,
+            intent="单语句直接生成目标查询结果。",
+        )
+        transient_program = SqlProgram(
+            program_id="",
+            spec_id="",
+            statements=[transient_stmt],
+        )
+        return self._render_statement_comment(
+            transient_stmt, transient_program, optimized_plan,
+        )
+
     # ── 表名解析 ──
 
     @staticmethod
