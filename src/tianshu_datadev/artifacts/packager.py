@@ -236,17 +236,39 @@ class ReviewPackageBuilder:
 
         return artifacts
 
+    @staticmethod
+    def _assemble_full_sql(sql_program_artifact: dict | None, sql_artifact: dict | None) -> str:
+        """拼接完整多语句 SQL——Packager 和 Provenance 共用。
+
+        多语句场景：按 statement_order 拼接所有语句 SQL + cleanup。
+        单语句场景：从 sql_artifact 取 compiled_sql.sql。
+        """
+        sql_parts: list[str] = []
+        if sql_program_artifact:
+            compiled = sql_program_artifact.get("compiled", {})
+            statements = compiled.get("statements", [])
+            for compiled_sql in statements:
+                sql = compiled_sql.get("sql", "")
+                if sql:
+                    sql_parts.append(sql)
+            cleanup = compiled.get("cleanup_sql", [])
+            if cleanup:
+                sql_parts.append("")  # 空行分隔
+                sql_parts.extend(cleanup)
+        elif sql_artifact and "compiled_sql" in sql_artifact:
+            sql_parts.append(sql_artifact["compiled_sql"].get("sql", ""))
+        return "\n\n".join(p for p in sql_parts if p)
+
     def _write_sql(
         self, package_dir: str, inputs: PackageInputs
     ) -> list[ArtifactRef]:
-        """写入 sql/ 目录。"""
+        """写入 sql/ 目录——完整多语句 SQL。"""
         artifacts: list[ArtifactRef] = []
         subdir = os.path.join(package_dir, "sql")
 
-        # main.sql——编译产物 SQL
-        sql_content = ""
-        if inputs.sql_artifact and "compiled_sql" in inputs.sql_artifact:
-            sql_content = inputs.sql_artifact["compiled_sql"].get("sql", "")
+        sql_content = self._assemble_full_sql(
+            inputs.sql_program_artifact, inputs.sql_artifact
+        )
 
         sql_path = os.path.join(subdir, "main.sql")
         self._write_file(sql_path, sql_content)

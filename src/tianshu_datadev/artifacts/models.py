@@ -391,3 +391,5 @@ class PackageInputs(StrictModel):
     validation_questions: list[dict] = []  # 来自 Validator 的 OpenQuestion 列表
     perf_results: list[dict] = []  # PerfValidationResult 序列化列表
     retry_count: int = 0  # 返工轮次
+    sql_program: dict | None = None  # SqlProgram.model_dump()——含 intent，供 review.md 和 provenance 使用
+    sql_program_artifact: dict | None = None  # SqlProgramArtifact.model_dump()——多语句编译产物
