@@ -1242,6 +1242,85 @@ class DuckDbSqlCompiler:
                 return self._table_mapping.get(base, base)
         return self._table_mapping.get(table_ref, table_ref)
 
+    # ── Operation 描述 ──
+
+    def _describe_single_step(self, step) -> str | None:
+        """单 step → 中文短语——用于 Operation 描述。
+
+        基于优化后 plan.steps，跳过信息量低的 step（如仅含单列的 ProjectStep）。
+        """
+        if isinstance(step, ScanStep):
+            n = len(step.required_columns) if step.required_columns else 0
+            table = step.table_ref
+            return f"从 {table} 扫描 {n} 个字段" if n else f"从 {table} 扫描"
+        elif isinstance(step, FilterStep):
+            # 取 predicate 的简要描述
+            pred_desc = self._render_predicate(step.predicate)
+            # 限制长度，避免注释过长
+            if len(pred_desc) > 60:
+                pred_desc = pred_desc[:57] + "..."
+            return f"过滤条件：{pred_desc}"
+        elif isinstance(step, JoinStep):
+            keys = ", ".join(
+                f"{lk.column_name}={rk.column_name}"
+                for lk, rk in step.join_keys
+            )
+            return f"与 {step.right_table_ref} 按 {keys} 关联"
+        elif isinstance(step, AggregateStep):
+            keys = ", ".join(gk.column_name for gk in step.group_keys)
+            n_metrics = len(step.metrics)
+            return f"按 {keys} 分组，聚合 {n_metrics} 个指标"
+        elif isinstance(step, WindowStep):
+            aliases = ", ".join(
+                wexpr.alias for wexpr in step.window_exprs if wexpr.alias
+            )
+            return f"计算窗口函数：{aliases}" if aliases else "计算窗口函数"
+        elif isinstance(step, ProjectStep):
+            n = len(step.columns)
+            return f"输出 {n} 列" if n > 1 else None  # 单列投影信息量低，跳过
+        elif isinstance(step, SortStep):
+            cols = ", ".join(s.column for s in step.order_by)
+            return f"按 {cols} 排序"
+        elif isinstance(step, LimitStep):
+            return f"限制 {step.limit} 行"
+        elif isinstance(step, CaseWhenStep):
+            return f"计算 {step.alias} 分类标签" if step.alias else "计算分类标签"
+        return None
+
+    def _derive_operation_description(self, plan: SqlBuildPlan) -> str:
+        """从优化后的 plan.steps 生成中文操作描述短语串。
+
+        按 step 顺序提取，连成逗号分隔的一句话。跳过信息量低的 step。
+        """
+        parts: list[str] = []
+        for step in plan.steps:
+            desc = self._describe_single_step(step)
+            if desc:
+                parts.append(desc)
+        if not parts:
+            return "（无操作描述）"
+        return "，".join(parts) + "。"
+
+    def _derive_input_tables(self, plan: SqlBuildPlan) -> str:
+        """从 plan.steps 提取输入表名（ScanStep + JoinStep 去重）。
+
+        仅提取非 _temp_ 前缀的原始输入表。
+        """
+        tables: list[str] = []
+        seen: set[str] = set()
+        for step in plan.steps:
+            if isinstance(step, ScanStep):
+                ref = step.table_ref
+                if ref not in seen and not ref.startswith("_temp_"):
+                    tables.append(ref)
+                    seen.add(ref)
+            elif isinstance(step, JoinStep):
+                ref = step.right_table_ref
+                if ref not in seen and not ref.startswith("_temp_"):
+                    tables.append(ref)
+                    seen.add(ref)
+        return ", ".join(tables) if tables else "（无输入表）"
+
     # ── 多语句编译（Phase 3A） ──
 
     def compile_program(self, program: SqlProgram) -> SqlProgramArtifact:
