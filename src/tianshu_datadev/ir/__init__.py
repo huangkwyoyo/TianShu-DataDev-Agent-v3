@@ -1,10 +1,13 @@
-"""IR 数据结构与 Protocol 接口定义。
+"""已废弃——此包仅保留 Phase 0 的旧 Protocol 兼容层。
 
-包含三层 IR 的 Protocol 接口和状态枚举。
-Phase 1 将添加具体 dataclass 实现。
+所有 Protocol 已被严格 Pydantic 模型替代，请勿在生产代码中导入。
+唯一合法使用方：tests/test_ir_protocols.py（架构演进追溯测试）。
 
-注意：ExecutionTrace 和 ResultSummary 已迁移至 tianshu_datadev.sql.models
-（严格 Pydantic 模型，替代旧 Protocol）。
+生产代码应直接使用：
+  - developer_spec.models（ParsedDeveloperSpec、SourceManifest 等）
+  - planning.sql_build_plan（SqlBuildPlan、AggregateStep 等）
+  - spark.models（DataTransformContractV1 等）
+  - sql.models（ExecutionTrace、ResultSummary 等）
 """
 
 from .protocols import (

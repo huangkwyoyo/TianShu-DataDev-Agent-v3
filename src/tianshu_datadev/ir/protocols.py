@@ -1,18 +1,35 @@
-"""DEPRECATED — Phase 1 及以后使用 strict Pydantic 模型（extra="forbid"）替代。
+"""══════════════════════════════════════════════════════════════════════════════
+已废弃——禁止在生产代码中导入！仅 test_ir_protocols.py 有权使用。
+═══════════════════════════════════════════════════════════════════════════════
 
-Phase 0 只定义最基础的 Protocol 接口和状态枚举。
-这些接口规定了各模块之间的契约——不包含实现代码。
+此文件是 Phase 0 的旧 Protocol 兼容层，保留仅用于测试的架构演进追溯。
+以下 Protocol 均已被 Phase 1-5 的严格 Pydantic 模型（extra="forbid"）替代。
 
-迁移规划：
-- ParsedDeveloperSpec → tianshu_datadev.developer_spec.models.ParsedDeveloperSpec
-- SourceManifest → tianshu_datadev.developer_spec.models.SourceManifest
-- 后续 Protocol 将在对应 Phase 中被严格 Pydantic 模型替换
+┌────────────────────────────┬──────────────────────────────────────────────────┐
+│ 旧 Protocol（本文件）       │ 当前替代（生产代码使用）                          │
+├────────────────────────────┼──────────────────────────────────────────────────┤
+│ RequirementIR              │ ParsedDeveloperSpec                              │
+│                            │   → tianshu_datadev.developer_spec.models        │
+│ SQLPlan                    │ SqlBuildPlan + SqlProgram                        │
+│                            │   → tianshu_datadev.planning.sql_build_plan       │
+│ SubIntent                  │ 已废弃——架构不再使用子意图拆分                       │
+│ CrossValidationResult      │ Phase 7 远期——届时使用严格 Pydantic 模型           │
+│ RepairDirective            │ Phase 7 远期——届时使用严格 Pydantic 模型           │
+│ MergedResult               │ 已废弃——架构不再使用多 SubIntent 合并               │
+│ TransformationContract     │ DataTransformContractV1                           │
+│                            │   → tianshu_datadev.spark.models (Phase 5)        │
+│ SparkCodeArtifact          │ Phase 6 远期——届时使用严格 Pydantic 模型           │
+│ TransformParams            │ Phase 6 远期——届时使用严格 Pydantic 模型           │
+└────────────────────────────┴──────────────────────────────────────────────────┘
 
-不要删除此文件——Phase 0 的 22 个测试依赖它。
+生产代码应导入对应的严格 Pydantic 模型，而非本文件中的 Protocol。
+Agent / 开发者：如果你通过搜索找到了本文件，请使用右列对应的替代模型。
+═══════════════════════════════════════════════════════════════════════════════
 """
 
 from __future__ import annotations
 
+import inspect
 import warnings
 
 warnings.warn(
@@ -20,6 +37,28 @@ warnings.warn(
     DeprecationWarning,
     stacklevel=2,
 )
+
+# ── 运行时调用栈检查——非测试代码导入直接报错，防止 Agent/开发者误用 ──
+# 检查调用栈中是否存在 test_ir_protocols 文件；若不存在则说明是生产代码误用
+_caller_frame = inspect.currentframe()
+if _caller_frame is not None:
+    _allowed = False
+    _f = _caller_frame.f_back
+    while _f is not None:
+        _filename = _f.f_code.co_filename
+        if "test_ir_protocols" in _filename:
+            _allowed = True
+            break
+        # 继续向上追溯——可能经过 ir/__init__.py 间接导入
+        _f = _f.f_back
+    if not _allowed:
+        raise RuntimeError(
+            "禁止在生产代码中导入已废弃的 ir.protocols！\n"
+            "旧 Protocol 已被严格 Pydantic 模型替代，请使用：\n"
+            "  RequirementIR     → developer_spec.models.ParsedDeveloperSpec\n"
+            "  SQLPlan           → planning.sql_build_plan.SqlBuildPlan\n"
+            "  TransformationContract → spark.models.DataTransformContractV1\n"
+        )
 
 # ── 以下为 Phase 0 原始代码，未修改 ──
 
