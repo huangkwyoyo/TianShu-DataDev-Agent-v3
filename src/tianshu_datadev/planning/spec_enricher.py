@@ -34,6 +34,7 @@ from tianshu_datadev.developer_spec.models import (
     ParsedDeveloperSpec,
     SourceManifest,
 )
+from tianshu_datadev.sql.expression_guard import validate_input_expression
 
 if TYPE_CHECKING:
     from tianshu_datadev.llm.adapters.base import ProviderAdapter
@@ -175,7 +176,10 @@ def _parse_description_to_metric(col) -> MetricDecl | None:
     if arg and arg != "*":
         # 包含运算符 → 表达式；否则 → 列名
         if any(op in arg for op in ("*", "/", "+", "-")):
-            input_expression = arg
+            # 安全校验——即使来自正则解析，仍需通过白名单
+            is_valid, _ = validate_input_expression(arg, mode="silent")
+            if is_valid:
+                input_expression = arg
         else:
             input_column = arg
 
@@ -1076,11 +1080,8 @@ _WINDOW_FUNCTION_ALIASES: dict[str, str] = {
     "AVG": "AVG_OVER",
 }
 
-# expression 字段中禁止出现的 SQL 特殊字符——与 _PHYSICAL_TABLE_NAME_FORBIDDEN 同策略
-_FORBIDDEN_EXPRESSION_CHARS: frozenset[str] = frozenset({";", "'", '"', "`"})
-
-# expression 字段中禁止出现的 SQL 注释/注入模式
-_FORBIDDEN_EXPRESSION_PATTERNS: tuple[str, ...] = ("--", "/*")
+# expression 字段安全校验——统一使用 expression_guard 共享模块
+# 禁止字符和模式定义见 tianshu_datadev.sql.expression_guard
 
 
 class SpecEnricher:
@@ -1304,6 +1305,13 @@ class SpecEnricher:
                 except Exception:
                     pass  # H3：filter 不合法，丢弃 filter 保留指标
 
+            # 安全校验——LLM 产出的 input_expression 含注入字符时静默丢弃
+            raw_input_expr = item.get("input_expression")
+            if raw_input_expr:
+                is_valid, _ = validate_input_expression(raw_input_expr, mode="silent")
+                if not is_valid:
+                    raw_input_expr = None  # 静默丢弃非法表达式
+
             inferred_metrics.append(
                 MetricDecl(
                     metric_name=item.get("metric_name", ""),
@@ -1311,7 +1319,7 @@ class SpecEnricher:
                     input_column=item.get("input_column"),
                     alias=item.get("alias", ""),
                     filter=filter_decl,
-                    input_expression=item.get("input_expression"),
+                    input_expression=raw_input_expr,
                     distinct=item.get("distinct", False),
                 )
             )
@@ -1340,10 +1348,9 @@ class SpecEnricher:
         # 解析计算指标
         for item in raw.get("inferred_computed_metrics", []):
             expr = item.get("expression", "")
-            # 安全检查——含 SQL 注入字符的表达式静默丢弃
-            if any(c in expr for c in _FORBIDDEN_EXPRESSION_CHARS):
-                continue
-            if any(p in expr for p in _FORBIDDEN_EXPRESSION_PATTERNS):
+            # 安全检查——含 SQL 注入字符的表达式静默丢弃（使用共享校验）
+            is_valid, _ = validate_input_expression(expr, mode="silent")
+            if not is_valid:
                 continue
             inferred_computed.append(
                 InferredComputedMetric(
