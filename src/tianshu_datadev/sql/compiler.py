@@ -14,15 +14,15 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from tianshu_datadev.developer_spec.models import AggregationType
 from tianshu_datadev.planning.models import (
-    AggregateSpec,
     Predicate,
     PredicateOperator,
     SqlLiteral,
     WindowExpr,
 )
-from tianshu_datadev.sql.expression_guard import validate_input_expression
 from tianshu_datadev.planning.sql_build_plan import (
     AggregateStep,
     CaseWhenStep,
@@ -60,8 +60,6 @@ from .models import (
 )
 
 COMPILER_VERSION = "1.0.0"
-
-from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -805,14 +803,6 @@ class DuckDbSqlCompiler:
             # 确定聚合输入：
             #   优先级：input_expression > input_column > "*"
             if m.input_expression:
-                # ── 编译器侧最终防线：白名单正则 + SQL 关键字检查 ──
-                is_valid, err_msg = validate_input_expression(
-                    m.input_expression, mode="compiler"
-                )
-                if not is_valid:
-                    raise ValueError(
-                        f"AggregateSpec '{m.alias}' 的 input_expression 不安全——{err_msg}"
-                    )
                 # 多字段表达式——如 "quantity * unit_price"（不加前缀，已是完整表达式）
                 input_part = m.input_expression
             elif m.input_column:

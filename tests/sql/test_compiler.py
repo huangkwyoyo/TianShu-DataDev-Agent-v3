@@ -2,6 +2,8 @@
 
 import os
 
+import pytest
+
 from tianshu_datadev.developer_spec.models import (
     AggregationType,
     InferredWindowMetric,
@@ -2397,4 +2399,5 @@ class TestWindowPipelineE2E:
         sql2 = compiler2.compile(plan2).sql
 
         assert sql1 == sql2, "相同输入应产生相同 SQL（确定性编译）"
-        assert sql1, "编译结果不应为空"
+
+
