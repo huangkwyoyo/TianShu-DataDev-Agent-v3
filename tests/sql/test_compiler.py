@@ -53,7 +53,7 @@ class TestDuckDbSqlCompiler:
         # 验证 CompiledSql 结构
         assert compiled.sql != ""
         assert compiled.sql_sha256 != ""
-        assert compiled.compiler_version == "1.0.0"
+        assert compiled.compiler_version == "1.1.0"
         assert compiled.input_plan_hash is not None
 
         # SQL 应包含关键词
