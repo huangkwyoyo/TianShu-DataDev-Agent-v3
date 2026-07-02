@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from tianshu_datadev.developer_spec.models import AggregationType
@@ -1169,6 +1170,26 @@ class DuckDbSqlCompiler:
             PredicateOperator.LIKE: "LIKE",
         }
         return mapping.get(op, str(op.value))
+
+    # ── 注释安全清洗 ──
+
+    @staticmethod
+    def _render_comment_line(label: str, value: str) -> str:
+        """安全渲染单行注释——清洗控制字符、换行、注释破坏序列。
+
+        规则：
+        1. 替换 CR/LF 为空格
+        2. 移除 C0 控制字符（0x00-0x1F，除 \\t 外）
+        3. 连续 "--" 替换为 "- -"（防止注释提前终止）
+        4. 首尾空白 trim
+        5. 统一前缀 "-- {label}: "
+        """
+        cleaned = str(value)
+        cleaned = cleaned.replace("\r", " ").replace("\n", " ")
+        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", cleaned)
+        cleaned = re.sub(r"--+", "- -", cleaned)
+        cleaned = cleaned.strip()
+        return f"-- {label}: {cleaned}"
 
     # ── 表名解析 ──
 
