@@ -1290,7 +1290,17 @@ class DuckDbSqlCompiler:
 
             # 创建临时编译器实例用于编译此语句
             stmt_compiler = DuckDbSqlCompiler(table_mapping=stmt_table_mapping)
-            compiled = stmt_compiler.compile(stmt.plan)
+            core = stmt_compiler._compile_core(stmt.plan)
+
+            # 构建 CompiledSql——先不包装，后续在注释阶段统一处理
+            raw_sql = core.raw_sql
+            compiled = CompiledSql(
+                sql=raw_sql,
+                sql_sha256=CompiledSql.compute_sql_hash(raw_sql, COMPILER_VERSION),
+                optimized_plan=core.optimized_sql_plan,
+                compiler_version=COMPILER_VERSION,
+                input_plan_hash=core.input_plan_hash,
+            )
 
             # 根据语句类型包装 SQL
             if stmt.kind == StatementKind.PRODUCER and stmt.produces:
