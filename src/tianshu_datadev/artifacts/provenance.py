@@ -12,7 +12,7 @@ import sys
 from .models import PackageInputs
 
 # 已知版本常量——Phase 2 硬编码，Phase 4 后从配置读取
-COMPILER_VERSION = "1.0.0"
+COMPILER_VERSION = "1.1.0"
 VALIDATOR_VERSION = "1.0.0"
 PROMPT_VERSION = "phase-2-fake"
 

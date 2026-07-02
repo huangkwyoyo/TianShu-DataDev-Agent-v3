@@ -60,7 +60,7 @@ from .models import (
     SqlProgramArtifact,
 )
 
-COMPILER_VERSION = "1.0.0"
+COMPILER_VERSION = "1.1.0"
 
 
 @dataclass(frozen=True)
