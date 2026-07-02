@@ -1478,56 +1478,70 @@ class DuckDbSqlCompiler:
             stmt_compiler = DuckDbSqlCompiler(table_mapping=stmt_table_mapping)
             core = stmt_compiler._compile_core(stmt.plan)
 
-            # 构建 CompiledSql——先不包装，后续在注释阶段统一处理
-            raw_sql = core.raw_sql
-            compiled = CompiledSql(
-                sql=raw_sql,
-                sql_sha256=CompiledSql.compute_sql_hash(raw_sql, COMPILER_VERSION),
-                optimized_plan=core.optimized_sql_plan,
-                compiler_version=COMPILER_VERSION,
-                input_plan_hash=core.input_plan_hash,
-            )
-
-            # 根据语句类型包装 SQL
+            # 根据语句类型包装 SQL 并 prepend 注释
             if stmt.kind == StatementKind.PRODUCER and stmt.produces:
-                # 生产者：CREATE TEMP TABLE {temp_id} AS {compiled_sql}
+                # 先包装 CREATE TEMP TABLE
                 wrapped_sql = (
-                    f"CREATE TEMP TABLE {stmt.produces} AS\n{compiled.sql}"
+                    f"CREATE TEMP TABLE {stmt.produces} AS\n{core.raw_sql}"
                 )
-                # 重新计算 hash（SQL 内容已变）
-                wrapped_sql_sha256 = CompiledSql.compute_sql_hash(
-                    wrapped_sql, COMPILER_VERSION
+                # 再 prepend 上下文注释
+                comment = self._render_statement_comment(
+                    stmt, program, core.optimized_plan,
                 )
+                final_sql = f"{comment}\n\n{wrapped_sql}"
                 compiled = CompiledSql(
-                    sql=wrapped_sql,
-                    sql_sha256=wrapped_sql_sha256,
-                    optimized_plan=compiled.optimized_plan,
-                    compiler_version=compiled.compiler_version,
-                    input_plan_hash=compiled.input_plan_hash,
+                    sql=final_sql,
+                    sql_sha256=CompiledSql.compute_sql_hash(final_sql, COMPILER_VERSION),
+                    optimized_plan=core.optimized_sql_plan,
+                    compiler_version=COMPILER_VERSION,
+                    input_plan_hash=core.input_plan_hash,
                 )
-                # 记录需要清理的 _temp 表
                 cleanup_sqls.append(f"DROP TABLE IF EXISTS {stmt.produces}")
 
             elif stmt.kind == StatementKind.CONSUMER:
-                # 消费者：直接使用编译结果（_temp 表引用已解析）
-                # 如果消费者也产生 _temp 表
                 if stmt.produces:
                     wrapped_sql = (
-                        f"CREATE TEMP TABLE {stmt.produces} AS\n{compiled.sql}"
+                        f"CREATE TEMP TABLE {stmt.produces} AS\n{core.raw_sql}"
                     )
-                    wrapped_sql_sha256 = CompiledSql.compute_sql_hash(
-                        wrapped_sql, COMPILER_VERSION
+                    comment = self._render_statement_comment(
+                        stmt, program, core.optimized_plan,
                     )
+                    final_sql = f"{comment}\n\n{wrapped_sql}"
                     compiled = CompiledSql(
-                        sql=wrapped_sql,
-                        sql_sha256=wrapped_sql_sha256,
-                        optimized_plan=compiled.optimized_plan,
-                        compiler_version=compiled.compiler_version,
-                        input_plan_hash=compiled.input_plan_hash,
+                        sql=final_sql,
+                        sql_sha256=CompiledSql.compute_sql_hash(final_sql, COMPILER_VERSION),
+                        optimized_plan=core.optimized_sql_plan,
+                        compiler_version=COMPILER_VERSION,
+                        input_plan_hash=core.input_plan_hash,
                     )
                     cleanup_sqls.append(f"DROP TABLE IF EXISTS {stmt.produces}")
+                else:
+                    # CONSUMER 不产生 _temp——直接 prepend 注释
+                    comment = self._render_statement_comment(
+                        stmt, program, core.optimized_plan,
+                    )
+                    final_sql = f"{comment}\n\n{core.raw_sql}"
+                    compiled = CompiledSql(
+                        sql=final_sql,
+                        sql_sha256=CompiledSql.compute_sql_hash(final_sql, COMPILER_VERSION),
+                        optimized_plan=core.optimized_sql_plan,
+                        compiler_version=COMPILER_VERSION,
+                        input_plan_hash=core.input_plan_hash,
+                    )
 
-            # FINAL / STANDALONE：直接使用编译结果，无包装
+            else:
+                # FINAL / STANDALONE——prepend 注释，无 CREATE TEMP TABLE 包装
+                comment = self._render_statement_comment(
+                    stmt, program, core.optimized_plan,
+                )
+                final_sql = f"{comment}\n\n{core.raw_sql}"
+                compiled = CompiledSql(
+                    sql=final_sql,
+                    sql_sha256=CompiledSql.compute_sql_hash(final_sql, COMPILER_VERSION),
+                    optimized_plan=core.optimized_sql_plan,
+                    compiler_version=COMPILER_VERSION,
+                    input_plan_hash=core.input_plan_hash,
+                )
 
             compiled_statements.append(compiled)
 
