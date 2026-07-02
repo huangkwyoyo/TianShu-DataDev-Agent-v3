@@ -145,6 +145,106 @@ class TestParserRejection:
             parser.parse(text)
         assert exc.value.error_code == ParseErrorCode.E007_FREE_SQL_FIELD
 
+    @pytest.mark.parametrize(
+        "unsafe_expression,desc",
+        [
+            ("1; DROP TABLE users; --", "分号+DROP注入"),
+            ("1' OR '1'='1", "单引号布尔注入"),
+            ("1--\nDELETE FROM users", "注释逃逸注入"),
+            ("1/*comment*/", "块注释注入"),
+        ],
+    )
+    def test_reject_unsafe_input_expression(self, unsafe_expression, desc):
+        """禁止宽松 8：input_expression 含注入字符 → E008。"""
+        parser = DeveloperSpecParser()
+        # 构造含不安全 input_expression 的最小合法 DeveloperSpec
+        text = f"""```markdown
+---
+spec:
+  type: aggregate_table
+  target_table: ads.test
+  target_grain: [dt]
+  summary: "安全测试"
+  source_tables:
+    - name: dwd.fact
+      alias: f
+      role: fact
+      key_columns:
+        - name: id
+          type: bigint
+          nullable: false
+      business_columns:
+        - name: val
+          type: integer
+          nullable: false
+  metrics:
+    - metric_name: unsafe_metric
+      aggregation: SUM
+      input_expression: "{unsafe_expression}"
+      alias: unsafe_alias
+  dimensions:
+    - dimension_name: dt
+      column_ref: dt
+  output_columns:
+    - name: dt
+      type: date
+    - name: unsafe_alias
+      type: integer
+---
+# 测试 E008
+```"""
+        with pytest.raises(ParseError) as exc:
+            parser.parse(text)
+        assert exc.value.error_code == ParseErrorCode.E008_UNSAFE_EXPRESSION, (
+            f"场景 '{desc}' 应抛出 E008，实际: {exc.value.error_code}"
+        )
+
+    def test_accept_safe_input_expression(self):
+        """合法 input_expression——纯算术表达式通过校验。"""
+        parser = DeveloperSpecParser()
+        text = """```markdown
+---
+spec:
+  type: aggregate_table
+  target_table: ads.test
+  target_grain: [dt]
+  summary: "合法表达式测试"
+  source_tables:
+    - name: dwd.fact
+      alias: f
+      role: fact
+      key_columns:
+        - name: id
+          type: bigint
+          nullable: false
+      business_columns:
+        - name: quantity
+          type: integer
+          nullable: false
+        - name: unit_price
+          type: decimal
+          nullable: false
+  metrics:
+    - metric_name: revenue
+      aggregation: SUM
+      input_expression: "quantity * unit_price"
+      alias: revenue
+  dimensions:
+    - dimension_name: dt
+      column_ref: dt
+  output_columns:
+    - name: dt
+      type: date
+    - name: revenue
+      type: decimal
+---
+# 合法表达式
+```
+"""
+        spec = parser.parse(text)
+        assert spec is not None
+        assert spec.metrics[0].input_expression == "quantity * unit_price"
+
 
 # ════════════════════════════════════════════
 # Hash 确定性

@@ -22,6 +22,8 @@ from typing import Any
 
 import yaml
 
+from tianshu_datadev.sql.expression_guard import validate_input_expression
+
 from .field_normalizer import FieldNormalizer
 from .models import (
     AggregationType,
@@ -56,6 +58,7 @@ class ParseErrorCode:
     E005_DUPLICATE_TABLE_ALIAS = "E005"  # 两个表使用相同别名
     E006_EMPTY_OUTPUT_COLUMNS = "E006"  # 输出列列表为空
     E007_FREE_SQL_FIELD = "E007"  # raw_sql/where_sql/expression: str 字段出现
+    E008_UNSAFE_EXPRESSION = "E008"  # input_expression 含禁止字符/模式——SQL 注入风险
 
 
 class ParseError(Exception):
@@ -483,6 +486,17 @@ class DeveloperSpecParser:
                     value=str(raw_filter.get("value", "")),
                 )
 
+            # ── Phase 4D 安全校验：input_expression 入站过滤 ──
+            raw_input_expr = raw.get("input_expression")
+            if raw_input_expr:
+                is_valid, err_msg = validate_input_expression(raw_input_expr, mode="strict")
+                if not is_valid:
+                    raise ParseError(
+                        ParseErrorCode.E008_UNSAFE_EXPRESSION,
+                        err_msg,
+                        field_ref=f"metrics.{raw.get('metric_name', '')}.input_expression",
+                    ) from None
+
             metrics.append(MetricDecl(
                 metric_name=raw.get("metric_name", ""),
                 aggregation=aggregation,
@@ -492,7 +506,7 @@ class DeveloperSpecParser:
                 variants=self._parse_metric_variants(raw.get("variants", [])),
                 # ── Phase 4D：filter / input_expression / distinct ──
                 filter=metric_filter,
-                input_expression=raw.get("input_expression"),
+                input_expression=raw_input_expr,
                 distinct=raw.get("distinct", False),
             ))
 

@@ -301,7 +301,7 @@ class MetricDecl(StrictModel):
     alias: str
     # ── Phase 4D 新增字段 ──
     filter: MetricFilterDecl | None = None  # 条件聚合（如 FILTER WHERE status='STANDARD'）
-    input_expression: str | None = None  # 多字段表达式（如 "quantity * unit_price"）
+    input_expression: str | None = None  # 多字段算术表达式（如 "quantity * unit_price"）——仅允许列引用+算术运算符（+-*/%），禁止 SQL 关键字/函数调用/注释/引号；非空时经 expression_guard 校验
     distinct: bool = False  # 去重聚合（用于 SUM(DISTINCT col)）
     # ── Phase 5 新增字段 ──
     variants: list[MetricVariant] | None = None  # 多条件变体——同一基础聚合 + 不同 filter
@@ -332,7 +332,7 @@ class InferredComputedMetric(StrictModel):
     """
 
     metric_name: str
-    expression: str  # 计算表达式，如 "fined_plate_count / unique_plate_count"
+    expression: str  # 计算表达式（如 "fined_plate_count / unique_plate_count"）——仅允许列引用+算术运算符，禁止 SQL 关键字/注释/引号；经 expression_guard 校验
     depends_on: list[str] = []  # 依赖的其他指标 alias（必须先计算）
     alias: str
     confidence: str = "medium"  # high | medium | low
