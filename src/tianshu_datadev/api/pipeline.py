@@ -338,7 +338,7 @@ class Pipeline:
             阶段状态列表，前端据此渲染指示灯
         """
         if all_stages is None:
-            all_stages = ["parser", "enrich", "build", "compile", "execute"]
+            all_stages = ["parser", "enrich", "build", "validate", "compile", "execute"]
         stages = []
         for s in all_stages:
             if s == failed_stage:
@@ -359,12 +359,77 @@ class Pipeline:
             "parser": "解析",
             "enrich": "增强",
             "build": "构建",
+            "validate": "验证",
             "compile": "编译",
             "execute": "执行",
             "contract": "契约",
             "package": "打包",
         }
         return _names.get(stage, stage)
+
+    def _build_validation_blocked_response(
+        self,
+        spec,
+        manifest,
+        plan,
+        all_questions: list,
+        *,
+        table_mapping: dict[str, str] | None = None,
+        all_stages: list[str] | None = None,
+    ) -> dict:
+        """构建 Validator 阻断响应——保存已完成产物，返回含 pipeline_error 的响应基底。
+
+        Validator 返回 passed=False 时调用此方法，在进入 compile 前中止流水线。
+        已完成产物（spec / manifest / plan）保留到 self._results 供诊断。
+
+        Args:
+            spec: 已解析的 DeveloperSpec
+            manifest: 事实源清单
+            plan: 已构建的 SqlBuildPlan
+            all_questions: 全部 OpenQuestion（含 blocking 和非 blocking）
+            table_mapping: 表名映射
+            all_stages: 完整阶段列表（run_all 传 8 阶段，其余默认 6 阶段）
+
+        Returns:
+            含 pipeline_error + pipeline_stages + validation_passed=False 的响应基底，
+            调用方需补充方法专属的空字段（如 sql_sha256 / execution_trace 等）。
+        """
+        blocking = [q for q in all_questions if q.blocking]
+        count = len(blocking)
+        descriptions = "；".join(q.description for q in blocking[:3])
+        if count > 3:
+            descriptions += f" …等 {count} 个问题"
+
+        request_id = self._gen_request_id(spec)
+        self._store_result(
+            request_id,
+            {
+                "parsed_spec": spec,
+                "manifest": manifest,
+                "plan": plan,
+                "table_mapping": table_mapping or {},
+            },
+        )
+
+        error_info = {
+            "stage": "validate",
+            "error_type": "ValidationBlocked",
+            "error_message": (
+                f"验证阶段发现 {count} 个阻塞问题，编译已中止：{descriptions}"
+            ),
+        }
+
+        return {
+            "request_id": request_id,
+            "spec_id": spec.spec_id,
+            "plan_id": plan.plan_id,
+            "validation_passed": False,
+            "open_questions": _summarize_open_questions(all_questions),
+            "pipeline_error": error_info,
+            "pipeline_stages": self._build_pipeline_stages(
+                "validate", error_info, all_stages
+            ),
+        }
 
     # ── 公共方法 ──────────────────────────────────────────
 
@@ -615,6 +680,19 @@ class Pipeline:
                 plan_questions: list = []
                 all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
 
+                if not _chain_passed:
+                    blocked = self._build_validation_blocked_response(
+                        spec, manifest, plan, all_questions,
+                        table_mapping=table_mapping,
+                    )
+                    blocked.update({
+                        "sql_sha256": "",
+                        "compiler_version": "",
+                        "execution_trace": None,
+                        "result_summary": None,
+                    })
+                    return blocked
+
                 stage = "compile"
                 compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
                 program_artifact = compiler.compile_program(sql_program)
@@ -643,6 +721,19 @@ class Pipeline:
                 plan_questions: list = []
                 all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
 
+                if not _chain_passed:
+                    blocked = self._build_validation_blocked_response(
+                        spec, manifest, plan, all_questions,
+                        table_mapping=table_mapping,
+                    )
+                    blocked.update({
+                        "sql_sha256": "",
+                        "compiler_version": "",
+                        "execution_trace": None,
+                        "result_summary": None,
+                    })
+                    return blocked
+
                 stage = "compile"
                 compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
                 program_artifact = compiler.compile_program(sql_program)
@@ -659,10 +750,23 @@ class Pipeline:
             else:
                 plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
 
-                # Validator 验证（非阻断——记录问题供排查）
+                # Validator 验证——blocking 问题阻断编译，非 blocking 记录供排查
                 validator = SqlBuildPlanValidator()
                 _passed, val_questions = validator.validate(plan, manifest)
                 all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
+
+                if not _passed:
+                    blocked = self._build_validation_blocked_response(
+                        spec, manifest, plan, all_questions,
+                        table_mapping=table_mapping,
+                    )
+                    blocked.update({
+                        "sql_sha256": "",
+                        "compiler_version": "",
+                        "execution_trace": None,
+                        "result_summary": None,
+                    })
+                    return blocked
 
                 stage = "compile"
                 compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
@@ -775,7 +879,10 @@ class Pipeline:
             符合 RunAllResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
         """
         self._purge_expired()
-        _RUN_ALL_STAGES = ["parser", "enrich", "build", "compile", "execute", "contract", "package"]
+        _RUN_ALL_STAGES = [
+            "parser", "enrich", "build", "validate",
+            "compile", "execute", "contract", "package",
+        ]
 
         # ── Stage 1-2: Parser + Enrich ──
         parsed = self._parse_and_enrich(
@@ -822,6 +929,19 @@ class Pipeline:
 
                 validator = SqlBuildPlanValidator()
                 passed, val_questions = validator.validate_multi_hop_chain(sql_program)
+
+                if not passed:
+                    all_qs = list(plan_questions) + list(val_questions) + list(extra_questions)
+                    blocked = self._build_validation_blocked_response(
+                        spec, manifest, plan, all_qs,
+                        table_mapping=table_mapping, all_stages=_RUN_ALL_STAGES,
+                    )
+                    blocked.update({
+                        "execution_status": "not_executed",
+                        "row_count": 0,
+                        "elapsed_ms": 0,
+                    })
+                    return blocked
 
                 stage = "compile"
                 compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
@@ -921,6 +1041,19 @@ class Pipeline:
                 validator = SqlBuildPlanValidator()
                 passed, val_questions = validator.validate_multi_hop_chain(sql_program)
 
+                if not passed:
+                    all_qs = list(plan_questions) + list(val_questions) + list(extra_questions)
+                    blocked = self._build_validation_blocked_response(
+                        spec, manifest, plan, all_qs,
+                        table_mapping=table_mapping, all_stages=_RUN_ALL_STAGES,
+                    )
+                    blocked.update({
+                        "execution_status": "not_executed",
+                        "row_count": 0,
+                        "elapsed_ms": 0,
+                    })
+                    return blocked
+
                 stage = "compile"
                 compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
                 program_artifact = compiler.compile_program(sql_program)
@@ -938,6 +1071,19 @@ class Pipeline:
 
                 validator = SqlBuildPlanValidator()
                 passed, val_questions = validator.validate(plan, manifest)
+
+                if not passed:
+                    all_qs = list(plan_questions) + list(val_questions) + list(extra_questions)
+                    blocked = self._build_validation_blocked_response(
+                        spec, manifest, plan, all_qs,
+                        table_mapping=table_mapping, all_stages=_RUN_ALL_STAGES,
+                    )
+                    blocked.update({
+                        "execution_status": "not_executed",
+                        "row_count": 0,
+                        "elapsed_ms": 0,
+                    })
+                    return blocked
 
                 stage = "compile"
                 compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
@@ -1405,6 +1551,20 @@ class Pipeline:
             validator = SqlBuildPlanValidator()
             _passed, val_questions = validator.validate(plan, manifest)
             all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
+
+            if not _passed:
+                blocked = self._build_validation_blocked_response(
+                    spec, manifest, plan, all_questions,
+                    table_mapping=table_mapping,
+                )
+                blocked.update({
+                    "generated_sql": "",
+                    "sql_sha256": "",
+                    "compiler_version": "",
+                    "execution_trace": None,
+                    "result_summary": None,
+                })
+                return blocked
 
             stage = "compile"
             compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})

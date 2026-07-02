@@ -92,26 +92,26 @@ class TestPipelineErrorHandling:
         assert "parsed_spec" in saved
         assert "manifest" in saved
 
-    def test_success_path_has_no_pipeline_error(self, pipeline, golden_spec):
+    def test_success_path_has_no_pipeline_error(self, pipeline, golden_spec_passing):
         """成功路径 → 不含 pipeline_error 字段——依赖 DuckDB。"""
         try:
             import duckdb  # noqa: F401
         except ImportError:
             pytest.skip("DuckDB 未安装")
-        result = pipeline.execute(golden_spec)
+        result = pipeline.execute(golden_spec_passing)
         assert "pipeline_error" not in result
         assert "request_id" in result
         assert "execution_trace" in result
         # 成功路径不返回 pipeline_stages
         assert "pipeline_stages" not in result
 
-    def test_pipeline_stages_all_ok_on_success(self, pipeline, golden_spec):
+    def test_pipeline_stages_all_ok_on_success(self, pipeline, golden_spec_passing):
         """成功路径验证——产物包含所有阶段数据。"""
         try:
             import duckdb  # noqa: F401
         except ImportError:
             pytest.skip("DuckDB 未安装")
-        result = pipeline.execute(golden_spec)
+        result = pipeline.execute(golden_spec_passing)
         # 成功路径不含 pipeline_error / pipeline_stages
         assert "pipeline_error" not in result
         assert "pipeline_stages" not in result
@@ -137,8 +137,8 @@ class TestPipelineErrorHandling:
         assert "error_type" in pe
         assert "error_message" in pe
         assert pe["stage"] == "parser"
-        # pipeline_stages 有 5 个阶段
-        assert len(result["pipeline_stages"]) == 5
+        # pipeline_stages 有 6 个阶段（含 validate）
+        assert len(result["pipeline_stages"]) == 6
         for s in result["pipeline_stages"]:
             assert "stage" in s
             assert "status" in s
@@ -148,7 +148,7 @@ class TestPipelineErrorHandling:
         assert "error_type" in failed_stage
         assert "error_message" in failed_stage
 
-    def test_partial_sql_sha256_on_compile_failure(self, pipeline, golden_spec):
+    def test_partial_sql_sha256_on_compile_failure(self, pipeline, golden_spec_passing):
         """compile 失败时 sql_sha256 应为空字符串。"""
         import tianshu_datadev.api.pipeline as pipeline_mod
         original_compiler = pipeline_mod.DuckDbSqlCompiler
@@ -162,7 +162,7 @@ class TestPipelineErrorHandling:
 
         pipeline_mod.DuckDbSqlCompiler = FailingCompiler
         try:
-            result = pipeline.execute(golden_spec)
+            result = pipeline.execute(golden_spec_passing)
         finally:
             pipeline_mod.DuckDbSqlCompiler = original_compiler
 
@@ -213,12 +213,13 @@ class TestPipelineStagesHelper:
             "parser": "failed",
             "enrich": "skipped",
             "build": "skipped",
+            "validate": "skipped",
             "compile": "skipped",
             "execute": "skipped",
         }
 
     def test_build_pipeline_stages_compile_failed(self, pipeline):
-        """compile 失败——parser+enrich+build 为 ok，compile failed，execute skipped。"""
+        """compile 失败——parser+enrich+build+validate 为 ok，compile failed，execute skipped。"""
         error_info = pipeline._capture_error("compile", RuntimeError("err"))
         stages = pipeline._build_pipeline_stages("compile", error_info)
         statuses = {s["stage"]: s["status"] for s in stages}
@@ -226,6 +227,7 @@ class TestPipelineStagesHelper:
             "parser": "ok",
             "enrich": "ok",
             "build": "ok",
+            "validate": "ok",
             "compile": "failed",
             "execute": "skipped",
         }
@@ -248,17 +250,21 @@ class TestPipelineStagesHelper:
         assert pipeline._stage_name_cn("package") == "打包"
         assert pipeline._stage_name_cn("unknown") == "unknown"
 
-    def test_build_pipeline_stages_7_stages(self, pipeline):
-        """run_all 的 7 阶段列表——contract 失败时前 5 阶段为 ok。"""
-        run_all_stages = ["parser", "enrich", "build", "compile", "execute", "contract", "package"]
+    def test_build_pipeline_stages_8_stages(self, pipeline):
+        """run_all 的 8 阶段列表——contract 失败时前 6 阶段为 ok。"""
+        run_all_stages = [
+            "parser", "enrich", "build", "validate",
+            "compile", "execute", "contract", "package",
+        ]
         error_info = pipeline._capture_error("contract", RuntimeError("打包前契约抽取失败"))
         stages = pipeline._build_pipeline_stages("contract", error_info, run_all_stages)
-        assert len(stages) == 7
+        assert len(stages) == 8
         statuses = {s["stage"]: s["status"] for s in stages}
         assert statuses == {
             "parser": "ok",
             "enrich": "ok",
             "build": "ok",
+            "validate": "ok",
             "compile": "ok",
             "execute": "ok",
             "contract": "failed",
@@ -266,10 +272,70 @@ class TestPipelineStagesHelper:
         }
 
     def test_build_pipeline_stages_package_failed(self, pipeline):
-        """package 失败——前 6 阶段为 ok。"""
-        run_all_stages = ["parser", "enrich", "build", "compile", "execute", "contract", "package"]
+        """package 失败——前 7 阶段为 ok。"""
+        run_all_stages = [
+            "parser", "enrich", "build", "validate",
+            "compile", "execute", "contract", "package",
+        ]
         error_info = pipeline._capture_error("package", RuntimeError("打包失败"))
         stages = pipeline._build_pipeline_stages("package", error_info, run_all_stages)
         statuses = {s["stage"]: s["status"] for s in stages}
         assert statuses["contract"] == "ok"
         assert statuses["package"] == "failed"
+
+
+class TestPipelineValidationBlocking:
+    """Validator 阻断行为——blocking 问题必须在 compile 前中止流水线。"""
+
+    def test_execute_blocks_on_validation_failure(self, pipeline, golden_spec):
+        """execute() 在 Validator 返回 blocking 问题时中止——不执行 SQL。"""
+        result = pipeline.execute(golden_spec)
+        # 应返回 pipeline_error 而非 execution_trace
+        assert "pipeline_error" in result
+        assert result["pipeline_error"]["stage"] == "validate"
+        assert result["pipeline_error"]["error_type"] == "ValidationBlocked"
+        assert "阻塞问题" in result["pipeline_error"]["error_message"]
+        # 不应有编译/执行产物
+        assert result["execution_trace"] is None
+        assert result["result_summary"] is None
+        assert result["sql_sha256"] == ""
+        # validation_passed 为 False
+        assert result["validation_passed"] is False
+        # pipeline_stages 标记 validate 为 failed
+        stages = {s["stage"]: s["status"] for s in result["pipeline_stages"]}
+        assert stages["validate"] == "failed"
+        assert stages["compile"] == "skipped"
+        assert stages["execute"] == "skipped"
+        # 已完成产物已保存供诊断
+        assert result["request_id"] in pipeline._results
+        saved = pipeline._results[result["request_id"]]
+        assert "parsed_spec" in saved
+        assert "manifest" in saved
+        assert "plan" in saved
+
+    def test_run_all_blocks_on_validation_failure(self, pipeline, golden_spec):
+        """run_all() 在 Validator blocking 时中止——不生成 Package。"""
+        result = pipeline.run_all(golden_spec)
+        assert "pipeline_error" in result
+        assert result["pipeline_error"]["stage"] == "validate"
+        assert result["pipeline_error"]["error_type"] == "ValidationBlocked"
+        # 不应有执行和打包产物
+        assert result["execution_status"] == "not_executed"
+        # pipeline_stages 使用 8 阶段，validate 为 failed
+        stages = {s["stage"]: s["status"] for s in result["pipeline_stages"]}
+        assert len(result["pipeline_stages"]) == 8
+        assert stages["validate"] == "failed"
+        assert stages["compile"] == "skipped"
+        assert stages["contract"] == "skipped"
+
+    def test_open_questions_include_blocking_details(self, pipeline, golden_spec):
+        """阻断响应的 open_questions 包含具体的 blocking 问题。"""
+        result = pipeline.execute(golden_spec)
+        questions = result["open_questions"]
+        blocking = [q for q in questions if q["blocking"]]
+        assert len(blocking) > 0, "应至少有一个 blocking 问题"
+        # 每个 blocking 问题有 question_id + description
+        for q in blocking:
+            assert "question_id" in q
+            assert "description" in q
+            assert q["blocking"] is True

@@ -54,7 +54,7 @@ class TestSpecParse:
         data = resp.json()
         assert "pipeline_error" in data
         assert data["pipeline_error"]["stage"] == "parser"
-        assert len(data["pipeline_stages"]) == 5
+        assert len(data["pipeline_stages"]) == 6
 
     def test_parse_rich_success_no_pipeline_error(self, client, golden_spec):
         """parse_rich 成功 → 不含 pipeline_error。"""

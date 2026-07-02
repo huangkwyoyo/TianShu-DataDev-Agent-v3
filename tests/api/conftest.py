@@ -35,5 +35,11 @@ def client(pipeline):
 
 @pytest.fixture
 def golden_spec():
-    """读取 golden fixture——golden_no_time_range.md。"""
+    """读取 golden fixture——golden_no_time_range.md（会触发 Validator 阻断）。"""
     return _read_fixture("golden_no_time_range.md")
+
+
+@pytest.fixture
+def golden_spec_passing():
+    """读取 golden fixture——golden_passing.md（行数低于阈值，可通过 Validator 校验）。"""
+    return _read_fixture("golden_passing.md")

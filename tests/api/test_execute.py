@@ -12,10 +12,10 @@ _CSV_PATH = os.path.abspath(
 class TestExecute:
     """POST /api/execute——编译+执行(dry_run) → ExecuteResponse 摘要。"""
 
-    def test_execute_success(self, client, golden_spec):
+    def test_execute_success(self, client, golden_spec_passing):
         """编译+执行成功——需要 DuckDB 和 CSV fixture。"""
         resp = client.post("/api/execute", json={
-            "markdown_text": golden_spec,
+            "markdown_text": golden_spec_passing,
             "table_paths": {"test_fact": _CSV_PATH},
         })
         if resp.status_code == 500 and "DuckDB" in resp.text:
@@ -29,9 +29,9 @@ class TestExecute:
         assert data["sql_sha256"] is not None
         assert data["compiler_version"] is not None
 
-    def test_execute_no_table_paths(self, client, golden_spec):
+    def test_execute_no_table_paths(self, client, golden_spec_passing):
         """不传 table_paths → 执行可能失败但不崩溃（表不存在）"""
-        resp = client.post("/api/execute", json={"markdown_text": golden_spec})
+        resp = client.post("/api/execute", json={"markdown_text": golden_spec_passing})
         if resp.status_code == 500 and "DuckDB" in resp.text:
             pytest.skip("DuckDB 未安装")
         # 即使表不存在，API 仍应返回 200（执行状态在 trace 中体现）
@@ -50,10 +50,10 @@ class TestExecute:
         assert stages["parser"] == "failed"
         assert stages["enrich"] == "skipped"
 
-    def test_execute_success_no_pipeline_error(self, client, golden_spec):
+    def test_execute_success_no_pipeline_error(self, client, golden_spec_passing):
         """成功路径 → 不含 pipeline_error 字段。"""
         resp = client.post("/api/execute", json={
-            "markdown_text": golden_spec,
+            "markdown_text": golden_spec_passing,
             "table_paths": {"test_fact": _CSV_PATH},
         })
         if resp.status_code == 500 and "DuckDB" in resp.text:
@@ -63,10 +63,10 @@ class TestExecute:
         assert "pipeline_error" not in data
         assert "pipeline_stages" not in data
 
-    def test_execute_rich_success(self, client, golden_spec):
+    def test_execute_rich_success(self, client, golden_spec_passing):
         """execute_rich 成功 → 含 generated_sql。"""
         resp = client.post("/api/execute-rich", json={
-            "markdown_text": golden_spec,
+            "markdown_text": golden_spec_passing,
             "table_paths": {"test_fact": _CSV_PATH},
         })
         if resp.status_code == 500 and "DuckDB" in resp.text:

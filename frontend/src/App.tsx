@@ -292,6 +292,14 @@ export default function App() {
               <OpenQuestionPanel questions={state.specResult.open_questions} />
             )}
 
+            {state.planResult && state.planResult.open_questions.length > 0 && (
+              <OpenQuestionPanel questions={state.planResult.open_questions} />
+            )}
+
+            {state.executeResult && state.executeResult.open_questions.length > 0 && (
+              <OpenQuestionPanel questions={state.executeResult.open_questions} />
+            )}
+
             {state.planResult && state.planResult.join_evidence.length > 0 && (
               <JoinEvidencePanel evidence={state.planResult.join_evidence} />
             )}

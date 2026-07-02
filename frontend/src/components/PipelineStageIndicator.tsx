@@ -25,6 +25,7 @@ const STAGE_CN: Record<string, string> = {
   parser: '解析',
   enrich: '增强',
   build: '构建',
+  validate: '验证',
   compile: '编译',
   execute: '执行',
 };

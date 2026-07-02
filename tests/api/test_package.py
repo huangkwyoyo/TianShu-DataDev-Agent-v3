@@ -4,7 +4,7 @@
 class TestPackage:
     """GET /api/package/{request_id}——获取 ReviewPackage manifest。"""
 
-    def test_get_package_success(self, client, pipeline, golden_spec):
+    def test_get_package_success(self, client, pipeline, golden_spec_passing):
         """先 run-all 再获取 package → 200。"""
         import os
         csv_path = os.path.abspath(
@@ -12,7 +12,7 @@ class TestPackage:
         )
         # 通过 pipeline 直接执行 run_all（不经过 HTTP 层）
         result = pipeline.run_all(
-            golden_spec, table_paths={"test_fact": csv_path}
+            golden_spec_passing, table_paths={"test_fact": csv_path}
         )
         request_id = result["request_id"]
         # 通过 HTTP 层获取 package

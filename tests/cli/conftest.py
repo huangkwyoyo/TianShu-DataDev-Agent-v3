@@ -18,7 +18,7 @@ def _read_fixture(filename: str) -> str:
 @pytest.fixture
 def temp_spec_file(tmp_path):
     """创建临时 DeveloperSpec 文件——内容来自 golden fixture。"""
-    content = _read_fixture("golden_no_time_range.md")
+    content = _read_fixture("golden_passing.md")
     f = tmp_path / "spec.md"
     f.write_text(content, encoding="utf-8")
     return str(f)
