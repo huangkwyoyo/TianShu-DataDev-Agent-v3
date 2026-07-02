@@ -1067,6 +1067,8 @@ class Pipeline:
                     validation_questions=[],
                     perf_results=[],
                     retry_count=0,
+                    sql_program=sql_program.model_dump(),                    # SqlProgram 元数据
+                    sql_program_artifact=program_artifact.model_dump(),      # 编译产物元数据
                 )
                 packager = ReviewPackageBuilder()
                 package_manifest = packager.build(package_inputs)
@@ -1269,6 +1271,12 @@ class Pipeline:
                 validation_questions=[q.model_dump() for q in val_questions],
                 perf_results=[],
                 retry_count=0,
+                sql_program=sql_program.model_dump(),                        # SqlProgram 元数据
+                sql_program_artifact=(
+                    program_artifact.model_dump()
+                    if program_artifact is not None
+                    else None
+                ),                                                            # 编译产物元数据（单表路径为 None）
             )
             package_manifest = packager.build(package_inputs)
 
