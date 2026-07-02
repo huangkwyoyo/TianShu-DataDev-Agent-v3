@@ -330,17 +330,25 @@ class PlanRichResponse(StrictModel):
 
 
 class ExecuteRichResponse(StrictModel):
-    """前端 Execute 面板完整响应——含 SQL 文本和执行结果。"""
+    """前端 Execute 面板完整响应——含 SQL 文本和执行结果。
+
+    成功路径返回 execution_trace + result_summary + generated_sql；
+    失败路径（Validator 阻断 / RUNTIME_FAIL / 编译失败）返回 pipeline_error + pipeline_stages，
+    且 execution_trace / result_summary 为 None。
+    """
 
     request_id: str
     spec_id: str
     plan_id: str
-    generated_sql: str  # 实际执行的 SQL 文本
+    generated_sql: str  # 实际执行的 SQL 文本（失败时为空字符串）
     sql_sha256: str
     compiler_version: str
-    execution_trace: ExecutionTraceSummary
-    result_summary: ResultSummarySummary
+    execution_trace: ExecutionTraceSummary | None = None  # 执行追踪摘要（失败时为 None）
+    result_summary: ResultSummarySummary | None = None  # 结果摘要（失败时为 None）
+    validation_passed: bool = False  # Validator 是否通过（透传给调用方判断链路状态）
     open_questions: list[OpenQuestionSummary] = []
+    pipeline_error: dict | None = None  # 失败时的错误信息（stage + error_type + error_message）
+    pipeline_stages: list[dict] = []  # 失败时的各阶段状态标记
 
 
 class ArtifactTreeNode(StrictModel):

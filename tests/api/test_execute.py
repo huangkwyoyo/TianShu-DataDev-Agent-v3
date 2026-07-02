@@ -43,6 +43,9 @@ class TestExecute:
             pytest.skip("DuckDB 未安装")
         # 即使表不存在，API 仍应返回 200（执行状态在 trace 中体现）
         assert resp.status_code == 200
+        data = resp.json()
+        # 响应至少包含链路状态字段之一（成功或失败均有明确标记）
+        assert "validation_passed" in data or "pipeline_error" in data
 
     def test_execute_invalid_spec(self, client):
         """无效输入 → 200 + pipeline_error（错误信息编码在响应体中）。"""
@@ -86,6 +89,7 @@ class TestExecute:
         assert resp.status_code == 200
         data = resp.json()
         assert "pipeline_error" not in data
+        assert data["validation_passed"] is True
         assert "generated_sql" in data
         assert len(data["generated_sql"]) > 0
 

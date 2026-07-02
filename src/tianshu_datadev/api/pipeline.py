@@ -1723,6 +1723,41 @@ class Pipeline:
             executor = DuckDBExecutor(table_paths=table_paths or {})
             trace, summary = executor.execute(compiled)
 
+            # ── 执行状态检查——RUNTIME_FAIL 阻断，不进入成功路径 ──
+            if isinstance(trace.status, ExecutionStatus) and trace.status == ExecutionStatus.RUNTIME_FAIL:
+                _plan_id = plan.plan_id if plan is not None else ""
+                _sql_sha256 = compiled.sql_sha256 if compiled is not None else ""
+                _compiler_ver = compiled.compiler_version if compiled is not None else ""
+                request_id = self._gen_request_id(spec)
+                self._store_result(request_id, {
+                    "parsed_spec": spec,
+                    "manifest": manifest,
+                    "plan": plan,
+                    "compiled": compiled,
+                    "trace": trace,
+                    "summary": summary,
+                    "table_mapping": table_mapping or {},
+                })
+                error_info = {
+                    "stage": "execute",
+                    "error_type": "ExecutionFailed",
+                    "error_message": trace.error_message or "SQL 执行失败",
+                }
+                return {
+                    "request_id": request_id,
+                    "spec_id": spec.spec_id,
+                    "plan_id": _plan_id,
+                    "validation_passed": True,
+                    "generated_sql": compiled.sql if compiled is not None else "",
+                    "sql_sha256": _sql_sha256,
+                    "compiler_version": _compiler_ver,
+                    "execution_trace": None,
+                    "result_summary": None,
+                    "open_questions": _summarize_open_questions(all_questions),
+                    "pipeline_error": error_info,
+                    "pipeline_stages": self._build_pipeline_stages("execute", error_info),
+                }
+
         except Exception as e:
             request_id = self._gen_request_id(spec)
             self._log_stage_failure("execute_rich", stage, e, request_id)
@@ -1743,6 +1778,7 @@ class Pipeline:
                 "request_id": request_id,
                 "spec_id": spec.spec_id,
                 "plan_id": _plan_id,
+                "validation_passed": False,
                 "generated_sql": getattr(compiled, "sql", "") if compiled is not None else "",
                 "sql_sha256": _sql_sha256,
                 "compiler_version": _compiler_ver,
@@ -1764,6 +1800,7 @@ class Pipeline:
             "request_id": request_id,
             "spec_id": spec.spec_id,
             "plan_id": plan.plan_id,
+            "validation_passed": True,
             "generated_sql": compiled.sql,
             "sql_sha256": compiled.sql_sha256,
             "compiler_version": compiled.compiler_version,
