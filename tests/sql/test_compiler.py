@@ -2399,4 +2399,3 @@ class TestWindowPipelineE2E:
         sql2 = compiler2.compile(plan2).sql
 
         assert sql1 == sql2, "相同输入应产生相同 SQL（确定性编译）"
-
