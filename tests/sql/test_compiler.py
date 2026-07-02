@@ -2400,4 +2400,3 @@ class TestWindowPipelineE2E:
 
         assert sql1 == sql2, "相同输入应产生相同 SQL（确定性编译）"
 
-

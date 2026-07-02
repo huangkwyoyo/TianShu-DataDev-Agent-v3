@@ -4,8 +4,6 @@ import hashlib
 import os
 import re
 
-import pytest
-
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan, SqlBuildPlanBuilder
 from tianshu_datadev.planning.sql_program import (
@@ -162,13 +160,13 @@ def test_comment_block_five_lines_complete():
     compiled = compiler.compile(plan)
 
     lines = compiled.sql.split("\n")
-    comment_lines = [l for l in lines if l.startswith("-- ")]
+    comment_lines = [line for line in lines if line.startswith("-- ")]
     assert len(comment_lines) >= 5, f"注释行数不足 5：{len(comment_lines)}"
-    assert any("Step:" in l for l in comment_lines)
-    assert any("Intent:" in l for l in comment_lines)
-    assert any("Operation:" in l for l in comment_lines)
-    assert any("Inputs:" in l for l in comment_lines)
-    assert any("Output:" in l for l in comment_lines)
+    assert any("Step:" in line for line in comment_lines)
+    assert any("Intent:" in line for line in comment_lines)
+    assert any("Operation:" in line for line in comment_lines)
+    assert any("Inputs:" in line for line in comment_lines)
+    assert any("Output:" in line for line in comment_lines)
 
 
 # ════════════════════════════════════════════
