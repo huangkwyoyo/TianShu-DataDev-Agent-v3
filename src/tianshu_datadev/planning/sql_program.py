@@ -19,6 +19,7 @@ from enum import Enum
 
 from tianshu_datadev.developer_spec.models import (
     OpenQuestion,
+    ParsedDeveloperSpec,
     StrictModel,
 )
 
@@ -30,6 +31,7 @@ from .sql_build_plan import (
 )
 from .temp_table import (
     TempTableSpec,
+    make_temp_name,
     validate_consumer_is_declared,
     validate_temp_table_naming,
     validate_temp_table_refs,
@@ -550,11 +552,234 @@ class SqlProgramBuilder:
     """Phase 3A 确定性 SqlProgram 构建器。
 
     构建策略：
-    - 单语句：STANDALONE 语句，无 DAG 依赖
-    - 多语句通过外部代码组装（Phase 3A 不自动化拆分单表计划为多步）
+    - build_single：单语句直接输出——STANDALONE 语句
+    - build_chain：多跳 Join 链——PRODUCER → ... → FINAL
+    - build_from_compute_steps：ComputeSteps DAG——PRODUCER/FINAL 按步骤依赖
+    - build_from_statements：通用方法——接受预构建的 SqlStatement 列表
 
-    当前实现为占位——外部代码构造 SqlStatement 列表后调用 build_from_statements()。
+    所有构建方法最终委托至 build_from_statements。
     """
+
+    def build_single(self, plan: SqlBuildPlan, spec_hash: str) -> SqlProgram:
+        """从单个 SqlBuildPlan 构建最小 SqlProgram——单语句直接输出。
+
+        Args:
+            plan: 单个 SqlBuildPlan
+            spec_hash: 对应 spec 的 hash
+
+        Returns:
+            SqlProgram——含单一 STANDALONE 语句
+        """
+        stmt = SqlStatement(
+            statement_id=plan.plan_id,
+            plan=plan,
+            kind=StatementKind.STANDALONE,
+            intent="单语句直接生成目标查询结果。",
+        )
+        return self.build_from_statements(
+            statements=[stmt],
+            spec_hash=spec_hash,
+            final_output=plan.plan_id,
+        )
+
+    def build_chain(
+        self,
+        plans: list[SqlBuildPlan],
+        spec_hash: str,
+        chain_id: str,
+    ) -> SqlProgram:
+        """从线性计划链构建多语句 SqlProgram——PRODUCER → ... → FINAL。
+
+        链中每个步骤依赖前一步骤的 _temp 表输出。
+        中间步骤为 PRODUCER，最后一个为 FINAL。
+
+        Args:
+            plans: 按执行顺序排列的 SqlBuildPlan 列表
+            spec_hash: 对应 spec 的 hash
+            chain_id: 执行链 ID（8 字符 hex）
+
+        Returns:
+            SqlProgram——含链式依赖的 PRODUCER/.../FINAL 语句
+        """
+        statements: list[SqlStatement] = []
+        temp_tables: list[TempTableSpec] = []
+
+        for idx, plan in enumerate(plans):
+            is_final = (idx == len(plans) - 1)
+
+            # ── 填写通用 intent ──
+            if is_final:
+                intent = "生成多步骤处理链的最终结果。"
+            else:
+                intent = f"生成第 {idx + 1} 步中间结果，供下一步处理使用。"
+
+            # ── 推导 DAG 依赖 ──
+            depends_on: list[str] = []
+            if idx > 0:
+                depends_on.append(plans[idx - 1].plan_id)
+
+            # ── 中间步骤产生 _temp 表 ──
+            produces: str | None = None
+            if not is_final:
+                produces = make_temp_name(chain_id, str(idx))
+
+            kind = StatementKind.FINAL if is_final else StatementKind.PRODUCER
+
+            stmt = SqlStatement(
+                statement_id=plan.plan_id,
+                plan=plan,
+                kind=kind,
+                depends_on=depends_on,
+                produces=produces,
+                intent=intent,
+            )
+            statements.append(stmt)
+
+        # ── 构建 TempTableSpec 列表 ──
+        for idx, plan in enumerate(plans):
+            if idx < len(plans) - 1:
+                temp_id = make_temp_name(chain_id, str(idx))
+                consumed_by = [plans[idx + 1].plan_id]
+                col_defs = _extract_output_columns(plan)
+                temp_tables.append(TempTableSpec(
+                    temp_id=temp_id,
+                    produced_by=plan.plan_id,
+                    consumed_by=consumed_by,
+                    column_defs=col_defs,
+                ))
+
+        final_output = plans[-1].plan_id if plans else None
+        return self.build_from_statements(
+            statements=statements,
+            temp_tables=temp_tables,
+            spec_hash=spec_hash,
+            final_output=final_output,
+        )
+
+    def build_from_compute_steps(
+        self,
+        plans: list[SqlBuildPlan],
+        spec: ParsedDeveloperSpec,
+        chain_id: str,
+    ) -> SqlProgram:
+        """从 ComputeSteps 的 Plan 链构建多语句 SqlProgram——DAG 编排。
+
+        每个 ComputeStep 对应一个 SqlBuildPlan。中间步骤输出 _temp 表，
+        最终步骤使用 spec.output_spec。DAG 依赖从 ComputeStep.source 推导。
+
+        Args:
+            plans: 按原始声明顺序排列的 SqlBuildPlan 列表（与 spec.compute_steps 顺序一致）
+            spec: 已解析的 DeveloperSpec（compute_steps 必须非空）
+            chain_id: 执行链 ID（8 字符 hex）
+
+        Returns:
+            SqlProgram——含 PRODUCER/FINAL 语句，intent 和 final_output_target 已填写
+        """
+        steps = spec.compute_steps
+        if not steps:
+            raise ValueError("compute_steps 为空")
+
+        statements: list[SqlStatement] = []
+        temp_tables: list[TempTableSpec] = []
+
+        for idx, (cs, plan) in enumerate(zip(steps, plans)):
+            is_final = (idx == len(steps) - 1)
+
+            # ── 填写 intent ──
+            if is_final:
+                intent = "本步骤用于生成项目书声明的最终输出结果。"
+            else:
+                # 查找此步骤的下游消费者
+                consumers: list[str] = []
+                for other_cs, _ in zip(steps, plans):
+                    other_src = (
+                        other_cs.source
+                        if isinstance(other_cs.source, list)
+                        else [other_cs.source]
+                    )
+                    if cs.step_name in other_src:
+                        consumers.append(other_cs.step_name)
+                if consumers:
+                    intent = (
+                        f"生成{cs.step_name}中间结果，"
+                        f"供后续{', '.join(consumers)}使用。"
+                        f"下游消费者：{', '.join(consumers)}"
+                    )
+                else:
+                    intent = f"生成{cs.step_name}中间结果，供下游使用。"
+
+            # ── 推导 DAG 依赖（从 ComputeStep.source） ──
+            depends_on: list[str] = []
+            src_list = (
+                cs.source if isinstance(cs.source, list) else [cs.source]
+            )
+            for src in src_list:
+                if src != "input":
+                    # 找到 src 对应的 plan_id
+                    for other_cs, other_plan in zip(steps, plans):
+                        if other_cs.step_name == src:
+                            if other_plan.plan_id not in depends_on:
+                                depends_on.append(other_plan.plan_id)
+                            break
+
+            # ── 中间步骤产生 _temp 表 ──
+            produces: str | None = None
+            if not is_final:
+                produces = make_temp_name(chain_id, cs.step_name)
+
+            kind = StatementKind.FINAL if is_final else StatementKind.PRODUCER
+
+            stmt = SqlStatement(
+                statement_id=plan.plan_id,
+                plan=plan,
+                kind=kind,
+                depends_on=depends_on,
+                produces=produces,
+                intent=intent,
+            )
+            statements.append(stmt)
+
+        # ── 构建 TempTableSpec 列表 ──
+        for idx, (cs, plan) in enumerate(zip(steps, plans)):
+            if not (idx == len(steps) - 1):
+                temp_id = make_temp_name(chain_id, cs.step_name)
+                # 收集消费者
+                consumed_by: list[str] = []
+                for other_cs, other_plan in zip(steps, plans):
+                    other_src = (
+                        other_cs.source
+                        if isinstance(other_cs.source, list)
+                        else [other_cs.source]
+                    )
+                    if cs.step_name in other_src:
+                        consumed_by.append(other_plan.plan_id)
+                col_defs = _extract_output_columns(plan)
+                temp_tables.append(TempTableSpec(
+                    temp_id=temp_id,
+                    produced_by=plan.plan_id,
+                    consumed_by=consumed_by,
+                    column_defs=col_defs,
+                ))
+
+        # ── 从 spec.output_spec 派生 final_output_target ──
+        final_output_target: str | None = None
+        output_spec = getattr(spec, "output_spec", None)
+        if output_spec:
+            table_name = getattr(output_spec, "table_name", None) or ""
+            partition = getattr(output_spec, "partition_spec", None)
+            if table_name:
+                final_output_target = table_name
+                if partition and hasattr(partition, "dt"):
+                    final_output_target = f"{table_name} partition dt={partition.dt}"
+
+        final_output = plans[-1].plan_id if plans else None
+        return self.build_from_statements(
+            statements=statements,
+            temp_tables=temp_tables,
+            spec_hash=spec.spec_hash,
+            final_output=final_output,
+            final_output_target=final_output_target,
+        )
 
     def build_from_statements(
         self,
@@ -562,6 +787,7 @@ class SqlProgramBuilder:
         temp_tables: list[TempTableSpec] | None = None,
         spec_hash: str = "",
         final_output: str | None = None,
+        final_output_target: str | None = None,
     ) -> SqlProgram:
         """从预构建的语句列表创建 SqlProgram。
 
@@ -570,6 +796,7 @@ class SqlProgramBuilder:
             temp_tables: _temp 中间表声明
             spec_hash: 对应 spec 的 hash
             final_output: 最终输出的 statement_id
+            final_output_target: FINAL 的真实输出目标（表名+分区等）
 
         Returns:
             SqlProgram——含计算后的 topological_order
@@ -593,4 +820,5 @@ class SqlProgramBuilder:
             temp_tables=temp_tables or [],
             topological_order=order,
             final_output=final_output,
+            final_output_target=final_output_target,
         )
