@@ -50,6 +50,9 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+markers = [
+    "slow: 需要真实 PySpark 子进程执行的慢速集成测试",
+]
 
 [tool.ruff]
 line-length = 110
