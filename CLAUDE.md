@@ -6,6 +6,21 @@
 - 注释应简洁明了，解释"为什么"而非"是什么"
 - 函数/类使用简短的中文 docstring 说明用途
 
+## CodeGraph 使用策略
+
+**前置条件：仅当 `.codegraph/` 目录存在且 `codegraph_explore` MCP 工具可用时才启用。**
+`.codegraph/` 在 `.gitignore` 中，不会被 git 追踪。未安装 CodeGraph 的 PC 上该目录不存在，
+此时**完全跳过本节**，直接使用 Grep/Glob/Read 传统工具链，不影响任何工作流。
+
+满足前置条件时，按以下策略使用：
+
+- **优先使用 `codegraph_explore`**：理解代码结构、查找符号定义、分析调用链和影响范围时，先尝试 CodeGraph。一次调用通常能替代多轮 grep + Read。
+- **不可用则回退**：如果 CodeGraph 返回空结果、daemon 未运行、或索引明显过时，直接使用 Grep/Glob/Read，不要阻塞工作流。
+- **锁冲突处理**：如遇 `file lock held by another process` 错误，运行 `codegraph unlock` 清除残留锁，然后 `codegraph sync` 刷新索引。
+- **索引同步**：大规模代码变更（>10 个文件）后，运行 `codegraph sync` 手动刷新，避免 auto-sync 延迟影响查询准确性。
+
+**CodeGraph 的核心价值**：Blast Radius 分析（修改前知道谁依赖目标符号）和调用者统计（含测试覆盖标记），这两项是传统 grep 无法替代的。
+
 ## 外接知识文档路径
 
 项目的外部知识积累存放在 Obsidian Vault 中，按优先级依次尝试以下路径：

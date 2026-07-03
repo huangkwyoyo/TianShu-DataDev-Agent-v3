@@ -6,7 +6,7 @@
 
 1. PySpark 是主要代码产物，SQL 是独立参考实现和验证手段。
 2. SQL 由 SqlBuildPlan / SqlProgram 经确定性 Compiler 生成，LLM 不生成 SQL 文本或片段。
-3. PySpark 由 LLM 生成，但必须满足纯转换函数、安全校验和真实执行契约。
+3. PySpark DSL 由确定性 Compiler 生成，LLM 只做语义标注（StepAnnotation），不直接输出代码。
 4. SQL 与 Spark 共享 DataTransformContract 和冻结快照，不共享实现代码。
 5. Comparator 只证明样本一致性；人负责业务审查和上线决策。
 6. LangGraph 是薄编排层，业务节点是普通 Python 函数。
@@ -27,8 +27,9 @@ ParsedDeveloperSpec
 
 [Spark-first v2.0]
   → DataTransformContract（从已验证 SqlBuildPlan 确定性抽取，三级递进）
-  → SparkDeveloper → Static Validator → 受控 PySpark DSL
-  → 双链验证（PlanEquivalence：SqlBuildPlan vs ExtractedSparkPlan + ResultComparator）
+  → SparkDeveloper（LLM 只做语义标注）→ SparkCompiler（确定性 PySpark DSL 生成）
+  → Static Validator（AST 硬门禁）
+  → 双链验证（PlanComparator：SqlBuildPlan vs SparkPlan + PhysicalVerifier）
   → 人工审查
 ```
 

@@ -1,46 +1,63 @@
-# Phase 6：受控 PySpark DSL + Static Validator
+# Phase 6：受控 PySpark DSL 生成
 
-> ⚠️ 本文为占位文档。Phase 4 退出后，必须基于 SQL-first v1.0 的真实 Harness 报告、人工接受率和试用反馈重写本文，才能启动本 Phase 的实施。
+> 状态：设计完成，待实施 | 设计文档：`docs/superpowers/specs/2026-07-03-spark-first-phase-6-8-design.md`
+> 实施计划：`docs/superpowers/specs/2026-07-03-spark-first-phase-6-8-implementation-plan.md`
+> 前置依赖：Phase 5 SparkPlan IR + mapper.py 确定性映射 ✅
 
-> 状态：占位——Phase 4 退出后重写
-> 前置依赖：Phase 5 SparkPlan IR + DataTransformContract v1 消费
+## 架构概要
 
-## 当前占位概要
+```
+DataTransformContractV1 → mapper.py → baseline SparkPlan（结构，确定性）
+                                     → SparkDeveloper（LLM，只做标注，不增删改 step）
+                                     → AnnotatedSparkPlan → AnnotationValidator
+                                     → SparkCompiler（确定性 PySpark DSL 生成）
+                                     → SparkCodeRenderer（安全渲染，禁止字符串拼接）
+                                     → Static Validator（AST 硬门禁，8 种错误码 E601-E608）
+```
 
-### 目标
+**核心原则**：LLM 不直接生成 PySpark 代码。mapper.py 是唯一 Contract → SparkPlan 结构生成路径。Compiler 确定性生成代码，所有代码片段通过 Renderer 封闭枚举/白名单渲染。
 
-1. SparkDeveloper（LLM）读 DataTransformContract v1，生成受控 PySpark 纯转换函数
-2. Static Validator 做 AST 白名单检查——默认拒绝未知语法
-3. SparkReviewer 输出结构化 ReviewFinding 与 OptimizationDirective
-4. SparkTester 输出 TestPlan 和测试代码（测试代码同样经过 Static Validator 和隔离执行）
+## 关键组件
 
-### 前置依赖
+| 组件 | 文件 | 职责 |
+|------|------|------|
+| `StepAnnotation` / `AnnotatedSparkPlan` | `annotations.py` | 标注模型，step_id 主键，annotation 数量 == steps 数量 |
+| `AnnotationValidator` | `annotations.py` | 确定性校验：数量匹配、step_id 有效、无重复 |
+| `SparkCompiler` | `compiler.py` | 9 种 step → PySpark DSL，固定入口 `transform(inputs, params) -> DataFrame` |
+| `SparkCodeRenderer` | `renderer.py` | 安全渲染——所有值来自封闭枚举/白名单，禁止裸 f-string |
+| `SparkStaticValidator` | `validator.py` | AST call-chain 分类，8 种错误码（E601-E608），预留 ExecutionSafetyProbe |
+| `SparkDeveloperService` | `developer.py` | LLM 封装（Phase 8 实现），StructuredOutput + AnnotationValidator |
 
-- DataTransformContract v1（Phase 5 已验证可映射为 SparkPlan IR）
-- SparkDeveloper 从 DataTransformContract 翻译，不独立读取 DeveloperSpec
+## 难度分组
 
-### 能力白名单
+```
+Phase 6A: scan / filter / project / sort / limit     ← 先做
+Phase 6B: aggregate / join / case_when               ← 后做
+Phase 6C: window（含帧边界）                          ← 最后
+```
 
-- scan / filter / join / aggregate / project / case_when / window
-- 纯转换函数入口：`transform(inputs: Mapping[str, DataFrame], params: TransformParams) -> DataFrame`
-- 只读取 `inputs` 中契约声明的数据源
+## 硬约束（C 类）
 
-### 禁止事项
+1. mapper.py 是唯一 Contract → SparkPlan 路径
+2. SparkDeveloper 只做标注，不增删改 step
+3. 删除 annotation 后执行代码完全等价
+4. `inputs["{source_name}"]` 禁止 `spark.read` / `spark.table`
+5. Compiled code 不含 SQL 文本
+6. 所有代码片段过 Renderer，禁止直接字符串拼接
 
-- 禁止 `spark.table`、`spark.read`、自行创建 SparkSession
-- 禁止 Action（collect/count/toPandas/foreach）、Sink（write/save/saveAsTable/insertInto）
-- 禁止 UDF（Python UDF / pandas UDF / 任意序列化执行）
-- 禁止网络、文件系统、数据库连接、进程、线程、动态执行、反射
-- 禁止 `eval`、`exec`、`compile`、动态导入和任意模块导入
-- 禁止 SparkDeveloper 查看 SQL 文本或 SqlBuildPlan 实现
+## 注释格式（5 行固定）
 
-### 验收标准骨架
+```
+# Step: <label>
+# Intent: <业务意图，含下游消费者>
+# Operation: <操作简述>
+# Inputs: <输入表列表>
+# Output: <输出表名/别名>
+```
 
-1. Developer 稳定输出符合入口契约的代码 artifact
-2. Static Validator 拒绝未注入数据源、Action、Sink、UDF、网络、文件和动态执行
-3. Reviewer 输出结构化 Finding 和 Directive，不直接替代最终代码
-4. Tester 代码经过与业务代码同等级的安全校验
+不含 SQL 文本。跨引擎对照通过 CrossReference（sql_artifact_id / sql_step_id）完成。
 
 ---
 
-> Phase 6 | 占位 | Phase 4 退出后由实施 Prompt 重写
+> 详细设计见 `docs/superpowers/specs/2026-07-03-spark-first-phase-6-8-design.md` §1
+> 实施步骤见 `docs/superpowers/specs/2026-07-03-spark-first-phase-6-8-implementation-plan.md` Phase 6A/6B/6C

@@ -16,7 +16,7 @@ TianShu DataDev Agent v3 是 **AI 辅助数据开发工具**，面向程序员 /
 2. SQL 由类型化 SqlBuildPlan / SqlProgram 经 Python 确定性编译生成。
 3. PySpark 代码满足受控纯转换函数契约。
 4. SQL 与 Spark 均在同一个冻结快照上真实执行。
-5. 确定性 Comparator 给出 `CONSISTENT_SAMPLE`。
+5. 确定性 Comparator 给出 `RESULT_CONSISTENT`（双引擎结果一致）或进入 `HUMAN_REVIEW`。
 6. 所有 WARN、不支持语义和人工确认项已写入审查材料。
 
 `REVIEW_READY` 只表示可以进入代码审查，不表示业务绝对正确、全量性能合格或生产就绪。
@@ -38,8 +38,9 @@ TianShu DataDev Agent v3 是 **AI 辅助数据开发工具**，面向程序员 /
 |------|------|------------|
 | `DRAFT` | 代码已生成，尚未验证 | 不代表可运行 |
 | `STATIC_VALIDATED` | 静态契约和安全检查通过 | 不代表运行成功 |
-| `RUNTIME_PASS` | 对应引擎在冻结样本上运行成功 | 不代表双引擎一致 |
-| `CONSISTENT_SAMPLE` | SQL/Spark 在样本和已比较维度上一致 | 不代表业务正确或全量一致 |
+| `EXECUTION_PASS` | 对应引擎在冻结样本上运行成功 | 不代表双引擎一致 |
+| `RESULT_CONSISTENT` | SQL/Spark 在样本和已比较维度上一致 | 不代表业务正确或全量一致 |
+| `LOGIC_EQUIVALENT` | SQL Plan ↔ Spark Plan 结构完全等价 | 不代表结果一致 |
 | `REVIEW_READY` | 材料完整，可以进入人工代码审查 | 不代表获准上线 |
 | `HUMAN_REVIEW` | 自动化无法继续或存在不确定项 | 不代表失败代码可接受 |
 
@@ -59,8 +60,10 @@ DeveloperSpec (.md 项目书)
 
 [Spark-first v2.0]
 → DataTransformContract（从已验证 SqlBuildPlan 确定性抽取，三级递进）
-→ SparkDeveloper → Static Validator → 受控 PySpark DSL
-→ 双链验证（PlanEquivalence + ResultComparator）
+→ mapper.py → baseline SparkPlan（确定性，唯一结构路径）
+→ SparkDeveloper（LLM 只做语义标注）→ SparkCompiler（确定性 PySpark DSL 生成）
+→ Static Validator（AST 硬门禁）
+→ 双链验证（PlanComparator + PhysicalVerifier）
 → 人工审查
 ```
 
@@ -85,13 +88,14 @@ DeveloperSpec (.md 项目书)
 | SQL Validator | 校验表字段存在、Join key 类型一致、证据等级硬门禁 |
 | SQL Compiler | 确定性编译 DuckDB SQL + 优化 Pass（列裁剪、谓词规范化、无用排序消除、常量折叠） |
 | PerfValidator | 性能门禁——REJECT 阻断 / WARN 记录 |
-| SparkDeveloper | 读 DataTransformContract，生成受控 PySpark 纯转换函数 |
-| SparkReviewer | 输出 ReviewFinding 与 OptimizationDirective |
-| SparkTester | 输出 TestPlan 和不可信测试代码 |
+| SparkDeveloper | 读 DataTransformContract + baseline SparkPlan，只输出语义标注（StepAnnotation），不增删改 step |
+| SparkCompiler | 确定性 PySpark DSL 生成——SparkPlan → 代码，所有片段过 Renderer 封闭枚举/白名单 |
+| SparkCodeRenderer | 安全渲染——禁止字符串拼接，所有值来自封闭模型/枚举/白名单 |
+| SparkStaticValidator | AST call-chain 硬门禁——8 种错误码（E601-E608），默认拒绝 |
 | Snapshot Builder | 构建关系一致、不可变的 Parquet 快照 |
 | Executors | 在隔离环境真实执行 SQL 和 Spark |
 | Normalizer / Comparator | 规范化并确定性判断结果一致性 |
-| PlanEquivalence | SQL 侧 SqlBuildPlan vs Spark 侧 ExtractedSparkPlan 结构等价比较 |
+| PlanComparator | SQL 侧 SqlBuildPlan vs Spark 侧 SparkPlan 结构等价比较（封装 plan_equivalence.py） |
 | DifferenceAnalyst | 解释差异，不决定验证结论 |
 | RepairPlanner | 输出结构化 RepairDirective |
 | LangGraph | 编排节点、分支、重试、checkpoint 和人工中断 |

@@ -103,8 +103,8 @@ legacy 的 6 层 SQL 安全检查和 12 层 Spark 安全检查覆盖了大量低
 | Contract 引用（git submodule） | **保留**——作为 SchemaRegistry 基础 | SchemaRegistry 物理元数据源 | Phase 0 |
 | SQL Compiler | **重写**——新 IR 结构，但保留 sqlglot Renderer 思路 | Compiler（输入 SqlBuildPlan/SqlProgram，输出 DuckDB SQL） | Phase 1C |
 | SQL Validator | **重写**——新增 WEAK/NONE 硬门禁、SOURCE_CONFLICT 检查 | Validator（事实源校验 + Join 证据门禁 + 语义校验 + PerfValidator） | Phase 1C |
-| Spark 多 Agent | **后移并重写**——Phase 5-6，输入改为 DataTransformContract v1 | SparkDeveloper / SparkReviewer / SparkTester | Phase 5-6 |
-| 交叉验证 | **后移并重写**——Phase 7，新增 PlanEquivalence 维度 | PlanEquivalenceComparator + ResultComparator（双链验证） | Phase 7 |
+| Spark 多 Agent | **后移并重写**——Phase 5-6，输入改为 DataTransformContract v1 | SparkDeveloper（标注）+ SparkCompiler（代码生成）+ Static Validator（AST 门禁） | Phase 5-6 |
+| 交叉验证 | **后移并重写**——Phase 7，新增逻辑+物理双链验证 | PlanComparator + PhysicalVerifier + RepairPlanner（双链验证） | Phase 7 |
 | 返工机制 | **后移并重写**——Phase 7-8，保持 2 轮上限 | DifferenceAnalyst + RepairPlanner | Phase 7-8 |
 | Code Review Package | **重写**——新目录结构，DeveloperSpec-first 命名 | Code Review Package | Phase 2 |
 | Harness | **重写**——新增 Join 推理质量"零容忍"维度 | Harness（七维门禁） | Phase 4 |

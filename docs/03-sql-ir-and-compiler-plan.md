@@ -443,7 +443,7 @@ Phase 3B 通过 `WindowExpr` 和 `CaseWhenStep` 表达以下场景：
 | `PLAN_VALIDATED` | SqlBuildPlan / SqlProgram 结构和事实源校验通过 |
 | `PLAN_REJECTED` | 非法字段、未注册引用、WEAK/NONE Join 或不受支持表达式 |
 | `COMPILED` | SQL artifact 已确定性生成 |
-| `RUNTIME_PASS` | DuckDB 在冻结快照上执行成功 |
+| `EXECUTION_PASS` | DuckDB 在冻结快照上执行成功 |
 | `HUMAN_REVIEW` | 无法确定规划、绑定、Join 或合并语义 |
 
 LLM 的 `confidence` 只能作为诊断元数据，不得参与安全判定、执行许可和自动通过。

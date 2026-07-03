@@ -11,7 +11,7 @@
 
 | Step 类型 | 对应 SQL Step | 说明 |
 |-----------|--------------|------|
-| `SparkReadStep` | ScanStep | `spark.read.parquet(path)` |
+| `SparkReadStep` | ScanStep | `{alias} = inputs["{source_name}"]`（物理路径在 SnapshotManifest） |
 | `SparkFilterStep` | FilterStep | `df.filter(condition)` |
 | `SparkJoinStep` | JoinStep | `df.join(other, on=keys, how=join_type)` |
 | `SparkAggregateStep` | AggregateStep | `df.groupBy(keys).agg(*metrics)` |

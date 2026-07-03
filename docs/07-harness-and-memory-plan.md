@@ -1,12 +1,11 @@
 # Phase 4 Harness + 回归 / 规则 / Schema 标注 — TianShu DataDev Agent v3
 
-> ⚠️ 本文为占位文档。Phase 4 退出后，必须基于 SQL-first v1.0 的真实 Harness 报告、人工接受率和试用反馈重写本文，才能启动本 Phase 的实施。
-
-> 文档版本：Phase 0.5 DeveloperSpec-first 架构校正版（占位）
+> 文档版本：2026-07-03 更新版
+> 状态：Phase 4 已退出，Harness 七维门禁已落地。Phase 8 将扩展 Spark 5 维度评测。
 
 ## 1. 当前状态
 
-**等待 Phase 4 退出。** 本文覆盖 Phase 4 的 Harness 评测系统与失败沉淀机制。具体的 Harness 实现代码、指标阈值、评测数据集——必须在 Phase 4 真实 LLM 硬化过程中校准后才能确定。**本项目不建设独立 Engineering Memory。**
+**Phase 4 已退出。** Harness 评测系统已实现，七维门禁可用。本文保留 Harness 设计参考；Spark 扩展维度设计见 `docs/superpowers/specs/2026-07-03-spark-first-phase-6-8-design.md` §3.3。
 
 ## 2. Harness 七维门禁定义
 
@@ -57,15 +56,27 @@ harness/datasets/
 - Harness 数据库和日志独立于产品运行时的 artifact store
 - 评测结果可生成 HarnessReport，但不参与自动路由、自动通过或自动上线决策
 
-## 6. 验收标准骨架
+## 6. Phase 8 Spark 扩展维度
+
+Phase 8 在已有 SQL Harness 基础上新增 5 个 Spark 专属评测维度：
+
+| 维度 | 说明 |
+|------|------|
+| `SPARK_CONTRACT_FIDELITY` | SparkPlan 与 Contract 的一致性 |
+| `SPARK_COMPILATION_DETERMINISM` | 同一 Contract 两次编译 → 相同 raw 代码 |
+| `SPARK_VALIDATOR_COVERAGE` | Static Validator 对 8 种错误码的拦截覆盖率 |
+| `SPARK_LOGIC_EQUIVALENCE` | SQL/Spark PlanComparator 结构一致 |
+| `SPARK_PHYSICAL_CONSISTENCY` | 双引擎同快照结果一致 |
+
+## 7. 验收标准
 
 1. Harness 不被产品运行时 import
 2. 模型输出评测不依赖全文快照
-3. 能区分样本一致率（CONSISTENT_SAMPLE）、黄金正确率和人工接受率
+3. 能区分 `RESULT_CONSISTENT`（样本一致）、黄金正确率和人工接受率
 4. Domain Knowledge 只有一个事实源——SourceManifest / SchemaRegistry
 5. 失败案例沉淀路径完整（回归 / 规则 / Schema 标注 / Prompt 回归），不存在独立 Memory 写入流程
 6. Harness case、Prompt 版本、模型版本和失败沉淀落点均可追溯
 
 ---
 
-> Phase 0.5 DeveloperSpec-first 校正 | 2026-06-26 | 占位——Phase 4 退出后重写
+> 2026-07-03 更新：移除占位标记，Phase 4 已退出。Spark 扩展维度设计见 superpowers/specs。

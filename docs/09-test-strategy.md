@@ -27,7 +27,7 @@ Phase 0 实际已有 22 个 pytest 用例，超过原定 `≤10` 预算。进入
 | Phase 4 | 100-130 | 真实 LLM 结构化输出、Harness 七维门禁、15 条 PERF 规则、安全评测六种攻击向量 |
 | Phase 4.5 | 110-140 | REST API 请求/响应 Schema、CLI 确定性、Web 前端输入校验 |
 | Phase 5 | 115-145 | SparkPlan IR Schema、DataTransformContract v1、SQL step 到 Spark step 映射、PlanEquivalence 规则 |
-| Phase 6 | 125-160 | SparkDeveloper 受控 DSL、Static Validator AST 白名单、Action/Sink/UDF 拒绝、SparkReviewer/Tester |
+| Phase 6 | 125-160 | SparkDeveloper 语义标注、SparkCompiler 确定性代码生成、SparkCodeRenderer 安全渲染、Static Validator AST 硬门禁（E601-E608） |
 | Phase 7 | 135-175 | PlanEquivalenceComparator、Snapshot Builder 关系一致抽取、ResultComparator 10 维度、差异诊断路由 |
 | Phase 8 | 140-190 | LangGraph 编排壳、Graph State 边界、返工上限、Spark Harness、前端 Spark-first 视图 |
 
