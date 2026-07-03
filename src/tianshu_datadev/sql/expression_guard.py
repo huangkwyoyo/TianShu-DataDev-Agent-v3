@@ -67,19 +67,22 @@ def validate_input_expression(
 
     Args:
         expression: 待校验的表达式字符串，None 视为合法（无表达式）
-        mode: "strict" — 返回错误信息供调用方抛出异常
-              "silent" — 静默模式（返回 False 但不抛异常，由调用方丢弃）
-              "compiler" — 编译器侧最终防线（白名单 + 关键字检查）
+        mode: "strict" — 同 silent，两者行为一致，均检查第 1-2 层（禁止字符 + 禁止模式），
+              区别在调用方——strict 模式的调用方（如 Parser）抛出异常阻断流程，
+              silent 模式的调用方（如 Enricher）静默丢弃非法表达式
+              "compiler" — 编译器侧最终防线（白名单正则 + SQL 关键字检查），比前两者更严格
 
     Returns:
         (is_valid, error_message): is_valid=True 表示安全，error_message 在失败时为诊断信息
+        注意：三种 mode 均不抛出异常——异常由调用方根据模式决定是否抛出
     """
     if expression is None:
         return True, ""
 
     expr = expression.strip()
     if not expr:
-        return True, ""
+        # 空字符串或纯空格——表达式应有实际内容，视作无效
+        return False, "表达式为空或仅包含空白字符"
 
     # ── 第 1 层：禁止字符 ──
     for ch in _FORBIDDEN_CHARS:
@@ -112,7 +115,7 @@ def validate_input_expression(
             # 使用词边界检查——避免误杀列名中包含的子串
             # 如 "amount" 不应因为包含 "COUNT" 而被拒绝
             # 但 "1 FROM users" 中的 "FROM" 应被拒绝
-            if re.search(rf"\b{kw}\b", expr_upper):
+            if re.search(rf"\b{re.escape(kw)}\b", expr_upper):
                 return False, (
                     f"表达式 '{expression}' 含 SQL 关键字 '{kw}'——"
                     f"input_expression 不允许包含 SQL 关键字"

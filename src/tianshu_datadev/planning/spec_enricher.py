@@ -17,6 +17,7 @@ SpecEnricher（Phase 4）：LLM 驱动，Prompt 嵌入 8 条硬约束。
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from typing import TYPE_CHECKING
@@ -38,6 +39,8 @@ from tianshu_datadev.sql.expression_guard import validate_input_expression
 
 if TYPE_CHECKING:
     from tianshu_datadev.llm.adapters.base import ProviderAdapter
+
+logger = logging.getLogger(__name__)
 
 # ════════════════════════════════════════════
 # 规则推断——中文关键词 → 聚合函数映射
@@ -176,12 +179,16 @@ def _parse_description_to_metric(col) -> MetricDecl | None:
     if arg and arg != "*":
         # 包含运算符 → 表达式；否则 → 列名
         if any(op in arg for op in ("*", "/", "+", "-")):
-            # 安全校验——即使来自正则解析，仍需通过白名单
+            # 双重校验：入站层（禁止字符） + 编译器层（白名单 + SQL 关键字拒绝）
             is_valid, _ = validate_input_expression(arg, mode="silent")
-            if is_valid:
+            is_valid_c, _ = validate_input_expression(arg, mode="compiler")
+            if is_valid and is_valid_c:
                 input_expression = arg
         else:
-            input_column = arg
+            # 基础入站校验——不接受禁止字符，防御深度不下降
+            is_valid, _ = validate_input_expression(arg, mode="silent")
+            if is_valid:
+                input_column = arg
 
     return MetricDecl(
         metric_name=col.name,
@@ -1305,12 +1312,17 @@ class SpecEnricher:
                 except Exception:
                     pass  # H3：filter 不合法，丢弃 filter 保留指标
 
-            # 安全校验——LLM 产出的 input_expression 含注入字符时静默丢弃
+            # 安全校验——LLM 产出的 input_expression 含注入字符或 SQL 关键字时静默丢弃
             raw_input_expr = item.get("input_expression")
             if raw_input_expr:
                 is_valid, _ = validate_input_expression(raw_input_expr, mode="silent")
-                if not is_valid:
-                    raw_input_expr = None  # 静默丢弃非法表达式
+                is_valid_c, _ = validate_input_expression(raw_input_expr, mode="compiler")
+                if not is_valid or not is_valid_c:
+                    logger.warning(
+                        "LLM 产出 input_expression '%s' 未通过安全校验（silent=%s, compiler=%s），已丢弃",
+                        raw_input_expr, is_valid, is_valid_c,
+                    )
+                    raw_input_expr = None  # 校验失败时静默丢弃表达式
 
             inferred_metrics.append(
                 MetricDecl(
@@ -1348,9 +1360,20 @@ class SpecEnricher:
         # 解析计算指标
         for item in raw.get("inferred_computed_metrics", []):
             expr = item.get("expression", "")
-            # 安全检查——含 SQL 注入字符的表达式静默丢弃（使用共享校验）
+            # 双重校验：入站层 + 编译器层（白名单正则 + SQL 关键字拒绝）
             is_valid, _ = validate_input_expression(expr, mode="silent")
-            if not is_valid:
+            is_valid_c, _ = validate_input_expression(expr, mode="compiler")
+            if not is_valid or not is_valid_c:
+                if not is_valid:
+                    logger.warning(
+                        "LLM 产出计算表达式 '%s' 含禁止字符/模式，已丢弃",
+                        expr,
+                    )
+                else:
+                    logger.warning(
+                        "LLM 产出计算表达式 '%s' 含 SQL 关键字或非法字符（compiler 拒绝），已丢弃",
+                        expr,
+                    )
                 continue
             inferred_computed.append(
                 InferredComputedMetric(

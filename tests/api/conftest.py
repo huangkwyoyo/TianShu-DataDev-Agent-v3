@@ -22,8 +22,11 @@ def _read_fixture(filename: str) -> str:
 
 @pytest.fixture
 def pipeline():
-    """创建真实 Pipeline 实例——使用临时目录避免污染。"""
-    return Pipeline(base_output_dir=tempfile.mkdtemp())
+    """创建真实 Pipeline 实例——使用临时目录避免污染，测试结束后清理。"""
+    tmpdir = tempfile.mkdtemp()
+    yield Pipeline(base_output_dir=tmpdir)
+    import shutil
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 @pytest.fixture

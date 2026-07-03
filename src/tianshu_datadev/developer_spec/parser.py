@@ -486,9 +486,10 @@ class DeveloperSpecParser:
                     value=str(raw_filter.get("value", "")),
                 )
 
-            # ── Phase 4D 安全校验：input_expression 入站过滤 ──
+            # ── Phase 4D 安全校验：input_expression 入站过滤 + 编译器层检查 ──
             raw_input_expr = raw.get("input_expression")
             if raw_input_expr:
+                # 入站层：禁止字符 + 禁止模式
                 is_valid, err_msg = validate_input_expression(raw_input_expr, mode="strict")
                 if not is_valid:
                     raise ParseError(
@@ -496,6 +497,16 @@ class DeveloperSpecParser:
                         err_msg,
                         field_ref=f"metrics.{raw.get('metric_name', '')}.input_expression",
                     ) from None
+                # 编译器层：白名单正则 + SQL 关键字拒绝
+                is_valid_c, err_msg_c = validate_input_expression(raw_input_expr, mode="compiler")
+                if not is_valid_c:
+                    raise ParseError(
+                        ParseErrorCode.E008_UNSAFE_EXPRESSION,
+                        err_msg_c,
+                        field_ref=f"metrics.{raw.get('metric_name', '')}.input_expression",
+                    ) from None
+                # 存储 strip 后的值——expression_guard 内部 strip 了，此处同步确保外部引用一致
+                raw_input_expr = raw_input_expr.strip()
 
             metrics.append(MetricDecl(
                 metric_name=raw.get("metric_name", ""),

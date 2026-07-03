@@ -592,8 +592,8 @@ class TestSpecEnricherParseLLM:
         assert result.inferred_computed_metrics[0].expression == "paid_count / total_count"
         assert result.inferred_computed_metrics[1].expression == "quantity * unit_price"
 
-    def test_parse_allows_empty_expression(self):
-        """空 expression——通过（允许不填）。"""
+    def test_parse_rejects_empty_expression(self):
+        """空 expression——被拒绝（expression 应有实际内容）。"""
         enricher = SpecEnricher()
         raw = {
             "inferred_metrics": [],
@@ -611,5 +611,4 @@ class TestSpecEnricherParseLLM:
 
         result = enricher._parse_llm_response(raw, spec)
 
-        assert len(result.inferred_computed_metrics) == 1
-        assert result.inferred_computed_metrics[0].expression == ""
+        assert len(result.inferred_computed_metrics) == 0

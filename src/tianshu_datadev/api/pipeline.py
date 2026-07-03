@@ -130,12 +130,12 @@ class Pipeline:
     def _store_result(self, request_id: str, data: dict) -> None:
         """缓存中间结果并记录写入时间戳——供 TTL 过期清理使用。"""
         self._results[request_id] = data
-        self._timestamps[request_id] = time.time()
+        self._timestamps[request_id] = time.monotonic()
 
     def _store_package(self, request_id: str, package: object) -> None:
         """缓存打包结果并记录写入时间戳——供 TTL 过期清理使用。"""
         self._packages[request_id] = package
-        self._timestamps[request_id] = time.time()
+        self._timestamps[request_id] = time.monotonic()
 
     def _purge_expired(self) -> int:
         """清理所有超过 TTL 的缓存条目。
@@ -146,7 +146,7 @@ class Pipeline:
         Returns:
             清理的条目数
         """
-        now = time.time()
+        now = time.monotonic()
         expired_ids = [
             rid for rid, ts in self._timestamps.items()
             if now - ts > self._ttl_seconds
@@ -704,9 +704,12 @@ class Pipeline:
                 program_result = execute_executor.execute_program(
                     program_artifact.compiled
                 )
-                last_result = program_result.results[-1]
-                trace = last_result.trace
-                summary = last_result.summary
+                last_result = (
+                    program_result.results[-1]
+                    if program_result.results else None
+                )
+                trace = last_result.trace if last_result is not None else None
+                summary = last_result.summary if last_result is not None else None
                 compiled = program_artifact.compiled.statements[-1]
             elif hypothesis and len(hypothesis.candidates) > 1:
                 # ── 多跳链路径 ──
@@ -746,9 +749,12 @@ class Pipeline:
                 program_result = execute_executor.execute_program(
                     program_artifact.compiled
                 )
-                last_result = program_result.results[-1]
-                trace = last_result.trace
-                summary = last_result.summary
+                last_result = (
+                    program_result.results[-1]
+                    if program_result.results else None
+                )
+                trace = last_result.trace if last_result is not None else None
+                summary = last_result.summary if last_result is not None else None
                 compiled = program_artifact.compiled.statements[-1]
             else:
                 plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
@@ -1009,6 +1015,8 @@ class Pipeline:
                         "manifest": manifest,
                         "plan": plan,
                         "compiled": program_artifact,
+                        "trace": execution_trace,
+                        "summary": execution_summary,
                         "table_mapping": table_mapping or {},
                     })
                     error_info = {
@@ -1021,16 +1029,12 @@ class Pipeline:
                         "spec_id": spec.spec_id,
                         "plan_id": plan.plan_id,
                         "validation_passed": passed,
-                        "execution_status": "not_executed",
+                        "execution_status": "runtime_failed",
                         "row_count": 0,
                         "elapsed_ms": 0,
                         "open_questions": _summarize_open_questions(
                             list(plan_questions) + list(val_questions) + list(extra_questions)
                         ),
-                        "contract_id": "",
-                        "package_id": "",
-                        "contract": {},
-                        "compiled": compiled_sql,
                         "pipeline_error": error_info,
                         "pipeline_stages": self._build_pipeline_stages(
                             "execute", error_info, _run_all_stages,
@@ -1169,8 +1173,14 @@ class Pipeline:
                 program_result = execute_executor.execute_program(
                     program_artifact.compiled
                 )
-                trace = program_result.results[-1].trace
-                summary = program_result.results[-1].summary
+                trace = (
+                    program_result.results[-1].trace
+                    if program_result.results else None
+                )
+                summary = (
+                    program_result.results[-1].summary
+                    if program_result.results else None
+                )
             else:
                 plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
 
@@ -1223,7 +1233,7 @@ class Pipeline:
                     "spec_id": spec.spec_id,
                     "plan_id": plan.plan_id,
                     "validation_passed": passed,
-                    "execution_status": "not_executed",
+                    "execution_status": "runtime_failed",
                     "row_count": 0,
                     "elapsed_ms": 0,
                     "open_questions": _summarize_open_questions(
@@ -1276,7 +1286,8 @@ class Pipeline:
                     program_artifact.model_dump()
                     if program_artifact is not None
                     else None
-                ),                                                            # 编译产物元数据（单表路径为 None）
+                ),
+                # 编译产物元数据（单表路径为 None）
             )
             package_manifest = packager.build(package_inputs)
 
@@ -1755,7 +1766,7 @@ class Pipeline:
                     "request_id": request_id,
                     "spec_id": spec.spec_id,
                     "plan_id": _plan_id,
-                    "validation_passed": True,
+                    "validation_passed": _passed,
                     "generated_sql": compiled.sql if compiled is not None else "",
                     "sql_sha256": _sql_sha256,
                     "compiler_version": _compiler_ver,
