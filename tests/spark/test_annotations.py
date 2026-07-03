@@ -5,10 +5,9 @@ from __future__ import annotations
 import pytest
 
 from tianshu_datadev.spark.annotations import (
-    AnnotationValidationResult,
+    AnnotatedSparkPlan,
     AnnotationValidator,
     AnnotationWarning,
-    AnnotatedSparkPlan,
     StepAnnotation,
     StepIntent,
     compute_annotation_hash,

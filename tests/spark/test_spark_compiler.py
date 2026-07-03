@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from tianshu_datadev.spark.compiler import SparkCompileResult, SparkCompiler
+from tianshu_datadev.spark.compiler import SparkCompiler
 from tianshu_datadev.spark.models import (
     SparkFilterStep,
     SparkLimitStep,
@@ -19,6 +19,7 @@ from tianshu_datadev.spark.models import (
     SparkSortSpec,
     SparkSortStep,
 )
+from tianshu_datadev.spark.renderer import RenderError
 
 
 def _make_plan(*steps) -> SparkPlan:
@@ -278,9 +279,173 @@ class TestCompileDeterminism:
         result = compiler.compile(plan)
 
         # 去除注释行
-        raw_lines = [l for l in result.raw_pyspark.split("\n") if not l.strip().startswith("#")]
-        ann_lines = [l for l in result.annotated_pyspark.split("\n") if not l.strip().startswith("#")]
+        raw_lines = [
+            line for line in result.raw_pyspark.split("\n")
+            if not line.strip().startswith("#")
+        ]
+        ann_lines = [
+            line for line in result.annotated_pyspark.split("\n")
+            if not line.strip().startswith("#")
+        ]
         assert raw_lines == ann_lines
+
+
+# ════════════════════════════════════════════
+# 安全补丁：恶意输入回归测试
+# ════════════════════════════════════════════
+
+
+class TestMaliciousInput:
+    """恶意输入在编译器/Renderer 层被安全处理——拒绝或转义。"""
+
+    def test_source_name_with_quotes_escaped(self):
+        """含双引号的 source_name——双引号被转义，输出合法 Python。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name='a"b', input_key="od"),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+        # 输出中双引号被转义，不是裸双引号
+        assert 'inputs[' in result.raw_pyspark
+        assert 'a\\"b' in result.raw_pyspark
+
+    def test_source_name_with_newline_escaped(self):
+        """含换行的 source_name——换行被转义为 \\n。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="a\nb", input_key="od"),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+        # 换行被转义，代码仍在单行内
+        assert "\\n" in result.raw_pyspark
+        # 生成的代码不跨行
+        read_line = [line for line in result.raw_pyspark.split("\n") if "inputs[" in line][0]
+        assert read_line.count("inputs[") == 1
+
+    def test_source_name_with_backslash_escaped(self):
+        """含反斜杠的 source_name——反斜杠被转义。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="a\\b", input_key="od"),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+        assert "a\\\\b" in result.raw_pyspark
+
+    def test_filter_right_exec_rejected(self):
+        """filter right 含 exec()——编译时抛出 RenderError。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
+            SparkFilterStep(input_alias="od", operator="EQ", left="od.status",
+                           right="exec('rm -rf /')"),
+        )
+        compiler = SparkCompiler()
+        with pytest.raises(RenderError, match="危险模式"):
+            compiler.compile(plan)
+
+    def test_filter_right_spark_read_rejected(self):
+        """filter right 含 spark.read——编译时抛出 RenderError。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
+            SparkFilterStep(input_alias="od", operator="EQ", left="od.status",
+                           right="spark.read.parquet('/tmp/evil')"),
+        )
+        compiler = SparkCompiler()
+        with pytest.raises(RenderError, match="危险模式"):
+            compiler.compile(plan)
+
+    def test_filter_right_import_rejected(self):
+        """filter right 含 import——编译时抛出 RenderError。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
+            SparkFilterStep(input_alias="od", operator="EQ", left="od.status",
+                           right="import os"),
+        )
+        compiler = SparkCompiler()
+        with pytest.raises(RenderError, match="危险模式"):
+            compiler.compile(plan)
+
+    def test_filter_right_unpaired_quotes_rejected(self):
+        """filter right 引号不配对——编译时抛出 RenderError。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
+            SparkFilterStep(input_alias="od", operator="EQ", left="od.status",
+                           right="'paid"),
+        )
+        compiler = SparkCompiler()
+        with pytest.raises(RenderError, match="引号不配对"):
+            compiler.compile(plan)
+
+    # ── 注释注入测试 ──
+
+    def test_source_name_newline_not_break_comment(self):
+        """source_name 含换行——注释中换行被清洗，不会产生裸代码行。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.\nimport os\n# order_detail",
+                         input_key="od"),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+        # 核心不变式：去注释后 annotated == raw
+        def _strip(code):
+            return "\n".join(
+                line for line in code.split("\n") if not line.lstrip().startswith("#")
+            )
+        assert _strip(result.annotated_pyspark) == result.raw_pyspark, (
+            "含换行的 source_name 导致注释注入——去注释后 annotated 与 raw 不一致"
+        )
+        # 额外验证：注释行中不含原始换行（已被 render_comment_text 清洗）
+        for line in result.annotated_pyspark.split("\n"):
+            if line.lstrip().startswith("#"):
+                assert "\n" not in line
+
+    def test_annotated_no_bare_code_from_malicious_input(self):
+        """含恶意换行+eval 的 input 不产生裸代码行——防御纵深验证。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.\neval('bad')\n# order_detail",
+                         input_key="od"),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+        # 核心不变式：去注释后 annotated == raw
+        def _strip(code):
+            return "\n".join(
+                line for line in code.split("\n") if not line.lstrip().startswith("#")
+            )
+        assert _strip(result.annotated_pyspark) == result.raw_pyspark, (
+            "恶意 source_name 导致注释注入"
+        )
+        # eval('bad') 出现在注释文本和 raw 的转义字符串中——两者均安全
+        # 关键：eval( 作为 Python 代码的唯一实例在 raw 中也存在（字符串字面量内）
+        raw_code_lines = [
+            line for line in result.raw_pyspark.split("\n")
+            if not line.lstrip().startswith("#") and "eval(" in line
+        ]
+        ann_non_comment_eval_lines = [
+            line for line in result.annotated_pyspark.split("\n")
+            if not line.lstrip().startswith("#") and "eval(" in line
+        ]
+        assert len(raw_code_lines) == len(ann_non_comment_eval_lines), (
+            f"eval( 在非注释代码行中数量不一致："
+            f"raw={len(raw_code_lines)}, annotated={len(ann_non_comment_eval_lines)}"
+        )
+
+    def test_annotated_minus_comments_equals_raw_with_malicious_source(self):
+        """即使 source_name 含特殊字符，去注释后 annotated 仍与 raw 一致。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.\r\nimport\x00os\x1b# order_detail",
+                         input_key="od"),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+        # 去注释后应完全一致
+        def _strip_comments(code: str) -> str:
+            return "\n".join(
+                line for line in code.split("\n")
+                if not line.lstrip().startswith("#")
+            )
+        assert _strip_comments(result.annotated_pyspark) == result.raw_pyspark, (
+            "恶意 source_name 导致 annotated 与 raw 不一致——注释注入风险"
+        )
 
 
 # ════════════════════════════════════════════

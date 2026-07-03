@@ -9,8 +9,6 @@ import pytest
 
 from tianshu_datadev.spark.validator import (
     SparkStaticValidator,
-    SparkValidationError,
-    SparkValidationResult,
 )
 
 
@@ -68,12 +66,11 @@ class TestE602UnsafeImport:
         assert any(e.error_code == "E602" for e in result.errors)
 
     def test_os_system_import_rejected(self, validator):
+        """import os 本身不触发 E602——只有 os.system 等完整路径才触发。"""
         code = "import os"
-        result = validator.validate(code)
+        _ = validator.validate(code)
         # "os" 本身不触发 E602，只有 "os.system" 触发
-        # 检查 import os 是否被拦截
         # 当前 E602 检查是针对完整模块名的，"os" 不在禁止列表中
-        pass
 
     def test_pyspark_imports_allowed(self, validator):
         """PySpark 标准导入允许。"""
@@ -108,7 +105,7 @@ class TestE603ActionNotAllowed:
         assert not result.is_valid
         assert any(e.error_code == "E603" for e in result.errors)
 
-    def test_df_toPandas_rejected(self, validator):
+    def test_df_toPandas_rejected(self, validator):  # noqa: N802
         code = "pdf = df.toPandas()"
         result = validator.validate(code)
         assert not result.is_valid
@@ -117,11 +114,9 @@ class TestE603ActionNotAllowed:
     def test_f_count_allowed(self, validator):
         """F.count() 聚合函数允许（不是 df.count() action）。"""
         code = "df.groupBy('x').agg(F.count('*'))"
-        result = validator.validate(code)
+        _ = validator.validate(code)
         # F.count 调用不应被误判为 df.count()
         # 当前 AST 实现中，F.count 是 Attribute chain，不会被 _check_action_call 拦截
-        # 因为 _check_action_call 只检查 method_name
-        pass
 
 
 # ════════════════════════════════════════════
@@ -254,7 +249,7 @@ def transform(inputs, params=None):
         result = validator.validate(code)
         assert result.is_valid
 
-    def test_select_filter_orderBy_valid(self, validator):
+    def test_select_filter_orderBy_valid(self, validator):  # noqa: N802
         code = '''df = inputs["t"]
 df2 = df.filter(F.col("x") > 0)
 df3 = df2.select(F.col("x"), F.col("y"))
@@ -263,3 +258,11 @@ df5 = df4.limit(100)
 '''
         result = validator.validate(code)
         assert result.is_valid
+
+    def test_escaped_source_name_passes(self, validator):
+        """render_dict_key 转义后的 inputs key 仍通过 Validator。"""
+        code = 'df = inputs["a\\\\"b"]'
+        result = validator.validate(code)
+        # 含转义字符的合法字符串不应被拦截
+        # E601 检查的是 spark.read / spark.table，不是 inputs[...]
+        assert not any(e.error_code == "E601" for e in result.errors)

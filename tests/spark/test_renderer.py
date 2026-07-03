@@ -184,6 +184,63 @@ class TestRenderComment:
         assert "——" in result
 
 
+class TestRenderCommentText:
+    """注释文本清洗——不添加 # 前缀，净化控制字符和注入。"""
+
+    def test_normal_text(self):
+        """正常文本原样返回。"""
+        result = SparkCodeRenderer.render_comment_text("数据读取")
+        assert result == "数据读取"
+
+    def test_newline_replaced_with_space(self):
+        """换行替换为空格——防止注释逃逸为裸代码行。"""
+        result = SparkCodeRenderer.render_comment_text("hello\nimport os\n# bad")
+        assert "\n" not in result
+        assert "import os" in result  # 内容保留但换行变空格
+
+    def test_carriage_return_replaced(self):
+        """回车替换为空格。"""
+        result = SparkCodeRenderer.render_comment_text("a\rb")
+        assert "\r" not in result
+
+    def test_tab_replaced_with_space(self):
+        """制表符替换为空格。"""
+        result = SparkCodeRenderer.render_comment_text("a\tb")
+        assert "\t" not in result
+
+    def test_null_byte_removed(self):
+        """空字节被丢弃。"""
+        result = SparkCodeRenderer.render_comment_text("a\x00b")
+        assert "\x00" not in result
+        assert "ab" in result
+
+    def test_escape_sequence_removed(self):
+        """ESC 控制字符被丢弃。"""
+        result = SparkCodeRenderer.render_comment_text("a\x1bb")
+        assert "\x1b" not in result
+
+    def test_del_removed(self):
+        """DEL (0x7F) 被丢弃。"""
+        result = SparkCodeRenderer.render_comment_text("a\x7fb")
+        assert "\x7f" not in result
+
+    def test_sql_comment_injection_prevented(self):
+        """SQL 注释 -- 被替换为 ——。"""
+        result = SparkCodeRenderer.render_comment_text("test -- DROP TABLE")
+        assert "--" not in result
+        assert "——" in result
+
+    def test_multiline_injection_produces_single_line(self):
+        """多行注入产出单行——不会在注释块中产生裸代码行。"""
+        result = SparkCodeRenderer.render_comment_text(
+            '从 inputs["dwd.\nimport os\n# order_detail"] 读取数据'
+        )
+        assert "\n" not in result
+        # 验证 "import os" 不再作为独立行存在
+        lines = result.split("\n")
+        assert len(lines) == 1
+
+
 class TestRenderImports:
     """导入块渲染测试。"""
 
@@ -201,3 +258,153 @@ class TestRenderFunctionSignature:
         assert "def transform(" in result
         assert "inputs: Mapping[str, DataFrame]" in result
         assert "-> DataFrame:" in result
+
+
+# ════════════════════════════════════════════
+# 安全补丁：render_dict_key / render_filter_right
+# ════════════════════════════════════════════
+
+
+class TestRenderDictKey:
+    """字典键安全渲染——转义双引号、反斜杠、控制字符。"""
+
+    def test_normal_key(self):
+        """普通键原样返回，用双引号包围。"""
+        result = SparkCodeRenderer.render_dict_key("dwd.order_detail")
+        assert result == '"dwd.order_detail"'
+
+    def test_key_with_double_quotes(self):
+        """含双引号的键——双引号被转义。"""
+        result = SparkCodeRenderer.render_dict_key('a"b')
+        assert result == r'"a\"b"'
+
+    def test_key_with_newline_rejected(self):
+        """含换行的键——换行被转义为 \\n 字面量。"""
+        result = SparkCodeRenderer.render_dict_key("a\nb")
+        assert "\\n" in result
+        assert "\n" not in result
+
+    def test_key_with_backslash(self):
+        """含反斜杠的键——反斜杠被转义。"""
+        result = SparkCodeRenderer.render_dict_key("a\\b")
+        assert result == r'"a\\b"'
+
+    def test_key_with_carriage_return(self):
+        """含回车的键——被转义。"""
+        result = SparkCodeRenderer.render_dict_key("a\rb")
+        assert "\\r" in result
+        assert "\r" not in result
+
+    def test_key_with_null_byte(self):
+        """含 NUL (0x00) 的键——转义为 \\x00。"""
+        result = SparkCodeRenderer.render_dict_key("a\x00b")
+        assert "\\x00" in result
+        assert "\x00" not in result
+
+    def test_key_with_escape_char(self):
+        """含 ESC (0x1B) 的键——转义为 \\x1b。"""
+        result = SparkCodeRenderer.render_dict_key("a\x1bb")
+        assert "\\x1b" in result
+        assert "\x1b" not in result
+
+    def test_key_with_del_char(self):
+        """含 DEL (0x7F) 的键——转义为 \\x7f。"""
+        result = SparkCodeRenderer.render_dict_key("a\x7fb")
+        assert "\\x7f" in result
+
+    def test_key_with_vt_char(self):
+        """含垂直制表符 (0x0B) 的键——转义为 \\x0b。"""
+        result = SparkCodeRenderer.render_dict_key("a\x0bb")
+        assert "\\x0b" in result
+
+    def test_key_with_form_feed(self):
+        """含换页符 (0x0C) 的键——转义为 \\x0c。"""
+        result = SparkCodeRenderer.render_dict_key("a\x0cb")
+        assert "\\x0c" in result
+
+    def test_all_control_chars_escaped(self):
+        """所有 ASCII 控制字符 (0x00-0x1F, 0x7F) 均被转义——输出不含原始控制字符。"""
+        # 构造含全部控制字符的键
+        controls = "".join(chr(i) for i in list(range(0x00, 0x20)) + [0x7F])
+        key = f"x{controls}y"
+        result = SparkCodeRenderer.render_dict_key(key)
+        # 输出中不应含任何原始控制字符（引号包围的字符串内全是可打印字符）
+        inner = result[1:-1]  # 去掉外双引号
+        for ch in inner:
+            cp = ord(ch)
+            assert cp >= 0x20 and cp != 0x7F, (
+                f"控制字符 U+{cp:04X} 未被转义：{repr(result)}"
+            )
+        # 验证有效控制字符被转义
+        assert "\\n" in result or "\\x0a" in result  # 换行被转义
+        assert "\\x00" in result  # NUL 被转义
+        assert "\\x7f" in result  # DEL 被转义
+
+
+class TestRenderFilterRight:
+    """过滤右值安全渲染——列引用委托 render_column，字面量安全校验。"""
+
+    def test_column_ref_rendered_as_fcol(self):
+        """含点号且无引号——识别为列引用。"""
+        result = SparkCodeRenderer.render_filter_right("od.status")
+        assert result == 'F.col("od.status")'
+
+    def test_safe_literal_passthrough(self):
+        """安全的预格式化字面量——校验通过后原样返回。"""
+        result = SparkCodeRenderer.render_filter_right("'paid'")
+        assert result == "'paid'"
+
+    def test_numeric_literal_passthrough(self):
+        """数值字面量——校验通过后原样返回。"""
+        result = SparkCodeRenderer.render_filter_right("100")
+        assert result == "100"
+
+    def test_malicious_exec_rejected(self):
+        """含 exec() 的右值——抛出 RenderError。"""
+        with pytest.raises(RenderError, match="危险模式"):
+            SparkCodeRenderer.render_filter_right("exec('rm -rf /')")
+
+    def test_malicious_eval_rejected(self):
+        """含 eval() 的右值——抛出 RenderError。"""
+        with pytest.raises(RenderError, match="危险模式"):
+            SparkCodeRenderer.render_filter_right("eval('__import__(\"os\")')")
+
+    def test_malicious_spark_read_rejected(self):
+        """含 spark.read 的右值——抛出 RenderError。"""
+        with pytest.raises(RenderError, match="危险模式"):
+            SparkCodeRenderer.render_filter_right("spark.read.parquet('/etc/passwd')")
+
+    def test_malicious_spark_table_rejected(self):
+        """含 spark.table 的右值——抛出 RenderError。"""
+        with pytest.raises(RenderError, match="危险模式"):
+            SparkCodeRenderer.render_filter_right("spark.table('secret')")
+
+    def test_malicious_spark_sql_rejected(self):
+        """含 spark.sql 的右值——抛出 RenderError。"""
+        with pytest.raises(RenderError, match="危险模式"):
+            SparkCodeRenderer.render_filter_right("spark.sql('DROP TABLE')")
+
+    def test_malicious_import_rejected(self):
+        """含 import 的右值——抛出 RenderError。"""
+        with pytest.raises(RenderError, match="危险模式"):
+            SparkCodeRenderer.render_filter_right("import os")
+
+    def test_malicious_subprocess_rejected(self):
+        """含 subprocess 的右值——抛出 RenderError。"""
+        with pytest.raises(RenderError, match="危险模式"):
+            SparkCodeRenderer.render_filter_right("subprocess.run('ls')")
+
+    def test_unpaired_quotes_rejected(self):
+        """引号不配对——抛出 RenderError。"""
+        with pytest.raises(RenderError, match="引号不配对"):
+            SparkCodeRenderer.render_filter_right("'paid")
+
+    def test_newline_injection_rejected(self):
+        """含换行控制字符——抛出 RenderError。"""
+        with pytest.raises(RenderError, match="控制字符"):
+            SparkCodeRenderer.render_filter_right("'paid'\n# injected")
+
+    def test_in_list_safe(self):
+        """IN 列表字面量——安全校验通过。"""
+        result = SparkCodeRenderer.render_filter_right("[1, 2, 3]")
+        assert result == "[1, 2, 3]"

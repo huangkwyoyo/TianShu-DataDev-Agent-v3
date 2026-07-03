@@ -46,10 +46,10 @@ class TestCommentFormat:
         result = compiler.compile(plan)
 
         comments = [
-            l for l in result.annotated_pyspark.split("\n")
-            if l.strip().startswith("# Step:") or l.strip().startswith("# Intent:")
-            or l.strip().startswith("# Operation:") or l.strip().startswith("# Inputs:")
-            or l.strip().startswith("# Output:")
+            line for line in result.annotated_pyspark.split("\n")
+            if line.strip().startswith("# Step:") or line.strip().startswith("# Intent:")
+            or line.strip().startswith("# Operation:") or line.strip().startswith("# Inputs:")
+            or line.strip().startswith("# Output:")
         ]
         # 每个 step 5 行注释
         assert len(comments) == 5
@@ -113,8 +113,8 @@ class TestCommentNoSQL:
 
         # 提取注释行
         comment_lines = [
-            l for l in result.annotated_pyspark.split("\n")
-            if l.strip().startswith("#")
+            line for line in result.annotated_pyspark.split("\n")
+            if line.strip().startswith("#")
         ]
 
         # SQL 关键字正则（仅匹配完整单词）
@@ -156,8 +156,8 @@ class TestAnnotationsRemovable:
         # 去除注释行
         def _strip_comments(code: str) -> str:
             lines = [
-                l for l in code.split("\n")
-                if not l.strip().startswith("#")
+                line for line in code.split("\n")
+                if not line.strip().startswith("#")
             ]
             return "\n".join(lines)
 

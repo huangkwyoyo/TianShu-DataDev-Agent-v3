@@ -86,6 +86,54 @@ class SparkCodeRenderer:
             )
         return name
 
+    # ── 控制字符转义（render_dict_key / render_comment_text 共用） ──
+
+    # 控制字符 → Python 转义序列映射
+    _CONTROL_CHAR_ESCAPE: dict[str, str] = {
+        "\n": "\\n", "\r": "\\r", "\t": "\\t",
+    }
+
+    @staticmethod
+    def _escape_control_chars(s: str) -> str:
+        """转义字符串中的全部 ASCII 控制字符（0x00-0x1F, 0x7F）。
+
+        已知字符使用简短转义（\\n/\\r/\\t），其余使用 \\xNN 格式。
+        用于 render_dict_key 生成安全的 Python 字符串字面量。
+        """
+        result: list[str] = []
+        for ch in s:
+            cp = ord(ch)
+            if cp < 0x20 or cp == 0x7F:
+                known = SparkCodeRenderer._CONTROL_CHAR_ESCAPE.get(ch)
+                if known:
+                    result.append(known)
+                else:
+                    result.append(f"\\x{cp:02x}")
+            else:
+                result.append(ch)
+        return "".join(result)
+
+    # ── 字典键渲染 ──
+
+    @staticmethod
+    def render_dict_key(key: str) -> str:
+        """渲染字典键字符串——转义双引号、反斜杠和全部控制字符，防止注入。
+
+        用于生成 inputs["key"] 形式的代码。key 不是 Python 变量名，
+        允许点号等字符，但必须转义可能破坏字符串边界的字符。
+
+        Args:
+            key: 字典键原始字符串
+
+        Returns:
+            带双引号包围的安全字符串
+        """
+        # 先转义反斜杠（必须在其他转义之前），再转义双引号
+        escaped = key.replace("\\", "\\\\").replace('"', '\\"')
+        # 转义全部 ASCII 控制字符（0x00-0x1F, 0x7F）
+        escaped = SparkCodeRenderer._escape_control_chars(escaped)
+        return f'"{escaped}"'
+
     # ── 列名渲染 ──
 
     @staticmethod
@@ -132,6 +180,58 @@ class SparkCodeRenderer:
         if isinstance(value, (int, float)):
             return str(value)
         raise RenderError(f"不支持的字面量类型：{type(value).__name__}")
+
+    # ── 过滤右值渲染 ──
+
+    # 右值中禁止出现的危险模式
+    _FORBIDDEN_RIGHT_PATTERNS: tuple[str, ...] = (
+        "exec(", "eval(", "compile(",
+        "__import__", "import ",
+        "spark.read", "spark.table", "spark.sql", "spark._jspark",
+        "subprocess", "os.system", "os.popen",
+    )
+
+    @staticmethod
+    def render_filter_right(value: str) -> str:
+        """渲染过滤条件右值——列引用走 render_column()，字面量经安全扫描后返回。
+
+        规则：
+        1. 含 "." 且不含引号 → 列引用，委托 render_column()
+        2. 其他 → 预格式化表达式，安全扫描后通过（拒绝危险模式和控制字符）
+
+        Args:
+            value: 过滤条件右值字符串
+
+        Returns:
+            安全渲染后的 Python 表达式片段
+
+        Raises:
+            RenderError: 检测到危险内容或格式异常
+        """
+        # 列引用检测——含点号且不含任何引号
+        if "." in value and "'" not in value and '"' not in value:
+            return SparkCodeRenderer.render_column(value)
+
+        # 安全扫描——拒绝危险模式
+        for pattern in SparkCodeRenderer._FORBIDDEN_RIGHT_PATTERNS:
+            if pattern.startswith("spark."):
+                # spark.* 检查大小写不敏感——SparK.Read 也会被拦截
+                if pattern in value.lower():
+                    raise RenderError(f"过滤右值含危险模式：'{pattern}'")
+            elif pattern in value:
+                raise RenderError(f"过滤右值含危险模式：'{pattern}'")
+
+        # 拒绝控制字符——换行/回车/空字节等可破坏代码结构
+        for ch in ["\n", "\r", "\x00", "\x1b"]:
+            if ch in value:
+                raise RenderError(f"过滤右值含控制字符：{repr(ch)}")
+
+        # 引号配对检查——防止字符串字面量逃逸
+        for quote in ("'", '"'):
+            if value.count(quote) % 2 != 0:
+                raise RenderError(f"过滤右值引号不配对（{quote} 出现 {value.count(quote)} 次）")
+
+        return value
 
     # ── 函数名渲染 ──
 
@@ -242,24 +342,51 @@ class SparkCodeRenderer:
         """
         return operator.upper() in _UNARY_OPERATORS
 
-    # ── 注释行渲染 ──
+    # ── 注释文本渲染 ──
+
+    @staticmethod
+    def render_comment_text(text: str) -> str:
+        """清洗注释文本——移除/替换控制字符、防止换行注入。
+
+        用于 _build_comment_block 中各字段（intent/operation/inputs/output）
+        的文本清洗。返回单行安全文本，不含 "# " 前缀。
+
+        Args:
+            text: 原始注释文本（可能含换行、控制字符）
+
+        Returns:
+            单行安全文本，控制字符已移除或替换
+        """
+        # 移除 ASCII 控制字符（0x00-0x1F, 0x7F），保留 \t 转为空格
+        cleaned: list[str] = []
+        for ch in text:
+            cp = ord(ch)
+            if cp == 0x09:  # \t → 空格
+                cleaned.append(" ")
+            elif cp < 0x20 or cp == 0x7F:
+                # 换行/回车 → 空格（防止注释逃逸为裸代码行）
+                # 其他控制字符 → 丢弃
+                if ch in ("\n", "\r"):
+                    cleaned.append(" ")
+                # 其余控制字符直接丢弃
+            else:
+                cleaned.append(ch)
+        result = "".join(cleaned)
+        # 防止 SQL 注释注入
+        result = result.replace("--", "——")
+        return result
 
     @staticmethod
     def render_comment_line(line: str) -> str:
-        """渲染单行注释——安全清洗控制字符和注入字符。
+        """渲染单行注释——清洗后添加 "# " 前缀。
 
         Args:
             line: 注释文本（不含 "# " 前缀）
 
         Returns:
-            安全的注释行字符串
+            安全的注释行字符串（"# " 开头，单行）
         """
-        # 移除控制字符（保留可打印字符）
-        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", line)
-        # 防止注释注入换行
-        cleaned = cleaned.replace("\n", " ").replace("\r", " ")
-        # 防止 "--" 被误解为 SQL 注释
-        cleaned = cleaned.replace("--", "——")
+        cleaned = SparkCodeRenderer.render_comment_text(line)
         return f"# {cleaned}"
 
     # ── 导入语句渲染 ──

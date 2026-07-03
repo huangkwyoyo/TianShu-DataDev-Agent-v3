@@ -173,6 +173,9 @@ class SparkCompiler:
 
         raw_hash = hashlib.sha256(raw_pyspark.encode()).hexdigest()
 
+        # 防御纵深：验证注释不含裸代码注入（去注释后应与 raw 一致）
+        self._verify_no_comment_injection(raw_pyspark, annotated_pyspark)
+
         return SparkCompileResult(
             raw_pyspark=raw_pyspark,
             annotated_pyspark=annotated_pyspark,
@@ -202,15 +205,15 @@ class SparkCompiler:
         source_name 作为 dict key 字符串使用，不校验 Python 标识符。
         """
         alias = self.renderer.validate_identifier(step.alias, "ReadStep.alias")
-        # source_name 是 inputs dict 的 key，不是 Python 变量名——允许点号等字符
-        source_name = step.source_name
-        raw = f'{alias} = inputs["{source_name}"]'
+        # source_name 通过 render_dict_key 安全渲染——转义双引号/反斜杠/控制字符
+        key_str = self.renderer.render_dict_key(step.source_name)
+        raw = f"{alias} = inputs[{key_str}]"
 
         comment = self._build_comment_block(
             step_id=step_id, index=index, total=total,
             intent="数据读取",
-            operation=f'从 inputs["{source_name}"] 读取数据，赋值为 DataFrame {alias}',
-            inputs=source_name,
+            operation=f'从 inputs["{step.source_name}"] 读取数据，赋值为 DataFrame {alias}',
+            inputs=step.source_name,
             output=alias,
         )
         return raw, comment
@@ -238,20 +241,20 @@ class SparkCompiler:
             else:  # IS_NOT_NULL
                 cond = f"{col_ref}.isNotNull()"
         elif op == "IN":
-            cond = f"{col_ref}.isin({step.right})"
+            right_str = self.renderer.render_filter_right(step.right)
+            cond = f"{col_ref}.isin({right_str})"
         elif op == "NOT_IN":
-            cond = f"~{col_ref}.isin({step.right})"
+            right_str = self.renderer.render_filter_right(step.right)
+            cond = f"~{col_ref}.isin({right_str})"
         elif op == "BETWEEN":
-            cond = f"{col_ref}.between({step.right})"
+            right_str = self.renderer.render_filter_right(step.right)
+            cond = f"{col_ref}.between({right_str})"
         elif op == "LIKE":
-            # step.right 是模式字符串
-            cond = f"{col_ref}.like({step.right})"
+            right_str = self.renderer.render_filter_right(step.right)
+            cond = f"{col_ref}.like({right_str})"
         else:
             py_op = self.renderer.render_operator(op)
-            right_str = step.right
-            # 如果右侧看起来像列引用（含 "."），渲染为 F.col
-            if "." in right_str and not right_str.startswith("'"):
-                right_str = self.renderer.render_column(right_str)
+            right_str = self.renderer.render_filter_right(step.right)
             cond = f"{col_ref} {py_op} {right_str}"
 
         raw = f"{out_alias} = {input_alias}.filter({cond})"
@@ -382,14 +385,36 @@ class SparkCompiler:
         """构建 5 行固定格式注释块。
 
         格式：Step / Intent / Operation / Inputs / Output
-        不含 SQL 文本。
+        所有文本字段均通过 render_comment_text 清洗——不含 SQL 文本、不含换行。
         """
+        r = self.renderer
         lines = [
             f"# Step: {step_id}（索引 {index + 1}/{total}）",
-            f"# Intent: {intent}",
-            f"# Operation: {operation}",
-            f"# Inputs: {inputs}",
-            f"# Output: {output}",
+            f"# Intent: {r.render_comment_text(intent)}",
+            f"# Operation: {r.render_comment_text(operation)}",
+            f"# Inputs: {r.render_comment_text(inputs)}",
+            f"# Output: {r.render_comment_text(output)}",
         ]
         # 每行独立清洗，末尾不加换行（由 add_step 统一管理）
         return "\n".join(lines)
+
+    @staticmethod
+    def _verify_no_comment_injection(raw: str, annotated: str) -> None:
+        """防御纵深：验证去注释后的 annotated_pyspark 与 raw_pyspark 一致。
+
+        若注释中含未清洗的换行，会导致 annotated 中出现裸代码行，
+        此时去注释后与 raw 不一致——抛出 RenderError 阻断。
+        """
+        from tianshu_datadev.spark.renderer import RenderError
+
+        def _strip_comments(code: str) -> str:
+            return "\n".join(
+                line for line in code.split("\n")
+                if not line.lstrip().startswith("#")
+            )
+
+        if _strip_comments(annotated) != raw:
+            raise RenderError(
+                "annotated_pyspark 安全验证失败——去注释后与 raw_pyspark 不一致，"
+                "可能存在注释注入产生的裸代码行"
+            )
