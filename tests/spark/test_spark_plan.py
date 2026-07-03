@@ -167,15 +167,20 @@ class TestSparkPlanModels:
     """SparkPlan IR 模型创建和严格性测试。"""
 
     def test_read_step_creation(self):
-        """ReadStep 基本创建。"""
+        """ReadStep 基本创建——Phase 0 迁移后使用 source_name + input_key。"""
         step = SparkReadStep(
             alias="od",
-            source_path="dwd.order_detail/",
+            source_name="dwd.order_detail",
+            input_key="od",
+            required_columns=["order_status", "user_id", "order_amount"],
             estimated_row_count=50000000,
         )
         assert step.step_type == SparkStepType.READ
-        assert step.format == "parquet"
         assert step.alias == "od"
+        assert step.source_name == "dwd.order_detail"
+        assert step.input_key == "od"
+        assert step.required_columns == ["order_status", "user_id", "order_amount"]
+        assert step.estimated_row_count == 50000000
 
     def test_filter_step_creation(self):
         """FilterStep 基本创建。"""
@@ -286,8 +291,8 @@ class TestSparkPlanModels:
     def test_spark_plan_creation_and_hash(self):
         """SparkPlan 创建和确定性 hash。"""
         steps: list = [
-            SparkReadStep(alias="od", source_path="dwd.order_detail/"),
-            SparkReadStep(alias="ri", source_path="dim.region_info/"),
+            SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
+            SparkReadStep(alias="ri", source_name="dim.region_info", input_key="ri"),
             SparkLimitStep(input_alias="", limit=100),
         ]
 

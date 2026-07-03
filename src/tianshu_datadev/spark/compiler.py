@@ -1,0 +1,395 @@
+"""Phase 6 SparkCompiler——SparkPlan → PySpark DSL 确定性代码生成。
+
+参照 SQL Compiler 的 _compile_core() + 注释渲染分层架构。
+不访问：DeveloperSpec、SqlBuildPlan、SQL 文本、LLM。
+所有代码片段通过 SparkCodeRenderer 生成——禁止直接 f-string 拼接。
+"""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass, field
+
+from tianshu_datadev.spark.models import (
+    SparkAggregateStep,
+    SparkCaseWhenStep,
+    SparkFilterStep,
+    SparkJoinStep,
+    SparkLimitStep,
+    SparkPlan,
+    SparkProjectStep,
+    SparkReadStep,
+    SparkSortStep,
+    SparkWindowStep,
+)
+from tianshu_datadev.spark.renderer import SparkCodeRenderer
+
+# ════════════════════════════════════════════
+# 编译结果
+# ════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class SparkCompileResult:
+    """SparkCompiler 的编译产出。
+
+    raw_pyspark 是执行版本（Validator/执行/hash 以此为准），
+    annotated_pyspark 是含注释的展示版本（仅供人审）。
+    """
+
+    raw_pyspark: str          # 无注释的纯 PySpark DSL 代码
+    annotated_pyspark: str    # 带结构化注释的代码
+    raw_hash: str             # raw_pyspark 的 SHA-256
+    step_ids: list[str] = field(default_factory=list)  # 编译器生成的 step_id 列表
+
+
+# ════════════════════════════════════════════
+# 编译器内部状态
+# ════════════════════════════════════════════
+
+
+@dataclass
+class _CompileState:
+    """编译过程中的可变状态——仅在 compile() 调用内使用。"""
+
+    raw_lines: list[str] = field(default_factory=list)
+    annotated_lines: list[str] = field(default_factory=list)
+    step_ids: list[str] = field(default_factory=list)
+    # 追踪每个 step 的输出变量名
+    output_var_map: dict[int, str] = field(default_factory=dict)
+    step_counter: int = 0
+
+    def next_step_id(self, step_type: str) -> str:
+        """生成下一个 step_id。"""
+        sid = f"{step_type}_{self.step_counter}"
+        self.step_counter += 1
+        return sid
+
+    def add_step(self, step_id: str, raw_code: str, comment_block: str) -> None:
+        """添加一个编译好的步骤。"""
+        if comment_block:
+            self.annotated_lines.append(comment_block)
+        self.raw_lines.append(raw_code)
+        self.annotated_lines.append(raw_code)
+        self.step_ids.append(step_id)
+
+
+# ════════════════════════════════════════════
+# SparkCompiler
+# ════════════════════════════════════════════
+
+
+class SparkCompiler:
+    """确定性 PySpark DSL 编译器——SparkPlan → PySpark 代码。
+
+    生成代码固定入口：
+        def transform(inputs: Mapping[str, DataFrame], params: TransformParams) -> DataFrame:
+
+    Phase 6A 支持 5 种 step：scan/filter/project/sort/limit。
+    Phase 6B 扩展 3 种：aggregate/join/case_when。
+    Phase 6C 扩展 1 种：window。
+    """
+
+    COMPILER_VERSION = "1.0.0"
+
+    def __init__(self, renderer: SparkCodeRenderer | None = None):
+        """初始化编译器。
+
+        Args:
+            renderer: 代码渲染器，默认创建新实例
+        """
+        self.renderer = renderer or SparkCodeRenderer()
+
+    # ── 公共入口 ──
+
+    def compile(
+        self,
+        plan: SparkPlan,
+        annotations: list | None = None,
+    ) -> SparkCompileResult:
+        """编译 SparkPlan 为 PySpark DSL 代码。
+
+        Args:
+            plan: mapper.py 产出的 SparkPlan
+            annotations: StepAnnotation 列表（可选，Phase 6A 暂无 LLM 标注）
+
+        Returns:
+            SparkCompileResult——含 raw + annotated 两个版本
+        """
+        state = _CompileState()
+
+        # 渲染导入和函数签名
+        imports = self.renderer.render_imports()
+        signature = self.renderer.render_function_signature()
+        state.raw_lines.append(imports)
+        state.raw_lines.append("")
+        state.raw_lines.append("")
+        state.annotated_lines.append(imports)
+        state.annotated_lines.append("")
+        state.annotated_lines.append("")
+
+        for i, step in enumerate(plan.steps):
+            step_type = type(step).__name__
+            step_id = state.next_step_id(step_type)
+
+            # 分发到具体的编译方法
+            if isinstance(step, SparkReadStep):
+                raw, comment = self._compile_read(step, step_id, i, len(plan.steps))
+            elif isinstance(step, SparkFilterStep):
+                raw, comment = self._compile_filter(step, step_id, i, len(plan.steps))
+            elif isinstance(step, SparkProjectStep):
+                raw, comment = self._compile_project(step, step_id, i, len(plan.steps))
+            elif isinstance(step, SparkSortStep):
+                raw, comment = self._compile_sort(step, step_id, i, len(plan.steps))
+            elif isinstance(step, SparkLimitStep):
+                raw, comment = self._compile_limit(step, step_id, i, len(plan.steps))
+            elif isinstance(step, SparkJoinStep):
+                raw, comment = self._compile_unsupported(step, step_id, "Phase 6B")
+            elif isinstance(step, SparkAggregateStep):
+                raw, comment = self._compile_unsupported(step, step_id, "Phase 6B")
+            elif isinstance(step, SparkCaseWhenStep):
+                raw, comment = self._compile_unsupported(step, step_id, "Phase 6B")
+            elif isinstance(step, SparkWindowStep):
+                raw, comment = self._compile_unsupported(step, step_id, "Phase 6C")
+            else:
+                raw, comment = self._compile_unsupported(step, step_id, "unknown")
+
+            state.add_step(step_id, raw, comment)
+
+        # 组装函数体
+        body_raw = "\n".join(f"    {line}" for line in state.raw_lines[3:])  # 跳过导入
+        body_annotated = "\n".join(f"    {line}" for line in state.annotated_lines[3:])
+
+        raw_pyspark = (
+            f"{imports}\n\n\n"
+            f"{signature}\n"
+            f"{body_raw}\n"
+        )
+        annotated_pyspark = (
+            f"{imports}\n\n\n"
+            f"{signature}\n"
+            f"{body_annotated}\n"
+        )
+
+        raw_hash = hashlib.sha256(raw_pyspark.encode()).hexdigest()
+
+        return SparkCompileResult(
+            raw_pyspark=raw_pyspark,
+            annotated_pyspark=annotated_pyspark,
+            raw_hash=raw_hash,
+            step_ids=state.step_ids,
+        )
+
+    def compile_raw(self, plan: SparkPlan) -> SparkCompileResult:
+        """编译无标注版本的代码（用于验证 annotation 不影响执行代码）。
+
+        Args:
+            plan: mapper.py 产出的 SparkPlan
+
+        Returns:
+            SparkCompileResult——raw_pyspark 与 compile(plan, annotations).raw_pyspark 相同
+        """
+        return self.compile(plan, annotations=None)
+
+    # ── Step 编译方法 ──
+
+    def _compile_read(
+        self, step: SparkReadStep, step_id: str, index: int, total: int,
+    ) -> tuple[str, str]:
+        """编译 ReadStep → {alias} = inputs["{source_name}"]。
+
+        不允许 spark.read.parquet()——物理路径在 SnapshotManifest。
+        source_name 作为 dict key 字符串使用，不校验 Python 标识符。
+        """
+        alias = self.renderer.validate_identifier(step.alias, "ReadStep.alias")
+        # source_name 是 inputs dict 的 key，不是 Python 变量名——允许点号等字符
+        source_name = step.source_name
+        raw = f'{alias} = inputs["{source_name}"]'
+
+        comment = self._build_comment_block(
+            step_id=step_id, index=index, total=total,
+            intent="数据读取",
+            operation=f'从 inputs["{source_name}"] 读取数据，赋值为 DataFrame {alias}',
+            inputs=source_name,
+            output=alias,
+        )
+        return raw, comment
+
+    def _compile_filter(
+        self, step: SparkFilterStep, step_id: str, index: int, total: int,
+    ) -> tuple[str, str]:
+        """编译 FilterStep → {out} = {input}.filter(...)。
+
+        操作符从白名单映射到 Python 操作符。
+        """
+        input_alias = self.renderer.validate_identifier(
+            step.input_alias, "FilterStep.input_alias"
+        )
+        op = step.operator.upper()
+        col_ref = self.renderer.render_column(step.left)
+
+        # 生成输出别名
+        out_alias = f"_f{index}"
+
+        if self.renderer.is_unary_operator(op):
+            # IS_NULL / IS_NOT_NULL
+            if op == "IS_NULL":
+                cond = f"{col_ref}.isNull()"
+            else:  # IS_NOT_NULL
+                cond = f"{col_ref}.isNotNull()"
+        elif op == "IN":
+            cond = f"{col_ref}.isin({step.right})"
+        elif op == "NOT_IN":
+            cond = f"~{col_ref}.isin({step.right})"
+        elif op == "BETWEEN":
+            cond = f"{col_ref}.between({step.right})"
+        elif op == "LIKE":
+            # step.right 是模式字符串
+            cond = f"{col_ref}.like({step.right})"
+        else:
+            py_op = self.renderer.render_operator(op)
+            right_str = step.right
+            # 如果右侧看起来像列引用（含 "."），渲染为 F.col
+            if "." in right_str and not right_str.startswith("'"):
+                right_str = self.renderer.render_column(right_str)
+            cond = f"{col_ref} {py_op} {right_str}"
+
+        raw = f"{out_alias} = {input_alias}.filter({cond})"
+
+        comment = self._build_comment_block(
+            step_id=step_id, index=index, total=total,
+            intent="数据过滤",
+            operation=f"对 {input_alias} 应用过滤条件：{step.left} {op} {step.right}",
+            inputs=input_alias,
+            output=out_alias,
+        )
+        return raw, comment
+
+    def _compile_project(
+        self, step: SparkProjectStep, step_id: str, index: int, total: int,
+    ) -> tuple[str, str]:
+        """编译 ProjectStep → {out} = {input}.select(...)。"""
+        input_alias = self.renderer.validate_identifier(
+            step.input_alias, "ProjectStep.input_alias"
+        )
+        out_alias = f"_p{index}"
+
+        col_strs: list[str] = []
+        for col in step.columns:
+            col_name = self.renderer.validate_identifier(
+                col.column_name, "ProjectStep.column_name"
+            )
+            if col.alias and col.alias != col.column_name:
+                alias = self.renderer.validate_identifier(
+                    col.alias, "ProjectStep.alias"
+                )
+                col_strs.append(f'F.col("{col_name}").alias("{alias}")')
+            else:
+                col_strs.append(f'F.col("{col_name}")')
+
+        cols_joined = ", ".join(col_strs)
+        raw = f"{out_alias} = {input_alias}.select({cols_joined})"
+
+        col_names = [c.column_name for c in step.columns]
+        comment = self._build_comment_block(
+            step_id=step_id, index=index, total=total,
+            intent="列投影",
+            operation=f"从 {input_alias} 选取列：{', '.join(col_names)}",
+            inputs=input_alias,
+            output=out_alias,
+        )
+        return raw, comment
+
+    def _compile_sort(
+        self, step: SparkSortStep, step_id: str, index: int, total: int,
+    ) -> tuple[str, str]:
+        """编译 SortStep → {out} = {input}.orderBy(*[...])。"""
+        input_alias = self.renderer.validate_identifier(
+            step.input_alias or f"_p{index - 1}", "SortStep.input_alias"
+        )
+        out_alias = f"_s{index}"
+
+        sort_strs: list[str] = []
+        for spec in step.order_by:
+            col_name = self.renderer.validate_identifier(
+                spec.column, "SortStep.column"
+            )
+            direction_fn = self.renderer.render_sort_direction(spec.direction)
+            sort_strs.append(f'{direction_fn}("{col_name}")')
+
+        sorts_joined = ", ".join(sort_strs)
+        raw = f"{out_alias} = {input_alias}.orderBy({sorts_joined})"
+
+        sort_desc = ", ".join(
+            f"{s.column} {s.direction.value}" for s in step.order_by
+        )
+        comment = self._build_comment_block(
+            step_id=step_id, index=index, total=total,
+            intent="排序",
+            operation=f"对 {input_alias} 排序：{sort_desc}",
+            inputs=input_alias,
+            output=out_alias,
+        )
+        return raw, comment
+
+    def _compile_limit(
+        self, step: SparkLimitStep, step_id: str, index: int, total: int,
+    ) -> tuple[str, str]:
+        """编译 LimitStep → {out} = {input}.limit({n})。"""
+        input_alias = self.renderer.validate_identifier(
+            step.input_alias or f"_s{index - 1}", "LimitStep.input_alias"
+        )
+        out_alias = f"_l{index}"
+
+        raw = f"{out_alias} = {input_alias}.limit({step.limit})"
+
+        comment = self._build_comment_block(
+            step_id=step_id, index=index, total=total,
+            intent="行限制",
+            operation=f"对 {input_alias} 取前 {step.limit} 行",
+            inputs=input_alias,
+            output=out_alias,
+        )
+        return raw, comment
+
+    def _compile_unsupported(
+        self, step, step_id: str, reason: str,
+    ) -> tuple[str, str]:
+        """编译不支持/未实现的 step 类型——生成占位符注释。"""
+        step_type = type(step).__name__
+        raw = f"# UNSUPPORTED: {step_type} — {reason}"
+        comment = (
+            f"# Step: {step_id}\n"
+            f"# Intent: 未实现\n"
+            f"# Operation: {step_type} 编译尚未实现（{reason}）\n"
+            f"# Inputs: N/A\n"
+            f"# Output: N/A"
+        )
+        return raw, comment
+
+    # ── 注释块生成 ──
+
+    def _build_comment_block(
+        self,
+        step_id: str,
+        index: int,
+        total: int,
+        intent: str,
+        operation: str,
+        inputs: str,
+        output: str,
+    ) -> str:
+        """构建 5 行固定格式注释块。
+
+        格式：Step / Intent / Operation / Inputs / Output
+        不含 SQL 文本。
+        """
+        lines = [
+            f"# Step: {step_id}（索引 {index + 1}/{total}）",
+            f"# Intent: {intent}",
+            f"# Operation: {operation}",
+            f"# Inputs: {inputs}",
+            f"# Output: {output}",
+        ]
+        # 每行独立清洗，末尾不加换行（由 add_step 统一管理）
+        return "\n".join(lines)

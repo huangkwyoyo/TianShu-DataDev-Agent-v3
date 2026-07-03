@@ -241,7 +241,7 @@ def _map_input_tables(
     """将 Contract 的 input_tables 映射为 ReadStep 列表。
 
     每个输入表生成一个独立的 ReadStep。
-    Phase 5 默认使用 parquet 格式，路径约定为 {table_name}/。
+    物理路径不存放在 SparkPlan 中——由 SnapshotManifest 在 Phase 7 管理。
 
     Args:
         input_tables: Contract 中的输入表列表
@@ -254,8 +254,9 @@ def _map_input_tables(
         steps.append(
             SparkReadStep(
                 alias=it.table_ref,
-                source_path=f"{it.source_table}/",  # Phase 5 路径约定
-                format="parquet",
+                source_name=it.source_table,
+                input_key=it.table_ref,
+                required_columns=[],  # Phase 5 暂不填充，Phase 7 从 Contract input_columns 填充
                 estimated_row_count=it.estimated_row_count,
             )
         )

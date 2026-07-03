@@ -90,12 +90,14 @@ class SparkReadStep(StrictModel):
     """Spark 读取步骤——从 DataTransformContractV1.input_tables 映射。
 
     对应 SQL 侧的 ScanStep。
+    物理路径不存放在 SparkPlan 中，由 SnapshotManifest 管理。
     """
 
     step_type: SparkStepType = SparkStepType.READ
     alias: str  # DataFrame 变量名（如 "od"）
-    source_path: str  # 源数据路径（parquet/csv 路径）
-    format: str = "parquet"  # 文件格式——Phase 5 固定 parquet
+    source_name: str  # inputs dict 的 key（替换旧 source_path，物理路径在 SnapshotManifest）
+    input_key: str  # 对应 ContractInputTable 的唯一标识
+    required_columns: list[str] = Field(default_factory=list)  # 需要的列（Phase 5 暂空）
     estimated_row_count: int | None = None  # 估算行数
 
 

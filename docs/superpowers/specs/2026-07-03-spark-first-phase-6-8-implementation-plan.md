@@ -187,9 +187,9 @@ uv run ruff check src/tianshu_datadev/spark/
 rg "f\"F\." src/tianshu_datadev/spark/compiler.py
 # 预期：零匹配（所有 F.xxx 必须通过 Renderer 生成）
 
-# 检查注释格式不含 SQL 文本
-rg -i "select\b|where\b|from\b|join\b" src/tianshu_datadev/spark/compiler.py --no-filename
-# 预期：只出现在字符串内的变量名/字段名，不在注释模板中
+# 检查注释格式不含 SQL 文本（仅扫描注释内容，排除 PySpark API 名如 .select() .join() 等）
+rg -n "#.*\b(SELECT|FROM|WHERE|JOIN|GROUP BY|ORDER BY|HAVING|UNION)\b" src/tianshu_datadev/spark/compiler.py src/tianshu_datadev/spark/renderer.py --no-filename -i
+# 预期：零匹配（注释中不得出现 SQL 关键字）
 
 # 检查无 spark.read / spark.table 出现在代码生成路径
 rg "spark\.(read|table)" src/tianshu_datadev/spark/compiler.py src/tianshu_datadev/spark/renderer.py
@@ -365,9 +365,9 @@ uv run pyright src/tianshu_datadev/spark/
 ### 安全扫描
 
 ```bash
-# executor.py 必须在 subprocess 中执行
-rg "subprocess|preexec_fn|tempfile.mkdtemp" src/tianshu_datadev/spark/executor.py
-# 预期：3 处全部命中
+# executor.py 必须在子进程/独立进程中执行（平台无关，不硬依赖 Unix 特有 API）
+rg "subprocess|multiprocessing|tempfile" src/tianshu_datadev/spark/executor.py
+# 预期：至少命中 subprocess 或 multiprocessing
 
 # executor.py 不得有裸 exec() 在主进程
 rg -n "^\s*exec\(" src/tianshu_datadev/spark/executor.py
@@ -467,7 +467,7 @@ uv run pyright src/tianshu_datadev/spark/
 
 ### 目标
 
-完成 Spark-first 路径的完整编排、统一交付物（SparkReviewPackage）、Harness 5 维度评测。这是 Phase 6-8 的最后一个 Phase。
+完成 Spark-first 路径的运行时编排（Orchestrator 编排 mapper→Developer→Compiler→Validator→Comparator→PhysicalVerifier 全链路运行时，不替代各阶段内部逻辑）、统一交付物（SparkReviewPackage）、Harness 5 维度评测。这是 Phase 6-8 的最后一个 Phase。
 
 ### 允许修改文件
 
@@ -573,7 +573,7 @@ Phase 0 ──► Phase 6A ──► Phase 7A ──► Phase 6B ──► Phase
 
 - [ ] `spark.read` 在 `src/tianshu_datadev/spark/` 下零出现
 - [ ] SQL 文本在 Spark 代码注释中零出现
-- [ ] `SparkPlan` 只在 `mapper.py` 中构造（由 `map_contract_to_spark_plan()` 返回）
+- [ ] `SparkPlan` 在生产链路（`src/tianshu_datadev/spark/` 下除 `__init__.py` 导出外）只在 `mapper.py` 中构造（由 `map_contract_to_spark_plan()` 返回）；测试 fixture 可直接构造
 - [ ] `RepairPlanner` 不直接修改任何 Plan 对象
 - [ ] 所有未覆盖能力标记 `NOT_EXECUTED` 或 `HUMAN_REVIEW`
 - [ ] 无 "PASS" / "Go" / "No-Go" 状态名
