@@ -187,10 +187,12 @@ class SparkCaseWhenBranch(StrictModel):
     """单个 CASE WHEN 分支。
 
     Phase 5 仅保留标签值——完整谓词还原在 Phase 7 PlanEquivalence 时做。
-    当前版本从 CaseWhenLabelSpec.labels 映射。
+    Phase 6B 新增 condition_column / condition_value 支持编译期代码生成。
     """
 
     label: str  # 标签值
+    condition_column: str = ""  # Phase 6B：条件列名（如 "status"）
+    condition_value: str = ""   # Phase 6B：条件值（如 "paid"）
 
 
 class SparkWindowStep(StrictModel):

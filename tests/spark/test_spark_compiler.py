@@ -1,6 +1,6 @@
-"""Phase 6 SparkCompiler 测试——5 种 step（scan/filter/project/sort/limit）编译。
+"""Phase 6 SparkCompiler 测试——9 种 step 编译（6A 5 种 + 6B 3 种 + 6C 占位）。
 
-6B/6C step 类型使用 skip/xfail 占位。
+6C step 类型（window）使用 skip/xfail 占位。
 """
 
 from __future__ import annotations
@@ -9,7 +9,14 @@ import pytest
 
 from tianshu_datadev.spark.compiler import SparkCompiler
 from tianshu_datadev.spark.models import (
+    SparkAggFunction,
+    SparkAggregateSpec,
+    SparkAggregateStep,
+    SparkCaseWhenBranch,
+    SparkCaseWhenStep,
     SparkFilterStep,
+    SparkJoinStep,
+    SparkJoinType,
     SparkLimitStep,
     SparkPlan,
     SparkProjectColumn,
@@ -449,24 +456,325 @@ class TestMaliciousInput:
 
 
 # ════════════════════════════════════════════
-# Phase 6B/6C skip/xfail 占位
+# Phase 6B 测试——aggregate / join / case_when
 # ════════════════════════════════════════════
 
 
-class TestPhase6BUnsupported:
-    """Phase 6B step 类型——占位测试。"""
+class TestCompileAggregate:
+    """AggregateStep 编译测试。"""
 
-    @pytest.mark.skip(reason="Phase 6B")
-    def test_aggregate_skip(self):
-        pass
+    def test_simple_aggregate_with_group_keys(self):
+        """基本 groupBy + 聚合编译。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
+            SparkAggregateStep(
+                input_alias="od",
+                group_keys=["region"],
+                metrics=[
+                    SparkAggregateSpec(
+                        function=SparkAggFunction.COUNT,
+                        input_column=None,
+                        alias="cnt",
+                    ),
+                    SparkAggregateSpec(
+                        function=SparkAggFunction.SUM,
+                        input_column="amount",
+                        alias="total_amount",
+                    ),
+                ],
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
 
-    @pytest.mark.skip(reason="Phase 6B")
-    def test_join_skip(self):
-        pass
+        assert ".groupBy(" in result.raw_pyspark
+        assert ".agg(" in result.raw_pyspark
+        assert 'F.col("region")' in result.raw_pyspark
+        assert "F.count(F.lit(1))" in result.raw_pyspark
+        assert 'F.sum(F.col("amount"))' in result.raw_pyspark
+        assert '.alias("cnt")' in result.raw_pyspark
+        assert '.alias("total_amount")' in result.raw_pyspark
 
-    @pytest.mark.skip(reason="Phase 6B")
-    def test_case_when_skip(self):
-        pass
+    def test_aggregate_with_multiple_group_keys(self):
+        """多 groupBy 键编译。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
+            SparkAggregateStep(
+                input_alias="od",
+                group_keys=["region", "category"],
+                metrics=[
+                    SparkAggregateSpec(
+                        function=SparkAggFunction.COUNT,
+                        input_column=None,
+                        alias="cnt",
+                    ),
+                ],
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        assert 'F.col("region")' in result.raw_pyspark
+        assert 'F.col("category")' in result.raw_pyspark
+
+    def test_aggregate_without_group_keys(self):
+        """无 groupBy 键——全局聚合。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
+            SparkAggregateStep(
+                input_alias="od",
+                group_keys=[],
+                metrics=[
+                    SparkAggregateSpec(
+                        function=SparkAggFunction.MAX,
+                        input_column="amount",
+                        alias="max_amount",
+                    ),
+                ],
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        assert ".groupBy(" not in result.raw_pyspark
+        assert ".agg(" in result.raw_pyspark
+        assert 'F.max(F.col("amount"))' in result.raw_pyspark
+
+    def test_aggregate_count_distinct(self):
+        """COUNT_DISTINCT 编译。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
+            SparkAggregateStep(
+                input_alias="od",
+                group_keys=["region"],
+                metrics=[
+                    SparkAggregateSpec(
+                        function=SparkAggFunction.COUNT_DISTINCT,
+                        input_column="user_id",
+                        alias="unique_users",
+                    ),
+                ],
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        assert "F.countDistinct" in result.raw_pyspark
+        assert 'F.col("user_id")' in result.raw_pyspark
+
+    def test_aggregate_multiple_metrics(self):
+        """多个聚合指标编译。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
+            SparkAggregateStep(
+                input_alias="od",
+                group_keys=["region"],
+                metrics=[
+                    SparkAggregateSpec(
+                        function=SparkAggFunction.COUNT, input_column=None, alias="cnt",
+                    ),
+                    SparkAggregateSpec(
+                        function=SparkAggFunction.SUM, input_column="amount", alias="total",
+                    ),
+                    SparkAggregateSpec(
+                        function=SparkAggFunction.AVG, input_column="amount", alias="avg_amt",
+                    ),
+                    SparkAggregateSpec(
+                        function=SparkAggFunction.MIN, input_column="amount", alias="min_amt",
+                    ),
+                    SparkAggregateSpec(
+                        function=SparkAggFunction.MAX, input_column="amount", alias="max_amt",
+                    ),
+                ],
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        assert result.raw_pyspark.count(".alias(") == 5
+        assert "F.count(F.lit(1))" in result.raw_pyspark
+        assert "F.sum" in result.raw_pyspark
+        assert "F.avg" in result.raw_pyspark
+        assert "F.min" in result.raw_pyspark
+        assert "F.max" in result.raw_pyspark
+
+
+class TestCompileJoin:
+    """JoinStep 编译测试。"""
+
+    def test_inner_join(self):
+        """INNER JOIN 编译。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
+            SparkReadStep(alias="up", source_name="dim.user_profile", input_key="up"),
+            SparkJoinStep(
+                left_alias="od",
+                right_alias="up",
+                left_key="user_id",
+                right_key="user_id",
+                join_type=SparkJoinType.INNER,
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        assert ".join(" in result.raw_pyspark
+        assert 'od["user_id"]' in result.raw_pyspark
+        assert 'up["user_id"]' in result.raw_pyspark
+        assert 'how="inner"' in result.raw_pyspark
+
+    def test_left_join(self):
+        """LEFT JOIN 编译。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
+            SparkReadStep(alias="up", source_name="dim.user_profile", input_key="up"),
+            SparkJoinStep(
+                left_alias="od",
+                right_alias="up",
+                left_key="user_id",
+                right_key="user_id",
+                join_type=SparkJoinType.LEFT,
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        assert 'how="left"' in result.raw_pyspark
+
+    def test_join_with_different_keys(self):
+        """不同 Join 键名编译。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
+            SparkReadStep(alias="ri", source_name="dim.region_info", input_key="ri"),
+            SparkJoinStep(
+                left_alias="od",
+                right_alias="ri",
+                left_key="region_code",
+                right_key="code",
+                join_type=SparkJoinType.INNER,
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        assert 'od["region_code"]' in result.raw_pyspark
+        assert 'ri["code"]' in result.raw_pyspark
+
+    def test_join_after_filter(self):
+        """Filter 后 Join——链式编译。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
+            SparkFilterStep(input_alias="od", operator="GT", left="od.amount", right="0"),
+            SparkReadStep(alias="up", source_name="dim.user_profile", input_key="up"),
+            SparkJoinStep(
+                left_alias="_f1",
+                right_alias="up",
+                left_key="user_id",
+                right_key="user_id",
+                join_type=SparkJoinType.INNER,
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        assert ".filter(" in result.raw_pyspark
+        assert ".join(" in result.raw_pyspark
+
+
+class TestCompileCaseWhen:
+    """CaseWhenStep 编译测试。"""
+
+    def test_simple_case_when(self):
+        """单分支 CASE WHEN 编译。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
+            SparkCaseWhenStep(
+                input_alias="od",
+                output_alias="status_label",
+                branches=[
+                    SparkCaseWhenBranch(
+                        label="normal",
+                        condition_column="status",
+                        condition_value="paid",
+                    ),
+                ],
+                else_value="other",
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        assert ".withColumn(" in result.raw_pyspark
+        assert "F.when(" in result.raw_pyspark
+        assert ".otherwise(" in result.raw_pyspark
+        assert 'F.col("status")' in result.raw_pyspark
+        # condition_value 直接渲染为等值比较的右值（'paid'）
+        # label 和 else_value 通过 F.lit() 渲染
+        assert "== 'paid'" in result.raw_pyspark
+        assert "F.lit('normal')" in result.raw_pyspark
+
+    def test_case_when_multiple_branches(self):
+        """多分支 CASE WHEN——链式 when 编译。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
+            SparkCaseWhenStep(
+                input_alias="od",
+                output_alias="priority_label",
+                branches=[
+                    SparkCaseWhenBranch(
+                        label="high",
+                        condition_column="priority",
+                        condition_value="1",
+                    ),
+                    SparkCaseWhenBranch(
+                        label="medium",
+                        condition_column="priority",
+                        condition_value="2",
+                    ),
+                    SparkCaseWhenBranch(
+                        label="low",
+                        condition_column="priority",
+                        condition_value="3",
+                    ),
+                ],
+                else_value="unknown",
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        assert result.raw_pyspark.count("F.when(") == 3
+        assert result.raw_pyspark.count(".otherwise(") == 3
+        assert "F.lit('high')" in result.raw_pyspark
+        assert "F.lit('medium')" in result.raw_pyspark
+        assert "F.lit('low')" in result.raw_pyspark
+
+    def test_case_when_else_none(self):
+        """无 else_value——默认为 F.lit(None)。"""
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
+            SparkCaseWhenStep(
+                input_alias="od",
+                output_alias="label",
+                branches=[
+                    SparkCaseWhenBranch(
+                        label="valid",
+                        condition_column="status",
+                        condition_value="active",
+                    ),
+                ],
+                else_value=None,
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        assert "F.lit(None)" in result.raw_pyspark
+
+
+# ════════════════════════════════════════════
+# Phase 6C skip 占位
+# ════════════════════════════════════════════
 
 
 class TestPhase6CUnsupported:

@@ -144,11 +144,11 @@ class SparkCompiler:
             elif isinstance(step, SparkLimitStep):
                 raw, comment = self._compile_limit(step, step_id, i, len(plan.steps))
             elif isinstance(step, SparkJoinStep):
-                raw, comment = self._compile_unsupported(step, step_id, "Phase 6B")
+                raw, comment = self._compile_join(step, step_id, i, len(plan.steps))
             elif isinstance(step, SparkAggregateStep):
-                raw, comment = self._compile_unsupported(step, step_id, "Phase 6B")
+                raw, comment = self._compile_aggregate(step, step_id, i, len(plan.steps))
             elif isinstance(step, SparkCaseWhenStep):
-                raw, comment = self._compile_unsupported(step, step_id, "Phase 6B")
+                raw, comment = self._compile_case_when(step, step_id, i, len(plan.steps))
             elif isinstance(step, SparkWindowStep):
                 raw, comment = self._compile_unsupported(step, step_id, "Phase 6C")
             else:
@@ -350,6 +350,139 @@ class SparkCompiler:
             step_id=step_id, index=index, total=total,
             intent="行限制",
             operation=f"对 {input_alias} 取前 {step.limit} 行",
+            inputs=input_alias,
+            output=out_alias,
+        )
+        return raw, comment
+
+    def _compile_join(
+        self, step: SparkJoinStep, step_id: str, index: int, total: int,
+    ) -> tuple[str, str]:
+        """编译 JoinStep → {out} = {left}.join({right}, on=..., how=...)。
+
+        Join 键使用 df["col"] 语法消除同名列歧义。
+        """
+        left = self.renderer.validate_identifier(
+            step.left_alias, "JoinStep.left_alias"
+        )
+        right = self.renderer.validate_identifier(
+            step.right_alias, "JoinStep.right_alias"
+        )
+        out_alias = f"_j{index}"
+
+        # Join 条件——使用 df["col"] 语法避免同名歧义
+        left_key_ref = self.renderer.render_join_key(step.left_alias, step.left_key)
+        right_key_ref = self.renderer.render_join_key(step.right_alias, step.right_key)
+        condition = f"{left_key_ref} == {right_key_ref}"
+
+        how = self.renderer.render_join_type(step.join_type)
+        raw = f"{out_alias} = {left}.join({right}, on={condition}, how={how})"
+
+        comment = self._build_comment_block(
+            step_id=step_id, index=index, total=total,
+            intent="表连接",
+            operation=f"{left} JOIN {right} ON {step.left_key} = {step.right_key}（{step.join_type.value}）",
+            inputs=f"{left}, {right}",
+            output=out_alias,
+        )
+        return raw, comment
+
+    def _compile_aggregate(
+        self, step: SparkAggregateStep, step_id: str, index: int, total: int,
+    ) -> tuple[str, str]:
+        """编译 AggregateStep → {out} = {input}.groupBy(...).agg(...)。
+
+        COUNT(*) 且 input_column 为 None 时使用 F.lit(1)。
+        无 group_keys 时为全局聚合（不含 groupBy）。
+        """
+        input_alias = self.renderer.validate_identifier(
+            step.input_alias, "AggregateStep.input_alias"
+        )
+        out_alias = f"_a{index}"
+
+        # Group key 列引用
+        group_cols = ", ".join(
+            self.renderer.render_column(k) for k in step.group_keys
+        )
+
+        # 聚合指标表达式
+        agg_parts: list[str] = []
+        for m in step.metrics:
+            fn_name = self.renderer.render_agg_function(m.function)
+            if m.input_column:
+                col_ref = self.renderer.render_column(m.input_column)
+                agg_expr = f"{fn_name}({col_ref})"
+            else:
+                # COUNT(*) → F.count(F.lit(1))
+                agg_expr = f"{fn_name}(F.lit(1))"
+            alias = self.renderer.validate_identifier(
+                m.alias, "AggregateSpec.alias"
+            )
+            agg_parts.append(f'{agg_expr}.alias("{alias}")')
+
+        agg_str = ", ".join(agg_parts)
+
+        if group_cols:
+            raw = f"{out_alias} = {input_alias}.groupBy({group_cols}).agg({agg_str})"
+        else:
+            raw = f"{out_alias} = {input_alias}.agg({agg_str})"
+
+        metrics_desc = ", ".join(
+            f"{m.function.value}({m.input_column or '*'}) AS {m.alias}"
+            for m in step.metrics
+        )
+        comment = self._build_comment_block(
+            step_id=step_id, index=index, total=total,
+            intent="数据聚合",
+            operation=f"对 {input_alias} 按 {step.group_keys or '(全局)'} 分组，计算 {metrics_desc}",
+            inputs=input_alias,
+            output=out_alias,
+        )
+        return raw, comment
+
+    def _compile_case_when(
+        self, step: SparkCaseWhenStep, step_id: str, index: int, total: int,
+    ) -> tuple[str, str]:
+        """编译 CaseWhenStep → {out} = {input}.withColumn(col, F.when(...).otherwise(...))。
+
+        Phase 6B 每个分支使用 condition_column == condition_value 的简单等值条件。
+        完整谓词还原（多条件）推迟到 Phase 7。
+        """
+        input_alias = self.renderer.validate_identifier(
+            step.input_alias, "CaseWhenStep.input_alias"
+        )
+        out_alias = f"_c{index}"
+        output_col = self.renderer.validate_identifier(
+            step.output_alias, "CaseWhenStep.output_alias"
+        )
+
+        # 构建 otherwise 链——从最内层开始
+        if step.else_value is not None:
+            else_lit = self.renderer.render_literal(step.else_value)
+            chain = f"F.lit({else_lit})"
+        else:
+            chain = "F.lit(None)"
+
+        # 倒序遍历分支——构建 F.when(cond, val).otherwise(inner)
+        for branch in reversed(step.branches):
+            cond_col = self.renderer.render_column(branch.condition_column)
+            cond_val = self.renderer.render_literal(branch.condition_value)
+            label_lit = self.renderer.render_literal(branch.label)
+            chain = f"F.when({cond_col} == {cond_val}, F.lit({label_lit})).otherwise({chain})"
+
+        raw = f'{out_alias} = {input_alias}.withColumn("{output_col}", {chain})'
+
+        branches_desc = ", ".join(
+            f"WHEN {b.condition_column} = {b.condition_value} THEN {b.label}"
+            for b in step.branches
+        )
+        comment = self._build_comment_block(
+            step_id=step_id, index=index, total=total,
+            intent="条件分支",
+            operation=(
+                f"对 {input_alias} 新增列 {output_col}："
+                f"{branches_desc} ELSE {step.else_value or 'NULL'}"
+            ),
             inputs=input_alias,
             output=out_alias,
         )

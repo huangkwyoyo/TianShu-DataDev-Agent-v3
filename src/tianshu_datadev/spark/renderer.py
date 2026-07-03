@@ -294,6 +294,33 @@ class SparkCodeRenderer:
         return f'"{join_type.value}"'
 
     @staticmethod
+    def render_join_key(dataframe_alias: str, column_name: str) -> str:
+        """渲染 Join 键引用——df["col"] 格式，用于消除同名列歧义。
+
+        对 dataframe_alias 做标识符校验，对 column_name 做安全校验。
+        返回 df["col"] 格式而非 F.col("col")，避免同名歧义。
+
+        Args:
+            dataframe_alias: DataFrame 变量名（如 "od"）
+            column_name: Join 键列名（如 "user_id"）
+
+        Returns:
+            'od["user_id"]' 格式的引用字符串
+
+        Raises:
+            RenderError: 标识符或列名不安全
+        """
+        SparkCodeRenderer.validate_identifier(
+            dataframe_alias, "join DataFrame 别名"
+        )
+        SparkCodeRenderer.validate_identifier(
+            column_name, "join 键列名"
+        )
+        if '"' in column_name or "'" in column_name or ";" in column_name:
+            raise RenderError(f"Join 键含非法字符：'{column_name}'")
+        return f'{dataframe_alias}["{column_name}"]'
+
+    @staticmethod
     def render_sort_direction(direction: SparkSortDirection) -> str:
         """渲染排序方向——来自 SparkSortDirection 枚举。
 

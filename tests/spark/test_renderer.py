@@ -408,3 +408,246 @@ class TestRenderFilterRight:
         """IN 列表字面量——安全校验通过。"""
         result = SparkCodeRenderer.render_filter_right("[1, 2, 3]")
         assert result == "[1, 2, 3]"
+
+
+# ════════════════════════════════════════════
+# Phase 6B 新增：render_join_key 安全测试
+# ════════════════════════════════════════════
+
+
+class TestRenderJoinKey:
+    """Join 键引用安全渲染——df["col"] 格式。"""
+
+    def test_valid_join_key(self):
+        """合法 join 键正常渲染。"""
+        result = SparkCodeRenderer.render_join_key("od", "user_id")
+        assert result == 'od["user_id"]'
+
+    def test_malicious_alias_rejected(self):
+        """恶意 DataFrame 别名——抛出 RenderError。"""
+        with pytest.raises(RenderError, match="非法标识符"):
+            SparkCodeRenderer.render_join_key("od; DROP TABLE", "user_id")
+
+    def test_malicious_column_rejected(self):
+        """恶意列名——抛出 RenderError。"""
+        with pytest.raises(RenderError, match="非法标识符"):
+            SparkCodeRenderer.render_join_key("od", "user_id; DROP TABLE")
+
+    def test_column_with_quotes_rejected(self):
+        """含引号的列名——被标识符校验拦截（引号违反安全标识符正则）。"""
+        with pytest.raises(RenderError):
+            SparkCodeRenderer.render_join_key("od", 'user_id"')
+
+
+# ════════════════════════════════════════════
+# Phase 6B 新增：Compiler 层恶意输入回归测试
+# ════════════════════════════════════════════
+
+
+class TestMaliciousInputPhase6B:
+    """Phase 6B aggregate/join/case_when 恶意输入安全测试。
+
+    通过 Compiler 编译时触发 Renderer 安全校验——验证恶意输入在编译器层被拦截。
+    """
+
+    def test_aggregate_malicious_group_key_rejected(self):
+        """aggregate group key 含 SQL 注入——编译时抛出 RenderError。"""
+        from tianshu_datadev.spark.compiler import SparkCompiler
+        from tianshu_datadev.spark.models import (
+            SparkAggFunction,
+            SparkAggregateSpec,
+            SparkAggregateStep,
+            SparkPlan,
+            SparkReadStep,
+        )
+
+        plan = SparkPlan(
+            plan_id="test",
+            version="v1",
+            source_phase="phase-6",
+            source_contract_hash="hash",
+            steps=[
+                SparkReadStep(alias="od", source_name="t", input_key="t"),
+                SparkAggregateStep(
+                    input_alias="od",
+                    group_keys=['region; DROP TABLE'],  # 恶意 key
+                    metrics=[
+                        SparkAggregateSpec(
+                            function=SparkAggFunction.COUNT,
+                            input_column=None,
+                            alias="cnt",
+                        ),
+                    ],
+                ),
+            ],
+        )
+        compiler = SparkCompiler()
+        with pytest.raises(RenderError, match="非法标识符"):
+            compiler.compile(plan)
+
+    def test_aggregate_malicious_metric_alias_rejected(self):
+        """aggregate metric alias 含恶意字符——编译时抛出 RenderError。"""
+        from tianshu_datadev.spark.compiler import SparkCompiler
+        from tianshu_datadev.spark.models import (
+            SparkAggFunction,
+            SparkAggregateSpec,
+            SparkAggregateStep,
+            SparkPlan,
+            SparkReadStep,
+        )
+
+        plan = SparkPlan(
+            plan_id="test",
+            version="v1",
+            source_phase="phase-6",
+            source_contract_hash="hash",
+            steps=[
+                SparkReadStep(alias="od", source_name="t", input_key="t"),
+                SparkAggregateStep(
+                    input_alias="od",
+                    group_keys=["region"],
+                    metrics=[
+                        SparkAggregateSpec(
+                            function=SparkAggFunction.COUNT,
+                            input_column=None,
+                            alias='cnt; DROP TABLE',  # 恶意 alias
+                        ),
+                    ],
+                ),
+            ],
+        )
+        compiler = SparkCompiler()
+        with pytest.raises(RenderError, match="非法标识符"):
+            compiler.compile(plan)
+
+    def test_join_malicious_left_alias_rejected(self):
+        """join left_alias 含恶意字符——编译时抛出 RenderError。"""
+        from tianshu_datadev.spark.compiler import SparkCompiler
+        from tianshu_datadev.spark.models import (
+            SparkJoinStep,
+            SparkJoinType,
+            SparkPlan,
+            SparkReadStep,
+        )
+
+        plan = SparkPlan(
+            plan_id="test",
+            version="v1",
+            source_phase="phase-6",
+            source_contract_hash="hash",
+            steps=[
+                SparkReadStep(alias="od", source_name="t", input_key="t"),
+                SparkReadStep(alias="up", source_name="t2", input_key="t2"),
+                SparkJoinStep(
+                    left_alias="od; import os",  # 恶意 alias
+                    right_alias="up",
+                    left_key="user_id",
+                    right_key="user_id",
+                    join_type=SparkJoinType.INNER,
+                ),
+            ],
+        )
+        compiler = SparkCompiler()
+        with pytest.raises(RenderError, match="非法标识符"):
+            compiler.compile(plan)
+
+    def test_join_malicious_key_rejected(self):
+        """join key 含恶意字符——编译时抛出 RenderError。"""
+        from tianshu_datadev.spark.compiler import SparkCompiler
+        from tianshu_datadev.spark.models import (
+            SparkJoinStep,
+            SparkJoinType,
+            SparkPlan,
+            SparkReadStep,
+        )
+
+        plan = SparkPlan(
+            plan_id="test",
+            version="v1",
+            source_phase="phase-6",
+            source_contract_hash="hash",
+            steps=[
+                SparkReadStep(alias="od", source_name="t", input_key="t"),
+                SparkReadStep(alias="up", source_name="t2", input_key="t2"),
+                SparkJoinStep(
+                    left_alias="od",
+                    right_alias="up",
+                    left_key='user_id"; exec(',  # 恶意 key
+                    right_key="user_id",
+                    join_type=SparkJoinType.INNER,
+                ),
+            ],
+        )
+        compiler = SparkCompiler()
+        with pytest.raises(RenderError):
+            compiler.compile(plan)
+
+    def test_case_when_malicious_condition_column_rejected(self):
+        """case_when condition_column 含恶意字符——编译时抛出 RenderError。"""
+        from tianshu_datadev.spark.compiler import SparkCompiler
+        from tianshu_datadev.spark.models import (
+            SparkCaseWhenBranch,
+            SparkCaseWhenStep,
+            SparkPlan,
+            SparkReadStep,
+        )
+
+        plan = SparkPlan(
+            plan_id="test",
+            version="v1",
+            source_phase="phase-6",
+            source_contract_hash="hash",
+            steps=[
+                SparkReadStep(alias="od", source_name="t", input_key="t"),
+                SparkCaseWhenStep(
+                    input_alias="od",
+                    output_alias="label",
+                    branches=[
+                        SparkCaseWhenBranch(
+                            label="bad",
+                            condition_column='status; DROP TABLE',  # 恶意列名
+                            condition_value="active",
+                        ),
+                    ],
+                    else_value="other",
+                ),
+            ],
+        )
+        compiler = SparkCompiler()
+        with pytest.raises(RenderError, match="非法标识符"):
+            compiler.compile(plan)
+
+    def test_case_when_malicious_output_alias_rejected(self):
+        """case_when output_alias 含恶意字符——编译时抛出 RenderError。"""
+        from tianshu_datadev.spark.compiler import SparkCompiler
+        from tianshu_datadev.spark.models import (
+            SparkCaseWhenBranch,
+            SparkCaseWhenStep,
+            SparkPlan,
+            SparkReadStep,
+        )
+
+        plan = SparkPlan(
+            plan_id="test",
+            version="v1",
+            source_phase="phase-6",
+            source_contract_hash="hash",
+            steps=[
+                SparkReadStep(alias="od", source_name="t", input_key="t"),
+                SparkCaseWhenStep(
+                    input_alias="od",
+                    output_alias='label"; exec(',  # 恶意 output_alias
+                    branches=[
+                        SparkCaseWhenBranch(
+                            label="ok",
+                            condition_column="status",
+                            condition_value="active",
+                        ),
+                    ],
+                    else_value="other",
+                ),
+            ],
+        )
+        compiler = SparkCompiler()
+        with pytest.raises(RenderError):
+            compiler.compile(plan)
