@@ -20,6 +20,7 @@ import json
 import logging
 import re
 import time
+import warnings
 from typing import TYPE_CHECKING
 
 from tianshu_datadev.developer_spec.models import (
@@ -30,6 +31,7 @@ from tianshu_datadev.developer_spec.models import (
     InferredWindowMetric,
     JoinDecl,
     JoinTypeEnum,
+    LegacyDescriptionDSLWarning,
     MetricDecl,
     MetricFilterDecl,
     ParsedDeveloperSpec,
@@ -741,8 +743,20 @@ class FakeSpecEnricher:
         for col in output_metric_cols:
             col_name = col.name
 
-            # 优先从 description 解析——结构化 DSL 比规则推断更可靠
+            # 优先使用结构化 hint（推荐方式）
+            if col.metric_hint:
+                inferred_metrics.append(col.metric_hint)
+                continue
+
+            # 次优：从旧 description DSL 解析（兼容模式，触发迁移警告）
             if col.description:
+                warnings.warn(
+                    f"列 '{col_name}' 通过旧 description DSL 推断指标 "
+                    f"（\"{col.description[:80]}{'...' if len(col.description) > 80 else ''}\"），"
+                    f"请迁移到 metric_hint 结构化字段",
+                    LegacyDescriptionDSLWarning,
+                    stacklevel=2,
+                )
                 parsed = _parse_description_to_metric(col)
                 if parsed:
                     inferred_metrics.append(parsed)
@@ -775,8 +789,13 @@ class FakeSpecEnricher:
                 )
             )
 
-        # 检测比率类指标——优先从 description 解析
+        # 检测比率类指标——优先使用结构化 hint
         for col in output_metric_cols:
+            # 优先使用结构化 hint（推荐方式）
+            if col.computed_hint:
+                inferred_computed.append(col.computed_hint)
+                continue
+            # 次优：从旧 description DSL 解析（兼容模式）
             if col.description:
                 computed = _parse_description_to_computed(col)
                 if computed:
@@ -796,8 +815,13 @@ class FakeSpecEnricher:
                     )
                     break
 
-        # 检测窗口/排名类指标——优先从 description 解析
+        # 检测窗口/排名类指标——优先使用结构化 hint
         for col in output_metric_cols:
+            # 优先使用结构化 hint（推荐方式）
+            if col.window_hint:
+                inferred_window.append(col.window_hint)
+                continue
+            # 次优：从旧 description DSL 解析（兼容模式）
             if col.description:
                 window = _parse_description_to_window(col)
                 if window:

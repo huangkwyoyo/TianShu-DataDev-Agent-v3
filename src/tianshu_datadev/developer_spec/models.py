@@ -14,7 +14,7 @@ import re
 from enum import Enum
 from typing import Annotated
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, field_validator, model_validator
 
 # ════════════════════════════════════════════
 # 基础
@@ -425,22 +425,50 @@ class InputTableDecl(StrictModel):
     business_columns: list[ColumnDecl] = []  # 从 YAML business_columns 解析
 
 
+class LegacyDescriptionDSLWarning(UserWarning):
+    """旧格式 description DSL 兼容警告——提示迁移到结构化 hint 字段。"""
+
+
 class OutputColumnDecl(StrictModel):
     """输出列声明——包含名称、类型和可选的 SQL 语义描述。
 
-    description 字段承载结构化 DSL：
+    结构化 hint 字段（推荐——Phase 7B 新增）：
+    - metric_hint: 聚合指标（如 COUNT、SUM、AVG）
+    - computed_hint: 计算指标（如比率 a / b）
+    - window_hint: 窗口指标（如 ROW_NUMBER、RANK）
+    三者互斥——每个输出列最多设置一个。
+
+    description 字段承载旧格式 DSL（已废弃，保留兼容）：
     - 简单聚合: "COUNT(*)" / "SUM(amount)" / "COUNT(DISTINCT user_id)"
-    - 条件聚合: "COUNT(DISTINCT plate_id)，仅含 STANDARD 状态"
     - 计算指标: "fined_count / total_count，范围 [0, 1]"
     - 窗口函数: "ROW_NUMBER() OVER (PARTITION BY dt ORDER BY cnt DESC)"
-    - 不支持函数: "MEDIAN(amount)" → 标记低置信度，走人工
+    旧格式仍可机械解析（白名单模式），但会触发 LEGACY_DESCRIPTION_DSL 警告。
+    建议迁移到结构化 hint 字段。
 
-    DescriptionParser 负责从 description 解析出 MetricDecl。
+    user_description 字段：人类可读说明（不参与任何 SQL 语义解析）。
     """
 
     name: str  # 输出列名
     type: str = "varchar"  # 输出列类型（date / bigint / decimal / varchar）
-    description: str | None = None  # SQL 语义描述——DescriptionParser 的输入
+    description: str | None = None  # 旧格式 description DSL（已废弃，保留兼容）
+    metric_hint: MetricDecl | None = None  # 结构化聚合指标提示（推荐）
+    computed_hint: InferredComputedMetric | None = None  # 结构化计算指标提示（推荐）
+    window_hint: InferredWindowMetric | None = None  # 结构化窗口指标提示（推荐）
+    user_description: str | None = None  # 人类可读说明（不参与 SQL 语义解析）
+
+    @model_validator(mode="after")
+    def _validate_hint_exclusivity(self):
+        """互斥校验：metric_hint / computed_hint / window_hint 最多一个非空。"""
+        hints = [
+            self.metric_hint is not None,
+            self.computed_hint is not None,
+            self.window_hint is not None,
+        ]
+        if sum(hints) > 1:
+            raise ValueError(
+                "metric_hint / computed_hint / window_hint 互斥，只能设置其中一个"
+            )
+        return self
 
 
 class OutputSpecDecl(StrictModel):

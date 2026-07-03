@@ -1,8 +1,8 @@
-"""Phase 7A PlanComparator 测试——SQL Plan ↔ Spark Plan 逻辑链路对比。
+"""Phase 7B PlanComparator 测试——SQL Plan ↔ Spark Plan 逻辑链路对比。
 
 覆盖：
-- 5 种 step 类型（scan/filter/project/sort/limit）逻辑对比
-- 非 5 种 step 类型标记 NOT_COVERED
+- 8 种 step 类型（scan/filter/project/sort/limit/aggregate/join/case_when）逻辑对比
+- window 类型标记 NOT_COVERED
 - PlanComparisonReport 结构完整性
 - PlanComparator 只读 SqlBuildPlan 结构化 artifact（不读 SQL 文本）
 - 状态禁止泛化 PASS
@@ -10,15 +10,17 @@
 
 from __future__ import annotations
 
-import pytest
-
 from tianshu_datadev.planning.models import (
+    AggregateSpec,
+    AggregationType,
     AliasExpr,
     ColumnRef,
     Predicate,
     PredicateOperator,
     SortDirection,
     SortSpec,
+    SqlLiteral,
+    WhenBranch,
 )
 from tianshu_datadev.planning.sql_build_plan import (
     FilterStep,
@@ -43,12 +45,8 @@ from tianshu_datadev.spark.models import (
 from tianshu_datadev.spark.plan_comparator import (
     ComparisonStatus,
     PlanComparator,
-    PlanComparisonReport,
 )
-from tianshu_datadev.spark.plan_equivalence import (
-    EquivalenceVerdict,
-)
-
+from tianshu_datadev.spark.plan_equivalence import EquivalenceVerdict
 
 # ════════════════════════════════════════════
 # Fixtures——最小合法 SqlBuildPlan 和 SparkPlan
@@ -437,15 +435,15 @@ class TestPlanComparatorLimitEquivalence:
 
 
 # ════════════════════════════════════════════
-# PlanComparator——NOT_COVERED 标记测试
+# PlanComparator——Join 逻辑对比测试
 # ════════════════════════════════════════════
 
 
-class TestPlanComparatorNotCovered:
-    """非 Phase 7A 覆盖类型 → NOT_COVERED（本 Phase 未覆盖，后续 Phase 会覆盖）。"""
+class TestPlanComparatorJoinEquivalence:
+    """Join ↔ Join 逻辑等价性对比（Phase 7B 收口）。"""
 
-    def test_join_not_in_enabled_types(self):
-        """Join 类型不在 Phase 7A 启用列表 → NOT_COVERED。"""
+    def test_join_not_equivalent_different_aliases(self):
+        """不同别名 → LOGIC_MISMATCH（SQL 侧用 table_ref，Spark 侧用 alias）。"""
         from tianshu_datadev.planning.sql_build_plan import JoinStep
         from tianshu_datadev.spark.models import SparkJoinStep, SparkJoinType
 
@@ -488,12 +486,67 @@ class TestPlanComparatorNotCovered:
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
 
-        # Join 不在 Phase 7A 的 5 种类型中 → NOT_COVERED
-        assert report.status == ComparisonStatus.NOT_COVERED
-        assert "join" in report.uncovered_step_types
+        # SQL left_table_ref="order_info" ≠ Spark left_alias="od" → LOGIC_MISMATCH
+        assert report.status == ComparisonStatus.LOGIC_MISMATCH
+        assert "join" in [r.step_type for r in report.step_results]
 
-    def test_aggregate_not_in_enabled_types(self):
-        """Aggregate 类型 → NOT_COVERED。"""
+    def test_join_equivalent_same_keys(self):
+        """相同 join 键和类型 → LOGIC_EQUIVALENT。"""
+        from tianshu_datadev.planning.sql_build_plan import JoinStep
+        from tianshu_datadev.spark.models import SparkJoinStep, SparkJoinType
+
+        sql_plan = _make_sql_plan([
+            _make_sql_scan_step(),
+            JoinStep(
+                step_type="join",
+                step_id="step_join_001",
+                right_table_ref="od",
+                join_type="INNER",
+                join_keys=[
+                    (
+                        ColumnRef(
+                            table_ref="od",
+                            column_name="user_id",
+                            normalized_name="user_id",
+                        ),
+                        ColumnRef(
+                            table_ref="od",
+                            column_name="user_id",
+                            normalized_name="user_id",
+                        ),
+                    ),
+                ],
+                relationship_ref="rel_001",
+            ),
+        ])
+        spark_plan = _make_spark_plan([
+            _make_spark_read_step(),
+            SparkJoinStep(
+                step_type=SparkStepType.JOIN,
+                left_alias="od",
+                right_alias="od",
+                left_key="user_id",
+                right_key="user_id",
+                join_type=SparkJoinType.INNER,
+            ),
+        ])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
+
+
+# ════════════════════════════════════════════
+# PlanComparator——Aggregate 逻辑对比测试
+# ════════════════════════════════════════════
+
+
+class TestPlanComparatorAggregateEquivalence:
+    """Aggregate ↔ Aggregate 逻辑等价性对比（Phase 7B 收口）。"""
+
+    def test_aggregate_not_equivalent_different_metrics(self):
+        """SQL 侧无 metrics，Spark 侧有 metrics → LOGIC_MISMATCH。"""
         from tianshu_datadev.planning.sql_build_plan import AggregateStep
         from tianshu_datadev.spark.models import (
             SparkAggFunction,
@@ -535,8 +588,157 @@ class TestPlanComparatorNotCovered:
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
 
-        assert report.status == ComparisonStatus.NOT_COVERED
-        assert "aggregate" in report.uncovered_step_types
+        assert report.status == ComparisonStatus.LOGIC_MISMATCH
+
+    def test_aggregate_equivalent(self):
+        """相同 group_keys 和 metrics → LOGIC_EQUIVALENT。"""
+        from tianshu_datadev.planning.sql_build_plan import AggregateStep
+        from tianshu_datadev.spark.models import (
+            SparkAggFunction,
+            SparkAggregateSpec,
+            SparkAggregateStep,
+        )
+
+        sql_plan = _make_sql_plan([
+            _make_sql_scan_step(),
+            AggregateStep(
+                step_type="aggregate",
+                step_id="step_agg_001",
+                group_keys=[
+                    ColumnRef(
+                        table_ref="order_info",
+                        column_name="region",
+                        normalized_name="region",
+                    ),
+                ],
+                metrics=[
+                    AggregateSpec(
+                        aggregation=AggregationType.COUNT,
+                        input_column=None,
+                        alias="cnt",
+                    ),
+                ],
+            ),
+        ])
+        spark_plan = _make_spark_plan([
+            _make_spark_read_step(),
+            SparkAggregateStep(
+                step_type=SparkStepType.AGGREGATE,
+                input_alias="od",
+                group_keys=["region"],
+                metrics=[
+                    SparkAggregateSpec(
+                        function=SparkAggFunction.COUNT,
+                        input_column=None,
+                        alias="cnt",
+                    ),
+                ],
+            ),
+        ])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
+
+
+# ════════════════════════════════════════════
+# PlanComparator——CaseWhen 逻辑对比测试
+# ════════════════════════════════════════════
+
+
+class TestPlanComparatorCaseWhenEquivalence:
+    """CaseWhen ↔ CaseWhen 逻辑等价性对比（Phase 7B 收口）。"""
+
+    def test_case_when_not_equivalent_no_cases(self):
+        """SQL 侧无 cases，Spark 侧有 branches → LOGIC_MISMATCH。"""
+        from tianshu_datadev.planning.sql_build_plan import CaseWhenStep
+        from tianshu_datadev.spark.models import (
+            SparkCaseWhenBranch,
+            SparkCaseWhenStep,
+        )
+
+        sql_plan = _make_sql_plan([
+            _make_sql_scan_step(),
+            CaseWhenStep(
+                step_type="case_when",
+                step_id="step_cw_001",
+                cases=[],
+                else_value=None,
+                alias="label",
+            ),
+        ])
+        spark_plan = _make_spark_plan([
+            _make_spark_read_step(),
+            SparkCaseWhenStep(
+                step_type=SparkStepType.CASE_WHEN,
+                input_alias="od",
+                output_alias="label",
+                branches=[SparkCaseWhenBranch(label="normal")],
+                else_value="other",
+            ),
+        ])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_MISMATCH
+
+    def test_case_when_equivalent(self):
+        """SQL cases 与 Spark branches 标签一致 → LOGIC_EQUIVALENT。"""
+        from tianshu_datadev.planning.sql_build_plan import CaseWhenStep
+        from tianshu_datadev.spark.models import (
+            SparkCaseWhenBranch,
+            SparkCaseWhenStep,
+        )
+
+        sql_plan = _make_sql_plan([
+            _make_sql_scan_step(),
+            CaseWhenStep(
+                step_type="case_when",
+                step_id="step_cw_001",
+                cases=[
+                    WhenBranch(
+                        condition=Predicate(
+                            left=ColumnRef(
+                                table_ref="order_info",
+                                column_name="status",
+                                normalized_name="status",
+                            ),
+                            operator=PredicateOperator.EQ,
+                            right=SqlLiteral(value="paid"),
+                        ),
+                        result=SqlLiteral(value="normal"),
+                    ),
+                ],
+                else_value=SqlLiteral(value="other"),
+                alias="label",
+            ),
+        ])
+        spark_plan = _make_spark_plan([
+            _make_spark_read_step(),
+            SparkCaseWhenStep(
+                step_type=SparkStepType.CASE_WHEN,
+                input_alias="od",
+                output_alias="label",
+                branches=[SparkCaseWhenBranch(label="normal")],
+                else_value="other",
+            ),
+        ])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
+
+
+# ════════════════════════════════════════════
+# PlanComparator——NOT_COVERED 标记测试（仅 window）
+# ════════════════════════════════════════════
+
+
+class TestPlanComparatorNotCovered:
+    """Phase 7B 未覆盖类型 → NOT_COVERED（仅 window，Phase 6C 覆盖）。"""
 
     def test_window_not_in_enabled_types(self):
         """Window 类型 → NOT_COVERED。"""
@@ -577,41 +779,6 @@ class TestPlanComparatorNotCovered:
         assert report.status == ComparisonStatus.NOT_COVERED
         assert "window" in report.uncovered_step_types
 
-    def test_case_when_not_in_enabled_types(self):
-        """CaseWhen 类型 → NOT_COVERED。"""
-        from tianshu_datadev.planning.sql_build_plan import CaseWhenStep
-        from tianshu_datadev.spark.models import (
-            SparkCaseWhenBranch,
-            SparkCaseWhenStep,
-        )
-
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            CaseWhenStep(
-                step_type="case_when",
-                step_id="step_cw_001",
-                cases=[],
-                else_value=None,
-                alias="label",
-            ),
-        ])
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            SparkCaseWhenStep(
-                step_type=SparkStepType.CASE_WHEN,
-                input_alias="od",
-                output_alias="label",
-                branches=[SparkCaseWhenBranch(label="normal")],
-                else_value="other",
-            ),
-        ])
-
-        comparator = PlanComparator()
-        report = comparator.compare(sql_plan, spark_plan)
-
-        assert report.status == ComparisonStatus.NOT_COVERED
-        assert "case_when" in report.uncovered_step_types
-
 
 # ════════════════════════════════════════════
 # PlanComparator——混合场景
@@ -619,52 +786,44 @@ class TestPlanComparatorNotCovered:
 
 
 class TestPlanComparatorMixedScenarios:
-    """混合 step 类型场景——部分已覆盖 + 部分未覆盖。"""
+    """混合 step 类型场景——部分已覆盖 + 部分未覆盖（Phase 7B）。"""
 
-    def test_covered_steps_equivalent_with_uncovered(
+    def test_covered_steps_with_uncovered_window(
         self,
     ):
-        """已覆盖部分等价 + 未覆盖部分 → NOT_COVERED（已覆盖部分结果有效）。"""
-        from tianshu_datadev.planning.sql_build_plan import JoinStep
-        from tianshu_datadev.spark.models import SparkJoinStep, SparkJoinType
+        """已覆盖部分 + window 未覆盖 → NOT_COVERED。"""
+        from tianshu_datadev.planning.sql_build_plan import WindowStep
+        from tianshu_datadev.spark.models import (
+            SparkWindowExpr,
+            SparkWindowFunction,
+            SparkWindowStep,
+        )
 
-        # SQL 侧：scan + filter（已覆盖，应等价）+ join（未覆盖）
+        # SQL 侧：scan + filter（已覆盖）+ window（未覆盖）
         sql_plan = _make_sql_plan([
             _make_sql_scan_step(),
             _make_sql_filter_step(),
-            JoinStep(
-                step_type="join",
-                step_id="step_join_001",
-                right_table_ref="user_profile",
-                join_type="INNER",
-                join_keys=[
-                    (
-                        ColumnRef(
-                            table_ref="order_info",
-                            column_name="user_id",
-                            normalized_name="user_id",
-                        ),
-                        ColumnRef(
-                            table_ref="user_profile",
-                            column_name="user_id",
-                            normalized_name="user_id",
-                        ),
-                    ),
-                ],
-                relationship_ref="rel_001",
+            WindowStep(
+                step_type="window",
+                step_id="step_window_001",
+                window_exprs=[],
             ),
         ])
-        # Spark 侧：read + filter（已覆盖，应等价）+ join（未覆盖）
+        # Spark 侧：read + filter（已覆盖）+ window（未覆盖）
         spark_plan = _make_spark_plan([
             _make_spark_read_step(),
             _make_spark_filter_step(),
-            SparkJoinStep(
-                step_type=SparkStepType.JOIN,
-                left_alias="od",
-                right_alias="up",
-                left_key="user_id",
-                right_key="user_id",
-                join_type=SparkJoinType.INNER,
+            SparkWindowStep(
+                step_type=SparkStepType.WINDOW,
+                input_alias="od",
+                expressions=[
+                    SparkWindowExpr(
+                        function=SparkWindowFunction.ROW_NUMBER,
+                        alias="rn",
+                        partition_by=["region"],
+                        order_by=["amount"],
+                    ),
+                ],
             ),
         ])
 
@@ -673,8 +832,8 @@ class TestPlanComparatorMixedScenarios:
 
         # 已覆盖部分等价 → 但存在未覆盖类型 → NOT_COVERED
         assert report.status == ComparisonStatus.NOT_COVERED
-        assert "join" in report.uncovered_step_types
-        # 已覆盖部分应等价（step_results 中可查）
+        assert "window" in report.uncovered_step_types
+        # 已覆盖部分应等价
         covered_results = [
             r for r in report.step_results
             if r.step_type in ("scan", "filter")
@@ -684,8 +843,8 @@ class TestPlanComparatorMixedScenarios:
             for r in covered_results
         )
 
-    def test_all_steps_not_covered(self):
-        """全部 step 均为未覆盖类型 → NOT_COVERED。"""
+    def test_all_covered_but_mismatched_join(self):
+        """全部已覆盖（含 join），但 join 别名不匹配 → LOGIC_MISMATCH。"""
         from tianshu_datadev.planning.sql_build_plan import JoinStep
         from tianshu_datadev.spark.models import SparkJoinStep, SparkJoinType
 
@@ -726,7 +885,8 @@ class TestPlanComparatorMixedScenarios:
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
 
-        assert report.status == ComparisonStatus.NOT_COVERED
+        # join 在 Phase 7B 已覆盖——left_table_ref="order_info" ≠ left_alias="od"
+        assert report.status == ComparisonStatus.LOGIC_MISMATCH
 
     def test_empty_both_sides(self):
         """双方均为空 steps——对比规则不支持（UNSUPPORTED_COMPARISON）。"""
@@ -791,50 +951,43 @@ class TestPlanComparisonReportStructure:
         assert "PASS" not in report.status.value
 
     def test_uncovered_types_marked(self):
-        """未覆盖类型在 uncovered_step_types 中正确标记。"""
-        from tianshu_datadev.planning.sql_build_plan import JoinStep
-        from tianshu_datadev.spark.models import SparkJoinStep, SparkJoinType
+        """未覆盖类型在 uncovered_step_types 中正确标记——window 应在列表中。"""
+        from tianshu_datadev.planning.sql_build_plan import WindowStep
+        from tianshu_datadev.spark.models import (
+            SparkWindowExpr,
+            SparkWindowFunction,
+            SparkWindowStep,
+        )
 
         sql_plan = _make_sql_plan([
             _make_sql_scan_step(),
-            JoinStep(
-                step_type="join",
-                step_id="step_join_001",
-                right_table_ref="user_profile",
-                join_type="INNER",
-                join_keys=[
-                    (
-                        ColumnRef(
-                            table_ref="order_info",
-                            column_name="user_id",
-                            normalized_name="user_id",
-                        ),
-                        ColumnRef(
-                            table_ref="user_profile",
-                            column_name="user_id",
-                            normalized_name="user_id",
-                        ),
-                    ),
-                ],
-                relationship_ref="rel_001",
+            WindowStep(
+                step_type="window",
+                step_id="step_window_001",
+                window_exprs=[],
             ),
         ])
         spark_plan = _make_spark_plan([
             _make_spark_read_step(),
-            SparkJoinStep(
-                step_type=SparkStepType.JOIN,
-                left_alias="od",
-                right_alias="up",
-                left_key="user_id",
-                right_key="user_id",
-                join_type=SparkJoinType.INNER,
+            SparkWindowStep(
+                step_type=SparkStepType.WINDOW,
+                input_alias="od",
+                expressions=[
+                    SparkWindowExpr(
+                        function=SparkWindowFunction.ROW_NUMBER,
+                        alias="rn",
+                        partition_by=["region"],
+                        order_by=["amount"],
+                    ),
+                ],
             ),
         ])
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
 
-        assert "join" in report.uncovered_step_types
+        assert report.status == ComparisonStatus.NOT_COVERED
+        assert "window" in report.uncovered_step_types
 
 
 # ════════════════════════════════════════════
@@ -857,16 +1010,89 @@ class TestPlanComparatorCustomEnabledTypes:
         assert report.status == ComparisonStatus.NOT_COVERED
 
     def test_custom_enabled_all_types(self):
-        """启用所有 Phase 7A 已支持扁平化的类型——scan/filter/project/sort/limit。
+        """启用所有 Phase 7B 已支持扁平化的 8 种类型。
 
-        join/aggregate/case_when/window 的扁平化属于 Phase 6B/6C 范围。
+        scan/filter/project/sort/limit/aggregate/join/case_when。
+        window 的扁平化属于 Phase 6C 范围。
         """
+        from tianshu_datadev.planning.sql_build_plan import (
+            AggregateStep,
+            CaseWhenStep,
+            JoinStep,
+        )
+        from tianshu_datadev.spark.models import (
+            SparkAggFunction,
+            SparkAggregateSpec,
+            SparkAggregateStep,
+            SparkCaseWhenBranch,
+            SparkCaseWhenStep,
+            SparkJoinStep,
+            SparkJoinType,
+        )
+
         sql_plan = _make_sql_plan([
             _make_sql_scan_step(),
             _make_sql_filter_step(),
             _make_sql_project_step(),
             _make_sql_sort_step(),
             _make_sql_limit_step(),
+            AggregateStep(
+                step_type="aggregate",
+                step_id="step_agg_001",
+                group_keys=[
+                    ColumnRef(
+                        table_ref="order_info",
+                        column_name="region",
+                        normalized_name="region",
+                    ),
+                ],
+                metrics=[
+                    AggregateSpec(
+                        aggregation=AggregationType.COUNT,
+                        input_column=None,
+                        alias="cnt",
+                    ),
+                ],
+            ),
+            JoinStep(
+                step_type="join",
+                step_id="step_join_001",
+                right_table_ref="od",
+                join_type="INNER",
+                join_keys=[
+                    (
+                        ColumnRef(
+                            table_ref="od", column_name="user_id",
+                            normalized_name="user_id",
+                        ),
+                        ColumnRef(
+                            table_ref="od", column_name="user_id",
+                            normalized_name="user_id",
+                        ),
+                    ),
+                ],
+                relationship_ref="rel_001",
+            ),
+            CaseWhenStep(
+                step_type="case_when",
+                step_id="step_cw_001",
+                cases=[
+                    WhenBranch(
+                        condition=Predicate(
+                            left=ColumnRef(
+                                table_ref="order_info",
+                                column_name="status",
+                                normalized_name="status",
+                            ),
+                            operator=PredicateOperator.EQ,
+                            right=SqlLiteral(value="paid"),
+                        ),
+                        result=SqlLiteral(value="normal"),
+                    ),
+                ],
+                else_value=SqlLiteral(value="other"),
+                alias="label",
+            ),
         ])
         spark_plan = _make_spark_plan([
             _make_spark_read_step(),
@@ -874,10 +1100,40 @@ class TestPlanComparatorCustomEnabledTypes:
             _make_spark_project_step(),
             _make_spark_sort_step(),
             _make_spark_limit_step(),
+            SparkAggregateStep(
+                step_type=SparkStepType.AGGREGATE,
+                input_alias="od",
+                group_keys=["region"],
+                metrics=[
+                    SparkAggregateSpec(
+                        function=SparkAggFunction.COUNT,
+                        input_column=None,
+                        alias="cnt",
+                    ),
+                ],
+            ),
+            SparkJoinStep(
+                step_type=SparkStepType.JOIN,
+                left_alias="od",
+                right_alias="od",
+                left_key="user_id",
+                right_key="user_id",
+                join_type=SparkJoinType.INNER,
+            ),
+            SparkCaseWhenStep(
+                step_type=SparkStepType.CASE_WHEN,
+                input_alias="od",
+                output_alias="label",
+                branches=[SparkCaseWhenBranch(label="normal")],
+                else_value="other",
+            ),
         ])
 
-        # 启用所有 5 种 Phase 7A 类型
-        all_types = {"scan", "filter", "project", "sort", "limit"}
+        # 启用所有 8 种 Phase 7B 类型
+        all_types = {
+            "scan", "filter", "project", "sort", "limit",
+            "aggregate", "join", "case_when",
+        }
         comparator = PlanComparator(enabled_step_types=all_types)
         report = comparator.compare(sql_plan, spark_plan)
 

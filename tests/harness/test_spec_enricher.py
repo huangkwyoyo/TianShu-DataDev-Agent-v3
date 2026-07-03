@@ -17,8 +17,12 @@ import pytest
 from tianshu_datadev.developer_spec.models import (
     AggregationType,
     EnrichedSpec,
+    InferredComputedMetric,
+    InferredWindowMetric,
+    LegacyDescriptionDSLWarning,
     MetricDecl,
     MetricFilterDecl,
+    OutputColumnDecl,
     ParsedDeveloperSpec,
 )
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
@@ -1061,3 +1065,261 @@ class TestScalarSubquery:
                     )
         finally:
             con.close()
+
+
+# ════════════════════════════════════════════
+# 结构化 hint 测试（Phase 7B——迁移旧 description DSL）
+# ════════════════════════════════════════════
+
+
+class TestStructuredHints:
+    """结构化 hint 字段——metric_hint / computed_hint / window_hint 直接使用。"""
+
+    @staticmethod
+    def _make_spec_with_hint_columns(
+        columns: list[OutputColumnDecl],
+    ) -> ParsedDeveloperSpec:
+        """构造含结构化 hint 列的 Spec。"""
+        from tianshu_datadev.developer_spec.models import (
+            ColumnDecl,
+            InputTableDecl,
+            OutputSpecDecl,
+        )
+
+        table = InputTableDecl(
+            table_alias="t",
+            source_table="db.test_table",
+            columns=[
+                ColumnDecl(column_name="id", normalized_name="id", data_type="bigint"),
+                ColumnDecl(column_name="amount", normalized_name="amount", data_type="decimal"),
+                ColumnDecl(column_name="dt", normalized_name="dt", data_type="date"),
+            ],
+            role="fact",
+        )
+
+        output_spec = OutputSpecDecl(
+            columns=columns,
+            grain=["dt"],
+        )
+
+        return ParsedDeveloperSpec(
+            spec_id="test_hints",
+            spec_hash="test_hints",
+            title="结构化 hint 测试",
+            description="测试结构化 hint 字段",
+            input_tables=[table],
+            metrics=[],
+            dimensions=[],
+            output_spec=output_spec,
+        )
+
+    def test_metric_hint_used_directly(self):
+        """metric_hint 字段 → Enricher 直接使用，不经过 description 解析。"""
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
+
+        col = OutputColumnDecl(
+            name="total_amount",
+            type="decimal",
+            metric_hint=MetricDecl(
+                metric_name="total_amount",
+                aggregation=AggregationType.SUM,
+                input_column="amount",
+                alias="total_amount",
+            ),
+        )
+        spec = self._make_spec_with_hint_columns([col])
+        manifest = build_manifest_from_spec(spec)
+        enricher = SpecEnricher()
+        enriched = enricher.enrich(spec, manifest)
+
+        assert len(enriched.inferred_metrics) == 1
+        assert enriched.inferred_metrics[0].aggregation == AggregationType.SUM
+        assert enriched.inferred_metrics[0].input_column == "amount"
+        assert enriched.inferred_metrics[0].alias == "total_amount"
+
+    def test_computed_hint_used_directly(self):
+        """computed_hint 字段 → Enricher 直接使用。"""
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
+
+        col = OutputColumnDecl(
+            name="ratio",
+            type="decimal",
+            computed_hint=InferredComputedMetric(
+                metric_name="ratio",
+                expression="a / b",
+                depends_on=["a", "b"],
+                alias="ratio",
+                confidence="high",
+            ),
+        )
+        spec = self._make_spec_with_hint_columns([col])
+        manifest = build_manifest_from_spec(spec)
+        enricher = SpecEnricher()
+        enriched = enricher.enrich(spec, manifest)
+
+        assert len(enriched.inferred_computed_metrics) == 1
+        assert enriched.inferred_computed_metrics[0].expression == "a / b"
+        assert enriched.inferred_computed_metrics[0].alias == "ratio"
+
+    def test_window_hint_used_directly(self):
+        """window_hint 字段 → Enricher 直接使用。"""
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
+
+        col = OutputColumnDecl(
+            name="rnk",
+            type="bigint",
+            window_hint=InferredWindowMetric(
+                metric_name="rnk",
+                window_function="ROW_NUMBER",
+                input_column="amount",
+                partition_by=["dt"],
+                order_by=["amount DESC"],
+                alias="rnk",
+                confidence="high",
+            ),
+        )
+        spec = self._make_spec_with_hint_columns([col])
+        manifest = build_manifest_from_spec(spec)
+        enricher = SpecEnricher()
+        enriched = enricher.enrich(spec, manifest)
+
+        assert len(enriched.inferred_window_metrics) == 1
+        assert enriched.inferred_window_metrics[0].window_function == "ROW_NUMBER"
+
+    def test_old_description_still_works(self):
+        """旧 description DSL 仍可解析——兼容模式。"""
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
+
+        col = OutputColumnDecl(
+            name="cnt",
+            type="bigint",
+            description="COUNT(*)",
+        )
+        spec = self._make_spec_with_hint_columns([col])
+        manifest = build_manifest_from_spec(spec)
+        enricher = SpecEnricher()
+
+        with pytest.warns(LegacyDescriptionDSLWarning):
+            enriched = enricher.enrich(spec, manifest)
+
+        assert len(enriched.inferred_metrics) == 1
+        assert enriched.inferred_metrics[0].aggregation == AggregationType.COUNT
+
+    def test_description_warns_legacy(self):
+        """旧 description DSL → 触发 LegacyDescriptionDSLWarning。"""
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
+
+        col = OutputColumnDecl(
+            name="cnt",
+            type="bigint",
+            description="COUNT(DISTINCT id)",
+        )
+        spec = self._make_spec_with_hint_columns([col])
+        manifest = build_manifest_from_spec(spec)
+        enricher = SpecEnricher()
+
+        with pytest.warns(LegacyDescriptionDSLWarning):
+            enricher.enrich(spec, manifest)
+
+    def test_hint_takes_priority_over_description(self):
+        """同时有 hint 和 description → hint 优先，不触发旧格式警告。"""
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
+
+        col = OutputColumnDecl(
+            name="cnt",
+            type="bigint",
+            description="COUNT(*)",  # 旧格式——应被忽略
+            metric_hint=MetricDecl(
+                metric_name="cnt",
+                aggregation=AggregationType.COUNT_DISTINCT,
+                input_column="id",
+                alias="cnt",
+            ),
+        )
+        spec = self._make_spec_with_hint_columns([col])
+        manifest = build_manifest_from_spec(spec)
+        enricher = SpecEnricher()
+
+        # hint 优先 → 不触发旧格式警告（hint 存在时跳过 description 解析）
+        import warnings
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            enriched = enricher.enrich(spec, manifest)
+            # metric_hint 存在时不应触发 LegacyDescriptionDSLWarning
+            legacy_count = sum(
+                1 for x in w
+                if issubclass(x.category, LegacyDescriptionDSLWarning)
+            )
+            assert legacy_count == 0, (
+                f"有 metric_hint 时不应触发旧格式警告，实际: {legacy_count}"
+            )
+
+        assert len(enriched.inferred_metrics) == 1
+        assert enriched.inferred_metrics[0].aggregation == AggregationType.COUNT_DISTINCT
+
+
+class TestHintMutualExclusion:
+    """互斥校验——metric_hint / computed_hint / window_hint 最多一个非空。"""
+
+    def test_single_hint_ok(self):
+        """单个 hint → 通过校验。"""
+        col = OutputColumnDecl(
+            name="x",
+            metric_hint=MetricDecl(
+                metric_name="x",
+                aggregation=AggregationType.COUNT,
+                alias="x",
+            ),
+        )
+        assert col.metric_hint is not None
+
+    def test_two_hints_raises(self):
+        """两个 hint 同时设置 → ValueError。"""
+        import pytest
+        with pytest.raises(ValueError, match="互斥"):
+            OutputColumnDecl(
+                name="x",
+                metric_hint=MetricDecl(
+                    metric_name="x",
+                    aggregation=AggregationType.COUNT,
+                    alias="x",
+                ),
+                computed_hint=InferredComputedMetric(
+                    metric_name="x",
+                    expression="a / b",
+                    depends_on=["a", "b"],
+                    alias="x",
+                ),
+            )
+
+    def test_three_hints_raises(self):
+        """三个 hint 同时设置 → ValueError。"""
+        import pytest
+        with pytest.raises(ValueError, match="互斥"):
+            OutputColumnDecl(
+                name="x",
+                metric_hint=MetricDecl(
+                    metric_name="x",
+                    aggregation=AggregationType.COUNT,
+                    alias="x",
+                ),
+                computed_hint=InferredComputedMetric(
+                    metric_name="x",
+                    expression="a / b",
+                    depends_on=["a", "b"],
+                    alias="x",
+                ),
+                window_hint=InferredWindowMetric(
+                    metric_name="x",
+                    window_function="ROW_NUMBER",
+                    input_column="y",
+                    alias="x",
+                ),
+            )
+
+    def test_no_hint_ok(self):
+        """无 hint → 通过校验。"""
+        col = OutputColumnDecl(name="x", description="just a column")
+        assert col.metric_hint is None
+        assert col.computed_hint is None
+        assert col.window_hint is None

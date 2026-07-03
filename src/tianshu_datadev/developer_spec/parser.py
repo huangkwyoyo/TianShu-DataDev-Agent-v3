@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import warnings
 from typing import Any
 
 import yaml
@@ -31,9 +32,12 @@ from .models import (
     ComputeStep,
     DimensionDecl,
     FilterDecl,
+    InferredComputedMetric,
+    InferredWindowMetric,
     InputTableDecl,
     JoinDecl,
     JoinTypeEnum,
+    LegacyDescriptionDSLWarning,
     MetricDecl,
     MetricFilterDecl,
     MetricVariant,
@@ -118,6 +122,33 @@ def _normalize_row_count(raw: str) -> tuple[int | None, str | None]:
         number *= _MAGNITUDE_MULTIPLIERS[unit]
 
     return int(number), raw_stripped
+
+
+def _parse_optional_hint(hint_value: Any, model_cls: type):
+    """将 YAML 中的结构化 hint dict 转换为对应的 Pydantic 模型。
+
+    None / 空 dict → None，非法数据 → None（不阻断解析，由 validator 兜底）。
+
+    Args:
+        hint_value: YAML 中的 hint 值（dict 或 None）
+        model_cls: 目标 Pydantic 模型类（MetricDecl / InferredComputedMetric / InferredWindowMetric）
+
+    Returns:
+        模型实例或 None
+    """
+    if hint_value is None:
+        return None
+    if isinstance(hint_value, model_cls):
+        return hint_value
+    if isinstance(hint_value, dict):
+        # 空 dict → None
+        if not hint_value:
+            return None
+        try:
+            return model_cls(**hint_value)
+        except Exception:
+            return None
+    return None
 
 
 class DeveloperSpecParser:
@@ -688,19 +719,41 @@ class DeveloperSpecParser:
 
         7 项禁止检查：output_columns 为空 → E006。
         """
-        # 从 output_columns 提取列声明列表（name + type + description）
+        # 从 output_columns 提取列声明列表（name + type + description + 结构化 hint）
         from tianshu_datadev.developer_spec.models import OutputColumnDecl
         raw_output_cols = spec_dict.get("output_columns", []) or []
         columns: list[OutputColumnDecl] = []
         for col in raw_output_cols:
             if isinstance(col, dict):
                 name = col.get("name", "")
-                if name:
-                    columns.append(OutputColumnDecl(
-                        name=name,
-                        type=col.get("type", "varchar"),
-                        description=col.get("description"),
-                    ))
+                if not name:
+                    continue
+                # 解析结构化 hint 字段（推荐方式）
+                metric_hint = _parse_optional_hint(col.get("metric_hint"), MetricDecl)
+                computed_hint = _parse_optional_hint(col.get("computed_hint"), InferredComputedMetric)
+                window_hint = _parse_optional_hint(col.get("window_hint"), InferredWindowMetric)
+                user_description = col.get("user_description")
+
+                # 旧 description 格式兼容：无结构化 hint 但有 description → 警告
+                old_description = col.get("description")
+                if old_description and not any([metric_hint, computed_hint, window_hint]):
+                    warnings.warn(
+                        f"列 '{name}' 使用旧 description DSL 格式 "
+                        f"（\"{old_description[:80]}{'...' if len(old_description) > 80 else ''}\"），"
+                        f"请迁移到 metric_hint / computed_hint / window_hint 结构化字段",
+                        LegacyDescriptionDSLWarning,
+                        stacklevel=2,
+                    )
+
+                columns.append(OutputColumnDecl(
+                    name=name,
+                    type=col.get("type", "varchar"),
+                    description=old_description,
+                    metric_hint=metric_hint,
+                    computed_hint=computed_hint,
+                    window_hint=window_hint,
+                    user_description=user_description,
+                ))
             elif isinstance(col, str):
                 # 向后兼容：纯字符串列名
                 columns.append(OutputColumnDecl(name=col))

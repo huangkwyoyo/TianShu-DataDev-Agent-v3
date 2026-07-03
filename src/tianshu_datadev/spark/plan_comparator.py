@@ -1,7 +1,9 @@
-"""Phase 7A PlanComparator——SQL Plan ↔ Spark Plan 逻辑链路对比器。
+"""Phase 7B PlanComparator——SQL Plan ↔ Spark Plan 逻辑链路对比器。
 
 封装 Phase 5 plan_equivalence.py 的 9 条对比规则和 compare_plans() 入口。
 只读取 SqlBuildPlan 结构化 artifact——不读取 SQL 文本。
+默认覆盖 8 类 step：scan/filter/project/sort/limit/aggregate/join/case_when。
+window/subquery 仍标记 NOT_COVERED。
 
 状态语义（精确区分）：
 - NOT_EXECUTED：整个对比流程尚未执行
@@ -117,20 +119,20 @@ class PlanComparator:
         report = comparator.compare(sql_plan, spark_plan)
     """
 
-    # Phase 7A 启用的 step 类型（5 种基础类型）
-    _PHASE_7A_ENABLED_TYPES: set[str] = {
+    # Phase 7B 启用的 step 类型（8 种：6A 5 种 + 6B 3 种）
+    _PHASE_7B_ENABLED_TYPES: set[str] = {
         "scan",
         "filter",
         "project",
         "sort",
         "limit",
+        "aggregate",    # Phase 6B
+        "join",         # Phase 6B
+        "case_when",    # Phase 6B
     }
 
-    # 需要标记为 NOT_EXECUTED 的 step 类型（Phase 6B/6C/未来）
+    # 需要标记为 NOT_COVERED 的 step 类型（Phase 6C/未来）
     _NOT_YET_COVERED_TYPES: set[str] = {
-        "join",         # Phase 6B
-        "aggregate",    # Phase 6B
-        "case_when",    # Phase 6B
         "window",       # Phase 6C
         "subquery",     # 尚未设计等价对比规则
     }
@@ -145,12 +147,12 @@ class PlanComparator:
 
         Args:
             enabled_step_types: 启用逻辑对比的 step 类型集合。
-                                None 时使用 Phase 7A 默认的 5 种类型。
+                                None 时使用 Phase 7B 默认的 8 种类型。
         """
         self._enabled_types = (
             enabled_step_types
             if enabled_step_types is not None
-            else self._PHASE_7A_ENABLED_TYPES.copy()
+            else self._PHASE_7B_ENABLED_TYPES.copy()
         )
 
     def compare(
@@ -170,7 +172,7 @@ class PlanComparator:
         Args:
             sql_plan: SQL 侧的 SqlBuildPlan（结构化 artifact，非 SQL 文本）
             spark_plan: Spark 侧的 SparkPlan
-            annotations: 语义标注列表（Phase 8 消费，Phase 7A 仅穿传）
+            annotations: 语义标注列表（Phase 8 消费，Phase 7 仅穿传）
             warnings: AnnotationWarning 列表（携带但不影响 verdict）
             enabled_step_types: 覆盖此实例默认的启用类型
 
@@ -310,7 +312,10 @@ class PlanComparator:
 
         转换规则：
         - filter: predicate.* → 顶层（left/operator/right）
-        - 其他类型：字段已在顶层，无需转换
+        - project: AliasExpr.expression.column_name → 顶层
+        - join: join_keys (ColumnRef 对) → left_table_ref/left_key/right_key
+        - aggregate: group_keys ColumnRef → 字符串，metrics aggregation → function
+        - case_when: cases → labels，else_value SqlLiteral → default_value 字符串
         """
         step_type = step_dict.get("step_type", "")
 
@@ -318,8 +323,13 @@ class PlanComparator:
             return PlanComparator._flatten_filter_step(step_dict)
         if step_type == "project":
             return PlanComparator._flatten_project_step(step_dict)
-        # scan / sort / limit / join / aggregate / case_when / window
-        # 的对比字段已在顶层，无需额外扁平化
+        if step_type == "join":
+            return PlanComparator._flatten_join_step(step_dict)
+        if step_type == "aggregate":
+            return PlanComparator._flatten_aggregate_step(step_dict)
+        if step_type == "case_when":
+            return PlanComparator._flatten_case_when_step(step_dict)
+        # scan / sort / limit / window 的对比字段已在顶层，无需额外扁平化
         return step_dict
 
     @staticmethod
@@ -389,6 +399,120 @@ class PlanComparator:
 
         result = dict(step_dict)
         result["columns"] = flattened_columns
+        return result
+
+    @staticmethod
+    def _flatten_join_step(step_dict: dict[str, Any]) -> dict[str, Any]:
+        """扁平化 JoinStep——从 join_keys 提取 left_table_ref / left_key / right_key。
+
+        SQL JoinStep 模型：join_keys 为 (ColumnRef, ColumnRef) 对列表，
+        每个 ColumnRef 含 table_ref / column_name / normalized_name。
+        对比函数期望 top-level 的 left_table_ref, right_table_ref, left_key, right_key。
+        right_table_ref 已在顶层（SafeIdentifier → 字符串）。
+        """
+        join_keys = step_dict.pop("join_keys", [])
+        result = dict(step_dict)
+
+        if join_keys and len(join_keys) > 0:
+            first_key = join_keys[0]
+            # join_keys 中的每个元素是 [left_col, right_col] 列表
+            if isinstance(first_key, list) and len(first_key) >= 2:
+                left_col, right_col = first_key[0], first_key[1]
+                if isinstance(left_col, dict):
+                    result["left_table_ref"] = left_col.get("table_ref", "")
+                    result["left_key"] = (
+                        left_col.get("normalized_name")
+                        or left_col.get("column_name", "")
+                    )
+                if isinstance(right_col, dict):
+                    result["right_key"] = (
+                        right_col.get("normalized_name")
+                        or right_col.get("column_name", "")
+                    )
+
+        # 防御性默认值——确保对比函数访问时不抛 KeyError
+        if "left_table_ref" not in result:
+            result["left_table_ref"] = ""
+        if "left_key" not in result:
+            result["left_key"] = ""
+        if "right_key" not in result:
+            result["right_key"] = ""
+
+        return result
+
+    @staticmethod
+    def _flatten_aggregate_step(step_dict: dict[str, Any]) -> dict[str, Any]:
+        """扁平化 AggregateStep——group_keys ColumnRef → 字符串，metrics aggregation → function。
+
+        SQL AggregateStep 模型：
+        - group_keys: list[ColumnRef] → 需转为字符串列表
+        - metrics: list[AggregateSpec]，其中函数名字段为 "aggregation" → 需重命名为 "function"
+          （Spark 侧 SparkAggregateSpec 使用 "function" 字段名）
+        """
+        result = dict(step_dict)
+
+        # 扁平化 group_keys: ColumnRef dict → 字符串
+        raw_groups = result.get("group_keys", [])
+        if raw_groups:
+            flat_groups: list[str] = []
+            for g in raw_groups:
+                if isinstance(g, dict):
+                    flat_groups.append(
+                        str(g.get("normalized_name") or g.get("column_name", ""))
+                    )
+                else:
+                    flat_groups.append(str(g))
+            result["group_keys"] = flat_groups
+
+        # 扁平化 metrics: aggregation → function（SQL/Spark 侧命名统一）
+        raw_metrics = result.get("metrics", [])
+        if raw_metrics:
+            flat_metrics: list[dict[str, Any]] = []
+            for m in raw_metrics:
+                if isinstance(m, dict):
+                    flat_m = dict(m)
+                    if "aggregation" in flat_m and "function" not in flat_m:
+                        flat_m["function"] = flat_m.pop("aggregation")
+                    flat_metrics.append(flat_m)
+                else:
+                    flat_metrics.append(m)
+            result["metrics"] = flat_metrics
+
+        return result
+
+    @staticmethod
+    def _flatten_case_when_step(step_dict: dict[str, Any]) -> dict[str, Any]:
+        """扁平化 CaseWhenStep——cases → labels，else_value SqlLiteral → default_value 字符串。
+
+        SQL CaseWhenStep 模型：
+        - cases: list[WhenBranch]，每个含 result: SqlLiteral → 提取 value 为 labels
+        - else_value: SqlLiteral | None → 提取 value 为 default_value
+        - alias: SafeIdentifier（对比函数不消费，保留不丢失）
+        """
+        result = dict(step_dict)
+
+        # cases → labels: 提取每个 WhenBranch 的 result.value
+        raw_cases = result.pop("cases", [])
+        labels: list[str] = []
+        for c in raw_cases:
+            if isinstance(c, dict):
+                res = c.get("result", {})
+                if isinstance(res, dict):
+                    labels.append(str(res.get("value", "")))
+                else:
+                    labels.append(str(res))
+        result["labels"] = labels
+
+        # else_value SqlLiteral → default_value 字符串
+        else_val = result.pop("else_value", None)
+        if else_val is not None:
+            if isinstance(else_val, dict):
+                result["default_value"] = str(else_val.get("value", ""))
+            else:
+                result["default_value"] = str(else_val)
+        else:
+            result["default_value"] = ""
+
         return result
 
     @staticmethod
