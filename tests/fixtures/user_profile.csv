@@ -1,0 +1,5 @@
+user_id,user_name,region,level,created_date
+101,Alice,North,Gold,2024-06-01
+102,Bob,South,Silver,2024-07-15
+103,Charlie,East,Bronze,2024-08-20
+104,Diana,West,Gold,2024-09-10

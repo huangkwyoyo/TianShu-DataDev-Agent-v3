@@ -1,0 +1,6 @@
+product_id,product_name,category,price,stock
+P001,Widget A,Electronics,29.99,100
+P002,Widget B,Clothing,49.50,200
+P003,Widget C,Electronics,15.00,150
+P004,Widget D,Home,89.99,50
+P005,Widget E,Clothing,35.00,300
