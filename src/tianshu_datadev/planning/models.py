@@ -202,7 +202,9 @@ class AggregateSpec(StrictModel):
     alias: SafeIdentifier  # 输出列别名
     # ── Phase 4D 新增字段 ──
     filter: MetricFilterDecl | None = None  # 条件聚合 FILTER (WHERE ...)
-    input_expression: str | None = None  # 多字段算术表达式（如 "quantity * unit_price"）——仅允许列引用+算术运算符（+-*/%），禁止 SQL 关键字/函数调用/注释/引号；非空时经 expression_guard 校验后进入编译器
+    input_expression: str | None = None  # 多字段算术表达式，如 "quantity * unit_price"
+    # input_expression 约束：仅允许列引用+算术运算符（+-*/%），禁止 SQL 关键字/函数调用/
+    # 注释/引号；非空时经 expression_guard 校验后进入编译器
     distinct: bool = False  # 去重聚合（用于 SUM(DISTINCT col)，COUNT_DISTINCT 已独立处理）
     # ── Phase 5 新增字段 ──
     source_table: str | None = None  # 源表别名——多表场景下消除列歧义

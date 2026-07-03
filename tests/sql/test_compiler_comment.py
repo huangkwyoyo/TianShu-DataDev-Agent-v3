@@ -14,7 +14,6 @@ from tianshu_datadev.planning.sql_program import (
 )
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
 
-
 # ── 辅助函数 ──
 
 

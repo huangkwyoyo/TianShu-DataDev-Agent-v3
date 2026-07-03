@@ -2,8 +2,6 @@
 
 import os
 
-import pytest
-
 from tianshu_datadev.developer_spec.models import (
     AggregationType,
     InferredWindowMetric,

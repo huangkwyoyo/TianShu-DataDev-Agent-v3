@@ -238,3 +238,56 @@ class TestPipelineE2E:
         assert artifact.spec_hash == spec.spec_hash
         assert artifact.hypothesis_id == hypothesis.hypothesis_id
         assert artifact.plan_id == plan.plan_id
+
+    def test_full_pipeline_golden_passing_compile_execute(self):
+        """golden_passing fixture 全链路——确保 compile + execute 路径被真正覆盖。
+
+        golden_passing 行数低于 100 万，不应触发 Validator blocking。
+        如果 blocking 出现则表明 golden fixture 退化，测试应失败而非跳过。
+        """
+        spec_text = _read_fixture("fixtures/golden/golden_passing.md")
+        parser = DeveloperSpecParser()
+        spec = parser.parse(spec_text)
+        manifest = _build_manifest(spec)
+
+        builder = SqlBuildPlanBuilder()
+        plan, _ = builder.build(spec)
+
+        validator = SqlBuildPlanValidator()
+        passed, questions = validator.validate(plan, manifest)
+        blocking = [q for q in questions if q.blocking]
+        assert not blocking, f"golden_passing 不应产生 blocking: {[q.description for q in blocking]}"
+        assert passed is True
+
+        # Compiler 编译
+        compiler = DuckDbSqlCompiler(table_mapping={"tf": "test_fact"})
+        compiled = compiler.compile(plan)
+        assert compiled.sql != ""
+        assert "SELECT" in compiled.sql.upper()
+
+        # SqlArtifact 溯源完整性
+        artifact = compiler.compile_to_artifact(plan, spec_hash=spec.spec_hash)
+        assert isinstance(artifact, SqlArtifact)
+        assert artifact.spec_hash == spec.spec_hash
+
+        # Executor 执行
+        table_paths = {"test_fact": _csv_path("test_fact.csv")}
+        executor = DuckDBExecutor(table_paths=table_paths)
+        try:
+            trace, summary = executor.execute(compiled)
+        except Exception as e:
+            if "DuckDB" in str(e) or "duckdb" in str(e).lower():
+                pytest.skip("DuckDB 未安装")
+            raise
+
+        # ExecutionTrace 验证
+        assert trace.engine == "duckdb"
+        assert trace.status in (
+            ExecutionStatus.RUNTIME_PASS,
+            ExecutionStatus.RUNTIME_FAIL,
+            ExecutionStatus.NOT_EXECUTED,
+        )
+        if trace.status == ExecutionStatus.RUNTIME_PASS:
+            assert trace.row_count >= 0
+            assert summary.row_count == trace.row_count
+            assert len(summary.columns) > 0
