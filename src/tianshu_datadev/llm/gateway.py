@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
@@ -25,7 +25,11 @@ from tianshu_datadev.llm.models import (
     LlmResponse,
     SchemaBinding,
 )
-from tianshu_datadev.prompts.manager import PromptManager
+
+if TYPE_CHECKING:
+    # 仅用于类型注解——运行时不需要实际类。
+    # 放在 TYPE_CHECKING 中打破 llm.gateway ↔ prompts.manager 循环导入。
+    from tianshu_datadev.prompts.manager import PromptManager
 
 
 class LLMGateway:
