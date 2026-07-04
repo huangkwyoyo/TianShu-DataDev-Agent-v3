@@ -234,6 +234,9 @@ class SparkOrchestrator:
         Returns:
             SparkPipelineState——含每阶段结果、错误列表、全局状态
         """
+        # 每次 run() 都是独立执行上下文——重置所有缓存，防止上一轮残留泄漏
+        self._cached_plan = None
+        self._cached_compile_result = None
         self._cached_sql_plan = sql_plan
         failures = stage_failures or {}
         # contract_hash 优先取 contract 的 hash，否则用参数

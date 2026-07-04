@@ -362,6 +362,67 @@ class TestSparkOrchestrator:
             f"错误消息应提及 SparkPlan，实际 errors={state.errors}"
         )
 
+    def test_consecutive_runs_do_not_leak_cached_plan(self):
+        """A 类修复：同一 Orchestrator 连续两次 run()，
+        第二次无 contract 但有 sql_plan → COMPARATOR 不得复用第一次的 spark_plan。
+
+        每次 run() 都是独立执行上下文——_cached_plan / _cached_compile_result
+        必须在 run() 开头重置为 None，防止上一轮残留泄漏。
+        """
+        from tianshu_datadev.artifacts.models import (
+            ContractInputTable,
+            ContractOutputColumn,
+            DataTransformContractV1,
+        )
+        from tianshu_datadev.planning.sql_build_plan import ScanStep, SqlBuildPlan
+
+        orchestrator = SparkOrchestrator()
+
+        # 构造最小 SqlBuildPlan
+        sql_plan = SqlBuildPlan(
+            plan_id="sql_leak_test",
+            spec_hash="leak_spec",
+            steps=[ScanStep(step_type="scan", step_id="scan_t", table_ref="t", required_columns=[])],
+        )
+
+        # 构造最小 Contract（驱动 Mapper 产出 SparkPlan）
+        contract = DataTransformContractV1(
+            contract_id="leak_test_contract",
+            source_sqlprogram_hash="leak_test",
+            input_tables=[ContractInputTable(table_ref="t", source_table="src.t")],
+            output_columns=[ContractOutputColumn(column_name="id", alias="id")],
+        )
+
+        # ── 第一次 run：contract + sql_plan → MAPPER SUCCESS + COMPARATOR SUCCESS ──
+        state1 = orchestrator.run(contract=contract, sql_plan=sql_plan)
+        assert state1.stage_results["MAPPER"] == "SUCCESS", (
+            f"第一次 MAPPER 应为 SUCCESS，实际 {state1.stage_results['MAPPER']}"
+        )
+        assert state1.stage_results["COMPARATOR"] == "SUCCESS", (
+            f"第一次 COMPARATOR 应为 SUCCESS，实际 {state1.stage_results['COMPARATOR']}，"
+            f"errors={state1.errors}"
+        )
+
+        # ── 第二次 run：只有 sql_plan，无 contract ──
+        # 正确行为：_cached_plan 已在 run() 开头重置为 None
+        # → MAPPER SKIPPED（无 contract）→ COMPARATOR SKIPPED（缺 SparkPlan）
+        state2 = orchestrator.run(
+            contract_hash="second_run_no_contract",
+            sql_plan=sql_plan,
+        )
+        assert state2.stage_results["MAPPER"] == "SKIPPED", (
+            f"第二次 MAPPER 应为 SKIPPED（无 contract），实际 {state2.stage_results['MAPPER']}"
+        )
+        # 关键断言：不得复用第一次的 SparkPlan
+        assert state2.stage_results["COMPARATOR"] == "SKIPPED", (
+            f"第二次 COMPARATOR 应为 SKIPPED（无 spark_plan），"
+            f"实际 {state2.stage_results['COMPARATOR']}——"
+            f"疑似复用了第一次 run 的残留 _cached_plan"
+        )
+        assert any("SparkPlan" in e for e in state2.errors), (
+            f"错误消息应指出缺少 SparkPlan，实际 errors={state2.errors}"
+        )
+
 
 # ════════════════════════════════════════════
 # 骨架级 E2E 测试——Orchestrator 真实调用组件
