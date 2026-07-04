@@ -1,7 +1,7 @@
 # Phase 6-8 已知风险登记
 
-> 日期：2026-07-04 | 最后更新：2026-07-04 C3/C4 业务集成第二轮——桥接生产化 + P0 覆盖确认
-> 状态：C1 已点亮（11/11），C2 架构已收口（复用 llm.adapters + PromptManager，mock 路径可回归），C3 测试级已点亮（桥接生产化），C4 P0 已点亮（D1/D2/D3/D5）
+> 日期：2026-07-04 | 最后更新：2026-07-04 C3 Orchestrator COMPARATOR 集成——sql_plan 驱动真实对比
+> 状态：C1 已点亮（11/11），C2 架构已收口（复用 llm.adapters + PromptManager，mock 路径可回归），C3 已点亮（桥接生产化 + Orchestrator 集成），C4 P0 已点亮（D1/D2/D3/D5）
 
 ---
 
@@ -71,22 +71,22 @@
 
 ## C3: Comparator 真实逻辑对比
 
-- **风险等级**：B（测试级已点亮，生产 SQL pipeline 串联待完成）
-- **发现阶段**：Phase 8 全局验收 | **进化阶段**：C3/C4 业务集成第二轮（桥接生产化）
-- **影响范围**：`src/tianshu_datadev/spark/plan_comparator.py::PlanComparator.compare()` + `src/tianshu_datadev/spark/contract_sql_bridge.py`
+- **风险等级**：A（已点亮——桥接生产化 + Orchestrator 集成完成）
+- **发现阶段**：Phase 8 全局验收 | **点亮阶段**：C3/C4 业务集成第三轮（Orchestrator COMPARATOR 集成）
+- **影响范围**：`src/tianshu_datadev/spark/plan_comparator.py` + `contract_sql_bridge.py` + `orchestrator.py`
 - **当前状态**：
-  - `PlanComparator` 接口已完整实现，9 种 step 对比规则已就绪——26/26 测试全绿
-  - `contract_to_sql_steps()` 桥接函数已生产化——从测试文件提升到 `spark/contract_sql_bridge.py`（完整类型注释 + 防御检查 + 单元测试）
-  - 双管线集成测试 `test_contract_to_spark_via_mapper_then_compare_all_eight_types`：同一 Contract → Mapper 产出 SparkPlan + 桥接产出 SqlBuildPlan → Comparator 对比——8 种 step 类型全部 LOGIC_EQUIVALENT
-  - Orchestrator 中 COMPARATOR 阶段仍标记 SKIPPED——桥接函数已就绪，但 Orchestrator 尚未集成（需要 sql_plan 参数传入 run() 入口）
-- **阻塞项**：
-  - 生产级 SQL pipeline 串联（Contract → SpecEnricher → SqlBuildPlanBuilder）属于 SQL pipeline 范围——不在 Spark pipeline 范围内
-  - 桥接函数 `contract_to_sql_steps()` 提供确定性替代路径——在 SQL pipeline 就绪前可启用 Orchestrator COMPARATOR 阶段
+  - `PlanComparator` 接口已完整实现，9 种 step 对比规则已就绪——30/30 测试全绿
+  - `contract_to_sql_steps()` 桥接函数已生产化到 `spark/contract_sql_bridge.py`
+  - **Orchestrator COMPARATOR 已集成**：`run()` 接收可选 `sql_plan: SqlBuildPlan` 参数
+    - 提供 `sql_plan` + `spark_plan`（Mapper 产出）→ 真实调用 `PlanComparator.compare()` → 记录 `comparator_report`
+    - 缺一 → SKIPPED，错误消息精确指出缺失项
+  - 31/31 orchestrator 测试全绿（含 3 个 COMPARATOR 集成测试）
+- **残留风险**：
+  - 桥接函数 `contract_to_sql_steps()` 是确定性映射——不经过 SQL pipeline 的 SpecEnricher 推测逻辑
+  - 在 SQL pipeline（SpecEnricher → SqlBuildPlanBuilder）正式就绪前，桥接函数提供等效替代
 - **下一轮行动**：
-  1. Orchestrator 集成：`run()` 方法接收可选的 `sql_plan: SqlBuildPlan` 参数 → COMPARATOR 阶段接入桥接产出
-  2. 桥接函数在 SQL pipeline `SpecEnricher → SqlBuildPlanBuilder` 就绪后替换
-- **影响评估**：不影响骨架级验收——桥接函数提供确定性对比能力，测试级 C3 已点亮
-- **处置建议**：Orchestrator 集成在下一轮业务集成中执行——修改量小（~20 行），风险低
+  - 桥接函数在 SQL pipeline 就绪后替换为 `SqlBuildPlanBuilder` 产出
+- **状态**：✅ 已点亮——C3 风险消除（Orchestrator 集成完成）
 
 ---
 
@@ -148,7 +148,7 @@
 |------|------|:---:|:---:|------|
 | C1 | 已消除 | — | — | 2026-07-04 点亮（11/11 真实 Spark 通过） |
 | C2 | 已消除 | — | — | 2026-07-04 架构收口 + 循环导入修复（PromptManager 可直接导入） |
-| C3 | B-测试级已点亮 | 否 | 否 | 桥接已生产化——Orchestrator 集成下一轮 |
+| C3 | 已消除 | — | — | 2026-07-04 点亮（桥接生产化 + Orchestrator 集成） |
 | C4 | B-P0 已点亮 | 否 | 否（P0）| D4 等 C3 生产串联——P0 已覆盖 |
 | R3 | 已消除 | — | — | 2026-07-04 已修复 |
 | R4 | 已消除 | — | — | — |
