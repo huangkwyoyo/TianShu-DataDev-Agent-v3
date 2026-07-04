@@ -207,12 +207,24 @@ class SparkWindowStep(StrictModel):
 
 
 class SparkWindowExpr(StrictModel):
-    """单个窗口函数表达式——映射 WindowSpecSummary。"""
+    """单个窗口函数表达式——映射 WindowSpecSummary。
+
+    frame_type / frame_start / frame_end 控制窗口帧边界（ROWS/RANGE BETWEEN）。
+    针对不同窗口函数的默认帧语义：
+    - ROW_NUMBER / RANK / DENSE_RANK / NTILE：默认 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    - LAG / LEAD：忽略帧（单行偏移）
+    - SUM_OVER / AVG_OVER / COUNT_OVER：默认 RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    """
 
     function: SparkWindowFunction  # 窗口函数名
     alias: str  # 输出列别名
+    input_column: str | None = None  # 输入列名（LAG/LEAD/SUM_OVER/AVG_OVER/COUNT_OVER 需要；排名函数不需要）
     partition_by: list[str] = []  # 分区键列名列表
     order_by: list[str] = []  # 排序键列名列表
+    # 帧边界配置（可选——默认使用函数类型对应的标准帧）
+    frame_type: str = "rows"  # "rows" | "range"
+    frame_start: str = "unbounded_preceding"  # 帧起始边界
+    frame_end: str = "current_row"  # 帧结束边界
 
 
 class SparkSortStep(StrictModel):

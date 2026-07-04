@@ -541,11 +541,24 @@ class DataTransformContractExtractor:
                 for s in wexpr.order_by
             ]
 
+            # 提取输入列/参数——从 WindowExpr.input 提取
+            # ColumnRef → 列名字符串；SqlLiteral → str(value)（NTILE 桶数）
+            # None → None（排名函数无需参数）
+            input_column: str | None = None
+            if wexpr.input is not None:
+                if hasattr(wexpr.input, "column_name"):
+                    # ColumnRef——LAG/LEAD/SUM_OVER/AVG_OVER/COUNT_OVER
+                    input_column = wexpr.input.column_name
+                elif hasattr(wexpr.input, "value"):
+                    # SqlLiteral——NTILE(n)
+                    input_column = str(wexpr.input.value)
+
             specs.append(
                 WindowSpecSummary(
                     statement_id=statement_id,
                     function=func,
                     alias=alias,
+                    input_column=input_column,
                     partition_by=partition_by,
                     order_by=order_by,
                 )

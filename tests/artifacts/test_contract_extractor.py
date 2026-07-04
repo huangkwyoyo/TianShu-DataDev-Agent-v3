@@ -373,7 +373,7 @@ def _make_case_when_step() -> CaseWhenStep:
 
 
 def _make_window_step() -> WindowStep:
-    """构建含窗口函数的步骤。"""
+    """构建含窗口函数的步骤——ROW_NUMBER + LAG（含输入列）。"""
     return WindowStep(
         step_id="win_1",
         window_exprs=[
@@ -390,6 +390,25 @@ def _make_window_step() -> WindowStep:
                     SortSpec(column="total", direction="DESC"),
                 ],
                 alias="rn",
+            ),
+            WindowExpr(
+                function=WindowFunction.LAG,
+                input=ColumnRef(
+                    table_ref="t1",
+                    column_name="total",
+                    normalized_name="total",
+                ),
+                partition_by=[
+                    ColumnRef(
+                        table_ref="t1",
+                        column_name="category",
+                        normalized_name="category",
+                    ),
+                ],
+                order_by=[
+                    SortSpec(column="order_date", direction="ASC"),
+                ],
+                alias="prev_total",
             ),
         ],
     )
@@ -480,13 +499,22 @@ class TestContractExtractorV1:
         assert cw.else_label == "低价值"
 
         # ── v1 新增字段 4: window_specs ──
-        assert len(contract.window_specs) >= 1
+        assert len(contract.window_specs) >= 2
         ws = contract.window_specs[0]
         assert ws.statement_id == "plan_s2"
         assert ws.function == "ROW_NUMBER"
         assert ws.alias == "rn"
+        assert ws.input_column is None  # 排名函数无输入列
         assert "category" in ws.partition_by
         assert "total" in ws.order_by
+
+        # LAG 窗口函数的 input_column 必须被正确提取
+        ws2 = contract.window_specs[1]
+        assert ws2.function == "LAG"
+        assert ws2.alias == "prev_total"
+        assert ws2.input_column == "total", (
+            f"LAG 窗口函数应提取 input_column='total'，实际为 {ws2.input_column!r}"
+        )
 
         # ── v1 新增字段 5: write_spec ──
         # 无 FinalWritePlan 时应为 None

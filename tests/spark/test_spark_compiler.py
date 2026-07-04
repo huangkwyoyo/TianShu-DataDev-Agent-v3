@@ -846,8 +846,29 @@ class TestCompileWindow:
         assert "F.dense_rank()" in result.raw_pyspark
         assert "dense_r" in result.raw_pyspark
 
-    def test_ntile(self):
-        """NTILE 编译。"""
+    def test_ntile_with_input_column(self):
+        """NTILE 使用 input_column 作为分桶数参数。"""
+        from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
+
+        step = SparkWindowStep(
+            input_alias="df",
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.NTILE,
+                    alias="bucket",
+                    input_column="4",
+                    order_by=["amount"],
+                ),
+            ],
+        )
+        plan = _make_plan(step)
+        result = SparkCompiler().compile(plan)
+
+        assert "F.ntile(4)" in result.raw_pyspark
+        assert "bucket" in result.raw_pyspark
+
+    def test_ntile_without_input_column_raises(self):
+        """NTILE 缺少 input_column 时抛出编译错误——不用占位值掩盖缺失语义。"""
         from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
 
         step = SparkWindowStep(
@@ -861,10 +882,9 @@ class TestCompileWindow:
             ],
         )
         plan = _make_plan(step)
-        result = SparkCompiler().compile(plan)
 
-        assert "F.ntile(1)" in result.raw_pyspark
-        assert "bucket" in result.raw_pyspark
+        with pytest.raises(ValueError, match="NTILE"):
+            SparkCompiler().compile(plan)
 
     # ── 偏移窗口函数 ──
 
@@ -909,6 +929,44 @@ class TestCompileWindow:
 
         assert "F.lead" in result.raw_pyspark
         assert "next_amount" in result.raw_pyspark
+
+    def test_lag_without_column_raises(self):
+        """LAG 缺少 input_column 时抛出编译错误——严禁用 F.lit(1) 占位掩盖缺失语义。"""
+        from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
+
+        step = SparkWindowStep(
+            input_alias="df",
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.LAG,
+                    alias="prev_amount",
+                    order_by=["order_date"],
+                ),
+            ],
+        )
+        plan = _make_plan(step)
+
+        with pytest.raises(ValueError, match="LAG"):
+            SparkCompiler().compile(plan)
+
+    def test_lead_without_column_raises(self):
+        """LEAD 缺少 input_column 时抛出编译错误——严禁用 F.lit(1) 占位掩盖缺失语义。"""
+        from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
+
+        step = SparkWindowStep(
+            input_alias="df",
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.LEAD,
+                    alias="next_amount",
+                    order_by=["order_date"],
+                ),
+            ],
+        )
+        plan = _make_plan(step)
+
+        with pytest.raises(ValueError, match="LEAD"):
+            SparkCompiler().compile(plan)
 
     # ── 聚合窗口函数 + 帧边界 ──
 

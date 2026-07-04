@@ -462,6 +462,54 @@ class TestSparkPlanMapper:
         assert result.spark_plan is not None
         assert result.spark_plan.write_mode is None
 
+    def test_window_input_column_passthrough(self):
+        """WindowSpecSummary.input_column → SparkWindowExpr.input_column 完整传递。"""
+        contract = _make_minimal_contract()
+        # 构造含 input_column 的窗口函数——LAG(amount) 和 NTILE(4)
+        contract.window_specs = [
+            WindowSpecSummary(
+                statement_id="stmt_lag",
+                function="LAG",
+                alias="prev_amount",
+                input_column="amount",
+                partition_by=["stat_date"],
+                order_by=["order_date"],
+            ),
+            WindowSpecSummary(
+                statement_id="stmt_ntile",
+                function="NTILE",
+                alias="bucket",
+                input_column="4",
+                partition_by=[],
+                order_by=["total_amount"],
+            ),
+        ]
+
+        result = map_contract_to_spark_plan(contract)
+        assert result.success is True, f"映射应成功，但失败：{result.gaps}"
+        plan = result.spark_plan
+        assert plan is not None
+
+        # 找到 WindowStep
+        window_steps = [s for s in plan.steps if isinstance(s, SparkWindowStep)]
+        assert len(window_steps) == 1, f"应有 1 个 WindowStep，实际 {len(window_steps)} 个"
+        ws = window_steps[0]
+        assert len(ws.expressions) == 2
+
+        # LAG 的 input_column 应传递到 SparkWindowExpr
+        lag_expr = ws.expressions[0]
+        assert lag_expr.function == SparkWindowFunction.LAG
+        assert lag_expr.input_column == "amount", (
+            f"LAG input_column 应传递 'amount'，实际为 {lag_expr.input_column!r}"
+        )
+
+        # NTILE 的 input_column 应传递到 SparkWindowExpr
+        ntile_expr = ws.expressions[1]
+        assert ntile_expr.function == SparkWindowFunction.NTILE
+        assert ntile_expr.input_column == "4", (
+            f"NTILE input_column 应传递 '4'，实际为 {ntile_expr.input_column!r}"
+        )
+
 
 # ════════════════════════════════════════════
 # PlanEquivalence 测试

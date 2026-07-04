@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import os
+
 import pytest
 
 from tianshu_datadev.spark.snapshot import (
@@ -26,7 +27,6 @@ from tianshu_datadev.spark.snapshot import (
     SnapshotSourceProvider,
     SnapshotSourceType,
 )
-
 
 # ════════════════════════════════════════════
 # Fixtures
@@ -501,8 +501,7 @@ class TestSnapshotBuilderIntegrity:
         )
 
         # 重新计算 hash 应与 manifest 中的一致
-        from tianshu_datadev.spark.snapshot import SnapshotBuilder as SB
-        expected_hash = SB._compute_snapshot_hash(manifest.files)
+        expected_hash = SnapshotBuilder._compute_snapshot_hash(manifest.files)
         assert expected_hash == manifest.snapshot_sha256
 
     def test_verify_integrity_local_fixture_checks_files(

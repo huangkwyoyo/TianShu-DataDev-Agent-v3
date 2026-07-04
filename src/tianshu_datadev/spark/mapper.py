@@ -539,6 +539,7 @@ def _map_windows(
         SparkWindowExpr(
             function=_WINDOW_FUNCTION_MAP[ws.function.upper()],
             alias=ws.alias,
+            input_column=ws.input_column,
             partition_by=ws.partition_by,
             order_by=ws.order_by,
         )

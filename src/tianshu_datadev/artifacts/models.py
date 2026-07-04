@@ -175,6 +175,8 @@ class WindowSpecSummary(StrictModel):
     statement_id: str  # 所属语句（对应 SqlStatement.statement_id）
     function: str  # 窗口函数名——ROW_NUMBER / RANK / SUM_OVER 等
     alias: str  # 输出列别名
+    input_column: str | None = None  # 窗口函数输入列（LAG/LEAD/SUM_OVER/AVG_OVER/COUNT_OVER）
+    # NTILE 时为正整数字符串（如 "4"）；排名函数（ROW_NUMBER/RANK/DENSE_RANK）为 None
     partition_by: list[str] = []  # 分区键列名列表（归一化名）
     order_by: list[str] = []  # 排序键列名列表（归一化名，不含方向）
 

@@ -150,7 +150,7 @@ class SparkCompiler:
             elif isinstance(step, SparkCaseWhenStep):
                 raw, comment = self._compile_case_when(step, step_id, i, len(plan.steps))
             elif isinstance(step, SparkWindowStep):
-                raw, comment = self._compile_unsupported(step, step_id, "Phase 6C")
+                raw, comment = self._compile_window(step, step_id, i, len(plan.steps))
             else:
                 raw, comment = self._compile_unsupported(step, step_id, "unknown")
 
@@ -487,6 +487,171 @@ class SparkCompiler:
             output=out_alias,
         )
         return raw, comment
+
+    def _compile_window(
+        self, step: SparkWindowStep, step_id: str, index: int, total: int,
+    ) -> tuple[str, str]:
+        """编译 WindowStep → {out} = {input}.withColumn(alias, fn.over(windowSpec))。
+
+        每个 SparkWindowExpr 生成一个 withColumn 调用，多个表达式链式调用。
+        帧边界仅在非标准默认值或显式指定时渲染。
+        """
+        input_alias = self.renderer.validate_identifier(
+            step.input_alias, "WindowStep.input_alias"
+        )
+        out_alias = f"_w{index}"
+
+        if not step.expressions:
+            # 空表达式列表——直通赋值（无操作）
+            raw = f"{out_alias} = {input_alias}"
+            comment = self._build_comment_block(
+                step_id=step_id, index=index, total=total,
+                intent="窗口函数（空）",
+                operation=f"对 {input_alias} 未指定任何窗口表达式，直通传递",
+                inputs=input_alias,
+                output=out_alias,
+            )
+            return raw, comment
+
+        # 构建 withColumn 链
+        chain = input_alias
+        expr_descs: list[str] = []
+
+        for expr in step.expressions:
+            alias = self.renderer.validate_identifier(expr.alias, "WindowExpr.alias")
+
+            # 渲染窗口函数调用
+            fn_call = self._render_window_fn_call(expr)
+
+            # 渲染 WindowSpec
+            window_spec = self._render_window_spec(expr)
+
+            chain = f"{chain}.withColumn(\"{alias}\", {fn_call}.over({window_spec}))"
+
+            col_info = expr.input_column or ""
+            expr_descs.append(f"{expr.function.value}({col_info}) AS {expr.alias}")
+
+        raw = f"{out_alias} = {chain}"
+
+        # 从第一个表达式提取 partition/order 信息（同一步骤的表达式共享同一窗口）
+        first = step.expressions[0]
+        partition_info = ", ".join(first.partition_by) if first.partition_by else "(全局)"
+        order_info = ", ".join(first.order_by) if first.order_by else "(无排序)"
+
+        comment = self._build_comment_block(
+            step_id=step_id, index=index, total=total,
+            intent="窗口函数",
+            operation=(
+                f"对 {input_alias} 应用窗口函数：{'; '.join(expr_descs)} "
+                f"PARTITION BY [{partition_info}] ORDER BY [{order_info}]"
+            ),
+            inputs=input_alias,
+            output=out_alias,
+        )
+        return raw, comment
+
+    def _render_window_fn_call(self, expr) -> str:
+        """渲染单个窗口函数调用——委托 renderer 生成函数名 + 参数。
+
+        排名函数（ROW_NUMBER/RANK/DENSE_RANK）无参数。
+        NTILE 需要整数参数（默认 1）。
+        LAG/LEAD 需要列名。
+        聚合窗口函数（SUM_OVER/AVG_OVER/COUNT_OVER）需要列名。
+        """
+        from tianshu_datadev.spark.models import SparkWindowFunction
+
+        fn_name = self.renderer.render_window_function(expr.function)
+
+        # 排名函数——无参数
+        if expr.function in (
+            SparkWindowFunction.ROW_NUMBER,
+            SparkWindowFunction.RANK,
+            SparkWindowFunction.DENSE_RANK,
+        ):
+            return f"{fn_name}()"
+
+        # NTILE——需要分桶数参数，来自 input_column（必须为正整数字符串）
+        if expr.function == SparkWindowFunction.NTILE:
+            if expr.input_column and expr.input_column.strip().isdigit():
+                return f"{fn_name}({expr.input_column.strip()})"
+            raise ValueError(
+                f"NTILE 窗口函数必须指定有效的分桶数（input_column），"
+                f"当前值为 {expr.input_column!r}，不允许用默认值掩盖缺失语义"
+            )
+
+        # LAG / LEAD——必须指定 input_column，严禁占位值
+        if expr.function in (SparkWindowFunction.LAG, SparkWindowFunction.LEAD):
+            if expr.input_column:
+                col_ref = self.renderer.render_column(expr.input_column)
+                return f"{fn_name}({col_ref})"
+            raise ValueError(
+                f"{expr.function.value} 窗口函数必须指定 input_column，"
+                f"不允许使用 F.lit(1) 占位掩盖缺失语义"
+            )
+
+        # 聚合窗口函数——SUM_OVER / AVG_OVER / COUNT_OVER
+        if expr.input_column:
+            col_ref = self.renderer.render_column(expr.input_column)
+            return f"{fn_name}({col_ref})"
+        # COUNT_OVER 无列名时使用 F.lit(1)（等价于 COUNT(*)）
+        return f"{fn_name}(F.lit(1))"
+
+    def _render_window_spec(self, expr) -> str:
+        """渲染 WindowSpec——partitionBy + orderBy + 帧边界。
+
+        帧边界使用 render_frame_boundary / render_frame_type 做白名单校验。
+        默认帧（unbounded_preceding → current_row, rows）仅在使用
+        聚合窗口函数时渲染，排名函数省略帧边界。
+        """
+        from tianshu_datadev.spark.models import SparkWindowFunction
+
+        parts: list[str] = []
+
+        # partitionBy
+        if expr.partition_by:
+            partition_cols = ", ".join(
+                self.renderer.render_column(c) for c in expr.partition_by
+            )
+            parts.append(f"Window.partitionBy({partition_cols})")
+
+        # orderBy
+        if expr.order_by:
+            order_cols = ", ".join(
+                self.renderer.render_column(c) for c in expr.order_by
+            )
+            # 仅当 partitionBy 在前时才省略 Window. 前缀
+            if expr.partition_by:
+                parts.append(f"orderBy({order_cols})")
+            else:
+                parts.append(f"Window.orderBy({order_cols})")
+
+        # 帧边界——聚合窗口函数才渲染（排名函数使用隐式默认帧即可）
+        is_aggregate_window = expr.function in (
+            SparkWindowFunction.SUM_OVER,
+            SparkWindowFunction.AVG_OVER,
+            SparkWindowFunction.COUNT_OVER,
+        )
+        # 检查是否为非默认帧配置
+        has_custom_frame = (
+            expr.frame_start != "unbounded_preceding"
+            or expr.frame_end != "current_row"
+            or expr.frame_type != "rows"
+        )
+
+        if is_aggregate_window or has_custom_frame:
+            frame_start = self.renderer.render_frame_boundary(expr.frame_start)
+            frame_end = self.renderer.render_frame_boundary(expr.frame_end)
+            frame_fn = self.renderer.render_frame_type(expr.frame_type)
+            parts.append(f"{frame_fn}({frame_start}, {frame_end})")
+
+        if not parts:
+            return "Window()"
+
+        # 链式拼接：Window.partitionBy(...).orderBy(...).rowsBetween(...)
+        result = parts[0]
+        for p in parts[1:]:
+            result += f".{p}"
+        return result
 
     def _compile_unsupported(
         self, step, step_id: str, reason: str,
