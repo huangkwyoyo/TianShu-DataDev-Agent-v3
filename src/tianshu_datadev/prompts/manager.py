@@ -35,6 +35,10 @@ _SCHEMA_PATH_MAP: dict[str, str] = {
     ),
     "SqlBuildPlan": "tianshu_datadev.planning.sql_build_plan.SqlBuildPlan",
     "SqlProgram": "tianshu_datadev.planning.sql_program.SqlProgram",
+    # Spark 管线——LLM 语义标注（Phase 8 C2 架构合并后统一入口）
+    "AnnotatedSparkPlan": (
+        "tianshu_datadev.spark.annotations.AnnotatedSparkPlan"
+    ),
 }
 
 

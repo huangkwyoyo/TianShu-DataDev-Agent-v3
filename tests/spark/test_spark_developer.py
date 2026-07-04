@@ -6,6 +6,7 @@
 - Prompt 不含 SQL 文本/DeveloperSpec 引用
 - AnnotationValidator 校验产出
 - Mock LLM 注入——确定性 fixture 验证 prompt 结构
+- ProviderAdapter 集成路径——复用既有 llm.adapters.base.ProviderAdapter + PromptManager
 """
 
 from __future__ import annotations
@@ -268,3 +269,162 @@ class TestPromptSafety:
         prompt = svc._build_prompt(plan)
 
         assert "```" not in prompt
+
+    def test_prompt_from_template_safe(self):
+        """使用 PromptManager 加载的模板渲染后也不含 SQL 关键字。"""
+        # PromptManager 已可作为公共入口直接导入（循环导入已于 2026-07-04 修复）
+        from tianshu_datadev.prompts.manager import PromptManager
+
+        pm = PromptManager()
+        plan = _make_simple_plan()
+        prompt = SparkDeveloperService._build_prompt(plan, prompt_manager=pm)
+
+        sql_keywords = ["SELECT", "FROM", "WHERE", "JOIN", "GROUP BY", "ORDER BY", "HAVING", "UNION"]
+        prompt_upper = prompt.upper()
+        for kw in sql_keywords:
+            assert kw not in prompt_upper, f"模板渲染后 Prompt 含 SQL 关键字: {kw}"
+
+
+# ════════════════════════════════════════════
+# TestProviderAdapterIntegration——既有 ProviderAdapter → Developer 集成路径
+# ════════════════════════════════════════════
+
+
+class TestProviderAdapterIntegration:
+    """既有 ProviderAdapter（llm.adapters.base）→ SparkDeveloperService 集成路径。
+
+    所有测试使用 mock ProviderAdapter + PromptManager（不调真实 LLM），
+    验证 from_provider_adapter() 工厂方法、重试逻辑、错误处理。
+    """
+
+    def test_from_provider_adapter_creates_service(self):
+        """from_provider_adapter() 创建可用实例——使用既有 ProviderAdapter 接口。"""
+        from tianshu_datadev.prompts.manager import PromptManager
+
+        class TestAdapter:
+            """最小 ProviderAdapter——仅用于验证实例创建。"""
+            def invoke(self, system_message, user_message, json_schema, model, temperature):
+                return {}
+            def provider_name(self):
+                return "test"
+
+        adapter = TestAdapter()
+        pm = PromptManager()
+        svc = SparkDeveloperService.from_provider_adapter(adapter, pm)
+        assert svc is not None
+        assert isinstance(svc, SparkDeveloperService)
+
+    def test_adapter_integration_with_mock_llm(self):
+        """ProviderAdapter 注入后 annotate() 正常产出——模拟真实 LLM 路径。"""
+        from tianshu_datadev.prompts.manager import PromptManager
+
+        class MockAdapter:
+            """模拟 ProviderAdapter.invoke()——返回确定性 AnnotatedSparkPlan 的 dict。"""
+
+            def invoke(
+                self, system_message: str, user_message: str,
+                json_schema: dict, model: str, temperature: float,
+            ) -> dict:
+                plan = _make_simple_plan()
+                return _mock_llm_annotate(plan).model_dump(mode="json")
+
+            def provider_name(self) -> str:
+                return "mock"
+
+        adapter = MockAdapter()
+        pm = PromptManager()
+        svc = SparkDeveloperService.from_provider_adapter(adapter, pm)
+        plan = _make_simple_plan()
+        result = svc.annotate(plan)
+
+        assert isinstance(result, AnnotatedSparkPlan)
+        assert len(result.annotations) == len(plan.steps)
+        assert result.plan_id == plan.plan_id
+
+    def test_adapter_retry_on_failure(self):
+        """LLM 调用首次失败后重试——重试成功则正常返回。"""
+        from tianshu_datadev.llm.adapters.base import AdapterError
+        from tianshu_datadev.prompts.manager import PromptManager
+
+        call_count = [0]
+
+        class RetryAdapter:
+            def invoke(
+                self, system_message: str, user_message: str,
+                json_schema: dict, model: str, temperature: float,
+            ) -> dict:
+                call_count[0] += 1
+                if call_count[0] < 2:
+                    raise AdapterError("模拟临时故障", provider="test")
+                plan = _make_simple_plan()
+                return _mock_llm_annotate(plan).model_dump(mode="json")
+
+            def provider_name(self) -> str:
+                return "retry"
+
+        adapter = RetryAdapter()
+        pm = PromptManager()
+        svc = SparkDeveloperService.from_provider_adapter(
+            adapter, pm, max_llm_retries=1
+        )
+        plan = _make_simple_plan()
+        result = svc.annotate(plan)
+
+        # 首次失败 + 1 次重试成功
+        assert call_count[0] == 2
+        assert isinstance(result, AnnotatedSparkPlan)
+
+    def test_adapter_exhausts_retries_raises(self):
+        """重试耗尽后仍然失败——抛出异常。"""
+        from tianshu_datadev.llm.adapters.base import AdapterError
+        from tianshu_datadev.prompts.manager import PromptManager
+
+        class AlwaysFailAdapter:
+            def invoke(
+                self, system_message: str, user_message: str,
+                json_schema: dict, model: str, temperature: float,
+            ) -> dict:
+                raise AdapterError("模拟永久故障", provider="test")
+
+            def provider_name(self) -> str:
+                return "fail"
+
+        adapter = AlwaysFailAdapter()
+        pm = PromptManager()
+        svc = SparkDeveloperService.from_provider_adapter(
+            adapter, pm, max_llm_retries=1
+        )
+        plan = _make_simple_plan()
+
+        with pytest.raises(AdapterError, match="模拟永久故障"):
+            svc.annotate(plan)
+
+    def test_adapter_non_retryable_error_raises_immediately(self):
+        """非 AdapterError（如 ValidationError）立即抛出——不浪费重试次数。"""
+        from tianshu_datadev.prompts.manager import PromptManager
+
+        call_count = [0]
+
+        class ValidationFailAdapter:
+            def invoke(
+                self, system_message: str, user_message: str,
+                json_schema: dict, model: str, temperature: float,
+            ) -> dict:
+                call_count[0] += 1
+                raise ValueError("Schema 校验失败——不可重试")
+
+            def provider_name(self) -> str:
+                return "validation_fail"
+
+        adapter = ValidationFailAdapter()
+        pm = PromptManager()
+        svc = SparkDeveloperService.from_provider_adapter(
+            adapter, pm, max_llm_retries=2
+        )
+        plan = _make_simple_plan()
+
+        with pytest.raises(ValueError, match="Schema 校验失败"):
+            svc.annotate(plan)
+
+        # 非 AdapterError 只调用 1 次——不浪费重试次数
+        assert call_count[0] == 1
