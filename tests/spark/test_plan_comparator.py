@@ -1152,8 +1152,8 @@ def _contract_to_sql_steps(
 ) -> list:
     """从 DataTransformContractV1 确定性构造 SqlBuildPlan step 列表——C3 双管线桥接。
 
-    这是 Contract → SqlBuildPlan 的最小确定性桥接函数。
-    不修改生产代码——只在测试内提供双管线同源能力。
+    已生产化到 src/tianshu_datadev/spark/contract_sql_bridge.py，保留用于向后兼容。
+    功能与 contract_to_sql_steps() 完全一致，新代码请直接导入生产模块使用。
 
     映射规则（与 Mapper 的 SparkPlan 映射对称）：
     - input_tables → ScanStep（每表一个）
@@ -1426,6 +1426,16 @@ class TestPlanComparatorContractIntegration:
 
         # ── Step 3: SQL 管线——Contract → _contract_to_sql_steps() 桥接 → SqlBuildPlan ──
         sql_steps = _contract_to_sql_steps(contract)
+
+        # 验证生产模块函数与本地桥接函数产出相同的 steps
+        from tianshu_datadev.spark.contract_sql_bridge import (
+            contract_to_sql_steps as prod_contract_to_sql_steps,
+        )
+        prod_steps = prod_contract_to_sql_steps(contract)
+        assert prod_steps == sql_steps, (
+            "生产模块 contract_to_sql_steps() 应与本地 _contract_to_sql_steps() 产出一致"
+        )
+
         sql_plan = _make_sql_plan(sql_steps)
 
         # ── Step 4: Comparator 对比 ──
@@ -1520,3 +1530,121 @@ class TestPlanComparatorContractIntegration:
 
         assert report.status == ComparisonStatus.NOT_COVERED
         assert "window" in report.uncovered_step_types
+
+    def test_contract_to_sql_steps_from_production_module(self):
+        """验证生产模块 contract_to_sql_steps() 对标准 Contract 产出 8 种 step 类型。"""
+        from tianshu_datadev.artifacts.models import (
+            CaseWhenLabelSpec,
+            ContractAggregation,
+            ContractInputTable,
+            ContractJoin,
+            ContractLimit,
+            ContractOutputColumn,
+            ContractPredicate,
+            ContractSort,
+            DataTransformContractV1,
+        )
+        from tianshu_datadev.spark.contract_sql_bridge import (
+            contract_to_sql_steps,
+        )
+
+        # 构造覆盖 8 种 step 的标准 Contract（与 C3 集成测试一致）
+        program_id = "prog_c3_module_test"
+        contract_id = DataTransformContractV1.generate_contract_id(program_id)
+        contract = DataTransformContractV1(
+            contract_id=contract_id,
+            version="v1",
+            source_phase="phase-3",
+            source_sqlprogram_hash=program_id,
+            input_tables=[
+                ContractInputTable(table_ref="od", source_table="dwd.order_detail"),
+                ContractInputTable(table_ref="ri", source_table="dim.region_info"),
+            ],
+            join_relationships=[
+                ContractJoin(
+                    join_id="join_od_ri",
+                    left_table="od",
+                    right_table="ri",
+                    left_key="region_code",
+                    right_key="region_code",
+                    join_type="INNER",
+                    evidence_chain={
+                        "level": "STRONG",
+                        "action": "ACCEPT",
+                        "left_field": {"raw": "region_code", "normalized": "region_code"},
+                        "right_field": {"raw": "region_code", "normalized": "region_code"},
+                        "evidence_checks": {
+                            "exact_name_match": True, "type_match": True, "unique_match": True,
+                        },
+                    },
+                    level="STRONG",
+                ),
+            ],
+            filters=[
+                ContractPredicate(operator="GT", left="od.amount", right="0"),
+            ],
+            aggregations=[
+                ContractAggregation(function="SUM", input_column="od.amount", alias="total_amt"),
+            ],
+            grouping_keys=["od.region_code"],
+            output_columns=[
+                ContractOutputColumn(column_name="region_code", alias="region_code"),
+                ContractOutputColumn(column_name="total_amt", alias="total_amt"),
+            ],
+            output_grain=["region_code"],
+            sort_spec=[ContractSort(column="total_amt", direction="DESC")],
+            limit_spec=ContractLimit(limit=100),
+            business_keys=["region_code"],
+            step_dag={"stmt_main": []},
+            temp_tables=[],
+            case_when_labels=[
+                CaseWhenLabelSpec(
+                    statement_id="stmt_label",
+                    output_alias="value_level",
+                    branch_count=2,
+                    labels=["high", "low"],
+                    else_label="mid",
+                ),
+            ],
+            window_specs=[],
+        )
+
+        # 调用生产模块的桥接函数
+        steps = contract_to_sql_steps(contract)
+
+        # 验证产出 8 种 step 类型
+        step_types = {s.step_type for s in steps}
+        expected_types = {"scan", "filter", "join", "aggregate", "case_when", "project", "sort", "limit"}
+        for etype in expected_types:
+            assert etype in step_types, f"step 类型 '{etype}' 未在结果中"
+
+        # scan 类型应出现 2 次（2 个输入表）
+        scan_types = [s for s in steps if s.step_type == "scan"]
+        assert len(scan_types) == 2, f"预期 2 个 scan，实际 {len(scan_types)}"
+
+        # 其他类型各出现 1 次
+        for etype in {"filter", "join", "aggregate", "case_when", "project", "sort", "limit"}:
+            matching = [s for s in steps if s.step_type == etype]
+            assert len(matching) == 1, f"预期 1 个 {etype}，实际 {len(matching)}"
+
+    def test_contract_to_sql_steps_empty_input(self):
+        """验证 input_tables 为空时返回空列表（防御行为）。"""
+        from tianshu_datadev.artifacts.models import (
+            DataTransformContractV1,
+        )
+        from tianshu_datadev.spark.contract_sql_bridge import (
+            contract_to_sql_steps,
+        )
+
+        # 构造空输入表的 Contract
+        contract = DataTransformContractV1(
+            contract_id="test_empty_input",
+            version="v1",
+            source_phase="phase-3",
+            source_sqlprogram_hash="empty_test",
+            input_tables=[],
+            output_columns=[],
+        )
+
+        steps = contract_to_sql_steps(contract)
+        assert steps == [], f"预期空列表，实际 {steps}"

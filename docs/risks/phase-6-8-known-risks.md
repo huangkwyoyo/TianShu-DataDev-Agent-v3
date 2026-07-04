@@ -1,7 +1,7 @@
 # Phase 6-8 已知风险登记
 
-> 日期：2026-07-04 | 最后更新：2026-07-04 C2 架构边界收口（完全合并到既有 LLM 基础设施）
-> 状态：C1 已点亮（11/11），C2 架构已收口（复用 llm.adapters + PromptManager，mock 路径可回归），C3/C4 等待前置条件
+> 日期：2026-07-04 | 最后更新：2026-07-04 C3/C4 业务集成第二轮——桥接生产化 + P0 覆盖确认
+> 状态：C1 已点亮（11/11），C2 架构已收口（复用 llm.adapters + PromptManager，mock 路径可回归），C3 测试级已点亮（桥接生产化），C4 P0 已点亮（D1/D2/D3/D5）
 
 ---
 
@@ -71,31 +71,42 @@
 
 ## C3: Comparator 真实逻辑对比
 
-- **风险等级**：骨架级（接口已对接，数据未通）
-- **发现阶段**：Phase 8 全局验收
-- **影响范围**：`src/tianshu_datadev/spark/plan_comparator.py::PlanComparator.compare()`
+- **风险等级**：B（测试级已点亮，生产 SQL pipeline 串联待完成）
+- **发现阶段**：Phase 8 全局验收 | **进化阶段**：C3/C4 业务集成第二轮（桥接生产化）
+- **影响范围**：`src/tianshu_datadev/spark/plan_comparator.py::PlanComparator.compare()` + `src/tianshu_datadev/spark/contract_sql_bridge.py`
 - **当前状态**：
-  - `PlanComparator` 接口已完整实现，9 种 step 对比规则已就绪
-  - `compare()` 需要 `SqlBuildPlan` 作为输入（由 SQL pipeline 产出）
-  - Spark pipeline 当前不产生 SqlBuildPlan
-  - Orchestrator 中 COMPARATOR 阶段标记 SKIPPED
-- **影响评估**：不影响骨架级验收——接口已预留，逻辑对比能力在 SQL pipeline 就绪后可即时启用
-- **处置建议**：业务集成时随 SQL 链路一起验收 Comparator 的端到端对比能力
+  - `PlanComparator` 接口已完整实现，9 种 step 对比规则已就绪——26/26 测试全绿
+  - `contract_to_sql_steps()` 桥接函数已生产化——从测试文件提升到 `spark/contract_sql_bridge.py`（完整类型注释 + 防御检查 + 单元测试）
+  - 双管线集成测试 `test_contract_to_spark_via_mapper_then_compare_all_eight_types`：同一 Contract → Mapper 产出 SparkPlan + 桥接产出 SqlBuildPlan → Comparator 对比——8 种 step 类型全部 LOGIC_EQUIVALENT
+  - Orchestrator 中 COMPARATOR 阶段仍标记 SKIPPED——桥接函数已就绪，但 Orchestrator 尚未集成（需要 sql_plan 参数传入 run() 入口）
+- **阻塞项**：
+  - 生产级 SQL pipeline 串联（Contract → SpecEnricher → SqlBuildPlanBuilder）属于 SQL pipeline 范围——不在 Spark pipeline 范围内
+  - 桥接函数 `contract_to_sql_steps()` 提供确定性替代路径——在 SQL pipeline 就绪前可启用 Orchestrator COMPARATOR 阶段
+- **下一轮行动**：
+  1. Orchestrator 集成：`run()` 方法接收可选的 `sql_plan: SqlBuildPlan` 参数 → COMPARATOR 阶段接入桥接产出
+  2. 桥接函数在 SQL pipeline `SpecEnricher → SqlBuildPlanBuilder` 就绪后替换
+- **影响评估**：不影响骨架级验收——桥接函数提供确定性对比能力，测试级 C3 已点亮
+- **处置建议**：Orchestrator 集成在下一轮业务集成中执行——修改量小（~20 行），风险低
 
 ---
 
 ## C4: Harness 真实样本评测
 
-- **风险等级**：C（延期实现）
-- **发现阶段**：Phase 8 全局验收
+- **风险等级**：B（P0 维度已点亮，P1 维度阻塞于 C3 生产串联，Harness Runner 为结果聚合器）
+- **发现阶段**：Phase 8 全局验收 | **进化阶段**：C3/C4 业务集成第二轮（P0 覆盖确认）
 - **影响范围**：`src/tianshu_datadev/harness/spark_eval.py::SparkHarnessRunner`
 - **当前状态**：
   - 5 维度评测框架已定义（CONTRACT_FIDELITY / COMPILATION_DETERMINISM / VALIDATOR_COVERAGE / LOGIC_EQUIVALENCE / PHYSICAL_CONSISTENCY）
-  - `SparkHarnessRunner.evaluate()` 当前是结果聚合器——统计预置 `case.passed` 布尔值
-  - 不执行真实编译/验证/对比
-  - 无业务样本集
-- **影响评估**：不影响骨架级验收——评测框架的模型定义和接口已就绪
-- **处置建议**：业务集成前准备至少 5 个业务样本（每维度 1 个），填充 `SparkEvalCase` 并接入真实评测逻辑
+  - **P0 已点亮**（26/26 测试全绿）：
+    - D1 CONTRACT_FIDELITY：真实 Mapper 执行 → step 数量/类型/别名校验（2 个 EvalCase）
+    - D2 COMPILATION_DETERMINISM：真实 Compiler 3 次编译 → raw_hash 全等（2 个 EvalCase）
+    - D3 VALIDATOR_COVERAGE：真实 Validator E601-E608 错误码检测（2 个 EvalCase）
+    - D5 PHYSICAL_CONSISTENCY：Compiler 产物 → Validator 前置条件验证 + C1 证据引用（3 个 EvalCase）
+  - **P1 未点亮**：D4 LOGIC_EQUIVALENCE——阻塞于 C3 生产 SQL pipeline 串联（见 C3 阻塞项）
+  - `SparkHarnessRunner.evaluate()` 当前为结果聚合器——统计预置 `case.passed` 布尔值，不自动执行评测逻辑
+  - 评测逻辑在测试代码中手动执行（Mapper/Compiler/Validator），结果填入 EvalCase 后交 Runner 聚合
+- **影响评估**：P0 维度（4/5）不依赖外部环境、不依赖 C3——测试级已点亮。Harness Runner 升级为自动评测驱动器属于 Phase 9+ 范围
+- **处置建议**：P0 维度已有测试覆盖——风险等级从 C（延期）降为 B（核心能力已就绪，D4 等 C3）
 
 ---
 
@@ -137,7 +148,7 @@
 |------|------|:---:|:---:|------|
 | C1 | 已消除 | — | — | 2026-07-04 点亮（11/11 真实 Spark 通过） |
 | C2 | 已消除 | — | — | 2026-07-04 架构收口 + 循环导入修复（PromptManager 可直接导入） |
-| C3 | 骨架级 | 否 | 否 | 随 SQL 链路验收 |
-| C4 | C-延期 | 否 | 是 | 业务集成前准备样本 |
+| C3 | B-测试级已点亮 | 否 | 否 | 桥接已生产化——Orchestrator 集成下一轮 |
+| C4 | B-P0 已点亮 | 否 | 否（P0）| D4 等 C3 生产串联——P0 已覆盖 |
 | R3 | 已消除 | — | — | 2026-07-04 已修复 |
 | R4 | 已消除 | — | — | — |
