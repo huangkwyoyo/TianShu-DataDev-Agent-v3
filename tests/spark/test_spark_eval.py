@@ -781,34 +781,387 @@ class TestC4D5PhysicalPrecondition:
         assert report.total_passed == 1
 
     def test_c4_harness_full_report_all_p0_dimensions(self):
-        """C4 P0 全维度 Harness 报告——D1/D2/D3/D5 均有至少 1 个 PASS 用例。"""
+        """C4 全维度 Harness 报告——D1/D2/D3/D4/D5 均有至少 1 个 PASS 用例。
+
+        D4 LOGIC_EQUIVALENCE 桥接级验证已于 2026-07-04 点亮——
+        同一 DataTransformContractV1 经 contract_to_sql_steps() + Mapper +
+        PlanComparator 完成双管线逻辑对比，纳入 Harness 评测框架。
+        """
         runner = SparkHarnessRunner()
 
-        # 之前各测试独立 runner，这里构造一个汇总报告
-        p0_dimensions = [
+        # 之前各测试独立 runner，这里构造一个汇总报告——P0+P1 全 5 维度
+        all_dimensions = [
             SparkEvalDimension.SPARK_CONTRACT_FIDELITY,
             SparkEvalDimension.SPARK_COMPILATION_DETERMINISM,
             SparkEvalDimension.SPARK_VALIDATOR_COVERAGE,
+            SparkEvalDimension.SPARK_LOGIC_EQUIVALENCE,
             SparkEvalDimension.SPARK_PHYSICAL_CONSISTENCY,
         ]
-        for dim in p0_dimensions:
+        for dim in all_dimensions:
             runner.add_case(SparkEvalCase(
-                case_id=f"p0_{dim.value}",
+                case_id=f"full_{dim.value}",
                 dimension=dim,
-                description=f"C4 P0 维度 {dim.value}——已点亮",
+                description=f"C4 维度 {dim.value}——已点亮",
                 expected_behavior="通过",
                 passed=True,
             ))
 
         report = runner.evaluate()
 
-        # D4 LOGIC_EQUIVALENCE 不在 P0 范围（依赖 C3 先点亮）
-        assert report.total_cases == 4
-        assert report.total_passed == 4
+        # D4 LOGIC_EQUIVALENCE 桥接级验证已点亮——全 5 维度
+        assert report.total_cases == 5
+        assert report.total_passed == 5
         assert report.overall_pass_rate == 1.0
 
-        # 验证维度结果不含 D4
-        p0_values = {d.value for d in p0_dimensions}
-        for dim_key in p0_values:
-            assert dim_key in report.dimension_results, f"P0 维度 {dim_key} 应在报告中"
+        # 验证维度结果含全部 5 个维度
+        all_values = {d.value for d in all_dimensions}
+        for dim_key in all_values:
+            assert dim_key in report.dimension_results, f"维度 {dim_key} 应在报告中"
             assert report.dimension_results[dim_key]["passed"] == 1
+
+
+# ════════════════════════════════════════════
+# C4 D4 LOGIC_EQUIVALENCE——桥接级验证
+# ════════════════════════════════════════════
+#
+# D4 验证目标：同一份结构化合同（DataTransformContractV1）分别驱动两条管线——
+#   SQL 管线：Contract → contract_to_sql_steps() 桥接 → SqlBuildPlan
+#   Spark 管线：Contract → Mapper(map_contract_to_spark_plan) → SparkPlan
+#   → PlanComparator.compare(sql_plan, spark_plan) → 逻辑等价性报告
+#
+# 这是桥接级验证（非生产级 SQL Pipeline 验证）：
+# - 桥接函数 contract_to_sql_steps() 是确定性映射，不经过 SpecEnricher 推测逻辑
+# - 它验证的最核心命题是"同一份结构化合同两边生成结果是否对得上"
+# - 完整 SQL Pipeline（SpecEnricher → SqlBuildPlanBuilder）生产级验收属于后续 Phase
+
+
+class TestC4D4LogicEquivalence:
+    """C4 D4 LOGIC_EQUIVALENCE——桥接级双管线逻辑对比。
+
+    使用 contract_to_sql_steps() 桥接函数 + Mapper + PlanComparator，
+    验证同一 DataTransformContractV1 在 SQL 和 Spark 两侧产出的
+    逻辑计划等价。
+    """
+
+    def test_logic_equivalence_bridge_all_eight_types(self):
+        """桥接级验证——同一 Contract（8 种 step 类型）→ 双管线 → Comparator 全部等价。
+
+        覆盖 scan/filter/project/sort/limit/aggregate/join/case_when。
+        验证 PlanComparator 判定 LOGIC_EQUIVALENT，零未覆盖类型。
+        """
+        from tianshu_datadev.artifacts.models import (
+            CaseWhenLabelSpec,
+            ContractAggregation,
+            ContractInputTable,
+            ContractJoin,
+            ContractLimit,
+            ContractOutputColumn,
+            ContractPredicate,
+            ContractSort,
+            DataTransformContractV1,
+        )
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan
+        from tianshu_datadev.spark.contract_sql_bridge import (
+            contract_to_sql_steps,
+        )
+        from tianshu_datadev.spark.mapper import map_contract_to_spark_plan
+        from tianshu_datadev.spark.plan_comparator import (
+            ComparisonStatus,
+            PlanComparator,
+        )
+
+        # ── 构造覆盖 8 种 step 的 Contract ──
+        program_id = "prog_c4_d4_bridge"
+        contract_id = DataTransformContractV1.generate_contract_id(program_id)
+        contract = DataTransformContractV1(
+            contract_id=contract_id,
+            version="v1",
+            source_phase="phase-3",
+            source_sqlprogram_hash=program_id,
+            input_tables=[
+                ContractInputTable(table_ref="od", source_table="dwd.order_detail"),
+                ContractInputTable(table_ref="ri", source_table="dim.region_info"),
+            ],
+            join_relationships=[
+                ContractJoin(
+                    join_id="join_od_ri",
+                    left_table="od",
+                    right_table="ri",
+                    left_key="region_code",
+                    right_key="region_code",
+                    join_type="INNER",
+                    evidence_chain={
+                        "level": "STRONG", "action": "ACCEPT",
+                        "left_field": {"raw": "region_code", "normalized": "region_code"},
+                        "right_field": {"raw": "region_code", "normalized": "region_code"},
+                        "evidence_checks": {
+                            "exact_name_match": True, "type_match": True, "unique_match": True,
+                        },
+                    },
+                    level="STRONG",
+                ),
+            ],
+            filters=[ContractPredicate(operator="GT", left="od.amount", right="0")],
+            aggregations=[
+                ContractAggregation(function="SUM", input_column="od.amount", alias="total_amt"),
+            ],
+            grouping_keys=["od.region_code"],
+            output_columns=[
+                ContractOutputColumn(column_name="region_code", alias="region_code"),
+                ContractOutputColumn(column_name="total_amt", alias="total_amt"),
+            ],
+            sort_spec=[ContractSort(column="total_amt", direction="DESC")],
+            limit_spec=ContractLimit(limit=100),
+            case_when_labels=[
+                CaseWhenLabelSpec(
+                    statement_id="stmt_label",
+                    output_alias="value_level",
+                    branch_count=2,
+                    labels=["high", "low"],
+                    else_label="mid",
+                ),
+            ],
+            output_grain=["region_code"],
+            business_keys=["region_code"],
+            step_dag={"stmt_main": []},
+            temp_tables=[],
+            window_specs=[],
+        )
+
+        # ── SQL 管线（桥接）──
+        sql_steps = contract_to_sql_steps(contract)
+        sql_plan = SqlBuildPlan(
+            plan_id=SqlBuildPlan.generate_plan_id(program_id),
+            spec_hash=program_id,
+            steps=sql_steps,
+        )
+
+        # ── Spark 管线（Mapper）──
+        mapping_result = map_contract_to_spark_plan(contract)
+        assert mapping_result.success, f"Mapper 失败: gaps={mapping_result.gaps}"
+        spark_plan = mapping_result.spark_plan
+
+        # ── Comparator 对比 ──
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        # ── 验证结果 ──
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+            f"预期 LOGIC_EQUIVALENT，实际 {report.status}，"
+            f"step_results={[(r.step_type, r.verdict.value) for r in report.step_results]}"
+        )
+        assert len(report.uncovered_step_types) == 0, (
+            f"不应有未覆盖类型，实际 {report.uncovered_step_types}"
+        )
+
+        # 验证所有 8 种 step 类型出现在结果中
+        result_types = {r.step_type for r in report.step_results}
+        expected_types = {"scan", "filter", "join", "aggregate", "case_when", "project", "sort", "limit"}
+        for etype in expected_types:
+            assert etype in result_types, f"step 类型 '{etype}' 未出现在对比结果中"
+
+        # ── 包装为 Harness EvalCase ──
+        runner = SparkHarnessRunner()
+        case = SparkEvalCase(
+            case_id="D4_bridge_001",
+            dimension=SparkEvalDimension.SPARK_LOGIC_EQUIVALENCE,
+            description=(
+                "桥接级验证：同一 Contract（8 种 step 类型）→ "
+                "contract_to_sql_steps() + Mapper → PlanComparator → LOGIC_EQUIVALENT"
+            ),
+            expected_behavior=(
+                "PlanComparator 判定 LOGIC_EQUIVALENT，"
+                "8 种类型（scan/filter/project/sort/limit/aggregate/join/case_when）全部等价"
+            ),
+            passed=True,
+            actual_result={
+                "contract_id": contract_id,
+                "comparison_status": report.status.value,
+                "step_results": [
+                    {"type": r.step_type, "verdict": r.verdict.value}
+                    for r in report.step_results
+                ],
+                "uncovered_count": len(report.uncovered_step_types),
+                "sql_step_count": len(sql_steps),
+                "spark_step_count": len(spark_plan.steps),
+            },
+        )
+        runner.add_case(case)
+        harness_report = runner.evaluate()
+
+        assert harness_report.total_cases == 1
+        assert harness_report.total_passed == 1
+        assert harness_report.overall_pass_rate == 1.0
+        dim_result = harness_report.dimension_results["SPARK_LOGIC_EQUIVALENCE"]
+        assert dim_result["passed"] == 1
+
+    def test_logic_equivalence_bridge_mismatch_detected(self):
+        """桥接级验证——人为制造 SQL/Spark 不一致，验证 D4 正确检测 LOGIC_MISMATCH。
+
+        构造两个 Contract——一个含 filter，一个不含。两者经各自管线产出后对比，
+        Comparator 应正确报告 LOGIC_MISMATCH。
+        """
+        from tianshu_datadev.artifacts.models import (
+            ContractInputTable,
+            ContractOutputColumn,
+            ContractPredicate,
+            DataTransformContractV1,
+        )
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan
+        from tianshu_datadev.spark.contract_sql_bridge import (
+            contract_to_sql_steps,
+        )
+        from tianshu_datadev.spark.mapper import map_contract_to_spark_plan
+        from tianshu_datadev.spark.plan_comparator import (
+            ComparisonStatus,
+            PlanComparator,
+        )
+
+        # ── Contract A：含 filter（SQL 侧用）──
+        program_a = "prog_c4_d4_mismatch_a"
+        contract_id_a = DataTransformContractV1.generate_contract_id(program_a)
+        contract_a = DataTransformContractV1(
+            contract_id=contract_id_a,
+            version="v1",
+            source_phase="phase-3",
+            source_sqlprogram_hash=program_a,
+            input_tables=[ContractInputTable(table_ref="od", source_table="dwd.order_detail")],
+            output_columns=[ContractOutputColumn(column_name="id", alias="id")],
+            filters=[ContractPredicate(operator="GT", left="od.amount", right="100")],
+        )
+
+        # ── Contract B：不含 filter（Spark 侧用）──
+        program_b = "prog_c4_d4_mismatch_b"
+        contract_id_b = DataTransformContractV1.generate_contract_id(program_b)
+        contract_b = DataTransformContractV1(
+            contract_id=contract_id_b,
+            version="v1",
+            source_phase="phase-3",
+            source_sqlprogram_hash=program_b,
+            input_tables=[ContractInputTable(table_ref="od", source_table="dwd.order_detail")],
+            output_columns=[ContractOutputColumn(column_name="id", alias="id")],
+        )
+
+        # SQL 管线：Contract A（含 filter）
+        sql_steps = contract_to_sql_steps(contract_a)
+        sql_plan = SqlBuildPlan(
+            plan_id=SqlBuildPlan.generate_plan_id(program_a),
+            spec_hash=program_a,
+            steps=sql_steps,
+        )
+
+        # Spark 管线：Contract B（不含 filter）
+        mapping_result = map_contract_to_spark_plan(contract_b)
+        assert mapping_result.success, f"Mapper 失败: gaps={mapping_result.gaps}"
+        spark_plan = mapping_result.spark_plan
+
+        # ── Comparator 对比 → 应检测到不一致 ──
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        # SQL 侧有 scan+filter，Spark 侧仅有 read → 数量不匹配
+        assert report.status == ComparisonStatus.LOGIC_MISMATCH, (
+            f"预期 LOGIC_MISMATCH（SQL 侧多一个 filter），实际 {report.status}"
+        )
+
+        # ── 包装为 Harness EvalCase ──
+        runner = SparkHarnessRunner()
+        case = SparkEvalCase(
+            case_id="D4_bridge_002",
+            dimension=SparkEvalDimension.SPARK_LOGIC_EQUIVALENCE,
+            description=(
+                "桥接级验证——人为不一致：SQL 含 filter，Spark 不含 → "
+                "PlanComparator 正确检测 LOGIC_MISMATCH"
+            ),
+            expected_behavior="PlanComparator 判定 LOGIC_MISMATCH",
+            passed=True,
+            actual_result={
+                "sql_contract_id": contract_id_a,
+                "spark_contract_id": contract_id_b,
+                "comparison_status": report.status.value,
+                "sql_step_count": len(sql_steps),
+                "spark_step_count": len(spark_plan.steps),
+            },
+        )
+        runner.add_case(case)
+        harness_report = runner.evaluate()
+
+        assert harness_report.total_passed == 1
+        dim_result = harness_report.dimension_results["SPARK_LOGIC_EQUIVALENCE"]
+        assert dim_result["passed"] == 1
+
+    def test_logic_equivalence_bridge_minimal_contract(self):
+        """桥接级验证——最小 Contract（单表扫描）→ 双管线等价。
+
+        验证最简场景下桥接链路不崩溃，且产出 LOGIC_EQUIVALENT。
+        """
+        from tianshu_datadev.artifacts.models import (
+            ContractInputTable,
+            ContractOutputColumn,
+            DataTransformContractV1,
+        )
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan
+        from tianshu_datadev.spark.contract_sql_bridge import (
+            contract_to_sql_steps,
+        )
+        from tianshu_datadev.spark.mapper import map_contract_to_spark_plan
+        from tianshu_datadev.spark.plan_comparator import (
+            ComparisonStatus,
+            PlanComparator,
+        )
+
+        # ── 最小 Contract：单表 + 单列投影 ──
+        program_id = "prog_c4_d4_minimal"
+        contract_id = DataTransformContractV1.generate_contract_id(program_id)
+        contract = DataTransformContractV1(
+            contract_id=contract_id,
+            version="v1",
+            source_phase="phase-3",
+            source_sqlprogram_hash=program_id,
+            input_tables=[ContractInputTable(table_ref="t", source_table="src.t")],
+            output_columns=[ContractOutputColumn(column_name="id", alias="id")],
+        )
+
+        # ── SQL 管线（桥接）──
+        sql_steps = contract_to_sql_steps(contract)
+        sql_plan = SqlBuildPlan(
+            plan_id=SqlBuildPlan.generate_plan_id(program_id),
+            spec_hash=program_id,
+            steps=sql_steps,
+        )
+
+        # ── Spark 管线（Mapper）──
+        mapping_result = map_contract_to_spark_plan(contract)
+        assert mapping_result.success, f"Mapper 失败: gaps={mapping_result.gaps}"
+        spark_plan = mapping_result.spark_plan
+
+        # ── Comparator 对比 ──
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+            f"预期 LOGIC_EQUIVALENT，实际 {report.status}，"
+            f"step_results={[(r.step_type, r.verdict.value) for r in report.step_results]}"
+        )
+
+        # ── 包装为 Harness EvalCase ──
+        runner = SparkHarnessRunner()
+        case = SparkEvalCase(
+            case_id="D4_bridge_003",
+            dimension=SparkEvalDimension.SPARK_LOGIC_EQUIVALENCE,
+            description=(
+                "桥接级验证——最小 Contract（单表 scan → 单列 project）→ "
+                "双管线产出 LOGIC_EQUIVALENT"
+            ),
+            expected_behavior="PlanComparator 判定 LOGIC_EQUIVALENT",
+            passed=True,
+            actual_result={
+                "contract_id": contract_id,
+                "comparison_status": report.status.value,
+                "step_count": len(sql_steps),
+            },
+        )
+        runner.add_case(case)
+        harness_report = runner.evaluate()
+
+        assert harness_report.total_passed == 1

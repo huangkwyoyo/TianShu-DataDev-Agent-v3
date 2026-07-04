@@ -1,7 +1,7 @@
 # Phase 6-8 已知风险登记
 
-> 日期：2026-07-04 | 最后更新：2026-07-04 C3 Orchestrator COMPARATOR 集成——sql_plan 驱动真实对比
-> 状态：C1 已点亮（11/11），C2 架构已收口（复用 llm.adapters + PromptManager，mock 路径可回归），C3 已点亮（桥接生产化 + Orchestrator 集成），C4 P0 已点亮（D1/D2/D3/D5）
+> 日期：2026-07-04 | 最后更新：2026-07-04 C4 D4 桥接级点亮——同一 Contract 双管线逻辑对比纳入 Harness
+> 状态：C1 已点亮（11/11），C2 架构已收口（复用 llm.adapters + PromptManager，mock 路径可回归），C3 已点亮（桥接生产化 + Orchestrator 集成），C4 全 5 维度桥接级已点亮（D1/D2/D3/D4/D5）
 
 ---
 
@@ -92,8 +92,8 @@
 
 ## C4: Harness 真实样本评测
 
-- **风险等级**：B（P0 维度已点亮，P1 维度阻塞于 C3 生产串联，Harness Runner 为结果聚合器）
-- **发现阶段**：Phase 8 全局验收 | **进化阶段**：C3/C4 业务集成第二轮（P0 覆盖确认）
+- **风险等级**：B（P0+P1 桥接级已全覆盖——D4 桥接级验证点亮，完整 SQL Pipeline 生产级验证待后续 Phase）
+- **发现阶段**：Phase 8 全局验收 | **进化阶段**：C3/C4 业务集成第四轮（D4 桥接级点亮）
 - **影响范围**：`src/tianshu_datadev/harness/spark_eval.py::SparkHarnessRunner`
 - **当前状态**：
   - 5 维度评测框架已定义（CONTRACT_FIDELITY / COMPILATION_DETERMINISM / VALIDATOR_COVERAGE / LOGIC_EQUIVALENCE / PHYSICAL_CONSISTENCY）
@@ -102,11 +102,16 @@
     - D2 COMPILATION_DETERMINISM：真实 Compiler 3 次编译 → raw_hash 全等（2 个 EvalCase）
     - D3 VALIDATOR_COVERAGE：真实 Validator E601-E608 错误码检测（2 个 EvalCase）
     - D5 PHYSICAL_CONSISTENCY：Compiler 产物 → Validator 前置条件验证 + C1 证据引用（3 个 EvalCase）
-  - **P1 未点亮**：D4 LOGIC_EQUIVALENCE——阻塞于 C3 生产 SQL pipeline 串联（见 C3 阻塞项）
+  - **D4 LOGIC_EQUIVALENCE 桥接级已点亮**（2026-07-04，3 个 EvalCase）：
+    - 同一 DataTransformContractV1 → contract_to_sql_steps() + Mapper → PlanComparator
+    - 8 种 step 类型全等价验证（scan/filter/project/sort/limit/aggregate/join/case_when）
+    - 人为不一致检测验证（LOGIC_MISMATCH 正确识别）
+    - 最小 Contract 边界验证
+    - **注意**：这是桥接级验证——使用确定性桥接函数 `contract_to_sql_steps()` 而非完整 SQL Pipeline（SpecEnricher → SqlBuildPlanBuilder）。它验证的核心命题是"同一份结构化合同两边生成结果是否对得上"，不是完整 SQL Pipeline 的生产级验收。
   - `SparkHarnessRunner.evaluate()` 当前为结果聚合器——统计预置 `case.passed` 布尔值，不自动执行评测逻辑
-  - 评测逻辑在测试代码中手动执行（Mapper/Compiler/Validator），结果填入 EvalCase 后交 Runner 聚合
-- **影响评估**：P0 维度（4/5）不依赖外部环境、不依赖 C3——测试级已点亮。Harness Runner 升级为自动评测驱动器属于 Phase 9+ 范围
-- **处置建议**：P0 维度已有测试覆盖——风险等级从 C（延期）降为 B（核心能力已就绪，D4 等 C3）
+  - 评测逻辑在测试代码中手动执行（Mapper/Compiler/Validator/Comparator），结果填入 EvalCase 后交 Runner 聚合
+- **影响评估**：P0+P1 全 5 维度桥接级已覆盖（27/27 测试全绿，含 3 个 D4 桥接测试）。完整 SQL Pipeline 生产级验收 + Harness Runner 自动评测驱动器属于 Phase 9+ 范围
+- **处置建议**：风险等级维持 B——D4 桥接级已点亮，剩余风险在 SQL Pipeline 生产级串联（非桥接）
 
 ---
 
@@ -149,6 +154,6 @@
 | C1 | 已消除 | — | — | 2026-07-04 点亮（11/11 真实 Spark 通过） |
 | C2 | 已消除 | — | — | 2026-07-04 架构收口 + 循环导入修复（PromptManager 可直接导入） |
 | C3 | 已消除 | — | — | 2026-07-04 点亮（桥接生产化 + Orchestrator 集成） |
-| C4 | B-P0 已点亮 | 否 | 否（P0）| D4 等 C3 生产串联——P0 已覆盖 |
+| C4 | B-D4 桥接级已点亮 | 否 | 否 | D4 桥接级已点亮——完整 SQL Pipeline 生产级验证待后续 Phase |
 | R3 | 已消除 | — | — | 2026-07-04 已修复 |
 | R4 | 已消除 | — | — | — |
