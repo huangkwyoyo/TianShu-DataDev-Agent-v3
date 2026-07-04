@@ -5,15 +5,25 @@
 
 返工上限 2 轮——超出后强制 HUMAN_REVIEW。
 AnnotationWarning 不触发自动返工。
+
+骨架级能力说明（2026-07-04 全局验收）：
+- MAPPER / COMPILER / VALIDATOR：真实调用已有组件实例
+- DEVELOPER：无 llm_call 注入时 SKIPPED
+- COMPARATOR：需 SqlBuildPlan（SQL pipeline 产出），当前 SKIPPED
+- PHYSICAL_VERIFIER：需 Spark 运行时环境，当前 SKIPPED
 """
 
 from __future__ import annotations
 
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from pydantic import Field
 
 from tianshu_datadev.developer_spec.models import StrictModel
+
+if TYPE_CHECKING:
+    from tianshu_datadev.artifacts.models import DataTransformContractV1
 
 # ════════════════════════════════════════════
 # SparkPipelineStage——6 阶段枚举
@@ -131,7 +141,9 @@ class SparkPipelineState(StrictModel):
             results.get(s, "NOT_EXECUTED") in ("SUCCESS", "SKIPPED")
             for s in logic_stages
         )
-        physical_executed = results.get("PHYSICAL_VERIFIER", "NOT_EXECUTED") != "NOT_EXECUTED"
+        # PHYSICAL_VERIFIER 的 SKIPPED 等同于 NOT_EXECUTED（均未实际执行物理对比）
+        physical_result = results.get("PHYSICAL_VERIFIER", "NOT_EXECUTED")
+        physical_executed = physical_result not in ("NOT_EXECUTED", "SKIPPED")
 
         if logic_all_ok and not physical_executed:
             self.overall_status = SparkPipelineStatus.LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED
@@ -162,8 +174,13 @@ class SparkOrchestrator:
     - 不直接构造 Prompt——由各阶段组件自行管理
 
     使用方式：
-        orchestrator = SparkOrchestrator(developer_service=dev_svc)
-        state = orchestrator.run(contract_hash="abc123")
+        # 测试/状态机模式（stage_failures 注入）
+        orchestrator = SparkOrchestrator()
+        state = orchestrator.run(contract_hash="abc123",
+                                 stage_failures={"COMPILER": "测试注入"})
+
+        # 骨架级真实执行
+        state = orchestrator.run(contract=my_contract, contract_hash="abc123")
     """
 
     MAX_RETRY = 2  # 最大返工轮次
@@ -179,33 +196,46 @@ class SparkOrchestrator:
                               None 时 DEVELOPER 阶段自动 SKIPPED。
         """
         self._developer_service = developer_service
+        # 缓存中间产物——供后续阶段使用
+        self._cached_plan = None           # SparkPlan | None
+        self._cached_compile_result = None  # SparkCompileResult | None
 
     def run(
         self,
-        contract_hash: str,
+        contract_hash: str = "",
+        contract: "DataTransformContractV1 | None" = None,
         stage_failures: dict[str, str] | None = None,
         retry_count: int = 0,
     ) -> SparkPipelineState:
         """执行全链路 Pipeline。
 
+        两种模式：
+        - 测试注入模式：提供 stage_failures 时，不调用真实组件，按注入结果标记
+        - 真实执行模式：提供 contract 时，真实调用 mapper/compiler/validator
+
         Args:
-            contract_hash: 来源 Contract 的 hash 值
+            contract_hash: 来源 Contract 的 hash 值（测试注入模式必填）
+            contract: DataTransformContractV1 实例（真实执行模式必填）
             stage_failures: 阶段失败注入（测试用）——key 为阶段名，value 为错误信息。
-                            None 时所有阶段默认成功。
+                            None 时走真实执行或默认成功。
             retry_count: 当前返工轮次（0 表示首次执行）
 
         Returns:
             SparkPipelineState——含每阶段结果、错误列表、全局状态
         """
         failures = stage_failures or {}
+        # contract_hash 优先取 contract 的 hash，否则用参数
+        effective_hash = contract_hash
+        if contract is not None and not effective_hash:
+            effective_hash = getattr(contract, "contract_id", contract_hash) or contract_hash
+
         state = SparkPipelineState(
-            contract_hash=contract_hash,
+            contract_hash=effective_hash,
             retry_count=retry_count,
         )
 
         # 返工上限提前检查——最高优先级
         if retry_count >= self.MAX_RETRY:
-            # 所有阶段标记 HUMAN_REVIEW
             for stage in SparkPipelineStage:
                 state.record_stage_result(stage, "HUMAN_REVIEW")
             state.errors.append(
@@ -217,16 +247,166 @@ class SparkOrchestrator:
 
         # 按顺序执行各阶段
         for stage in SparkPipelineStage:
-            if stage.value in failures:
-                state.record_stage_result(stage, "FAILURE")
-                state.errors.append(
-                    f"[{stage.value}] {failures[stage.value]}"
-                )
-            elif stage == SparkPipelineStage.DEVELOPER and self._developer_service is None:
-                # 未注入 Developer → 跳过
-                state.record_stage_result(stage, "SKIPPED")
-            else:
-                state.record_stage_result(stage, "SUCCESS")
+            self._execute_stage(stage, state, contract, failures)
 
         state.derive_overall_status()
         return state
+
+    def _execute_stage(
+        self,
+        stage: SparkPipelineStage,
+        state: SparkPipelineState,
+        contract: "DataTransformContractV1 | None",
+        failures: dict[str, str],
+    ) -> None:
+        """执行单个 Pipeline 阶段。
+
+        分发逻辑：
+        - stage_failures 中有注入 → FAILURE
+        - 真实组件可用 → SUCCESS（并填充 hash 字段）
+        - 组件不可用（无 contract/无 SqlBuildPlan/无 Spark）→ SKIPPED
+
+        Args:
+            stage: 当前阶段
+            state: Pipeline 状态（会被原地修改）
+            contract: Contract 实例（可为 None）
+            failures: 阶段失败注入字典
+        """
+        # ── 测试注入优先 ──
+        if stage.value in failures:
+            state.record_stage_result(stage, "FAILURE")
+            state.errors.append(f"[{stage.value}] {failures[stage.value]}")
+            return
+
+        # ── MAPPER ──
+        if stage == SparkPipelineStage.MAPPER:
+            self._run_mapper(stage, state, contract)
+        # ── DEVELOPER ──
+        elif stage == SparkPipelineStage.DEVELOPER:
+            self._run_developer(stage, state)
+        # ── COMPILER ──
+        elif stage == SparkPipelineStage.COMPILER:
+            self._run_compiler(stage, state)
+        # ── VALIDATOR ──
+        elif stage == SparkPipelineStage.VALIDATOR:
+            self._run_validator(stage, state)
+        # ── COMPARATOR ──
+        elif stage == SparkPipelineStage.COMPARATOR:
+            self._run_comparator(stage, state)
+        # ── PHYSICAL_VERIFIER ──
+        elif stage == SparkPipelineStage.PHYSICAL_VERIFIER:
+            self._run_physical_verifier(stage, state)
+
+    # ── 各阶段实现 ──
+
+    def _run_mapper(
+        self,
+        stage: SparkPipelineStage,
+        state: SparkPipelineState,
+        contract: "DataTransformContractV1 | None",
+    ) -> None:
+        """执行 MAPPER 阶段——Contract → SparkPlan。"""
+        if contract is None:
+            state.record_stage_result(stage, "SKIPPED")
+            state.errors.append("[MAPPER] SKIPPED: 未提供 Contract")
+            return
+
+        try:
+            from tianshu_datadev.spark.mapper import map_contract_to_spark_plan
+            from tianshu_datadev.spark.models import SparkPlan
+
+            result = map_contract_to_spark_plan(contract)
+            if result.success and result.spark_plan is not None:
+                plan_hash = SparkPlan.compute_plan_hash(result.spark_plan)
+                state.spark_plan_hash = plan_hash
+                state.record_stage_result(stage, "SUCCESS")
+                self._cached_plan = result.spark_plan
+            else:
+                state.record_stage_result(stage, "FAILURE")
+                gap_msgs = [g.message for g in result.gaps] if result.gaps else ["未知错误"]
+                state.errors.append(f"[MAPPER] 映射失败：{'; '.join(gap_msgs)}")
+        except Exception as e:
+            state.record_stage_result(stage, "FAILURE")
+            state.errors.append(f"[MAPPER] 异常：{e}")
+
+    def _run_developer(self, stage: SparkPipelineStage, state: SparkPipelineState) -> None:
+        """执行 DEVELOPER 阶段——LLM 语义标注（可选）。"""
+        if self._developer_service is None:
+            state.record_stage_result(stage, "SKIPPED")
+            state.errors.append("[DEVELOPER] SKIPPED: 未注入 SparkDeveloperService")
+            return
+
+        plan = self._cached_plan
+        if plan is None:
+            state.record_stage_result(stage, "SKIPPED")
+            state.errors.append("[DEVELOPER] SKIPPED: 无 SparkPlan（Mapper 未执行或失败）")
+            return
+
+        try:
+            annotated = self._developer_service.annotate(plan)
+            state.annotation_hash = annotated.baseline_plan_hash
+            state.record_stage_result(stage, "SUCCESS")
+        except Exception as e:
+            state.record_stage_result(stage, "FAILURE")
+            state.errors.append(f"[DEVELOPER] 标注异常：{e}")
+
+    def _run_compiler(self, stage: SparkPipelineStage, state: SparkPipelineState) -> None:
+        """执行 COMPILER 阶段——SparkPlan → PySpark DSL。"""
+        plan = self._cached_plan
+        if plan is None:
+            state.record_stage_result(stage, "SKIPPED")
+            state.errors.append("[COMPILER] SKIPPED: 无 SparkPlan（Mapper 未执行或失败）")
+            return
+
+        try:
+            from tianshu_datadev.spark.compiler import SparkCompiler
+
+            compiler = SparkCompiler()
+            result = compiler.compile(plan)
+            state.compiled_code_sha256 = result.raw_hash
+            state.record_stage_result(stage, "SUCCESS")
+            self._cached_compile_result = result
+        except Exception as e:
+            state.record_stage_result(stage, "FAILURE")
+            state.errors.append(f"[COMPILER] 编译异常：{e}")
+
+    def _run_validator(self, stage: SparkPipelineStage, state: SparkPipelineState) -> None:
+        """执行 VALIDATOR 阶段——PySpark DSL 安全校验。"""
+        compile_result = self._cached_compile_result
+        if compile_result is None:
+            state.record_stage_result(stage, "SKIPPED")
+            state.errors.append("[VALIDATOR] SKIPPED: 无编译产物（Compiler 未执行或失败）")
+            return
+
+        try:
+            from tianshu_datadev.spark.validator import SparkStaticValidator
+
+            validator = SparkStaticValidator()
+            validation = validator.validate(compile_result.raw_pyspark)
+            if validation.is_valid:
+                state.record_stage_result(stage, "SUCCESS")
+            else:
+                state.record_stage_result(stage, "FAILURE")
+                for e in validation.errors:
+                    state.errors.append(
+                        f"[VALIDATOR] {e.error_code}: {e.detail}"
+                    )
+        except Exception as e:
+            state.record_stage_result(stage, "FAILURE")
+            state.errors.append(f"[VALIDATOR] 校验异常：{e}")
+
+    def _run_comparator(self, stage: SparkPipelineStage, state: SparkPipelineState) -> None:
+        """执行 COMPARATOR 阶段——SQL ↔ Spark 逻辑对比（需 SqlBuildPlan）。"""
+        state.record_stage_result(stage, "SKIPPED")
+        state.errors.append(
+            "[COMPARATOR] SKIPPED: 需要 SqlBuildPlan（SQL pipeline 产出），当前未提供"
+        )
+
+    def _run_physical_verifier(
+        self, stage: SparkPipelineStage, state: SparkPipelineState,
+    ) -> None:
+        """执行 PHYSICAL_VERIFIER 阶段——双引擎物理结果对比（需 Spark 运行时）。"""
+        state.record_stage_result(stage, "SKIPPED")
+        state.errors.append(
+            "[PHYSICAL_VERIFIER] SKIPPED: 需要 Spark 运行时环境，当前未配置"
+        )

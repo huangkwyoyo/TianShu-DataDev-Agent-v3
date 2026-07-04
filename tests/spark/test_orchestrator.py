@@ -187,10 +187,11 @@ class TestSparkOrchestrator:
             assert stage.value in state.stage_results
 
     def test_run_default_flow_success(self):
-        """默认 run（无实际组件注入）→ 所有阶段标记 SUCCESS。"""
+        """默认 run（无 contract、无 stage_failures）→ 所有阶段 SKIPPED，
+        全局状态 LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED（无失败，但无可执行内容）。"""
         orchestrator = SparkOrchestrator()
         state = orchestrator.run(contract_hash="test_hash")
-        assert state.overall_status == SparkPipelineStatus.ALL_CONSISTENT
+        assert state.overall_status == SparkPipelineStatus.LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED
 
     def test_run_with_stage_failure_triggers_repair(self):
         """阶段失败 → 触发 RepairPlanner 分类 → REPAIR_NEEDED。"""
@@ -248,3 +249,271 @@ class TestSparkOrchestrator:
         state = orchestrator.run(contract_hash="test_hash")
         # 没有 developer → DEVELOPER 阶段跳过
         assert state.stage_results["DEVELOPER"] == "SKIPPED"
+
+
+# ════════════════════════════════════════════
+# 骨架级 E2E 测试——Orchestrator 真实调用组件
+# ════════════════════════════════════════════
+#
+# R3（Mapper input_alias 空值）已于 2026-07-04 修复——_chain_input_aliases()
+# 在 mapper 组装步骤后自动填充线性依赖链。真实 Contract E2E 测试见
+# test_real_contract_e2e_mapper_compiler_validator。
+
+
+def _make_e2e_spark_plan():
+    """构造骨架级 E2E 测试用的 SparkPlan——scan + filter + project + sort。"""
+    from tianshu_datadev.spark.models import (
+        SparkFilterStep,
+        SparkPlan,
+        SparkProjectColumn,
+        SparkProjectStep,
+        SparkReadStep,
+        SparkSortDirection,
+        SparkSortSpec,
+        SparkSortStep,
+    )
+
+    return SparkPlan(
+        plan_id="acceptance_e2e_plan",
+        version="v1",
+        source_phase="phase-5",
+        source_contract_hash="acceptance_test_001",
+        steps=[
+            SparkReadStep(
+                alias="od",
+                source_name="dwd.order_detail",
+                input_key="order_detail",
+            ),
+            SparkFilterStep(
+                input_alias="od",
+                operator="GT",
+                left="od.amount",
+                right="100",
+            ),
+            SparkProjectStep(
+                input_alias="_f0",
+                columns=[
+                    SparkProjectColumn(column_name="order_id", alias="order_id"),
+                    SparkProjectColumn(column_name="amount", alias="amount"),
+                ],
+            ),
+            SparkSortStep(
+                input_alias="_p2",
+                order_by=[
+                    SparkSortSpec(column="amount", direction=SparkSortDirection.DESC),
+                ],
+            ),
+        ],
+    )
+
+
+class TestOrchestratorSkeletonE2E:
+    """骨架级端到端——Orchestrator 真实调用 mapper → compiler → validator。
+
+    R3（Mapper input_alias 空值）已修复——真实 Contract 可经 mapper 全链路流转。
+    Comparator 和 PhysicalVerifier 因依赖外部条件标记 SKIPPED。
+    """
+
+    def test_skeleton_e2e_compiler_validator_review_package(self):
+        """最小真实链路：SparkPlan → Compiler → Validator → ReviewPackage。"""
+        from tianshu_datadev.spark.compiler import SparkCompiler
+        from tianshu_datadev.spark.models import SparkPlan
+        from tianshu_datadev.spark.review_builder import SparkReviewBuilder
+        from tianshu_datadev.spark.validator import SparkStaticValidator
+
+        plan = _make_e2e_spark_plan()
+        plan_hash = SparkPlan.compute_plan_hash(plan)
+
+        # Step 1：编译
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+        assert result.raw_pyspark is not None
+        assert len(result.raw_pyspark) > 0
+        assert result.raw_hash is not None
+
+        # Step 2：安全校验
+        validator = SparkStaticValidator()
+        validation = validator.validate(result.raw_pyspark)
+        assert validation.is_valid, f"Validator 拒绝合法代码：{validation.errors}"
+
+        # Step 3：构建 PipelineState（模拟 Orchestrator 状态填充）
+        from tianshu_datadev.spark.orchestrator import SparkPipelineState
+
+        state = SparkPipelineState(contract_hash="acceptance_test_001")
+        state.spark_plan_hash = plan_hash
+        state.compiled_code_sha256 = result.raw_hash
+        state.record_stage_result(SparkPipelineStage.MAPPER, "SUCCESS")
+        state.record_stage_result(SparkPipelineStage.COMPILER, "SUCCESS")
+        state.record_stage_result(SparkPipelineStage.VALIDATOR, "SUCCESS")
+        state.record_stage_result(SparkPipelineStage.DEVELOPER, "SKIPPED")
+        state.record_stage_result(SparkPipelineStage.COMPARATOR, "SKIPPED")
+        state.record_stage_result(SparkPipelineStage.PHYSICAL_VERIFIER, "SKIPPED")
+        state.derive_overall_status()
+
+        assert state.overall_status == SparkPipelineStatus.LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED
+
+        # Step 4：构建交付物
+        builder = SparkReviewBuilder()
+        pkg = builder.build(state)
+        assert pkg.package_id.startswith("pkg_")
+        assert pkg.provenance.spark_plan_hash == plan_hash
+        assert pkg.provenance.compiled_code_sha256 == result.raw_hash
+        assert pkg.overall_status == "LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED"
+
+    def test_skeleton_e2e_hash_determinism(self):
+        """同一 SparkPlan 两次编译产出相同 hash——证明确定性。"""
+        from tianshu_datadev.spark.compiler import SparkCompiler
+
+        plan = _make_e2e_spark_plan()
+        result1 = SparkCompiler().compile(plan)
+        result2 = SparkCompiler().compile(plan)
+        assert result1.raw_hash == result2.raw_hash
+
+    def test_backward_compat_stage_failures_still_works(self):
+        """stage_failures 注入模式仍正常工作——向后兼容。"""
+        orchestrator = SparkOrchestrator()
+        state = orchestrator.run(
+            contract_hash="test_hash",
+            stage_failures={"COMPILER": "测试注入——编译失败"},
+        )
+        assert state.stage_results["COMPILER"] == "FAILURE"
+        assert state.overall_status == SparkPipelineStatus.REPAIR_NEEDED
+        # 无 contract → MAPPER 标记 SKIPPED（无法映射）
+        assert state.stage_results["MAPPER"] == "SKIPPED"
+
+    def test_run_without_contract_skips_mapper(self):
+        """无 contract 时 MAPPER 标记 SKIPPED——不崩溃。"""
+        orchestrator = SparkOrchestrator()
+        state = orchestrator.run(contract_hash="no_contract")
+        assert state.stage_results["MAPPER"] == "SKIPPED"
+        # 后续依赖 Mapper 的阶段也 SKIPPED
+        assert state.stage_results["COMPILER"] == "SKIPPED"
+        assert state.stage_results["VALIDATOR"] == "SKIPPED"
+
+    def test_stage_failures_takes_priority_over_real_contract(self):
+        """stage_failures 注入优先于真实 contract 执行——测试注入模式隔离。"""
+        from tianshu_datadev.artifacts.models import (
+            ContractInputTable,
+            ContractOutputColumn,
+            ContractSort,
+            DataTransformContractV1,
+        )
+
+        contract_id = DataTransformContractV1.generate_contract_id("acceptance_test_002")
+        contract = DataTransformContractV1(
+            contract_id=contract_id,
+            version="v1",
+            source_phase="phase-3",
+            source_sqlprogram_hash="acceptance_test_002",
+            input_tables=[
+                ContractInputTable(
+                    table_ref="od",
+                    source_table="dwd.order_detail",
+                    estimated_row_count=1000,
+                ),
+            ],
+            output_columns=[
+                ContractOutputColumn(
+                    column_name="order_id", alias="order_id", data_type="string",
+                ),
+            ],
+            sort_spec=[ContractSort(column="order_id", direction="ASC")],
+        )
+
+        orchestrator = SparkOrchestrator()
+        state = orchestrator.run(
+            contract=contract,
+            stage_failures={"MAPPER": "注入失败"},
+        )
+        # 注入优先——MAPPER 应为 FAILURE 而非 SUCCESS
+        assert state.stage_results["MAPPER"] == "FAILURE"
+        assert any("注入失败" in e for e in state.errors)
+
+    def test_real_contract_e2e_mapper_compiler_validator(self):
+        """R3 收口验证——真实 DataTransformContractV1 经 orchestrator.run(contract=contract)
+        完成 MAPPER → COMPILER → VALIDATOR 全链路。
+
+        通过标准：
+        - MAPPER / COMPILER / VALIDATOR SUCCESS
+        - DEVELOPER / COMPARATOR / PHYSICAL_VERIFIER SKIPPED
+        - overall_status = LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED
+        - spark_plan_hash / compiled_code_sha256 非空（hash 链完整）
+        - ReviewPackage 可生成
+        """
+        from tianshu_datadev.artifacts.models import (
+            ContractInputTable,
+            ContractOutputColumn,
+            ContractPredicate,
+            ContractSort,
+            DataTransformContractV1,
+        )
+        from tianshu_datadev.spark.review_builder import SparkReviewBuilder
+
+        # 构造最小真实 Contract：单表 → 过滤 → 投影 → 排序
+        contract_id = DataTransformContractV1.generate_contract_id("acceptance_r3_e2e")
+        contract = DataTransformContractV1(
+            contract_id=contract_id,
+            version="v1",
+            source_phase="phase-3",
+            source_sqlprogram_hash="acceptance_r3_e2e",
+            input_tables=[
+                ContractInputTable(
+                    table_ref="od",
+                    source_table="dwd.order_detail",
+                    estimated_row_count=1000,
+                ),
+            ],
+            output_columns=[
+                ContractOutputColumn(
+                    column_name="order_id", alias="order_id", data_type="string",
+                ),
+                ContractOutputColumn(
+                    column_name="amount", alias="amount", data_type="decimal(18,2)",
+                ),
+            ],
+            filters=[
+                ContractPredicate(
+                    operator="GT", left="od.amount", right="100",
+                ),
+            ],
+            sort_spec=[ContractSort(column="amount", direction="DESC")],
+        )
+
+        orchestrator = SparkOrchestrator()
+        state = orchestrator.run(contract=contract)
+
+        # ── 阶段结果验证 ──
+        assert state.stage_results["MAPPER"] == "SUCCESS", (
+            f"MAPPER 应为 SUCCESS，实际 {state.stage_results['MAPPER']}，"
+            f"错误：{state.errors}"
+        )
+        assert state.stage_results["COMPILER"] == "SUCCESS", (
+            f"COMPILER 应为 SUCCESS，实际 {state.stage_results['COMPILER']}，"
+            f"错误：{state.errors}"
+        )
+        assert state.stage_results["VALIDATOR"] == "SUCCESS", (
+            f"VALIDATOR 应为 SUCCESS，实际 {state.stage_results['VALIDATOR']}，"
+            f"错误：{state.errors}"
+        )
+        assert state.stage_results["DEVELOPER"] == "SKIPPED"
+        assert state.stage_results["COMPARATOR"] == "SKIPPED"
+        assert state.stage_results["PHYSICAL_VERIFIER"] == "SKIPPED"
+
+        # ── 全局状态验证 ──
+        assert state.overall_status == SparkPipelineStatus.LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED, (
+            f"全局状态应为 LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED，"
+            f"实际 {state.overall_status}"
+        )
+
+        # ── Hash 链完整性验证 ──
+        assert state.spark_plan_hash != "", "spark_plan_hash 不应为空"
+        assert state.compiled_code_sha256 != "", "compiled_code_sha256 不应为空"
+        assert state.contract_hash != "", "contract_hash 不应为空"
+
+        # ── ReviewPackage 可生成 ──
+        builder = SparkReviewBuilder()
+        pkg = builder.build(state)
+        assert pkg.package_id.startswith("pkg_")
+        assert pkg.provenance.spark_plan_hash == state.spark_plan_hash
+        assert pkg.provenance.compiled_code_sha256 == state.compiled_code_sha256
+        assert pkg.overall_status == "LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED"
