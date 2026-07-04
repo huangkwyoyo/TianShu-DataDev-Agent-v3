@@ -202,6 +202,9 @@ def map_contract_to_spark_plan(
     steps.extend(sort_steps)
     steps.extend(limit_steps)
 
+    # 填充步骤间的线性依赖链——确保每个步骤的 input_alias 正确指向前驱步骤的输出
+    _chain_input_aliases(steps)
+
     spark_plan = SparkPlan(
         plan_id=plan_id,
         version="v1",
@@ -674,3 +677,87 @@ def _infer_input_alias_from_columns(
         if "." in oc.column_name:
             return oc.column_name.split(".")[0]
     return ""
+
+
+# ════════════════════════════════════════════
+# input_alias 依赖链填充
+# ════════════════════════════════════════════
+
+
+def _get_step_output_alias(step, index: int) -> str:
+    """返回编译器将赋予该步骤的输出别名。
+
+    命名规则与 compiler.py 的 out_alias 赋值保持严格一致：
+    - ReadStep → step.alias（如 "od"）
+    - FilterStep → _f{index}
+    - ProjectStep → _p{index}
+    - SortStep → _s{index}
+    - LimitStep → _l{index}
+    - JoinStep → _j{index}
+    - AggregateStep → _a{index}
+    - CaseWhenStep → _c{index}
+    - WindowStep → _w{index}
+
+    Args:
+        step: SparkPlan 步骤实例
+        index: 步骤在 plan.steps 中的全局位置索引（0-based）
+
+    Returns:
+        编译器将赋予该步骤的输出变量名
+    """
+    if isinstance(step, SparkReadStep):
+        return step.alias
+    if isinstance(step, SparkFilterStep):
+        return f"_f{index}"
+    if isinstance(step, SparkProjectStep):
+        return f"_p{index}"
+    if isinstance(step, SparkSortStep):
+        return f"_s{index}"
+    if isinstance(step, SparkLimitStep):
+        return f"_l{index}"
+    if isinstance(step, SparkJoinStep):
+        return f"_j{index}"
+    if isinstance(step, SparkAggregateStep):
+        return f"_a{index}"
+    if isinstance(step, SparkCaseWhenStep):
+        return f"_c{index}"
+    if isinstance(step, SparkWindowStep):
+        return f"_w{index}"
+    # 未知步骤类型——保守返回占位符
+    return f"_u{index}"
+
+
+def _chain_input_aliases(steps: list) -> None:
+    """填充步骤间的线性依赖链——每个步骤的 input_alias 指向前一步骤的输出别名。
+
+    在 map_contract_to_spark_plan() 组装步骤列表后、构造 SparkPlan 前调用。
+    仅填充当前为空字符串的 input_alias——已由映射函数显式设置的字段不受影响。
+
+    不处理的步骤类型：
+    - SparkReadStep：数据源，无输入依赖，仅记录其输出供后续步骤引用
+    - SparkJoinStep：使用 left_alias/right_alias 指定输入，不使用 input_alias
+
+    Args:
+        steps: 已排序的步骤列表（会被原地修改）
+    """
+    prev_output: str | None = None
+
+    for i, step in enumerate(steps):
+        cur_output = _get_step_output_alias(step, i)
+
+        # ReadStep 为数据源——无输入依赖，仅记录输出供后续步骤引用
+        if isinstance(step, SparkReadStep):
+            prev_output = cur_output
+            continue
+
+        # JoinStep 使用 left_alias/right_alias——跳过 input_alias 填充
+        if isinstance(step, SparkJoinStep):
+            prev_output = cur_output
+            continue
+
+        # 填充空的 input_alias——已显式设置的字段不受影响
+        if hasattr(step, 'input_alias') and getattr(step, 'input_alias', None) == "":
+            if prev_output is not None:
+                step.input_alias = prev_output
+
+        prev_output = cur_output

@@ -510,6 +510,100 @@ class TestSparkPlanMapper:
             f"NTILE input_column 应传递 '4'，实际为 {ntile_expr.input_column!r}"
         )
 
+    def test_input_alias_chain_populated_for_linear_steps(self):
+        """简单线性 Contract（read → filter → project → sort → limit）的
+        input_alias 依赖链被正确填充——R3 收口验证。"""
+        contract = _make_minimal_contract()
+        # 简化为单表单过滤器场景——去掉 join/aggregate/window/case_when + 仅保留一个输入表
+        contract.input_tables = [
+            ContractInputTable(
+                table_ref="od",
+                source_table="dwd.order_detail",
+                estimated_row_count=50000000,
+            ),
+        ]
+        contract.join_relationships = []
+        contract.aggregations = []
+        contract.grouping_keys = []
+        contract.window_specs = []
+        contract.case_when_labels = []
+        contract.output_columns = [
+            ContractOutputColumn(column_name="order_id", alias="order_id"),
+            ContractOutputColumn(column_name="amount", alias="amount"),
+        ]
+        contract.sort_spec = [ContractSort(column="amount", direction="DESC")]
+        contract.limit_spec = ContractLimit(limit=10)
+
+        result = map_contract_to_spark_plan(contract)
+        assert result.success is True, f"映射应成功：{result.gaps}"
+        plan = result.spark_plan
+        assert plan is not None
+
+        # 验证步骤顺序：ReadStep → FilterStep → ProjectStep → SortStep → LimitStep
+        step_types = [type(s).__name__ for s in plan.steps]
+        assert "SparkReadStep" in step_types
+        assert "SparkFilterStep" in step_types
+        assert "SparkProjectStep" in step_types
+        assert "SparkSortStep" in step_types
+        assert "SparkLimitStep" in step_types
+
+        # 核心验证：每个非首步的 input_alias 非空且指向正确的编译器输出别名
+        for i, step in enumerate(plan.steps):
+            if isinstance(step, SparkReadStep):
+                # ReadStep 为数据源，无 input_alias
+                assert step.alias == "od"
+            elif isinstance(step, SparkFilterStep):
+                # FilterStep 的 input_alias 由 _extract_table_alias 设置为 "od"
+                assert step.input_alias == "od", (
+                    f"FilterStep[{i}] input_alias 应为 'od'，实际为 {step.input_alias!r}"
+                )
+            elif isinstance(step, SparkProjectStep):
+                # 前一步是 FilterStep(index)，编译器输出为 _f{index}
+                assert step.input_alias != "", (
+                    f"ProjectStep[{i}] input_alias 不应为空（R3 修复验证）"
+                )
+                assert step.input_alias.startswith("_f"), (
+                    f"ProjectStep[{i}] input_alias 应指向 FilterStep 输出，"
+                    f"实际为 {step.input_alias!r}"
+                )
+            elif isinstance(step, SparkSortStep):
+                assert step.input_alias != "", (
+                    f"SortStep[{i}] input_alias 不应为空（R3 修复验证）"
+                )
+                assert step.input_alias.startswith("_p"), (
+                    f"SortStep[{i}] input_alias 应指向 ProjectStep 输出，"
+                    f"实际为 {step.input_alias!r}"
+                )
+            elif isinstance(step, SparkLimitStep):
+                assert step.input_alias != "", (
+                    f"LimitStep[{i}] input_alias 不应为空（R3 修复验证）"
+                )
+                assert step.input_alias.startswith("_s"), (
+                    f"LimitStep[{i}] input_alias 应指向 SortStep 输出，"
+                    f"实际为 {step.input_alias!r}"
+                )
+
+    def test_input_alias_chain_full_contract_no_empty_aliases(self):
+        """完整 Contract（9 种 step）映射后，所有需要 input_alias 的步骤
+        均非空——R3 收口全量验证。"""
+        contract = _make_minimal_contract()
+        result = map_contract_to_spark_plan(contract)
+        assert result.success is True, f"映射应成功：{result.gaps}"
+        plan = result.spark_plan
+        assert plan is not None
+
+        # 遍历所有步骤，验证需要 input_alias 的步骤均非空
+        for i, step in enumerate(plan.steps):
+            if isinstance(step, SparkReadStep):
+                continue  # 数据源，无 input_alias
+            if isinstance(step, SparkJoinStep):
+                continue  # 使用 left_alias/right_alias
+            # 其余步骤类型均需非空 input_alias
+            assert step.input_alias != "", (
+                f"{type(step).__name__}[{i}] input_alias 为空——"
+                f"R3 依赖链填充未覆盖此步骤类型"
+            )
+
 
 # ════════════════════════════════════════════
 # PlanEquivalence 测试
