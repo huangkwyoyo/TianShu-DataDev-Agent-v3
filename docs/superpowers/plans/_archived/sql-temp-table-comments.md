@@ -1,6 +1,7 @@
 # SQL Pipeline 临时表注释块——实施计划
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **注意：** 本文档属于 SQL-first Pipeline 路径（非 Spark-first 路径），与 `business-integration-round1.md` 等 Spark 路径方案书无直接关联。保留作为 SQL 路径的历史参考。
 
 **Goal:** SQL-first Pipeline 输出的每个临时表前带结构化注释块（Step/Intent/Operation/Inputs/Output），串联后展示清晰的处理过程和目标结果。
 
