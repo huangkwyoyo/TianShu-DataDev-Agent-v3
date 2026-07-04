@@ -180,11 +180,16 @@ class TestSparkOrchestrator:
         assert state.contract_hash == "test_hash"
 
     def test_run_records_all_stage_results(self):
-        """run() 记录全部 6 个阶段的执行结果。"""
+        """run() 记录全部 6 个阶段的执行结果；不传 sql_plan 时 COMPARATOR 仍为 SKIPPED。"""
         orchestrator = SparkOrchestrator()
         state = orchestrator.run(contract_hash="test_hash")
         for stage in SparkPipelineStage:
             assert stage.value in state.stage_results
+        # 不传 sql_plan → COMPARATOR 标记 SKIPPED（非 NOT_EXECUTED，因为阶段已执行）
+        assert state.stage_results["COMPARATOR"] == "SKIPPED", (
+            f"无 sql_plan 时 COMPARATOR 应为 SKIPPED，"
+            f"实际 {state.stage_results['COMPARATOR']}，errors={state.errors}"
+        )
 
     def test_run_default_flow_success(self):
         """默认 run（无 contract、无 stage_failures）→ 所有阶段 SKIPPED，
@@ -249,6 +254,113 @@ class TestSparkOrchestrator:
         state = orchestrator.run(contract_hash="test_hash")
         # 没有 developer → DEVELOPER 阶段跳过
         assert state.stage_results["DEVELOPER"] == "SKIPPED"
+
+    # ── COMPARATOR 集成测试 ──
+
+    def test_comparator_with_sql_plan_compares_instead_of_skip(self):
+        """提供 sql_plan + spark_plan → COMPARATOR 真实对比，不再 SKIPPED。"""
+        from tianshu_datadev.planning.models import ColumnRef
+        from tianshu_datadev.planning.sql_build_plan import ScanStep, SqlBuildPlan
+        from tianshu_datadev.spark.models import SparkPlan, SparkReadStep
+
+        orchestrator = SparkOrchestrator()
+        state = SparkPipelineState(contract_hash="test_hash")
+
+        # 构造最小 SqlBuildPlan
+        sql_plan = SqlBuildPlan(
+            plan_id="test_sql_plan",
+            spec_hash="test_spec",
+            steps=[
+                ScanStep(
+                    step_type="scan",
+                    step_id="scan_t",
+                    table_ref="t",
+                    required_columns=[
+                        ColumnRef(table_ref="t", column_name="id", normalized_name="id"),
+                    ],
+                ),
+            ],
+        )
+        # 构造最小 SparkPlan（单 read step）
+        spark_plan = SparkPlan(
+            plan_id="test_spark_plan",
+            version="v1",
+            source_phase="phase-3",
+            source_contract_hash="test_hash",
+            steps=[SparkReadStep(alias="t", source_name="tbl", input_key="tbl_key")],
+        )
+
+        # 注入缓存
+        orchestrator._cached_sql_plan = sql_plan
+        orchestrator._cached_plan = spark_plan
+
+        # 执行 COMPARATOR
+        orchestrator._run_comparator(SparkPipelineStage.COMPARATOR, state)
+
+        # 验证：不再 SKIPPED
+        assert state.stage_results["COMPARATOR"] == "SUCCESS", (
+            f"预期 SUCCESS，实际 {state.stage_results['COMPARATOR']}，"
+            f"errors={state.errors}"
+        )
+        assert state.comparator_report is not None
+
+    def test_comparator_without_sql_plan_still_skips(self):
+        """不设 sql_plan → COMPARATOR 保持 SKIPPED，错误消息包含 SqlBuildPlan。"""
+        from tianshu_datadev.spark.models import SparkPlan, SparkReadStep
+
+        orchestrator = SparkOrchestrator()
+        state = SparkPipelineState(contract_hash="test_hash")
+
+        # 仅设 spark_plan，不设 sql_plan
+        spark_plan = SparkPlan(
+            plan_id="test_spark_plan",
+            version="v1",
+            source_phase="phase-3",
+            source_contract_hash="test_hash",
+            steps=[SparkReadStep(alias="t", source_name="tbl", input_key="tbl_key")],
+        )
+        orchestrator._cached_plan = spark_plan
+        # _cached_sql_plan 保持 None
+
+        orchestrator._run_comparator(SparkPipelineStage.COMPARATOR, state)
+
+        assert state.stage_results["COMPARATOR"] == "SKIPPED"
+        assert any("SqlBuildPlan" in e for e in state.errors), (
+            f"错误消息应提及 SqlBuildPlan，实际 errors={state.errors}"
+        )
+
+    def test_comparator_without_spark_plan_still_skips(self):
+        """设 sql_plan 但不设 spark_plan → COMPARATOR SKIPPED，错误消息包含 SparkPlan。"""
+        from tianshu_datadev.planning.models import ColumnRef
+        from tianshu_datadev.planning.sql_build_plan import ScanStep, SqlBuildPlan
+
+        orchestrator = SparkOrchestrator()
+        state = SparkPipelineState(contract_hash="test_hash")
+
+        # 仅设 sql_plan，不设 spark_plan
+        sql_plan = SqlBuildPlan(
+            plan_id="test_sql_plan",
+            spec_hash="test_spec",
+            steps=[
+                ScanStep(
+                    step_type="scan",
+                    step_id="scan_t",
+                    table_ref="t",
+                    required_columns=[
+                        ColumnRef(table_ref="t", column_name="id", normalized_name="id"),
+                    ],
+                ),
+            ],
+        )
+        orchestrator._cached_sql_plan = sql_plan
+        # _cached_plan 保持 None
+
+        orchestrator._run_comparator(SparkPipelineStage.COMPARATOR, state)
+
+        assert state.stage_results["COMPARATOR"] == "SKIPPED"
+        assert any("SparkPlan" in e for e in state.errors), (
+            f"错误消息应提及 SparkPlan，实际 errors={state.errors}"
+        )
 
 
 # ════════════════════════════════════════════

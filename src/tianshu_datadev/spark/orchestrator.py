@@ -9,7 +9,7 @@ AnnotationWarning 不触发自动返工。
 骨架级能力说明（2026-07-04 全局验收）：
 - MAPPER / COMPILER / VALIDATOR：真实调用已有组件实例
 - DEVELOPER：无 llm_call 注入时 SKIPPED
-- COMPARATOR：需 SqlBuildPlan（SQL pipeline 产出），当前 SKIPPED
+- COMPARATOR：有 SqlBuildPlan + SparkPlan 时真实对比，缺一 SKIPPED
 - PHYSICAL_VERIFIER：需 Spark 运行时环境，当前 SKIPPED
 """
 
@@ -24,6 +24,8 @@ from tianshu_datadev.developer_spec.models import StrictModel
 
 if TYPE_CHECKING:
     from tianshu_datadev.artifacts.models import DataTransformContractV1
+    from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan
+    from tianshu_datadev.spark.plan_comparator import PlanComparisonReport
 
 # ════════════════════════════════════════════
 # SparkPipelineStage——6 阶段枚举
@@ -79,6 +81,10 @@ class SparkPipelineState(StrictModel):
     compiled_code_sha256: str = ""                            # compiler 产出的代码 hash
     snapshot_id: str = ""                                     # 快照 ID
     verification_report_id: str = ""                          # 验证报告 ID
+    comparator_report: "PlanComparisonReport | None" = Field(  # Comparator 对比报告
+        default=None,
+        description="COMPARATOR 阶段产出的逻辑对比报告，仅在 sql_plan+spark_plan 均可用时非空",
+    )
     stage_results: dict[str, str] = Field(                    # 每阶段执行结果
         default_factory=lambda: {
             "MAPPER": "NOT_EXECUTED",
@@ -198,12 +204,14 @@ class SparkOrchestrator:
         self._developer_service = developer_service
         # 缓存中间产物——供后续阶段使用
         self._cached_plan = None           # SparkPlan | None
+        self._cached_sql_plan = None       # SqlBuildPlan | None
         self._cached_compile_result = None  # SparkCompileResult | None
 
     def run(
         self,
         contract_hash: str = "",
         contract: "DataTransformContractV1 | None" = None,
+        sql_plan: "SqlBuildPlan | None" = None,
         stage_failures: dict[str, str] | None = None,
         retry_count: int = 0,
     ) -> SparkPipelineState:
@@ -216,6 +224,9 @@ class SparkOrchestrator:
         Args:
             contract_hash: 来源 Contract 的 hash 值（测试注入模式必填）
             contract: DataTransformContractV1 实例（真实执行模式必填）
+            sql_plan: SqlBuildPlan 实例（可选）。
+                      提供时 COMPARATOR 阶段使用 sql_plan + spark_plan 执行真实逻辑对比。
+                      不提供时 COMPARATOR 标记 SKIPPED。
             stage_failures: 阶段失败注入（测试用）——key 为阶段名，value 为错误信息。
                             None 时走真实执行或默认成功。
             retry_count: 当前返工轮次（0 表示首次执行）
@@ -223,6 +234,7 @@ class SparkOrchestrator:
         Returns:
             SparkPipelineState——含每阶段结果、错误列表、全局状态
         """
+        self._cached_sql_plan = sql_plan
         failures = stage_failures or {}
         # contract_hash 优先取 contract 的 hash，否则用参数
         effective_hash = contract_hash
@@ -396,11 +408,28 @@ class SparkOrchestrator:
             state.errors.append(f"[VALIDATOR] 校验异常：{e}")
 
     def _run_comparator(self, stage: SparkPipelineStage, state: SparkPipelineState) -> None:
-        """执行 COMPARATOR 阶段——SQL ↔ Spark 逻辑对比（需 SqlBuildPlan）。"""
-        state.record_stage_result(stage, "SKIPPED")
-        state.errors.append(
-            "[COMPARATOR] SKIPPED: 需要 SqlBuildPlan（SQL pipeline 产出），当前未提供"
-        )
+        """执行 COMPARATOR 阶段——SQL ↔ Spark 逻辑对比（需 SqlBuildPlan + SparkPlan）。"""
+        if self._cached_sql_plan is not None and self._cached_plan is not None:
+            try:
+                from tianshu_datadev.spark.plan_comparator import PlanComparator
+
+                comparator = PlanComparator()
+                report = comparator.compare(self._cached_sql_plan, self._cached_plan)
+                state.record_stage_result(stage, "SUCCESS")
+                state.comparator_report = report  # 存储报告供后续 Review Package 使用
+            except Exception as e:
+                state.record_stage_result(stage, "FAILURE")
+                state.errors.append(f"[COMPARATOR] 对比异常：{e}")
+        else:
+            state.record_stage_result(stage, "SKIPPED")
+            missing = []
+            if self._cached_sql_plan is None:
+                missing.append("SqlBuildPlan")
+            if self._cached_plan is None:
+                missing.append("SparkPlan")
+            state.errors.append(
+                f"[COMPARATOR] SKIPPED: 缺少 {' + '.join(missing)}，无法执行逻辑对比"
+            )
 
     def _run_physical_verifier(
         self, stage: SparkPipelineStage, state: SparkPipelineState,
@@ -410,3 +439,9 @@ class SparkOrchestrator:
         state.errors.append(
             "[PHYSICAL_VERIFIER] SKIPPED: 需要 Spark 运行时环境，当前未配置"
         )
+
+
+# 延迟重建模型——让 Pydantic 解析 TYPE_CHECKING 导入的 PlanComparisonReport 类型
+from tianshu_datadev.spark.plan_comparator import PlanComparisonReport  # noqa: E402
+
+SparkPipelineState.model_rebuild()
