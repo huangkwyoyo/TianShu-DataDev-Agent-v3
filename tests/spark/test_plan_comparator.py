@@ -1140,3 +1140,383 @@ class TestPlanComparatorCustomEnabledTypes:
         # 全部在对比范围内且等价
         assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
         assert len(report.uncovered_step_types) == 0
+
+
+# ════════════════════════════════════════════
+# C3 集成链路——同一 Contract 驱动双管线 → Comparator
+# ════════════════════════════════════════════
+
+
+def _contract_to_sql_steps(
+    contract,  # DataTransformContractV1——类型注释在函数内部延迟导入
+) -> list:
+    """从 DataTransformContractV1 确定性构造 SqlBuildPlan step 列表——C3 双管线桥接。
+
+    这是 Contract → SqlBuildPlan 的最小确定性桥接函数。
+    不修改生产代码——只在测试内提供双管线同源能力。
+
+    映射规则（与 Mapper 的 SparkPlan 映射对称）：
+    - input_tables → ScanStep（每表一个）
+    - filters → FilterStep
+    - join_relationships → JoinStep
+    - aggregations + grouping_keys → AggregateStep
+    - case_when_labels → CaseWhenStep（标签级，不含完整谓词）
+    - output_columns → ProjectStep
+    - sort_spec → SortStep
+    - limit_spec → LimitStep
+
+    不映射 window_specs——Phase 7B Comparator 不启用 window。
+    """
+    from tianshu_datadev.planning.models import (
+        AggregateSpec,
+        AggregationType,
+        AliasExpr,
+        ColumnRef,
+        Predicate,
+        PredicateOperator,
+        SortDirection,
+        SortSpec,
+        SqlLiteral,
+        WhenBranch,
+    )
+    from tianshu_datadev.planning.sql_build_plan import (
+        AggregateStep,
+        CaseWhenStep,
+        FilterStep,
+        JoinStep,
+        LimitStep,
+        ProjectStep,
+        ScanStep,
+        SortStep,
+    )
+
+    steps: list = []
+
+    # 1. input_tables → ScanStep
+    for tbl in contract.input_tables:
+        steps.append(ScanStep(
+            step_type="scan",
+            step_id=f"scan_{tbl.table_ref}",
+            table_ref=tbl.table_ref,
+            required_columns=[],  # 测试级——Comparator 不逐列对比 required_columns
+        ))
+
+    # 2. filters → FilterStep
+    for i, f in enumerate(contract.filters):
+        left_parts = f.left.split(".", 1)
+        left_col = left_parts[1] if len(left_parts) > 1 else left_parts[0]
+        left_table = left_parts[0] if len(left_parts) > 1 else ""
+        steps.append(FilterStep(
+            step_type="filter",
+            step_id=f"filter_{i:03d}",
+            predicate=Predicate(
+                left=ColumnRef(table_ref=left_table, column_name=left_col, normalized_name=left_col),
+                operator=PredicateOperator(f.operator),
+                right=SqlLiteral(value=f.right.strip("'").strip('"')),
+            ),
+        ))
+
+    # 3. join_relationships → JoinStep
+    for j in contract.join_relationships:
+        steps.append(JoinStep(
+            step_type="join",
+            step_id=f"join_{j.join_id}",
+            right_table_ref=j.right_table,
+            join_type=j.join_type,
+            join_keys=[(
+                ColumnRef(table_ref=j.left_table, column_name=j.left_key, normalized_name=j.left_key),
+                ColumnRef(table_ref=j.right_table, column_name=j.right_key, normalized_name=j.right_key),
+            )],
+            relationship_ref=j.join_id,
+        ))
+
+    # 4. aggregations + grouping_keys → AggregateStep
+    if contract.aggregations:
+        agg_metrics = []
+        for agg in contract.aggregations:
+            agg_type = AggregationType(agg.function) if agg.function else AggregationType.COUNT
+            # 从 "od.amount" 提取列名 "amount"
+            raw_col = agg.input_column or ""
+            col_name = raw_col.split(".", 1)[1] if "." in raw_col else raw_col
+            agg_metrics.append(AggregateSpec(
+                aggregation=agg_type,
+                input_column=col_name,
+                alias=agg.alias,
+            ))
+        group_keys = []
+        for gk in contract.grouping_keys:
+            parts = gk.split(".", 1)
+            col = parts[1] if len(parts) > 1 else parts[0]
+            tbl = parts[0] if len(parts) > 1 else ""
+            group_keys.append(ColumnRef(table_ref=tbl, column_name=col, normalized_name=col))
+        steps.append(AggregateStep(
+            step_type="aggregate",
+            step_id="agg_001",
+            group_keys=group_keys,
+            metrics=agg_metrics,
+        ))
+
+    # 5. case_when_labels → CaseWhenStep（标签级——完整谓词在 Phase 7 做）
+    if contract.case_when_labels:
+        for cw in contract.case_when_labels:
+            cases = []
+            for label in cw.labels:
+                cases.append(WhenBranch(
+                    condition=Predicate(
+                        left=ColumnRef(table_ref="", column_name="", normalized_name=""),
+                        operator=PredicateOperator.EQ,
+                        right=SqlLiteral(value=""),
+                    ),
+                    result=SqlLiteral(value=label),
+                ))
+            steps.append(CaseWhenStep(
+                step_type="case_when",
+                step_id=f"cw_{cw.statement_id}",
+                cases=cases,
+                else_value=SqlLiteral(value=cw.else_label) if cw.else_label else None,
+                alias=cw.output_alias,
+            ))
+
+    # 6. output_columns → ProjectStep
+    if contract.output_columns:
+        proj_cols = []
+        for oc in contract.output_columns:
+            col_ref = ColumnRef(
+                table_ref="", column_name=oc.column_name,
+                normalized_name=oc.column_name,
+            )
+            proj_cols.append(AliasExpr(expression=col_ref, alias=oc.alias))
+        steps.append(ProjectStep(
+            step_type="project",
+            step_id="proj_001",
+            columns=proj_cols,
+        ))
+
+    # 7. sort_spec → SortStep
+    if contract.sort_spec:
+        sort_specs = []
+        for s in contract.sort_spec:
+            sort_specs.append(SortSpec(
+                column=s.column,
+                direction=SortDirection(s.direction),
+            ))
+        steps.append(SortStep(
+            step_type="sort",
+            step_id="sort_001",
+            order_by=sort_specs,
+        ))
+
+    # 8. limit_spec → LimitStep
+    if contract.limit_spec:
+        steps.append(LimitStep(
+            step_type="limit",
+            step_id="limit_001",
+            limit=contract.limit_spec.limit,
+        ))
+
+    return steps
+
+
+class TestPlanComparatorContractIntegration:
+    """C3 集成链路：同一 DataTransformContractV1 → 双管线自动产出 → Comparator。
+
+    Spark 管线：Contract → Mapper（map_contract_to_spark_plan）→ SparkPlan
+    SQL 管线：  Contract → _contract_to_sql_steps() 桥接 → SqlBuildPlan
+
+    桥接函数是测试内的最小确定性映射——不修改生产代码。
+    后续若生产代码提供 Contract → SqlBuildPlan 的正式路径，替换此桥接即可。
+    """
+
+    def test_contract_to_spark_via_mapper_then_compare_all_eight_types(
+        self,
+    ):
+        """同一 Contract → Mapper + 手工 SqlBuildPlan → Comparator——8 种已启用类型全部等价。
+
+        覆盖 scan/filter/project/sort/limit/aggregate/join/case_when（Phase 7B 启用）。
+        window 在 Phase 7B 为 NOT_COVERED——后续 Phase 覆盖。
+        """
+        from tianshu_datadev.artifacts.models import (
+            CaseWhenLabelSpec,
+            ContractAggregation,
+            ContractInputTable,
+            ContractJoin,
+            ContractLimit,
+            ContractOutputColumn,
+            ContractPredicate,
+            ContractSort,
+            DataTransformContractV1,
+        )
+        from tianshu_datadev.spark.mapper import map_contract_to_spark_plan
+
+        # ── Step 1: 构造覆盖 9 种 step 的 Contract ──
+        program_id = "prog_c3_integration"
+        contract_id = DataTransformContractV1.generate_contract_id(program_id)
+        contract = DataTransformContractV1(
+            contract_id=contract_id,
+            version="v1",
+            source_phase="phase-3",
+            source_sqlprogram_hash=program_id,
+            input_tables=[
+                ContractInputTable(
+                    table_ref="od",
+                    source_table="dwd.order_detail",
+                ),
+                ContractInputTable(
+                    table_ref="ri",
+                    source_table="dim.region_info",
+                ),
+            ],
+            join_relationships=[
+                ContractJoin(
+                    join_id="join_od_ri",
+                    left_table="od",
+                    right_table="ri",
+                    left_key="region_code",
+                    right_key="region_code",
+                    join_type="INNER",
+                    evidence_chain={
+                        "level": "STRONG",
+                        "action": "ACCEPT",
+                        "left_field": {"raw": "region_code", "normalized": "region_code"},
+                        "right_field": {"raw": "region_code", "normalized": "region_code"},
+                        "evidence_checks": {
+                            "exact_name_match": True, "type_match": True, "unique_match": True,
+                        },
+                    },
+                    level="STRONG",
+                ),
+            ],
+            filters=[
+                ContractPredicate(operator="GT", left="od.amount", right="0"),
+            ],
+            aggregations=[
+                ContractAggregation(function="SUM", input_column="od.amount", alias="total_amt"),
+            ],
+            grouping_keys=["od.region_code"],
+            output_columns=[
+                ContractOutputColumn(column_name="region_code", alias="region_code"),
+                ContractOutputColumn(column_name="total_amt", alias="total_amt"),
+            ],
+            output_grain=["region_code"],
+            sort_spec=[ContractSort(column="total_amt", direction="DESC")],
+            limit_spec=ContractLimit(limit=100),
+            business_keys=["region_code"],
+            step_dag={"stmt_main": []},
+            temp_tables=[],
+            case_when_labels=[
+                CaseWhenLabelSpec(
+                    statement_id="stmt_label",
+                    output_alias="value_level",
+                    branch_count=2,
+                    labels=["high", "low"],
+                    else_label="mid",
+                ),
+            ],
+            window_specs=[],
+        )
+
+        # ── Step 2: Spark 管线——Contract → Mapper → SparkPlan ──
+        mapping_result = map_contract_to_spark_plan(contract)
+        assert mapping_result.success, (
+            f"Mapper 应成功映射，实际失败：gaps={mapping_result.gaps}, "
+            f"unsupported={mapping_result.unsupported}"
+        )
+        spark_plan = mapping_result.spark_plan
+        assert spark_plan is not None
+
+        # ── Step 3: SQL 管线——Contract → _contract_to_sql_steps() 桥接 → SqlBuildPlan ──
+        sql_steps = _contract_to_sql_steps(contract)
+        sql_plan = _make_sql_plan(sql_steps)
+
+        # ── Step 4: Comparator 对比 ──
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        # ── Step 5: 验证——8 种已启用类型全部等价 ──
+        # Mapper 产出的 SparkPlan 含 read+filter+join+aggregate+case_when+project+sort+limit
+        # SqlBuildPlan 含 scan+scan+filter+join+aggregate+case_when+project+sort+limit
+        # 全部在 Phase 7B 启用范围内
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+            f"预期 LOGIC_EQUIVALENT，实际 {report.status}，"
+            f"step_results={[(r.step_type, r.verdict.value) for r in report.step_results]}"
+        )
+        assert len(report.uncovered_step_types) == 0, (
+            f"不应有任何未覆盖类型，实际 {report.uncovered_step_types}"
+        )
+
+        # 验证所有 step 类型都出现在结果中
+        result_types = {r.step_type for r in report.step_results}
+        expected_types = {"scan", "filter", "join", "aggregate", "case_when", "project", "sort", "limit"}
+        for etype in expected_types:
+            assert etype in result_types, f"step 类型 '{etype}' 未出现在对比结果中"
+
+    def test_contract_with_window_marked_not_covered(self):
+        """Contract 含 window → Mapper 产出含 WindowStep → Comparator 标记 NOT_COVERED。"""
+        from tianshu_datadev.artifacts.models import (
+            ContractInputTable,
+            ContractOutputColumn,
+            DataTransformContractV1,
+            WindowSpecSummary,
+        )
+        from tianshu_datadev.planning.models import (
+            ColumnRef,
+        )
+        from tianshu_datadev.planning.sql_build_plan import WindowStep
+        from tianshu_datadev.spark.mapper import map_contract_to_spark_plan
+
+        # 构造含 window 的最小 Contract
+        program_id = "prog_c3_window"
+        contract_id = DataTransformContractV1.generate_contract_id(program_id)
+        contract = DataTransformContractV1(
+            contract_id=contract_id,
+            version="v1",
+            source_phase="phase-3",
+            source_sqlprogram_hash=program_id,
+            input_tables=[
+                ContractInputTable(table_ref="od", source_table="dwd.order_detail"),
+            ],
+            output_columns=[
+                ContractOutputColumn(column_name="order_id", alias="order_id"),
+                ContractOutputColumn(column_name="rn", alias="rn"),
+            ],
+            window_specs=[
+                WindowSpecSummary(
+                    statement_id="stmt_rank",
+                    function="ROW_NUMBER",
+                    alias="rn",
+                    partition_by=["order_id"],
+                    order_by=["amount"],
+                ),
+            ],
+        )
+
+        # Mapper → SparkPlan（含 WindowStep）
+        mapping_result = map_contract_to_spark_plan(contract)
+        assert mapping_result.success, f"Mapper 失败: {mapping_result.gaps}"
+        spark_plan = mapping_result.spark_plan
+
+        # SQL 侧：手工构造对等的 SqlBuildPlan（scan + window）
+        sql_steps = [
+            ScanStep(
+                step_type="scan",
+                step_id="scan_od",
+                table_ref="od",
+                required_columns=[
+                    ColumnRef(table_ref="od", column_name="order_id", normalized_name="order_id"),
+                    ColumnRef(table_ref="od", column_name="amount", normalized_name="amount"),
+                ],
+            ),
+            WindowStep(
+                step_type="window",
+                step_id="win_001",
+                window_exprs=[],
+            ),
+        ]
+        sql_plan = _make_sql_plan(sql_steps)
+
+        # Comparator → window 标记 NOT_COVERED
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.NOT_COVERED
+        assert "window" in report.uncovered_step_types

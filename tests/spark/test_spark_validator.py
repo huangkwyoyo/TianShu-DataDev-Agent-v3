@@ -112,11 +112,106 @@ class TestE603ActionNotAllowed:
         assert any(e.error_code == "E603" for e in result.errors)
 
     def test_f_count_allowed(self, validator):
-        """F.count() 聚合函数允许（不是 df.count() action）。"""
-        code = "df.groupBy('x').agg(F.count('*'))"
-        _ = validator.validate(code)
-        # F.count 调用不应被误判为 df.count()
-        # 当前 AST 实现中，F.count 是 Attribute chain，不会被 _check_action_call 拦截
+        """F.count() 聚合函数允许（不是 df.count() action）。
+
+        F 必须通过 from pyspark.sql import functions as F 导入——
+        绑定分析需要看到导入声明才能确认 F 是 functions 别名。
+        """
+        code = """
+from pyspark.sql import functions as F
+df.groupBy('x').agg(F.count('*'))
+"""
+        result = validator.validate(code)
+        assert result.is_valid, (
+            f"F.count() 聚合函数不应被误判为 df.count() action: {result.errors}"
+        )
+
+    def test_f_reassigned_to_df_count_rejected(self, validator):
+        """C 类修复：F = df 后 F.count() 应被拦截为 E603。
+
+        仅因名字叫 F 就放行是不安全的——必须验证 F 未被重新赋值污染。
+        """
+        code = """
+from pyspark.sql import functions as F
+df = inputs["t"]
+F = df
+F.count()
+"""
+        result = validator.validate(code)
+        assert not result.is_valid, (
+            f"F=df 后 F.count() 应拦截为 E603，不能因名字叫 F 就放行: {result.errors}"
+        )
+        assert any(e.error_code == "E603" for e in result.errors), (
+            f"期望 E603，实际错误: {result.errors}"
+        )
+
+    def test_f_reassigned_to_df_collect_rejected(self, validator):
+        """C 类修复：F = df 后 F.collect() 应被拦截为 E603。"""
+        code = """
+from pyspark.sql import functions as F
+df = inputs["t"]
+F = df
+F.collect()
+"""
+        result = validator.validate(code)
+        assert not result.is_valid, (
+            f"F=df 后 F.collect() 应拦截为 E603: {result.errors}"
+        )
+        assert any(e.error_code == "E603" for e in result.errors), (
+            f"期望 E603，实际错误: {result.errors}"
+        )
+
+    def test_fn_alias_reassigned_count_rejected(self, validator):
+        """C 类修复：任意 functions 别名被 DataFrame 覆盖后都不放行。"""
+        code = """
+from pyspark.sql import functions as fn
+df = inputs["t"]
+fn = df
+fn.count()
+"""
+        result = validator.validate(code)
+        assert not result.is_valid, (
+            f"fn=df 后 fn.count() 应拦截为 E603: {result.errors}"
+        )
+        assert any(e.error_code == "E603" for e in result.errors), (
+            f"期望 E603，实际错误: {result.errors}"
+        )
+
+    def test_f_attr_overwrite_count_rejected(self, validator):
+        """C 类残留修复：F.count = df.count 属性覆盖后 F.count() 应拦截。
+
+        属性赋值 F.count = df.count 的 AST 目标是 ast.Attribute（非 ast.Name），
+        上一轮只检测了名称重绑定，未检测属性覆盖——此测试将关闭该残留绕过。
+        """
+        code = """
+from pyspark.sql import functions as F
+df = inputs["t"]
+F.count = df.count
+F.count()
+"""
+        result = validator.validate(code)
+        assert not result.is_valid, (
+            f"F.count=df.count 后 F.count() 应拦截为 E603: {result.errors}"
+        )
+        assert any(e.error_code == "E603" for e in result.errors), (
+            f"期望 E603，实际错误: {result.errors}"
+        )
+
+    def test_f_attr_overwrite_collect_rejected(self, validator):
+        """C 类残留修复：F.collect = df.collect 属性覆盖后 F.collect() 应拦截。"""
+        code = """
+from pyspark.sql import functions as F
+df = inputs["t"]
+F.collect = df.collect
+F.collect()
+"""
+        result = validator.validate(code)
+        assert not result.is_valid, (
+            f"F.collect=df.collect 后 F.collect() 应拦截为 E603: {result.errors}"
+        )
+        assert any(e.error_code == "E603" for e in result.errors), (
+            f"期望 E603，实际错误: {result.errors}"
+        )
 
 
 # ════════════════════════════════════════════
