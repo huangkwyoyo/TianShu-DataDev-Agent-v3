@@ -651,3 +651,130 @@ class TestMaliciousInputPhase6B:
         compiler = SparkCompiler()
         with pytest.raises(RenderError):
             compiler.compile(plan)
+
+
+# ════════════════════════════════════════════
+# Phase 6C：窗口帧边界渲染测试
+# ════════════════════════════════════════════
+
+
+class TestRenderFrameBoundary:
+    """render_frame_boundary 单元测试——覆盖三种符号值 + 整数字面量 + 非法输入拒绝。"""
+
+    def test_unbounded_preceding_renders_camel_case(self):
+        """unbounded_preceding → Window.unboundedPreceding（camelCase，非 UPPER_SNAKE_CASE）。"""
+        result = SparkCodeRenderer.render_frame_boundary("unbounded_preceding")
+        assert result == "Window.unboundedPreceding"
+
+    def test_unbounded_following_renders_camel_case(self):
+        """unbounded_following → Window.unboundedFollowing。"""
+        result = SparkCodeRenderer.render_frame_boundary("unbounded_following")
+        assert result == "Window.unboundedFollowing"
+
+    def test_current_row_renders_camel_case(self):
+        """current_row → Window.currentRow。"""
+        result = SparkCodeRenderer.render_frame_boundary("current_row")
+        assert result == "Window.currentRow"
+
+    def test_case_insensitive_and_whitespace_tolerant(self):
+        """大小写不敏感 + 前后空白容忍。"""
+        result1 = SparkCodeRenderer.render_frame_boundary("  Unbounded_Preceding  ")
+        assert result1 == "Window.unboundedPreceding"
+        assert SparkCodeRenderer.render_frame_boundary("CURRENT_ROW") == "Window.currentRow"
+
+    def test_non_negative_integer_passthrough(self):
+        """非负整数字面量原样返回。"""
+        assert SparkCodeRenderer.render_frame_boundary("0") == "0"
+        assert SparkCodeRenderer.render_frame_boundary("3") == "3"
+        assert SparkCodeRenderer.render_frame_boundary(" 10 ") == "10"
+
+    def test_invalid_boundary_raises(self):
+        """非白名单符号且非数字 → RenderError。"""
+        with pytest.raises(RenderError, match="非法的窗口帧边界值"):
+            SparkCodeRenderer.render_frame_boundary("invalid")
+        with pytest.raises(RenderError, match="非法的窗口帧边界值"):
+            SparkCodeRenderer.render_frame_boundary("preceding")
+        with pytest.raises(RenderError, match="非法的窗口帧边界值"):
+            SparkCodeRenderer.render_frame_boundary("-1")  # 负数不是非负整数
+
+    def test_negative_integer_rejected(self):
+        """负整数字面量被拒绝——digits only 检查不通过（含负号）。"""
+        with pytest.raises(RenderError, match="非法的窗口帧边界值"):
+            SparkCodeRenderer.render_frame_boundary("-5")
+
+    def test_float_rejected(self):
+        """浮点数字面量被拒绝。"""
+        with pytest.raises(RenderError, match="非法的窗口帧边界值"):
+            SparkCodeRenderer.render_frame_boundary("1.5")
+
+
+class TestRenderFrameType:
+    """render_frame_type 单元测试——rows/range 映射 + 非法输入拒绝。"""
+
+    def test_rows_renders_rows_between(self):
+        """rows → rowsBetween。"""
+        assert SparkCodeRenderer.render_frame_type("rows") == "rowsBetween"
+
+    def test_range_renders_range_between(self):
+        """range → rangeBetween。"""
+        assert SparkCodeRenderer.render_frame_type("range") == "rangeBetween"
+
+    def test_case_insensitive_and_whitespace_tolerant(self):
+        """大小写不敏感 + 前后空白容忍。"""
+        assert SparkCodeRenderer.render_frame_type("  ROWS  ") == "rowsBetween"
+        assert SparkCodeRenderer.render_frame_type("Range") == "rangeBetween"
+
+    def test_invalid_frame_type_raises(self):
+        """非 rows/range → RenderError。"""
+        with pytest.raises(RenderError, match="非法的窗口帧类型"):
+            SparkCodeRenderer.render_frame_type("groups")
+        with pytest.raises(RenderError, match="非法的窗口帧类型"):
+            SparkCodeRenderer.render_frame_type("")
+
+
+# ════════════════════════════════════════════
+# Phase 6C：窗口帧边界编译器集成测试补充
+# ════════════════════════════════════════════
+
+
+class TestWindowFrameBoundaryIntegration:
+    """通过 Compiler 编译验证 render_frame_boundary 输出的正确 PySpark API 名称。"""
+
+    def test_compiled_output_uses_camel_case_frame_constants(self):
+        """编译产物中含 Window.unboundedPreceding / Window.currentRow，而非大写形式。"""
+        from tianshu_datadev.spark.compiler import SparkCompiler
+        from tianshu_datadev.spark.models import (
+            SparkPlan,
+            SparkReadStep,
+            SparkWindowExpr,
+            SparkWindowFunction,
+            SparkWindowStep,
+        )
+
+        step = SparkWindowStep(
+            input_alias="df",
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.SUM_OVER,
+                    alias="running_total",
+                    input_column="amount",
+                    partition_by=["region"],
+                    order_by=["order_date"],
+                ),
+            ],
+        )
+        plan = SparkPlan(
+            plan_id="test",
+            version="v1",
+            source_phase="phase-6",
+            source_contract_hash="hash",
+            steps=[SparkReadStep(alias="df", source_name="t", input_key="t"), step],
+        )
+        result = SparkCompiler().compile(plan)
+
+        # 正确：camelCase
+        assert "Window.unboundedPreceding" in result.raw_pyspark
+        assert "Window.currentRow" in result.raw_pyspark
+        # 错误形式不应出现
+        assert "Window.UNBOUNDED_PRECEDING" not in result.raw_pyspark
+        assert "Window.CURRENT_ROW" not in result.raw_pyspark

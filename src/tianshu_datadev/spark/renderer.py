@@ -279,6 +279,68 @@ class SparkCodeRenderer:
         }
         return _fn_map[func]
 
+    # ── Window 帧边界渲染 ──
+
+    # 合法的帧边界符号值
+    _FRAME_BOUNDARY_SYMBOLS: frozenset[str] = frozenset({
+        "unbounded_preceding", "unbounded_following", "current_row",
+    })
+
+    # 帧边界符号 snake_case → PySpark camelCase 显式映射
+    _FRAME_BOUNDARY_CAMEL_MAP: dict[str, str] = {
+        "unbounded_preceding": "Window.unboundedPreceding",
+        "unbounded_following": "Window.unboundedFollowing",
+        "current_row": "Window.currentRow",
+    }
+
+    @staticmethod
+    def render_frame_boundary(boundary: str) -> str:
+        """渲染窗口帧边界值——白名单符号或非负整数。
+
+        合法值：
+        - 符号值："unbounded_preceding" / "unbounded_following" / "current_row"
+          → 映射为 PySpark camelCase 常量（Window.unboundedPreceding 等）
+        - 整数字面量：如 "0"、"5"（非负整数）
+
+        Args:
+            boundary: 帧边界字符串表示
+
+        Returns:
+            PySpark Window 帧边界表达式
+
+        Raises:
+            RenderError: 边界值不在白名单且不是非负整数
+        """
+        b = boundary.strip().lower()
+        # 符号值——显式映射到 PySpark camelCase 常量
+        camel = SparkCodeRenderer._FRAME_BOUNDARY_CAMEL_MAP.get(b)
+        if camel is not None:
+            return camel
+        # 非负整数字面量
+        if b.isdigit():
+            return boundary.strip()
+        raise RenderError(f"非法的窗口帧边界值：'{boundary}'")
+
+    @staticmethod
+    def render_frame_type(frame_type: str) -> str:
+        """渲染窗口帧类型——rows 或 range。
+
+        Args:
+            frame_type: "rows" 或 "range"
+
+        Returns:
+            PySpark Window 帧类型方法名
+
+        Raises:
+            RenderError: 帧类型不在白名单
+        """
+        ft = frame_type.strip().lower()
+        if ft == "rows":
+            return "rowsBetween"
+        elif ft == "range":
+            return "rangeBetween"
+        raise RenderError(f"非法的窗口帧类型：'{frame_type}'，仅支持 rows / range")
+
     # ── Join/Sort 枚举渲染 ──
 
     @staticmethod

@@ -1,7 +1,4 @@
-"""Phase 6 SparkCompiler 测试——9 种 step 编译（6A 5 种 + 6B 3 种 + 6C 占位）。
-
-6C step 类型（window）使用 skip/xfail 占位。
-"""
+"""Phase 6 SparkCompiler 测试——9 种 step 编译（6A 5 种 + 6B 3 种 + 6C 1 种）。"""
 
 from __future__ import annotations
 
@@ -775,16 +772,338 @@ class TestCompileCaseWhen:
 
 
 # ════════════════════════════════════════════
-# Phase 6C skip 占位
+# Phase 6C 测试——window 编译 + 帧边界
 # ════════════════════════════════════════════
 
 
-class TestPhase6CUnsupported:
-    """Phase 6C step 类型——占位测试。"""
+class TestCompileWindow:
+    """Phase 6C 窗口函数编译测试——含帧边界渲染。"""
 
-    @pytest.mark.skip(reason="Phase 6C")
-    def test_window_skip(self):
-        pass
+    # ── 排名窗口函数 ──
+
+    def test_row_number_basic(self):
+        """ROW_NUMBER 基本编译。"""
+        from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
+
+        step = SparkWindowStep(
+            input_alias="input_df",
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.ROW_NUMBER,
+                    alias="row_num",
+                    order_by=["amount"],
+                ),
+            ],
+        )
+        plan = _make_plan(step)
+        result = SparkCompiler().compile(plan)
+
+        assert "row_num" in result.raw_pyspark
+        assert "F.row_number()" in result.raw_pyspark
+        assert "Window.orderBy" in result.raw_pyspark
+        # ROW_NUMBER 不使用帧边界
+        assert "rowsBetween" not in result.raw_pyspark
+
+    def test_rank_with_partition(self):
+        """RANK + partitionBy 编译。"""
+        from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
+
+        step = SparkWindowStep(
+            input_alias="input_df",
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.RANK,
+                    alias="rank_val",
+                    partition_by=["region"],
+                    order_by=["amount"],
+                ),
+            ],
+        )
+        plan = _make_plan(step)
+        result = SparkCompiler().compile(plan)
+
+        assert "F.rank()" in result.raw_pyspark
+        assert "Window.partitionBy" in result.raw_pyspark
+        assert "rank_val" in result.raw_pyspark
+
+    def test_dense_rank(self):
+        """DENSE_RANK 编译。"""
+        from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
+
+        step = SparkWindowStep(
+            input_alias="df",
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.DENSE_RANK,
+                    alias="dense_r",
+                    order_by=["score"],
+                ),
+            ],
+        )
+        plan = _make_plan(step)
+        result = SparkCompiler().compile(plan)
+
+        assert "F.dense_rank()" in result.raw_pyspark
+        assert "dense_r" in result.raw_pyspark
+
+    def test_ntile(self):
+        """NTILE 编译。"""
+        from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
+
+        step = SparkWindowStep(
+            input_alias="df",
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.NTILE,
+                    alias="bucket",
+                    order_by=["amount"],
+                ),
+            ],
+        )
+        plan = _make_plan(step)
+        result = SparkCompiler().compile(plan)
+
+        assert "F.ntile(1)" in result.raw_pyspark
+        assert "bucket" in result.raw_pyspark
+
+    # ── 偏移窗口函数 ──
+
+    def test_lag_with_column(self):
+        """LAG 带列名编译。"""
+        from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
+
+        step = SparkWindowStep(
+            input_alias="df",
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.LAG,
+                    alias="prev_amount",
+                    input_column="amount",
+                    order_by=["order_date"],
+                ),
+            ],
+        )
+        plan = _make_plan(step)
+        result = SparkCompiler().compile(plan)
+
+        assert "F.lag" in result.raw_pyspark
+        assert "prev_amount" in result.raw_pyspark
+
+    def test_lead_with_column(self):
+        """LEAD 带列名编译。"""
+        from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
+
+        step = SparkWindowStep(
+            input_alias="df",
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.LEAD,
+                    alias="next_amount",
+                    input_column="amount",
+                    order_by=["order_date"],
+                ),
+            ],
+        )
+        plan = _make_plan(step)
+        result = SparkCompiler().compile(plan)
+
+        assert "F.lead" in result.raw_pyspark
+        assert "next_amount" in result.raw_pyspark
+
+    # ── 聚合窗口函数 + 帧边界 ──
+
+    def test_sum_over(self):
+        """SUM_OVER + 默认帧边界。"""
+        from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
+
+        step = SparkWindowStep(
+            input_alias="df",
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.SUM_OVER,
+                    alias="running_total",
+                    input_column="amount",
+                    partition_by=["region"],
+                    order_by=["order_date"],
+                ),
+            ],
+        )
+        plan = _make_plan(step)
+        result = SparkCompiler().compile(plan)
+
+        assert "F.sum" in result.raw_pyspark
+        assert "running_total" in result.raw_pyspark
+        # 聚合窗口函数应有帧边界
+        assert "rowsBetween" in result.raw_pyspark
+        assert "Window.unboundedPreceding" in result.raw_pyspark
+        assert "Window.currentRow" in result.raw_pyspark
+
+    def test_count_over(self):
+        """COUNT_OVER 编译。"""
+        from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
+
+        step = SparkWindowStep(
+            input_alias="df",
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.COUNT_OVER,
+                    alias="cnt",
+                    input_column="order_id",
+                    partition_by=["region"],
+                ),
+            ],
+        )
+        plan = _make_plan(step)
+        result = SparkCompiler().compile(plan)
+
+        assert "F.count" in result.raw_pyspark
+        assert "rowsBetween" in result.raw_pyspark
+
+    def test_avg_over(self):
+        """AVG_OVER 编译。"""
+        from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
+
+        step = SparkWindowStep(
+            input_alias="df",
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.AVG_OVER,
+                    alias="avg_val",
+                    input_column="score",
+                    order_by=["order_date"],
+                ),
+            ],
+        )
+        plan = _make_plan(step)
+        result = SparkCompiler().compile(plan)
+
+        assert "F.avg" in result.raw_pyspark
+
+    # ── 自定义帧边界 ──
+
+    def test_custom_frame_range(self):
+        """自定义 RANGE 帧边界。"""
+        from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
+
+        step = SparkWindowStep(
+            input_alias="df",
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.SUM_OVER,
+                    alias="range_sum",
+                    input_column="amount",
+                    order_by=["order_date"],
+                    frame_type="range",
+                    frame_start="unbounded_preceding",
+                    frame_end="current_row",
+                ),
+            ],
+        )
+        plan = _make_plan(step)
+        result = SparkCompiler().compile(plan)
+
+        assert "rangeBetween" in result.raw_pyspark
+        assert "Window.unboundedPreceding" in result.raw_pyspark
+
+    def test_custom_frame_rows_between(self):
+        """自定义 ROWS 帧边界——3 PRECEDING AND 3 FOLLOWING。"""
+        from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
+
+        step = SparkWindowStep(
+            input_alias="df",
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.AVG_OVER,
+                    alias="moving_avg",
+                    input_column="amount",
+                    order_by=["order_date"],
+                    frame_type="rows",
+                    frame_start="3",
+                    frame_end="3",
+                ),
+            ],
+        )
+        plan = _make_plan(step)
+        result = SparkCompiler().compile(plan)
+
+        # 自定义整数帧边界
+        assert "rowsBetween(3, 3)" in result.raw_pyspark
+
+    # ── 多表达式窗口 ──
+
+    def test_multiple_expressions(self):
+        """单步骤包含多个窗口表达式——链式 withColumn。"""
+        from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
+
+        step = SparkWindowStep(
+            input_alias="df",
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.ROW_NUMBER,
+                    alias="row_num",
+                    partition_by=["region"],
+                    order_by=["amount"],
+                ),
+                SparkWindowExpr(
+                    function=SparkWindowFunction.SUM_OVER,
+                    alias="total",
+                    input_column="amount",
+                    partition_by=["region"],
+                ),
+            ],
+        )
+        plan = _make_plan(step)
+        result = SparkCompiler().compile(plan)
+
+        # 两个 withColumn 链式调用
+        assert result.raw_pyspark.count(".withColumn") == 2
+        assert "F.row_number()" in result.raw_pyspark
+        assert "F.sum" in result.raw_pyspark
+
+    # ── 空表达式 ──
+
+    def test_empty_expressions(self):
+        """空表达式列表——生成占位注释。"""
+        from tianshu_datadev.spark.models import SparkWindowStep
+
+        step = SparkWindowStep(
+            input_alias="df",
+            expressions=[],
+        )
+        plan = _make_plan(step)
+        result = SparkCompiler().compile(plan)
+
+        # 空表达式应生成直通赋值 _w0 = df，不含裸注释行
+        assert "_w0 = df" in result.raw_pyspark
+        assert "# WINDOW" not in result.raw_pyspark
+        assert "# Step:" in result.annotated_pyspark
+
+    # ── 注释格式 ──
+
+    def test_window_comment_format(self):
+        """窗口函数编译产物含 5 行注释。"""
+        from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
+
+        step = SparkWindowStep(
+            input_alias="df",
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.ROW_NUMBER,
+                    alias="rn",
+                    partition_by=["dept"],
+                    order_by=["salary"],
+                ),
+            ],
+        )
+        plan = _make_plan(step)
+        result = SparkCompiler().compile(plan)
+
+        annotated = result.annotated_pyspark
+        assert "# Step:" in annotated
+        assert "# Intent: 窗口函数" in annotated
+        assert "# Operation:" in annotated
+        assert "# Inputs:" in annotated
+        assert "# Output:" in annotated
 
 
 # ════════════════════════════════════════════
