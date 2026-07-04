@@ -8,7 +8,7 @@ TianShu DataDev Agent v3 是 AI 辅助数据开发工具。它接收程序员编
 
 系统不自动上线、不写生产库、不生成生产数据。人是最终代码审查者和上线决策者。
 
-当前阶段：`Phase 3C 收尾 → Phase 4A 基础设施就绪`。核心流水线（Parser/Planner/Validator/Compiler/Executor/Packager）已完成，多语句 SqlProgram + _temp 生命周期 + 窗口函数 + 受控写入审查 + CompilerBackend 接口 + DataTransformContract v1 均已实现；LLM Gateway + PromptManager + Adapter 基础设施已就绪。Phase 3 Exit HarnessReport 已生成（GO），Phase 3→4 门禁解除。详见 `docs/roadmap/` 各 Phase 核销结果。
+当前阶段：`Phase 8+ Spark-first v2.0 完成，C1-C4 桥接级全部点亮`。项目状态详见 `docs/10-current-state-and-verification-status.md`（Phase 进度矩阵、C1-C4 状态、测试基线、残留风险、下一步方向）。
 
 ## 2. SQL Generation Boundary
 

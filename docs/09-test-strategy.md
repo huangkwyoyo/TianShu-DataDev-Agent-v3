@@ -146,11 +146,12 @@ Phase 0 实际已有 22 个 pytest 用例，超过原定 `≤10` 预算。进入
 
 ### Phase 5-8
 
-测试重点随 Phase 4 退出后重写的实施 Prompt 同步更新。当前占位：
-- Phase 5：PlanEquivalence 规则、DataTransformContract v1 覆盖完整。
-- Phase 6：受控 PySpark DSL 白名单、Static Validator 拒绝 Action/Sink/UDF。
-- Phase 7：PlanEquivalenceComparator、Snapshot Builder 一致性、ResultComparator 10 维度、故意注入差异全部被发现。
-- Phase 8：LangGraph interrupt/resume 可复现、Spark HarnessVerdict 正确。
+Phase 5-8 已全部实施并回归通过（2026-07-04）。当前测试基线：552 passed / 11 skipped。详细状态见 `docs/10-current-state-and-verification-status.md`。
+
+- Phase 5：PlanEquivalence 规则、DataTransformContract v1——已完成。
+- Phase 6：受控 PySpark DSL（9 种 step 编译）、Static Validator（E601-E608 全错误码）——已完成。
+- Phase 7：PlanComparator（9 种 step 逻辑对比）、PhysicalVerifier（DuckDB ↔ PySpark）、Snapshot Builder——已完成。
+- Phase 8：Orchestrator（6 阶段编排）、SparkReviewPackage、Harness 5 维度评测——已完成。
 
 ## 8. 质量门
 
