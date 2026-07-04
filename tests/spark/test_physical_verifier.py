@@ -3,10 +3,17 @@
 覆盖：
 - ResultCanonicalizer 规范化策略（排序/NULL/NaN/Decimal/去重）
 - DuckDB 真实执行（SQL 查询本地 Parquet 快照）
-- Spark 执行 mock（PySpark 环境不可用时）
+- Spark 执行 mock（PySpark 环境不可用时，mock 覆盖 34 个用例）
 - PhysicalVerificationStatus 精确状态（禁止泛化 PASS）
 - 不支持类型标记 UNSUPPORTED_SEMANTICS
 - 双引擎结果对比（一致/不一致/错误）
+
+重要说明：
+- TestDuckDBMockedSpark 的 34 个用例在 DuckDB 真实执行 + Spark mock 下全部通过
+- TestRealSparkExecution 的 11 个真实 Spark 物理一致性用例需 `--run-slow` 且
+  本机安装 PySpark（含兼容 Java 版本）才执行；不具备时自动 skipped
+- 因此当前本机验收结论应为"SQL 安全 + DuckDB 真实 + PySpark mock 闭环已证明"，
+  而非"本机真实 Spark 双引擎闭环已完整证明"
 """
 
 from __future__ import annotations
@@ -262,14 +269,38 @@ class TestDuckDBSecurity:
         assert result == sql
 
     def test_validate_with_select(self):
-        """WITH ... SELECT 通过校验。"""
+        """WITH ... SELECT 必须被拒绝——CTE 不在项目架构允许范围内。"""
         sql = (
             'WITH regional AS (SELECT "region", AVG("amount") AS avg_amt '
             'FROM "order_info" GROUP BY "region") '
             'SELECT * FROM regional ORDER BY "region"'
         )
-        result = _validate_select_sql(sql)
-        assert result == sql
+        with pytest.raises(ValueError, match="SELECT 开头"):
+            _validate_select_sql(sql)
+
+    def test_rejects_cte_with_select(self):
+        """CTE（WITH ... AS (...) SELECT）必须被拒绝——项目用 _temp_ 表而非 CTE。
+
+        验证 WITH 前缀被结构白名单拒绝，错误消息含 "SELECT 开头"。
+        """
+        sql = "WITH cte AS (SELECT 1 AS n) SELECT * FROM cte"
+        with pytest.raises(ValueError, match="SELECT 开头"):
+            _validate_select_sql(sql)
+
+    def test_rejects_multi_cte(self):
+        """多个 CTE（WITH a AS (...), b AS (...) SELECT）必须被拒绝。"""
+        sql = (
+            'WITH a AS (SELECT 1 AS n), b AS (SELECT n+1 AS m FROM a) '
+            'SELECT * FROM b'
+        )
+        with pytest.raises(ValueError, match="SELECT 开头"):
+            _validate_select_sql(sql)
+
+    def test_rejects_cte_with_insert(self):
+        """WITH ... INSERT 必须被拒绝——结构白名单 + 关键词黑名单双重拦截。"""
+        sql = "WITH cte AS (SELECT 1) INSERT INTO t SELECT * FROM cte"
+        with pytest.raises(ValueError):
+            _validate_select_sql(sql)
 
     def test_rejects_multi_statement(self):
         """拒绝多语句——分号分隔。"""
@@ -349,6 +380,16 @@ class TestDuckDBSecurity:
         # 不去除引号内容中的 --，结果无分号多语句，应通过
         result = _validate_select_sql(sql)
         assert result == sql
+
+    def test_rejects_multistatement_hidden_in_string(self):
+        """字符串内 -- 导致注释误剥离→多语句检测绕过——回归测试。
+
+        复现：SELECT '--'; SELECT 2 中 '--' 被正则当作行注释删掉，
+        连带吃掉分号，导致多语句检测失效。修复后必须先剥离字符串再剥离注释。
+        """
+        sql = "SELECT '--'; SELECT 2"
+        with pytest.raises(ValueError, match="多语句"):
+            _validate_select_sql(sql)
 
     # ── 注释去除单元测试 ──
 
@@ -528,7 +569,7 @@ class TestPhysicalVerifierWithMock:
         assert len(report.diffs) > 0
 
     def test_unsupported_step_types(self, temp_parquet_dir):
-        """Window step → UNSUPPORTED_SEMANTICS。"""
+        """Subquery step → UNSUPPORTED_SEMANTICS（window 已在 Phase 7C 开放）。"""
         verifier = PhysicalVerifier()
 
         report = verifier.verify(
@@ -537,11 +578,49 @@ class TestPhysicalVerifierWithMock:
             snapshot_dir=temp_parquet_dir,
             contract_hash="test_hash_abc",
             snapshot_id="snap_test_001",
-            uncovered_step_types=["window"],
+            uncovered_step_types=["subquery"],
         )
 
         assert report.status == PhysicalVerificationStatus.UNSUPPORTED_SEMANTICS
-        assert "window" in report.uncovered_step_types
+        assert "subquery" in report.uncovered_step_types
+
+    def test_window_removed_from_unsupported(self):
+        """window 不再在 _UNSUPPORTED_STEP_TYPES 中——Phase 7C 开放窗口验证。"""
+        assert "window" not in PhysicalVerifier._UNSUPPORTED_STEP_TYPES, (
+            "Phase 7C 应移除 window 的 UNSUPPORTED 标记，"
+            "当前 _UNSUPPORTED_STEP_TYPES 仍包含 window"
+        )
+
+    def test_window_step_proceeds_to_execution(self, temp_parquet_dir):
+        """含 window 的 plan 不再被 UNSUPPORTED_SEMANTICS 拦截——进入正常执行流程。"""
+        # 准备与 DuckDB 一致的窗口查询结果
+        expected_rows = [
+            {"order_id": "1", "amount": 100, "region": "east", "rn": "1"},
+            {"order_id": "2", "amount": 200, "region": "west", "rn": "1"},
+            {"order_id": "3", "amount": 150, "region": "east", "rn": "2"},
+        ]
+        mock_spark = _MockSparkExecutor(rows=expected_rows)
+        verifier = PhysicalVerifier(spark_executor=mock_spark)
+
+        sql = (
+            'SELECT *, ROW_NUMBER() OVER (PARTITION BY "region" ORDER BY "order_id") AS rn '
+            'FROM "order_info" ORDER BY "order_id"'
+        )
+        pyspark = 'result_df = input_df.withColumn("rn", F.row_number().over(windowSpec))'
+
+        report = verifier.verify(
+            sql_query=sql,
+            pyspark_code=pyspark,
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_hash_window",
+            snapshot_id="snap_test_window",
+            order_keys=["order_id"],
+        )
+
+        # window 不再被 UNSUPPORTED_SEMANTICS 拦截——应进入正常对比流程
+        assert report.status != PhysicalVerificationStatus.UNSUPPORTED_SEMANTICS, (
+            f"window 不应被 UNSUPPORTED_SEMANTICS 拦截，实际状态：{report.status.value}"
+        )
 
     def test_canonicalization_needed_no_order_keys(self, temp_parquet_dir):
         """无排序键多行结果 → CANONICALIZATION_NEEDED。"""
@@ -585,6 +664,122 @@ class TestPhysicalVerifierWithMock:
 
         assert report.status == PhysicalVerificationStatus.EXECUTION_ERROR
         assert "Mock Spark error" in report.error_message
+
+
+class TestWindowPhysicalVerification:
+    """Phase 7C 窗口函数物理验证——DuckDB 真实 + Spark mock。"""
+
+    def test_window_row_number_consistent(self, temp_parquet_dir):
+        """ROW_NUMBER 窗口——DuckDB 与 mock Spark 结果一致。"""
+        # DuckDB 执行 ROW_NUMBER() OVER (ORDER BY order_id) 的结果
+        expected_rows = [
+            {"order_id": "1", "amount": 100, "region": "east", "rn": 1},
+            {"order_id": "2", "amount": 200, "region": "west", "rn": 2},
+            {"order_id": "3", "amount": 150, "region": "east", "rn": 3},
+        ]
+        mock_spark = _MockSparkExecutor(rows=expected_rows)
+        verifier = PhysicalVerifier(spark_executor=mock_spark)
+
+        sql = (
+            'SELECT *, ROW_NUMBER() OVER (ORDER BY "order_id") AS rn '
+            'FROM "order_info" ORDER BY "order_id"'
+        )
+        pyspark = (
+            'from pyspark.sql.window import Window\n'
+            'result_df = input_df.withColumn('
+            '"rn", F.row_number().over(Window.orderBy("order_id"))'
+            ').orderBy("order_id")'
+        )
+
+        report = verifier.verify(
+            sql_query=sql,
+            pyspark_code=pyspark,
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_hash_window_rn",
+            snapshot_id="snap_test_window_rn",
+            order_keys=["order_id"],
+        )
+
+        assert report.status == PhysicalVerificationStatus.RESULT_CONSISTENT, (
+            f"预期 RESULT_CONSISTENT，实际 {report.status.value}。"
+            f" diffs: {report.diffs[:3] if report.diffs else '无'}"
+        )
+
+    def test_window_sum_over_consistent(self, temp_parquet_dir):
+        """SUM_OVER 聚合窗口——DuckDB 与 mock Spark 结果一致。"""
+        # SUM(amount) OVER (PARTITION BY region ORDER BY order_id)
+        # east: row1=100, row3=100+150=250; west: row2=200
+        expected_rows = [
+            {"order_id": "1", "amount": 100, "region": "east", "running_total": 100},
+            {"order_id": "2", "amount": 200, "region": "west", "running_total": 200},
+            {"order_id": "3", "amount": 150, "region": "east", "running_total": 250},
+        ]
+        mock_spark = _MockSparkExecutor(rows=expected_rows)
+        verifier = PhysicalVerifier(spark_executor=mock_spark)
+
+        sql = (
+            'SELECT *, SUM("amount") OVER (PARTITION BY "region" ORDER BY "order_id") '
+            'AS running_total FROM "order_info" ORDER BY "order_id"'
+        )
+        pyspark = (
+            'from pyspark.sql.window import Window\n'
+            'window_spec = Window.partitionBy("region").orderBy("order_id")\n'
+            'result_df = input_df.withColumn('
+            '"running_total", F.sum("amount").over(window_spec)'
+            ').orderBy("order_id")'
+        )
+
+        report = verifier.verify(
+            sql_query=sql,
+            pyspark_code=pyspark,
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_hash_window_sum",
+            snapshot_id="snap_test_window_sum",
+            order_keys=["order_id"],
+        )
+
+        assert report.status == PhysicalVerificationStatus.RESULT_CONSISTENT, (
+            f"预期 RESULT_CONSISTENT，实际 {report.status.value}。"
+            f" diffs: {report.diffs[:3] if report.diffs else '无'}"
+        )
+
+    def test_window_partitioned_row_number_consistent(self, temp_parquet_dir):
+        """分区 ROW_NUMBER——DuckDB 与 mock Spark 结果一致。"""
+        # ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount)
+        # east: (1,100) → rn=1, (3,150) → rn=2; west: (2,200) → rn=1
+        expected_rows = [
+            {"order_id": "1", "amount": 100, "region": "east", "rn": 1},
+            {"order_id": "3", "amount": 150, "region": "east", "rn": 2},
+            {"order_id": "2", "amount": 200, "region": "west", "rn": 1},
+        ]
+        mock_spark = _MockSparkExecutor(rows=expected_rows)
+        verifier = PhysicalVerifier(spark_executor=mock_spark)
+
+        sql = (
+            'SELECT *, ROW_NUMBER() OVER (PARTITION BY "region" ORDER BY "amount") AS rn '
+            'FROM "order_info" ORDER BY "region", "amount"'
+        )
+        pyspark = (
+            'from pyspark.sql.window import Window\n'
+            'window_spec = Window.partitionBy("region").orderBy("amount")\n'
+            'result_df = input_df.withColumn('
+            '"rn", F.row_number().over(window_spec)'
+            ').orderBy("region", "amount")'
+        )
+
+        report = verifier.verify(
+            sql_query=sql,
+            pyspark_code=pyspark,
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_hash_window_part",
+            snapshot_id="snap_test_window_part",
+            order_keys=["region", "amount"],
+        )
+
+        assert report.status == PhysicalVerificationStatus.RESULT_CONSISTENT, (
+            f"预期 RESULT_CONSISTENT，实际 {report.status.value}。"
+            f" diffs: {report.diffs[:3] if report.diffs else '无'}"
+        )
 
 
 # ════════════════════════════════════════════
@@ -649,7 +844,7 @@ class TestPhysicalVerificationReport:
 # ════════════════════════════════════════════
 
 
-# 8 种 Phase 6A+6B step 类型的参数化用例
+# 9 种 Phase 6A+6B+6C step 类型的参数化用例
 # 每项：(用例名, SQL, PySpark DSL, 排序键)
 _REAL_SPARK_CASES: list[tuple[str, str, str, list[str]]] = [
     # ── 6A step 类型 ──
@@ -717,18 +912,57 @@ _REAL_SPARK_CASES: list[tuple[str, str, str, list[str]]] = [
         ').orderBy("order_id")',
         ["order_id"],
     ),
+    # ── 6C step 类型：窗口函数 ──
+    (
+        "window_row_number",
+        'SELECT *, ROW_NUMBER() OVER (ORDER BY "order_id") AS rn '
+        'FROM "order_info" ORDER BY "order_id"',
+        'from pyspark.sql.window import Window\n'
+        'result_df = input_df.withColumn('
+        '"rn", F.row_number().over(Window.orderBy("order_id"))'
+        ').orderBy("order_id")',
+        ["order_id"],
+    ),
+    (
+        "window_sum_over",
+        'SELECT *, SUM("amount") OVER (PARTITION BY "region" ORDER BY "order_id") '
+        'AS running_total FROM "order_info" ORDER BY "order_id"',
+        'from pyspark.sql.window import Window\n'
+        'window_spec = Window.partitionBy("region").orderBy("order_id")\n'
+        'result_df = input_df.withColumn('
+        '"running_total", F.sum("amount").over(window_spec)'
+        ').orderBy("order_id")',
+        ["order_id"],
+    ),
+    (
+        "window_rank",
+        'SELECT *, RANK() OVER (ORDER BY "amount") AS rk '
+        'FROM "order_info" ORDER BY "order_id"',
+        'from pyspark.sql.window import Window\n'
+        'result_df = input_df.withColumn('
+        '"rk", F.rank().over(Window.orderBy("amount"))'
+        ').orderBy("order_id")',
+        ["order_id"],
+    ),
 ]
 
 
 class TestRealSparkExecution:
-    """真实 PySpark 子进程验证——双引擎结果一致性。
+    """真实 PySpark 子进程验证——双引擎结果一致性（需 PySpark 环境）。
 
     每个用例：
     1. 在 DuckDB 中执行 SQL（基准引擎）
     2. 在真实 PySpark 子进程中执行 DSL（验证引擎）
     3. 断言 RESULT_CONSISTENT
 
-    默认跳过（需 --run-slow），每次约 30s（SparkSession 启动开销）。
+    前置条件：
+    - 标记 @pytest.mark.slow，需显式 `--run-slow`
+    - 本机需安装 PySpark 及兼容 Java 版本
+    - 不满足时 spark_available fixture 自动 skip 全部 11 个用例
+    - 每次约 30s（SparkSession 启动开销）
+
+    当前 11 个用例覆盖 6A（scan/filter/project/sort/limit）+ 6B（aggregate/join/case_when）
+    + 6C（window_row_number/window_sum_over/window_rank）。
     """
 
     @pytest.fixture(scope="class")

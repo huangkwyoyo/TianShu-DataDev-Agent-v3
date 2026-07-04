@@ -7,7 +7,7 @@
 - RESULT_CONSISTENT：双引擎结果一致
 - RESULT_MISMATCH：双引擎结果不一致
 - CANONICALIZATION_NEEDED：缺少排序键 → 无法确定等价
-- UNSUPPORTED_SEMANTICS：step 类型不支持物理对比（如 window 在 Phase 6C）
+- UNSUPPORTED_SEMANTICS：step 类型不支持物理对比（如 subquery 尚无对比规则）
 - HUMAN_REVIEW：自动判定无法得出结论，需人工介入
 - NOT_EXECUTED：尚未执行物理验证
 - EXECUTION_ERROR：任一引擎执行失败
@@ -43,9 +43,9 @@ _FORBIDDEN_SQL_KEYWORDS_RE = re.compile(
     re.IGNORECASE,
 )
 
-# 白名单结构——必须以 WITH（可选）+ SELECT 开头
+# 白名单结构——必须以 SELECT 开头（禁止 CTE / WITH）
 _SELECT_STRUCTURE_RE = re.compile(
-    r"^\s*(?:WITH\b.+?\bAS\s*\(.+?\)\s*)?SELECT\b",
+    r"^\s*SELECT\b",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -119,12 +119,19 @@ def _has_multiple_statements(sql: str) -> bool:
 
 
 def _validate_select_sql(sql_query: str) -> str:
-    """校验 SQL 查询——仅允许单条只读 SELECT / WITH ... SELECT。
+    """校验 SQL 查询——仅允许单条只读 SELECT。
 
-    安全策略（三层纵深防御）：
-    1. 结构白名单：去除注释后，必须以 WITH（可选）+ SELECT 开头
-    2. 多语句检测：拒绝分号分隔的多语句
-    3. 关键词黑名单：在剥离字符串字面量后检测 DDL/DML/高风险操作
+    职责边界：
+        本函数仅校验 PhysicalVerifier 的最终查询 SQL——即 DuckDB 读取快照视图
+        并产出双引擎对比结果的 SELECT 语句。CREATE TEMP TABLE / _temp_ 中间表
+        机制属于 SqlProgram 编译/执行链路，不走本函数。
+
+    安全策略（三层纵深防御，按顺序执行）：
+    1. 剥离字符串字面量——先于注释剥离，防止字符串内 -- 和 /* */ 干扰后续检测
+    2. 去除注释——在剥离字符串后的文本上操作，确保安全
+    3. 多语句检测：拒绝分号分隔的多语句
+    4. 结构白名单：必须以 SELECT 开头（禁止 CTE / WITH）
+    5. 关键词黑名单：检测 DDL/DML/高风险操作
 
     Args:
         sql_query: 待校验的原始 SQL 字符串
@@ -135,26 +142,29 @@ def _validate_select_sql(sql_query: str) -> str:
     Raises:
         ValueError: SQL 不符合安全策略，含具体拒绝原因和 SQL 前 200 字符
     """
-    # Step 1: 去除注释
-    cleaned = _strip_sql_comments(sql_query)
+    # Step 1: 剥离字符串字面量——必须在注释剥离之前执行
+    # 防止字符串内的 -- 和 /* */ 被正则误当作注释剥离（如 SELECT '--'; SELECT 2）
+    no_strings = _strip_string_literals(sql_query)
 
-    # Step 2: 检测多语句（注释去除后检测——注释内分号不触发）
+    # Step 2: 去除注释（在剥离字符串后的文本上操作，此时 -- 只可能出现在真实注释中）
+    cleaned = _strip_sql_comments(no_strings)
+
+    # Step 3: 检测多语句（注释去除后检测——注释内分号不触发）
     if _has_multiple_statements(cleaned):
         raise ValueError(
             f"SQL 安全校验失败：禁止多语句（分号分隔）。"
             f"SQL 前 200 字符：{sql_query[:200]}"
         )
 
-    # Step 3: 结构白名单——必须以 WITH 或 SELECT 开头
+    # Step 4: 结构白名单——必须以 SELECT 开头（禁止 CTE / WITH）
     if not _SELECT_STRUCTURE_RE.match(cleaned):
         raise ValueError(
-            f"SQL 安全校验失败：仅允许 WITH ... SELECT 或 SELECT 开头的只读查询。"
+            f"SQL 安全校验失败：仅允许 SELECT 开头的只读查询（禁止 CTE / WITH）。"
             f"SQL 前 200 字符：{sql_query[:200]}"
         )
 
-    # Step 4: 关键词黑名单（在剥离字符串字面量后检测，避免误判）
-    stripped = _strip_string_literals(cleaned)
-    match = _FORBIDDEN_SQL_KEYWORDS_RE.search(stripped)
+    # Step 5: 关键词黑名单（字符串已剥离、注释已去除，直接检测即可）
+    match = _FORBIDDEN_SQL_KEYWORDS_RE.search(cleaned)
     if match:
         raise ValueError(
             f"SQL 安全校验失败：包含禁止的关键词 '{match.group()}'. "
@@ -392,9 +402,8 @@ class PhysicalVerifier:
         )
     """
 
-    # Phase 7B 物理验证不支持的 step 类型
+    # Phase 7C 物理验证不支持的 step 类型——window 已在 Phase 6C/7C 开放
     _UNSUPPORTED_STEP_TYPES: set[str] = {
-        "window",       # Phase 6C
         "subquery",     # 尚无等价对比规则
     }
 
@@ -632,7 +641,7 @@ class PhysicalVerifier:
         """通过 DuckDB 执行 SQL 查询——主进程内执行（轻量，无安全风险）。
 
         DuckDB 是内嵌式数据库——不需要子进程隔离。
-        安全校验：_validate_select_sql 白名单——仅允许单条只读 SELECT / WITH ... SELECT。
+        安全校验：_validate_select_sql 白名单——仅允许单条只读 SELECT。
 
         Args:
             sql_query: DuckDB SQL 查询
@@ -641,7 +650,7 @@ class PhysicalVerifier:
         Returns:
             SparkExecutionResult——含输出行数据
         """
-        # 白名单 SQL 安全校验——仅允许单条只读 SELECT/WITH ... SELECT
+        # 白名单 SQL 安全校验——仅允许单条只读 SELECT
         try:
             _validate_select_sql(sql_query)
         except ValueError as e:
