@@ -256,19 +256,40 @@ class WindowExpr(StrictModel):
     alias: SafeIdentifier  # 输出列别名——SafeIdentifier 防止 AS 子句注入
 
 
-class AliasExpr(StrictModel):
-    """别名表达式——列引用或窗口表达式 + 输出别名。
+class SqlRawExpression(StrictModel):
+    """安全的原始 SQL 表达式片段——经校验后直接渲染到 SELECT 子句。
 
-    Phase 1B 仅支持 ColumnRef 表达式，
-    Phase 3B 扩展支持 WindowExpr。
+    仅用于 compute_ratios 等派生列场景。使用约束：
+    1. 所有列引用必须来自上游合法列（Compiler 渲染时校验）
+    2. 不得包含 SQL 注入关键字（Compiler 黑名单校验）
+    3. 仅允许在 AliasExpr.expression 中使用——不可作为独立 step
     """
 
-    expression: ColumnRef | WindowExpr
+    sql_fragment: str  # 如 "total_crashes * 1000000.0 / NULLIF(total_trip_count, 0)"
+
+
+class AliasExpr(StrictModel):
+    """别名表达式——列引用、窗口表达式或安全原始 SQL 片段 + 输出别名。
+
+    Phase 1B 仅支持 ColumnRef 表达式，
+    Phase 3B 扩展支持 WindowExpr，
+    Phase 7A 扩展支持 SqlRawExpression（派生表达式——安全原始 SQL 片段）。
+    """
+
+    expression: ColumnRef | WindowExpr | SqlRawExpression
     alias: SafeIdentifier  # 输出列别名——SafeIdentifier 防止 AS 子句注入
 
 
 class WhenBranch(StrictModel):
-    """CASE WHEN 分支——条件谓词 + 结果字面量。"""
+    """CASE WHEN 分支——条件谓词（结构化模式）或原始 SQL 条件（字符串模式）+ 结果字面量。
 
-    condition: Predicate
+    两种模式：
+    1. 结构化模式：condition 为 Predicate——用于单列简单比较（如 status = 'VIP'）
+    2. 字符串模式：raw_condition 为 SqlRawExpression——用于复杂布尔表达式
+       （如 crash_per_million_trips >= 800 OR violation_per_thousand_trips >= 15）
+    raw_condition 非空时优先——Compiler 直接渲染为 WHEN 子句。
+    """
+
+    condition: Predicate | None = None  # 结构化条件谓词（简单比较模式）
+    raw_condition: SqlRawExpression | None = None  # 原始 SQL 条件片段（字符串模式，复杂布尔表达式）
     result: SqlLiteral

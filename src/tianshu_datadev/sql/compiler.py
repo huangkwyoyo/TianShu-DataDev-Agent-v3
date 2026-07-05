@@ -22,6 +22,7 @@ from tianshu_datadev.planning.models import (
     Predicate,
     PredicateOperator,
     SqlLiteral,
+    SqlRawExpression,
     WindowExpr,
 )
 from tianshu_datadev.planning.sql_build_plan import (
@@ -61,6 +62,30 @@ from .models import (
 )
 
 COMPILER_VERSION = "1.1.0"
+
+# SQL 注入防护黑名单——SqlRawExpression 不得包含的关键字/模式
+_FORBIDDEN_SQL_KEYWORDS: set[str] = {
+    "INSERT", "DROP", "DELETE", "UPDATE", "CREATE", "ALTER",
+    "EXEC", "EXECUTE", "TRUNCATE", "GRANT", "REVOKE",
+    ";", "--", "/*", "*/", "xp_", "sp_",
+}
+
+
+def _validate_raw_expression(fragment: str) -> None:
+    """校验 SqlRawExpression 不含 SQL 注入关键字。
+
+    Args:
+        fragment: 原始 SQL 表达式片段
+
+    Raises:
+        ValueError: 含禁止关键字时抛出——阻断编译
+    """
+    upper = fragment.upper()
+    for keyword in _FORBIDDEN_SQL_KEYWORDS:
+        if keyword in upper:
+            raise ValueError(
+                f"SqlRawExpression 含禁止关键字 '{keyword}': {fragment[:80]}"
+            )
 
 
 @dataclass(frozen=True)
@@ -811,6 +836,13 @@ class DuckDbSqlCompiler:
                 col_expr = self._render_window_expr(expr)
                 if col_expr:
                     cols.append(col_expr)
+            elif isinstance(expr, SqlRawExpression):
+                # Phase 7A：安全原始 SQL 表达式——经校验后直接渲染
+                _validate_raw_expression(expr.sql_fragment)
+                if ae.alias:
+                    cols.append(f"{expr.sql_fragment} AS {ae.alias}")
+                else:
+                    cols.append(expr.sql_fragment)
             elif hasattr(expr, "column_name"):
                 col_expr = expr.column_name
                 # 有 table_ref 时添加表前缀——消除 Join 后列歧义
@@ -877,6 +909,13 @@ class DuckDbSqlCompiler:
         expr = ae.expression
         if isinstance(expr, WindowExpr):
             return self._render_window_expr(expr)
+        elif isinstance(expr, SqlRawExpression):
+            # 安全校验后直接渲染原始 SQL 片段
+            _validate_raw_expression(expr.sql_fragment)
+            col_expr = expr.sql_fragment
+            if ae.alias:
+                return f"{col_expr} AS {ae.alias}"
+            return col_expr
         elif hasattr(expr, "column_name"):
             col_expr = expr.column_name
             if ae.alias and ae.alias != col_expr:
@@ -912,7 +951,15 @@ class DuckDbSqlCompiler:
         parts: list[str] = ["CASE"]
 
         for branch in step.cases:
-            cond_sql = self._render_predicate(branch.condition)
+            # 字符串模式：raw_condition 非空 → 直接渲染 SQL 片段（经安全校验）
+            if branch.raw_condition is not None:
+                _validate_raw_expression(branch.raw_condition.sql_fragment)
+                cond_sql = branch.raw_condition.sql_fragment
+            elif branch.condition is not None:
+                # 类型化模式：Predicate → 结构化渲染
+                cond_sql = self._render_predicate(branch.condition)
+            else:
+                continue  # 两种模式都不匹配——防御性跳过
             result_sql = self._render_literal(branch.result)
             parts.append(f"  WHEN {cond_sql} THEN {result_sql}")
 

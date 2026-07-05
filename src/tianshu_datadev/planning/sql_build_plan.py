@@ -33,6 +33,7 @@ from .models import (
     SortDirection,
     SortSpec,
     SqlLiteral,
+    SqlRawExpression,
     WhenBranch,
     WindowExpr,
     WindowFunction,
@@ -758,6 +759,14 @@ class SqlBuildPlanBuilder:
                     # group_keys 处理中完成，此处的 ProjectStep 读取聚合结果表而非上游临时表
                     proj_cols = self._build_compute_step_passthrough(cs)
 
+                # ── 派生表达式列（如 crash_per_million_trips = total_crashes * 1e6 / total_trip_count）──
+                if cs.expressions:
+                    for expr in cs.expressions:
+                        proj_cols.append(AliasExpr(
+                            expression=SqlRawExpression(sql_fragment=expr.expression),
+                            alias=SafeIdentifier(expr.name),
+                        ))
+
                 plan_steps.append(ProjectStep(
                     step_id=SqlBuildPlan.generate_step_id(
                         "project", {"step": cs.step_name, "intermediate": True}
@@ -1113,24 +1122,40 @@ class SqlBuildPlanBuilder:
         }
 
         branches: list[WhenBranch] = []
+        # 用于 step_id 内容的摘要（字符串模式用 when/then，类型化模式用 col/op/val/then）
+        branch_summaries: list[dict] = []
         for b in case_when.branches:
-            col_norm = self._normalizer.normalize(b.condition_column)
-            op = operator_map.get(b.condition_operator, PredicateOperator.EQ)
+            if b.when is not None and b.then is not None:
+                # ── 字符串模式：复杂布尔表达式（如 crash_per_million_trips >= 800 OR ...）──
+                raw_cond = SqlRawExpression(sql_fragment=b.when)
+                branches.append(WhenBranch(
+                    raw_condition=raw_cond,
+                    result=SqlLiteral(value=b.then),
+                ))
+                branch_summaries.append({"when": b.when[:60], "then": b.then})
+            elif b.condition_column is not None:
+                # ── 类型化模式：单列简单比较（如 status = 'VIP'）──
+                col_norm = self._normalizer.normalize(b.condition_column)
+                op = operator_map.get(b.condition_operator, PredicateOperator.EQ)
 
-            condition = Predicate(
-                left=ColumnRef(
-                    table_ref=source_table,  # 合流步骤用左表别名消除列歧义
-                    column_name=b.condition_column,
-                    normalized_name=col_norm,
-                ),
-                operator=op,
-                right=SqlLiteral(value=b.condition_value),
-            )
-            # THEN 结果——引用上游分支步骤产出的指标 alias（SQL 表达式直通渲染）
-            branches.append(WhenBranch(
-                condition=condition,
-                result=SqlLiteral(value=b.result_column, is_sql_expr=True),
-            ))
+                condition = Predicate(
+                    left=ColumnRef(
+                        table_ref=source_table,  # 合流步骤用左表别名消除列歧义
+                        column_name=b.condition_column,
+                        normalized_name=col_norm,
+                    ),
+                    operator=op,
+                    right=SqlLiteral(value=b.condition_value),
+                )
+                branches.append(WhenBranch(
+                    condition=condition,
+                    result=SqlLiteral(value=b.result_column, is_sql_expr=True),
+                ))
+                branch_summaries.append({
+                    "col": b.condition_column, "op": b.condition_operator,
+                    "val": b.condition_value, "then": b.result_column,
+                })
+            # 忽略两种模式都不匹配的分支（防御性处理）
 
         # ELSE 默认值
         else_val = None
@@ -1139,11 +1164,7 @@ class SqlBuildPlanBuilder:
 
         step_id_content = {
             "step": step_name,
-            "branches": [
-                {"col": b.condition_column, "op": b.condition_operator,
-                 "val": b.condition_value, "then": b.result_column}
-                for b in case_when.branches
-            ],
+            "branches": branch_summaries,
             "else": case_when.else_value,
             "chain": chain_id,
         }
