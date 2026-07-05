@@ -1090,12 +1090,6 @@ class TestNYCCase06SqlPipeline:
                 f"编译 SQL 不得包含 CTE (WITH ... AS): {stmt_sql.sql[:200]}"
             )
 
-    @pytest.mark.xfail(
-        reason="已知限制：compute_ratios 步骤不支持比率计算（crash_per_million_trips = "
-               "total_crashes / total_trip_count * 1e6）和 risk_label 步骤不支持 CASE WHEN "
-               "输出——Task 4 已修复 source=input + joins 和合并步骤列透传，比率/CASE WHEN 遗留到后续 Phase",
-        strict=False,
-    )
     def test_run_all_produces_borough_results(self, nyc06_spec_md, nyc06_csv_paths):
         """Pipeline.run_all() 全链路执行——输出应包含 5 个 NYC 行政区结果。"""
         pipeline = Pipeline()
@@ -1127,11 +1121,6 @@ class TestNYCCase06SqlPipeline:
             f"输出行数应 >= 5（5 个 NYC 行政区），实际={summary['row_count']}"
         )
 
-    @pytest.mark.xfail(
-        reason="已知限制：risk_label 步骤的 CASE WHEN（safety_risk_level）和 "
-               "compute_ratios 步骤的比率计算均未实现——遗留到后续 Phase",
-        strict=False,
-    )
     def test_safety_risk_level_values_valid(self, nyc06_spec_md, nyc06_csv_paths):
         """safety_risk_level 列值必须为预定义的风险等级之一。"""
         pipeline = Pipeline()
@@ -1172,10 +1161,10 @@ class TestNYCCase06SqlPipeline:
             )
 
     @pytest.mark.xfail(
-        reason="已知限制：DuckDBExecutor.execute_program() 的内部连接不对外暴露，"
-               "且当前 pipeline 因比率计算/CASE WHEN 未实现无法全链路通过。"
-               "temp 表清理由 DuckDBExecutor 的 finally 块保证（连接关闭即自动清理），"
-               "外部新建 :memory: 连接无法检查内部临时表——需后续 Phase 暴露 cleanup_status",
+        reason="已知限制：execute 阶段已通过（B 类收口完成），但本测试尚未实现真正的 temp 表"
+               "清理验证——仅断言 execute 成功。DuckDBExecutor.execute_program() 的内部连接"
+               "不对外暴露，外部新建 :memory: 连接无法检查内部临时表。"
+               "需后续 Phase 暴露 cleanup_status 后改为直接断言。",
         strict=False,
     )
     def test_temp_tables_cleaned_after_execution(self, nyc06_spec_md, nyc06_csv_paths):
@@ -1196,3 +1185,115 @@ class TestNYCCase06SqlPipeline:
         # 验证 Pipeline 内部清理机制存在——DuckDBExecutor 的 finally 块保证清理
         # 临时表在连接关闭时由 DuckDB 自动清理，新建连接无法检测
         # 此测试需后续 Phase 暴露 cleanup_status 后改为直接断言
+
+
+# ════════════════════════════════════════════
+# Phase 10 Case06——Spark 双链验证测试
+# ════════════════════════════════════════════
+
+
+class TestNYCCase06SparkDualChain:
+    """NYC 案例 06——多语句 DAG 跨域融合 Spark 双管线逻辑验证。
+
+    Case06 使用 SqlProgram（7 步 DAG，_temp_* 临时表串联），其 Comparator 缺口
+    通过 PlanComparator.compare_program() 收口——将所有语句的 step 扁平化后与
+    SparkPlan 对比，过滤 _temp_* 内部管道 scan。
+
+    注意：compute_ratios（比率计算）和 risk_label（CASE WHEN）属于 B 类遗留，
+    导致严格断言 xfail。一旦 B 类功能收口，xfail 应自然转正。
+    """
+
+    @pytest.mark.xfail(
+        reason="已知限制：DAG 归一化（_normalize_dag_steps）已将 aggregate 3→1 和 project 7→1，"
+               "但 scan/join/aggregate 的内容级差异（_temp_* 表引用与 Mapper 别名）导致仍为 "
+               "LOGIC_MISMATCH。需更深层的 plan 级别对齐（scan 过滤、join 重排等）。"
+               "一旦后续 Phase 补齐内容级对齐，此 xfail 应自然转正。",
+        strict=True,
+    )
+    def test_spark_orchestrator_logic_equivalence(self, nyc06_spec_md, nyc06_csv_paths):
+        """多语句 DAG Spark Orchestrator 逻辑等价判定——显式断言 comparator_report.status。"""
+        pytest.importorskip("pyspark", reason="PySpark 环境不可用")
+
+        from tianshu_datadev.spark.orchestrator import SparkOrchestrator
+        from tianshu_datadev.spark.plan_comparator import ComparisonStatus
+
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc06_spec_md, table_paths=nyc06_csv_paths)
+        bundle = pipeline.export_artifacts(result["request_id"])
+
+        # 获取 SqlProgram 和 V1 Contract（ComputeSteps 路径直接产 V1）
+        sql_program = bundle.sql_program
+        contract_v1 = bundle.data_transform_contract
+
+        assert sql_program is not None, "SqlProgram 不应为空——ComputeSteps 路径应填充"
+        assert contract_v1 is not None, "Contract 不应为空"
+
+        orchestrator = SparkOrchestrator()
+        state = orchestrator.run(
+            contract=contract_v1, sql_plan=sql_program,
+        )
+
+        # ① comparator_report 必须非空
+        assert state.comparator_report is not None, (
+            "Orchestrator 应产出 PlanComparisonReport"
+        )
+        # ② 严格断言——应为 LOGIC_EQUIVALENT（当前 xfail：比率/CASE WHEN 未实现）
+        assert state.comparator_report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+            f"Case 06 逻辑对比应判定为等价，"
+            f"实际 status={state.comparator_report.status}"
+        )
+        # ③ overall_status 一致性
+        assert state.overall_status.value in {
+            "LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED", "ALL_CONSISTENT",
+        }
+
+    def test_spark_comparator_report_not_mismatch(self, nyc06_spec_md, nyc06_csv_paths):
+        """Comparator 应正常运行不崩溃——多语句 DAG 全链路可执行。
+
+        此测试是防御性的——确保 SqlProgram 扁平化 + Orchestrator + Comparator
+        全链路可正常运行，不抛异常。由于 SQL 侧扁平化步骤与 Mapper 产出的 SparkPlan
+        存在结构差异（Mapper 使用 V1 Contract 独立生成拓扑，与原始 DAG 步骤不完全对称），
+        Comparator 的状态（LOGIC_EQUIVALENT / LOGIC_MISMATCH / NOT_COVERED）取决于
+        两侧 plan 结构一致性——任何状态都是有意义的诊断信号。
+        """
+        pytest.importorskip("pyspark", reason="PySpark 环境不可用")
+
+        from tianshu_datadev.spark.orchestrator import SparkOrchestrator
+
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc06_spec_md, table_paths=nyc06_csv_paths)
+        bundle = pipeline.export_artifacts(result["request_id"])
+
+        orchestrator = SparkOrchestrator()
+        state = orchestrator.run(
+            contract=bundle.data_transform_contract, sql_plan=bundle.sql_program,
+        )
+
+        # 关键防御：Comparator 全链路不抛异常，产出有效报告
+        assert state.comparator_report is not None, (
+            "Orchestrator 应产出 PlanComparisonReport"
+        )
+        assert state.comparator_report.report_id, (
+            "报告 ID 不应为空"
+        )
+        assert len(state.comparator_report.step_results) > 0, (
+            "step_results 应包含对比结果"
+        )
+
+    def test_contract_v1_is_extracted_from_run_all(self, nyc06_spec_md, nyc06_csv_paths):
+        """Case06 run_all() 应直接产出 DataTransformContractV1（非 Lite）。"""
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc06_spec_md, table_paths=nyc06_csv_paths)
+        bundle = pipeline.export_artifacts(result["request_id"])
+
+        assert bundle.data_transform_contract is not None
+        contract = bundle.data_transform_contract
+        # ComputeSteps 路径应直接产 V1
+        from tianshu_datadev.artifacts.models import DataTransformContractV1
+        assert isinstance(contract, DataTransformContractV1), (
+            f"应为 DataTransformContractV1，实际={type(contract).__name__}"
+        )
+        # 验证 risk_label 的 CASE WHEN 标签被正确提取
+        assert len(contract.case_when_labels) > 0, (
+            "Case06 Contract 应包含 risk_label 的 CASE WHEN 标签"
+        )

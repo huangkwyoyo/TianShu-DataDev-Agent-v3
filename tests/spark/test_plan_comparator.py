@@ -30,6 +30,11 @@ from tianshu_datadev.planning.sql_build_plan import (
     SortStep,
     SqlBuildPlan,
 )
+from tianshu_datadev.planning.sql_program import (
+    SqlProgram,
+    SqlStatement,
+    StatementKind,
+)
 from tianshu_datadev.spark.models import (
     SparkFilterStep,
     SparkLimitStep,
@@ -1722,3 +1727,468 @@ class TestPlanComparatorContractIntegration:
 
         steps = contract_to_sql_steps(contract)
         assert steps == [], f"预期空列表，实际 {steps}"
+
+
+# ════════════════════════════════════════════
+# Phase 10 Case06——多语句 SqlProgram 扁平化对比测试
+# ════════════════════════════════════════════
+
+
+class TestPlanComparatorMultiStatementFlatten:
+    """多语句 SqlProgram → 扁平化 step 列表 → SparkPlan 对比。
+
+    Case06 SqlProgram 多语句 DAG Comparator 缺口收口——验证 _flatten_sql_program_steps()
+    正确过滤 _temp_* scan（内部管道）并保留所有语义 step。
+    """
+
+    @staticmethod
+    def _make_minimal_sql_program(
+        statements: list[SqlStatement],
+        spec_id: str = "test_spec_case06",
+    ) -> SqlProgram:
+        """构造最小合法 SqlProgram——用于多语句扁平化测试。"""
+        program_id = SqlProgram.generate_program_id(spec_id)
+        return SqlProgram(
+            program_id=program_id,
+            spec_id=spec_id,
+            statements=statements,
+            topological_order=[s.statement_id for s in statements],
+        )
+
+    @staticmethod
+    def _make_statement(
+        statement_id: str,
+        plan: SqlBuildPlan,
+        kind: StatementKind = StatementKind.PRODUCER,
+        depends_on: list[str] | None = None,
+        produces: str | None = None,
+    ) -> SqlStatement:
+        """构造最小合法 SqlStatement。"""
+        return SqlStatement(
+            statement_id=statement_id,
+            plan=plan,
+            kind=kind,
+            depends_on=depends_on or [],
+            produces=produces,
+        )
+
+    def test_flatten_excludes_temp_table_scans(self):
+        """_temp_* scan 应从扁平化结果中排除——它们是 DAG 内部管道，Spark 侧无对应。"""
+        from tianshu_datadev.planning.sql_build_plan import (
+            ScanStep,
+        )
+        from tianshu_datadev.planning.sql_program import (
+            SqlProgram,
+            SqlStatement,
+            StatementKind,
+        )
+
+        # 构造 2 语句 SqlProgram：stmt_0 产生 _temp_c0_trip_agg，stmt_1 读取它
+        stmt_0_plan = _make_sql_plan([
+            ScanStep(
+                step_type="scan", step_id="scan_ft",
+                table_ref="fact_trips",
+                required_columns=[
+                    ColumnRef(table_ref="fact_trips", column_name="boro", normalized_name="boro"),
+                ],
+            ),
+            _make_sql_filter_step("filter_001"),
+            _make_sql_project_step("proj_001"),
+        ])
+        stmt_1_plan = _make_sql_plan([
+            ScanStep(
+                step_type="scan", step_id="scan_temp",
+                table_ref="_temp_c0_trip_agg",  # ← 应被过滤
+                required_columns=[
+                    ColumnRef(table_ref="_temp_c0_trip_agg", column_name="boro", normalized_name="boro"),
+                ],
+            ),
+            _make_sql_filter_step("filter_002"),
+        ])
+
+        sql_program = SqlProgram(
+            program_id=SqlProgram.generate_program_id("test_flatten_temp"),
+            spec_id="test_flatten_temp",
+            statements=[
+                SqlStatement(
+                    statement_id="stmt_0",
+                    plan=stmt_0_plan,
+                    kind=StatementKind.PRODUCER,
+                    produces="_temp_c0_trip_agg",
+                ),
+                SqlStatement(
+                    statement_id="stmt_1",
+                    plan=stmt_1_plan,
+                    kind=StatementKind.CONSUMER,
+                    depends_on=["stmt_0"],
+                ),
+            ],
+            topological_order=["stmt_0", "stmt_1"],
+        )
+
+        flat = PlanComparator._flatten_sql_program_steps(sql_program)
+
+        # _temp_* scan 应被排除
+        temp_scans = [
+            s for s in flat
+            if s.get("step_type") == "scan" and str(s.get("table_ref", "")).startswith("_temp_")
+        ]
+        assert len(temp_scans) == 0, (
+            f"_temp_* scan 应被排除，实际仍有 {len(temp_scans)} 个：{temp_scans}"
+        )
+
+        # 源表 scan（fact_trips）应保留
+        source_scans = [
+            s for s in flat
+            if s.get("step_type") == "scan" and s.get("table_ref") == "fact_trips"
+        ]
+        assert len(source_scans) == 1, f"源表 scan 应保留 1 个，实际 {len(source_scans)}"
+
+        # 语义 step 应保留
+        filter_count = sum(1 for s in flat if s.get("step_type") == "filter")
+        project_count = sum(1 for s in flat if s.get("step_type") == "project")
+        assert filter_count == 2, f"应保留 2 个 filter，实际 {filter_count}"
+        assert project_count == 1, f"应保留 1 个 project，实际 {project_count}"
+
+    def test_flatten_preserves_all_semantic_steps(self):
+        """扁平化后所有语义 step（filter/aggregate/join/project）的类型和数量应完整保留。"""
+        from tianshu_datadev.planning.sql_build_plan import (
+            AggregateStep,
+            JoinStep,
+            ScanStep,
+        )
+        from tianshu_datadev.planning.sql_program import (
+            SqlProgram,
+            SqlStatement,
+            StatementKind,
+        )
+
+        # 构造含多种语义 step 的 3 语句 SqlProgram
+        stmt_0_plan = _make_sql_plan([
+            ScanStep(
+                step_type="scan", step_id="scan_od",
+                table_ref="order_detail",
+                required_columns=[
+                    ColumnRef(table_ref="order_detail", column_name="order_id", normalized_name="order_id"),
+                ],
+            ),
+            _make_sql_filter_step("filter_agg"),
+            AggregateStep(
+                step_type="aggregate", step_id="agg_001",
+                group_keys=[
+                    ColumnRef(table_ref="order_detail", column_name="region", normalized_name="region"),
+                ],
+                metrics=[
+                    AggregateSpec(aggregation=AggregationType.COUNT, input_column=None, alias="cnt"),
+                ],
+            ),
+            _make_sql_project_step("proj_agg"),
+        ])
+
+        stmt_1_plan = _make_sql_plan([
+            ScanStep(
+                step_type="scan", step_id="scan_od2",
+                table_ref="order_detail",
+                required_columns=[
+                    ColumnRef(table_ref="order_detail", column_name="order_id", normalized_name="order_id"),
+                ],
+            ),
+            JoinStep(
+                step_type="join", step_id="join_001",
+                right_table_ref="od",
+                join_type="INNER",
+                join_keys=[(
+                    ColumnRef(table_ref="od", column_name="user_id", normalized_name="user_id"),
+                    ColumnRef(table_ref="od", column_name="user_id", normalized_name="user_id"),
+                )],
+                relationship_ref="rel_001",
+            ),
+            _make_sql_project_step("proj_join"),
+        ])
+
+        sql_program = SqlProgram(
+            program_id=SqlProgram.generate_program_id("test_preserve_semantic"),
+            spec_id="test_preserve_semantic",
+            statements=[
+                SqlStatement(
+                    statement_id="stmt_0", plan=stmt_0_plan,
+                    kind=StatementKind.PRODUCER, produces="_temp_c0_agg",
+                ),
+                SqlStatement(
+                    statement_id="stmt_1", plan=stmt_1_plan,
+                    kind=StatementKind.CONSUMER,
+                ),
+            ],
+            topological_order=["stmt_0", "stmt_1"],
+        )
+
+        flat = PlanComparator._flatten_sql_program_steps(sql_program)
+
+        # 统计各类型数量
+        type_counts: dict[str, int] = {}
+        for s in flat:
+            t = s.get("step_type", "")
+            type_counts[t] = type_counts.get(t, 0) + 1
+
+        # scan: 2 个源表 scan（两个 order_detail）
+        assert type_counts.get("scan", 0) == 2, f"应保留 2 个源表 scan，实际 {type_counts.get('scan', 0)}"
+        # filter: 1 个
+        assert type_counts.get("filter", 0) == 1
+        # aggregate: 1 个
+        assert type_counts.get("aggregate", 0) == 1
+        # join: 1 个
+        assert type_counts.get("join", 0) == 1
+        # project: 2 个
+        assert type_counts.get("project", 0) == 2
+
+    def test_compare_program_vs_spark_plan_equivalent(self):
+        """最小 2 语句 SqlProgram（scan+filter → agg+proj）vs 等价 SparkPlan → LOGIC_EQUIVALENT。"""
+        from tianshu_datadev.planning.sql_build_plan import (
+            AggregateStep,
+            ScanStep,
+        )
+        from tianshu_datadev.planning.sql_program import (
+            SqlProgram,
+            SqlStatement,
+            StatementKind,
+        )
+        from tianshu_datadev.spark.models import (
+            SparkAggFunction,
+            SparkAggregateSpec,
+            SparkAggregateStep,
+        )
+
+        # SQL 侧：2 语句 SqlProgram
+        stmt_0_plan = _make_sql_plan([
+            ScanStep(
+                step_type="scan", step_id="scan_od",
+                table_ref="od",
+                required_columns=[
+                    ColumnRef(table_ref="od", column_name="amount", normalized_name="amount"),
+                    ColumnRef(table_ref="od", column_name="region", normalized_name="region"),
+                ],
+            ),
+            _make_sql_filter_step("filter_001"),
+            AggregateStep(
+                step_type="aggregate", step_id="agg_001",
+                group_keys=[
+                    ColumnRef(table_ref="od", column_name="region", normalized_name="region"),
+                ],
+                metrics=[
+                    AggregateSpec(aggregation=AggregationType.SUM, input_column="amount", alias="total_amt"),
+                ],
+            ),
+            _make_sql_project_step("proj_001"),
+        ])
+        # stmt_1 读取 _temp 表再做一次 project（模拟 FINAL 包装）
+        stmt_1_plan = _make_sql_plan([
+            ScanStep(
+                step_type="scan", step_id="scan_temp",
+                table_ref="_temp_c0_agg",  # ← 应被过滤
+                required_columns=[
+                    ColumnRef(table_ref="_temp_c0_agg", column_name="region", normalized_name="region"),
+                ],
+            ),
+            ProjectStep(
+                step_type="project", step_id="proj_final",
+                columns=[
+                    AliasExpr(
+                        expression=ColumnRef(
+                            table_ref="_temp_c0_agg",
+                            column_name="region", normalized_name="region",
+                        ),
+                        alias="region",
+                    ),
+                    AliasExpr(
+                        expression=ColumnRef(
+                            table_ref="_temp_c0_agg",
+                            column_name="total_amt", normalized_name="total_amt",
+                        ),
+                        alias="total_amt",
+                    ),
+                ],
+            ),
+        ])
+
+        sql_program = SqlProgram(
+            program_id=SqlProgram.generate_program_id("test_eq"),
+            spec_id="test_eq",
+            statements=[
+                SqlStatement(
+                    statement_id="stmt_0", plan=stmt_0_plan,
+                    kind=StatementKind.PRODUCER, produces="_temp_c0_agg",
+                ),
+                SqlStatement(
+                    statement_id="stmt_1", plan=stmt_1_plan,
+                    kind=StatementKind.FINAL, depends_on=["stmt_0"],
+                ),
+            ],
+            topological_order=["stmt_0", "stmt_1"],
+        )
+
+        # Spark 侧：等价 SparkPlan（read+filter+aggregate+project+project）
+        spark_plan = _make_spark_plan([
+            SparkReadStep(
+                step_type=SparkStepType.READ, alias="od",
+                source_name="order_detail", input_key="order_detail_key",
+                required_columns=["amount", "region"],
+            ),
+            SparkFilterStep(
+                step_type=SparkStepType.FILTER, input_alias="od",
+                operator="GT", left="amount", right="threshold",
+            ),
+            SparkAggregateStep(
+                step_type=SparkStepType.AGGREGATE, input_alias="od",
+                group_keys=["region"],
+                metrics=[
+                    SparkAggregateSpec(
+                        function=SparkAggFunction.SUM,
+                        input_column="amount", alias="total_amt",
+                    ),
+                ],
+            ),
+            SparkProjectStep(
+                step_type=SparkStepType.PROJECT, input_alias="od",
+                columns=[
+                    SparkProjectColumn(column_name="order_id", alias="order_id"),
+                    SparkProjectColumn(column_name="amount", alias="amount"),
+                ],
+            ),
+            SparkProjectStep(
+                step_type=SparkStepType.PROJECT, input_alias="od",
+                columns=[
+                    SparkProjectColumn(column_name="region", alias="region"),
+                    SparkProjectColumn(column_name="total_amt", alias="total_amt"),
+                ],
+            ),
+        ])
+
+        comparator = PlanComparator()
+        report = comparator.compare_program(sql_program, spark_plan)
+
+        # _temp_* scan 已被过滤 → 对比范围不含 _temp_*，全部为已启用类型
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+            f"预期 LOGIC_EQUIVALENT，实际 {report.status}，"
+            f"step_results={[(r.step_type, r.verdict.value) for r in report.step_results]}"
+        )
+
+    def test_compare_program_vs_spark_plan_mismatch(self):
+        """SqlProgram vs 不等价 SparkPlan（移除 filter）→ LOGIC_MISMATCH。"""
+        from tianshu_datadev.planning.sql_build_plan import (
+            ScanStep,
+        )
+        from tianshu_datadev.planning.sql_program import (
+            SqlProgram,
+            SqlStatement,
+            StatementKind,
+        )
+
+        # SQL 侧：scan + filter + project
+        stmt_plan = _make_sql_plan([
+            ScanStep(
+                step_type="scan", step_id="scan_od",
+                table_ref="od",
+                required_columns=[
+                    ColumnRef(table_ref="od", column_name="amount", normalized_name="amount"),
+                ],
+            ),
+            _make_sql_filter_step("filter_001"),
+            _make_sql_project_step("proj_001"),
+        ])
+
+        sql_program = SqlProgram(
+            program_id=SqlProgram.generate_program_id("test_mismatch"),
+            spec_id="test_mismatch",
+            statements=[
+                SqlStatement(statement_id="stmt_0", plan=stmt_plan, kind=StatementKind.STANDALONE),
+            ],
+            topological_order=["stmt_0"],
+        )
+
+        # Spark 侧：仅有 read + project（缺少 filter）——不等价
+        spark_plan = _make_spark_plan([
+            SparkReadStep(
+                step_type=SparkStepType.READ, alias="od",
+                source_name="order_detail", input_key="order_detail_key",
+            ),
+            SparkProjectStep(
+                step_type=SparkStepType.PROJECT, input_alias="od",
+                columns=[
+                    SparkProjectColumn(column_name="order_id", alias="order_id"),
+                    SparkProjectColumn(column_name="amount", alias="amount"),
+                ],
+            ),
+        ])
+
+        comparator = PlanComparator()
+        report = comparator.compare_program(sql_program, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_MISMATCH, (
+            f"预期 LOGIC_MISMATCH（Spark 侧缺 filter），实际 {report.status}"
+        )
+
+
+# ── _normalize_dag_steps 单元测试 ──
+
+
+class TestNormalizeDagSteps:
+    """Comparator DAG 归一化——_normalize_dag_steps() 的单元测试。
+
+    验证扁平化后的多个同类型 step 被正确合并为单一步骤。
+    """
+
+    def test_merges_multiple_aggregates(self):
+        """3 个 aggregate step → 归一化为 1 个，metrics 和 group_keys 合并去重。"""
+        steps = [
+            {"step_type": "scan", "table_ref": "fc"},
+            {"step_type": "aggregate", "group_keys": ["borough"],
+             "metrics": [{"function": "COUNT", "alias": "total_crashes"}]},
+            {"step_type": "aggregate", "group_keys": ["borough"],
+             "metrics": [{"function": "SUM", "alias": "total_injured"}]},
+            {"step_type": "aggregate", "group_keys": ["violation_county"],
+             "metrics": [{"function": "SUM", "alias": "total_violations"}]},
+        ]
+        result = PlanComparator._normalize_dag_steps(steps)
+        agg_steps = [s for s in result if s.get("step_type") == "aggregate"]
+        assert len(agg_steps) == 1, f"预期 1 个 aggregate，实际 {len(agg_steps)}"
+        assert len(agg_steps[0]["metrics"]) == 3
+        assert set(agg_steps[0]["group_keys"]) == {"borough", "violation_county"}
+
+    def test_merges_multiple_projects(self):
+        """7 个 project step → 归一化为 1 个，columns 合并去重。"""
+        steps = [
+            {"step_type": "project", "columns": [
+                {"column_name": "borough", "alias": "borough"},
+                {"column_name": "total_crashes", "alias": "total_crashes"},
+            ]},
+            {"step_type": "project", "columns": [
+                {"column_name": "total_injured", "alias": "total_injured"},
+            ]},
+            {"step_type": "project", "columns": [
+                {"column_name": "borough", "alias": "borough"},  # 重复——应去重
+                {"column_name": "total_killed", "alias": "total_killed"},
+            ]},
+        ]
+        result = PlanComparator._normalize_dag_steps(steps)
+        proj_steps = [s for s in result if s.get("step_type") == "project"]
+        assert len(proj_steps) == 1, f"预期 1 个 project，实际 {len(proj_steps)}"
+        assert len(proj_steps[0]["columns"]) == 4  # borough 去重后 4 个唯一列（borough/total_crashes/total_injured/total_killed）
+
+    def test_preserves_other_types(self):
+        """scan/filter/join/case_when 不受归一化影响——原样保留。"""
+        steps = [
+            {"step_type": "scan", "table_ref": "fc"},
+            {"step_type": "filter", "operator": "GT"},
+            {"step_type": "join", "join_type": "LEFT"},
+            {"step_type": "case_when", "labels": ["高风险"]},
+            {"step_type": "aggregate", "group_keys": ["x"], "metrics": []},
+            {"step_type": "project", "columns": []},
+        ]
+        result = PlanComparator._normalize_dag_steps(steps)
+        types = [s.get("step_type") for s in result]
+        assert types.count("scan") == 1
+        assert types.count("filter") == 1
+        assert types.count("join") == 1
+        assert types.count("case_when") == 1
+        assert types.count("aggregate") == 1
+        assert types.count("project") == 1
