@@ -34,6 +34,10 @@ def contract_to_sql_steps(
 ) -> list:
     """从 DataTransformContractV1 确定性构造 SqlBuildPlan step 列表。
 
+    @deprecated 自 Phase 9A2 起——请优先使用 Pipeline.export_artifacts().sql_build_plan
+    获取真实 SQL Pipeline 产出的 SqlBuildPlan。本函数保留为向后兼容 fallback，
+    供已有测试和未接入 SQL Pipeline 的场景使用。
+
     该函数将 Contract 中各个结构化字段一一映射为 SqlBuildPlan 的各类 Step，
     作为 SQL 管线的输入供 PlanComparator 与 Mapper 产出的 SparkPlan 对比。
 

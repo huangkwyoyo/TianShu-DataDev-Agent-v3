@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from tianshu_datadev.spark.orchestrator import (
     SparkOrchestrator,
     SparkPipelineStage,
@@ -690,3 +692,79 @@ class TestOrchestratorSkeletonE2E:
         assert pkg.provenance.spark_plan_hash == state.spark_plan_hash
         assert pkg.provenance.compiled_code_sha256 == state.compiled_code_sha256
         assert pkg.overall_status == "LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED"
+
+    # ── Phase 9A2: 真实 SQL Pipeline SqlBuildPlan 驱动 COMPARATOR ──
+
+    def test_comparator_with_real_sql_pipeline_plan(self):
+        """9A3 集成测试——真实 SQL Pipeline 全链路驱动 COMPARATOR。
+
+        使用 Pipeline.run_all() → export_artifacts() 获取真实 SqlBuildPlan 和
+        DataTransformContractLite，经 adapt_lite_to_v1() 适配为 V1 后传入 Orchestrator，
+        验证 MAPPER → COMPARATOR 全阶段 SUCCESS。
+
+        与 9A2 版本的关键区别：不再手工构造 DataTransformContractV1 绕过
+        export_artifacts() 导出的 contract——而是使用确定性适配层升级 Lite → V1。
+        """
+        try:
+            import duckdb  # noqa: F401
+        except ImportError:
+            pytest.skip("DuckDB 未安装")
+
+        import os
+        import tempfile
+
+        from tianshu_datadev.api.pipeline import Pipeline
+        from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+
+        # ── 1. 使用真实 SQL Pipeline 获取 SqlBuildPlan ──
+        root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        spec_path = os.path.join(root, "tests", "fixtures", "golden", "golden_passing.md")
+        csv_path = os.path.abspath(
+            os.path.join(root, "tests", "fixtures", "sql", "test_fact.csv")
+        )
+        with open(spec_path, "r", encoding="utf-8") as f:
+            markdown_text = f.read()
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            pipeline = Pipeline(base_output_dir=tmpdir, adapter=None)
+            result = pipeline.run_all(
+                markdown_text,
+                table_mapping={"tf": "test_fact"},
+                table_paths={"test_fact": csv_path},
+            )
+            request_id = result["request_id"]
+
+            bundle = pipeline.export_artifacts(request_id)
+            assert bundle is not None, "export_artifacts 不应返回 None"
+            assert bundle.sql_build_plan is not None, "真实 SqlBuildPlan 不应为 None"
+
+            # ── 2. 适配 contract（Lite → V1）——不再手工构造 V1 ──
+            assert bundle.data_transform_contract is not None, (
+                "export_artifacts() 应包含 data_transform_contract"
+            )
+            v1_contract = adapt_lite_to_v1(bundle.data_transform_contract)
+
+            # ── 3. Orchestrator 使用真实 SqlBuildPlan + 适配后的 V1 contract ──
+            orchestrator = SparkOrchestrator()
+            state = orchestrator.run(
+                contract=v1_contract,
+                sql_plan=bundle.sql_build_plan,
+            )
+
+            # ── 4. 验证 COMPARATOR 阶段成功 ──
+            assert state.stage_results["MAPPER"] == "SUCCESS", (
+                f"MAPPER 应为 SUCCESS，实际 {state.stage_results['MAPPER']}，"
+                f"errors={state.errors}"
+            )
+            assert state.stage_results["COMPARATOR"] == "SUCCESS", (
+                f"COMPARATOR 应为 SUCCESS（真实 SqlBuildPlan 驱动），"
+                f"实际 {state.stage_results['COMPARATOR']}，"
+                f"errors={state.errors}"
+            )
+            assert state.comparator_report is not None, (
+                "comparator_report 不应为 None"
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)

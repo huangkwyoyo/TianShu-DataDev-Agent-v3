@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from tianshu_datadev.harness.spark_eval import (
     SparkEvalCase,
     SparkEvalDimension,
@@ -1165,3 +1167,459 @@ class TestC4D4LogicEquivalence:
         harness_report = runner.evaluate()
 
         assert harness_report.total_passed == 1
+
+    def test_d4_with_real_sql_pipeline_plan(self):
+        """9A3——真实 SQL Pipeline 全链路 D4 LOGIC_EQUIVALENCE。
+
+        使用 Pipeline.run_all() → export_artifacts() 获取真实 SqlBuildPlan 和
+        DataTransformContractLite，经 adapt_lite_to_v1() 适配为 V1 后传入 Mapper，
+        验证 PlanComparator 判定等价。
+
+        与 9A2 版本的关键区别：不再手工构造 DataTransformContractV1 绕过
+        export_artifacts() 导出的 contract——而是使用确定性适配层升级 Lite → V1。
+        """
+        try:
+            import duckdb  # noqa: F401
+        except ImportError:
+            pytest.skip("DuckDB 未安装")
+
+        import os
+        import tempfile
+
+        from tianshu_datadev.api.pipeline import Pipeline
+        from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+        from tianshu_datadev.spark.mapper import map_contract_to_spark_plan
+        from tianshu_datadev.spark.plan_comparator import (
+            ComparisonStatus,
+            PlanComparator,
+        )
+
+        # ── 1. 真实 SQL Pipeline → SqlBuildPlan + DataTransformContractLite ──
+        root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        spec_path = os.path.join(
+            root, "tests", "fixtures", "golden", "golden_passing.md"
+        )
+        csv_path = os.path.abspath(
+            os.path.join(root, "tests", "fixtures", "sql", "test_fact.csv")
+        )
+        with open(spec_path, "r", encoding="utf-8") as f:
+            markdown_text = f.read()
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            pipeline = Pipeline(base_output_dir=tmpdir, adapter=None)
+            result = pipeline.run_all(
+                markdown_text,
+                table_mapping={"tf": "test_fact"},
+                table_paths={"test_fact": csv_path},
+            )
+            request_id = result["request_id"]
+
+            bundle = pipeline.export_artifacts(request_id)
+            assert bundle is not None
+            assert bundle.sql_build_plan is not None
+            real_sql_plan = bundle.sql_build_plan
+
+            # ── 2. 适配 contract（Lite → V1）——不再手工构造 V1 ──
+            assert bundle.data_transform_contract is not None, (
+                "export_artifacts() 应包含 data_transform_contract"
+            )
+            v1_contract = adapt_lite_to_v1(bundle.data_transform_contract)
+
+            # ── 3. Spark 管线（Mapper——使用适配后的 V1 contract）──
+            mapping_result = map_contract_to_spark_plan(v1_contract)
+            assert mapping_result.success, f"Mapper 失败: gaps={mapping_result.gaps}"
+            spark_plan = mapping_result.spark_plan
+
+            # ── 4. Comparator 对比（真实 SqlBuildPlan vs Mapper SparkPlan）──
+            comparator = PlanComparator()
+            report = comparator.compare(real_sql_plan, spark_plan)
+
+            assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+                f"预期 LOGIC_EQUIVALENT，实际 {report.status}，"
+                f"step_results="
+                f"{[(r.step_type, r.verdict.value) for r in report.step_results]}"
+            )
+
+            # ── 5. 包装为 Harness D4 EvalCase ──
+            runner = SparkHarnessRunner()
+            case = SparkEvalCase(
+                case_id="D4_real_pipeline_001",
+                dimension=SparkEvalDimension.SPARK_LOGIC_EQUIVALENCE,
+                description=(
+                    "9A3 生产级验证——真实 SQL Pipeline SqlBuildPlan + "
+                    "adapt_lite_to_v1() 适配后的 Contract 驱动 Mapper，"
+                    "PlanComparator 判定等价"
+                ),
+                expected_behavior="PlanComparator 判定 LOGIC_EQUIVALENT",
+                passed=True,
+                actual_result={
+                    "spec_hash": bundle.spec_hash,
+                    "comparison_status": report.status.value,
+                    "sql_pipeline_step_count": len(real_sql_plan.steps),
+                    "adapter_used": True,
+                },
+            )
+            runner.add_case(case)
+            harness_report = runner.evaluate()
+
+            assert harness_report.total_passed == 1, (
+                f"D4 真实 Pipeline 用例应通过，"
+                f"实际 total_passed={harness_report.total_passed}"
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ════════════════════════════════════════════
+# 9A3: Lite→V1 适配层单元测试
+# ════════════════════════════════════════════
+
+
+class TestContractAdapter:
+    """DataTransformContractLite → DataTransformContractV1 确定性适配。
+
+    验证适配器无损传递所有公共字段，并为 V1 独有字段填入合理默认值。
+    """
+
+    def test_adapt_lite_to_v1_preserves_all_common_fields(self):
+        """Lite → V1 适配后所有公共字段值不变。"""
+        from tianshu_datadev.artifacts.models import (
+            ContractAggregation,
+            ContractColumn,
+            ContractInputTable,
+            ContractJoin,
+            ContractLimit,
+            ContractOutputColumn,
+            ContractPredicate,
+            ContractSort,
+            DataTransformContractLite,
+        )
+        from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+
+        # ── 构造一个字段完整的 Lite contract ──
+        lite = DataTransformContractLite(
+            contract_id="dtc_lite_test123456",
+            version="lite",
+            source_phase="phase-2",
+            source_sqlbuildplan_hash="abc123",
+            input_tables=[
+                ContractInputTable(table_ref="od", source_table="dwd.order_detail"),
+                ContractInputTable(table_ref="ri", source_table="dim.region_info"),
+            ],
+            input_columns=[
+                ContractColumn(
+                    column_name="order_id", normalized_name="order_id",
+                    data_type="unknown", table_ref="od",
+                ),
+                ContractColumn(
+                    column_name="amount", normalized_name="amount",
+                    data_type="unknown", table_ref="od",
+                ),
+            ],
+            join_relationships=[
+                ContractJoin(
+                    join_id="join_1",
+                    left_table="od", right_table="ri",
+                    left_key="region_code", right_key="region_code",
+                    join_type="INNER",
+                    evidence_chain={"level": "STRONG"}, level="STRONG",
+                ),
+            ],
+            filters=[ContractPredicate(operator="GT", left="od.amount", right="100")],
+            aggregations=[
+                ContractAggregation(function="SUM", input_column="od.amount", alias="total_amt"),
+            ],
+            grouping_keys=["od.region_code"],
+            output_columns=[
+                ContractOutputColumn(column_name="region_code", alias="region_code"),
+                ContractOutputColumn(column_name="total_amt", alias="total_amt"),
+            ],
+            output_grain=["od.region_code"],
+            sort_spec=[ContractSort(column="total_amt", direction="DESC")],
+            limit_spec=ContractLimit(limit=100, offset=0),
+            business_keys=["region_code"],
+            semantic_policy_ref="policy_v1",
+        )
+
+        # ── 适配 ──
+        v1 = adapt_lite_to_v1(lite)
+
+        # ── 验证 V1 类型 ──
+        from tianshu_datadev.artifacts.models import DataTransformContractV1
+        assert isinstance(v1, DataTransformContractV1)
+
+        # ── 公共字段一一对应 ──
+        assert v1.input_tables == lite.input_tables
+        assert v1.input_columns == lite.input_columns
+        assert v1.join_relationships == lite.join_relationships
+        assert v1.filters == lite.filters
+        assert v1.aggregations == lite.aggregations
+        assert v1.grouping_keys == lite.grouping_keys
+        assert v1.output_columns == lite.output_columns
+        assert v1.output_grain == lite.output_grain
+        assert v1.sort_spec == lite.sort_spec
+        assert v1.limit_spec == lite.limit_spec
+        assert v1.business_keys == lite.business_keys
+        assert v1.semantic_policy_ref == lite.semantic_policy_ref
+
+        # ── V1 独有字段默认值 ──
+        assert v1.step_dag == {}
+        assert v1.temp_tables == []
+        assert v1.case_when_labels == []
+        assert v1.window_specs == []
+        assert v1.write_spec is None
+
+        # ── V1 元数据正确 ──
+        assert v1.version == "v1"
+        assert v1.source_phase == "phase-3"
+        assert v1.source_sqlprogram_hash == lite.source_sqlbuildplan_hash
+        assert v1.contract_id.startswith("dtc_v1_")
+
+    def test_adapt_lite_to_v1_minimal_contract(self):
+        """最小 Lite contract（仅必填字段）→ V1 适配不崩溃。"""
+        from tianshu_datadev.artifacts.models import DataTransformContractLite
+        from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+
+        lite = DataTransformContractLite(
+            contract_id="dtc_lite_minimal000",
+            source_sqlbuildplan_hash="minimal_hash",
+        )
+
+        v1 = adapt_lite_to_v1(lite)
+
+        assert v1.contract_id.startswith("dtc_v1_")
+        assert v1.source_sqlprogram_hash == "minimal_hash"
+        assert v1.input_tables == []
+        assert v1.step_dag == {}
+
+    def test_adapt_lite_to_v1_contract_id_deterministic(self):
+        """同一 Lite → 多次适配产生相同 V1 contract_id（确定性）。"""
+        from tianshu_datadev.artifacts.models import DataTransformContractLite
+        from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+
+        lite = DataTransformContractLite(
+            contract_id="dtc_lite_det_test",
+            source_sqlbuildplan_hash="deterministic_hash",
+        )
+
+        v1_a = adapt_lite_to_v1(lite)
+        v1_b = adapt_lite_to_v1(lite)
+
+        assert v1_a.contract_id == v1_b.contract_id
+        assert v1_a.source_sqlprogram_hash == v1_b.source_sqlprogram_hash
+
+
+# ════════════════════════════════════════════
+# 9A3: Harness 自动驱动器集成测试
+# ════════════════════════════════════════════
+
+
+class TestC4AutoDrive:
+    """9A3 Harness 自动驱动器——Pipeline + Orchestrator 注入 → 自动评测。
+
+    验证 SparkHarnessRunner 在注入 pipeline + orchestrator 后：
+    1. evaluate() 自动执行全链路（不再依赖手工填入 case.passed）
+    2. 从真实 export_artifacts() 读取 contract（经 adapt_lite_to_v1 适配）
+    3. Orchestrator 完成 MAPPER → COMPILER → VALIDATOR → COMPARATOR
+    4. 被动模式（passive=True）向后兼容
+    """
+
+    def test_auto_drive_full_pipeline_mapper_to_comparator(self):
+        """自动驱动器——真实 Pipeline + Orchestrator 全链路评测。
+
+        单表 DeveloperSpec → Pipeline.run_all() → export_artifacts()
+        → adapt_lite_to_v1() → Orchestrator.run() → 自动判定 passed。
+        """
+        try:
+            import duckdb  # noqa: F401
+        except ImportError:
+            pytest.skip("DuckDB 未安装")
+
+        import os
+        import tempfile
+
+        from tianshu_datadev.api.pipeline import Pipeline
+        from tianshu_datadev.harness.spark_eval import (
+            SparkEvalCase,
+            SparkEvalDimension,
+            SparkHarnessRunner,
+        )
+        from tianshu_datadev.spark.orchestrator import SparkOrchestrator
+
+        # ── 准备 Pipeline + Orchestrator ──
+        root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        spec_path = os.path.join(
+            root, "tests", "fixtures", "golden", "golden_passing.md"
+        )
+        csv_path = os.path.abspath(
+            os.path.join(root, "tests", "fixtures", "sql", "test_fact.csv")
+        )
+        with open(spec_path, "r", encoding="utf-8") as f:
+            markdown_text = f.read()
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            pipeline = Pipeline(base_output_dir=tmpdir, adapter=None)
+            orchestrator = SparkOrchestrator()
+
+            # ── 构造含 developer_spec_md 的 EvalCase ──
+            runner = SparkHarnessRunner(
+                pipeline=pipeline, orchestrator=orchestrator,
+            )
+            case = SparkEvalCase(
+                case_id="D4_auto_drive_001",
+                dimension=SparkEvalDimension.SPARK_LOGIC_EQUIVALENCE,
+                description=(
+                    "9A3 自动驱动器——真实 Pipeline + Orchestrator 全链路，"
+                    "从 export_artifacts() 读取 contract 经适配后驱动 Mapper"
+                ),
+                expected_behavior=(
+                    "MAPPER/COMPILER/VALIDATOR/COMPARATOR 均 SUCCESS，"
+                    "自动判定 passed=True"
+                ),
+                developer_spec_md=markdown_text,
+                actual_result={
+                    "table_paths": {"test_fact": csv_path},
+                    "table_mapping": {"tf": "test_fact"},
+                },
+            )
+            runner.add_case(case)
+
+            # ── 自动执行 ──
+            report = runner.evaluate()
+
+            # ── 验证 ──
+            assert report.total_cases == 1
+            assert report.total_passed == 1, (
+                f"自动驱动器应判定 passed=True，"
+                f"实际 total_passed={report.total_passed}，"
+                f"actual_result={case.actual_result}"
+            )
+            assert report.overall_pass_rate == 1.0
+
+            # 验证 stage_results 已写入
+            stage_results = case.actual_result.get("stage_results", {})
+            assert stage_results.get("MAPPER") == "SUCCESS", (
+                f"MAPPER 应为 SUCCESS，实际 stage_results={stage_results}"
+            )
+            assert stage_results.get("COMPILER") == "SUCCESS"
+            assert stage_results.get("VALIDATOR") == "SUCCESS"
+            assert stage_results.get("COMPARATOR") == "SUCCESS"
+
+            # 验证 comparator_status 已记录
+            assert "comparator_status" in case.actual_result
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_auto_drive_orchestrator_stages_recorded(self):
+        """自动驱动器——Orchestrator 全部 6 阶段结果记录到 actual_result。"""
+        try:
+            import duckdb  # noqa: F401
+        except ImportError:
+            pytest.skip("DuckDB 未安装")
+
+        import os
+        import tempfile
+
+        from tianshu_datadev.api.pipeline import Pipeline
+        from tianshu_datadev.harness.spark_eval import (
+            SparkEvalCase,
+            SparkEvalDimension,
+            SparkHarnessRunner,
+        )
+        from tianshu_datadev.spark.orchestrator import SparkOrchestrator
+
+        root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        spec_path = os.path.join(
+            root, "tests", "fixtures", "golden", "golden_passing.md"
+        )
+        csv_path = os.path.abspath(
+            os.path.join(root, "tests", "fixtures", "sql", "test_fact.csv")
+        )
+        with open(spec_path, "r", encoding="utf-8") as f:
+            markdown_text = f.read()
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            pipeline = Pipeline(base_output_dir=tmpdir, adapter=None)
+            orchestrator = SparkOrchestrator()
+
+            runner = SparkHarnessRunner(
+                pipeline=pipeline, orchestrator=orchestrator,
+            )
+            case = SparkEvalCase(
+                case_id="D1_auto_drive_002",
+                dimension=SparkEvalDimension.SPARK_CONTRACT_FIDELITY,
+                description="验证 stage_results 包含全部 6 阶段",
+                expected_behavior="6 阶段状态已记录",
+                developer_spec_md=markdown_text,
+                actual_result={
+                    "table_paths": {"test_fact": csv_path},
+                    "table_mapping": {"tf": "test_fact"},
+                },
+            )
+            runner.add_case(case)
+
+            _report = runner.evaluate()
+
+            stage_results = case.actual_result.get("stage_results", {})
+            expected_stages = {
+                "MAPPER", "DEVELOPER", "COMPILER", "VALIDATOR",
+                "COMPARATOR", "PHYSICAL_VERIFIER",
+            }
+            for stage in expected_stages:
+                assert stage in stage_results, (
+                    f"stage_results 应包含 {stage}，"
+                    f"实际 keys={list(stage_results.keys())}"
+                )
+
+            # DEVELOPER 和 PHYSICAL_VERIFIER 应为 SKIPPED（未注入 developer_service + 无 Spark 运行时）
+            assert stage_results["DEVELOPER"] == "SKIPPED"
+            assert stage_results["PHYSICAL_VERIFIER"] == "SKIPPED"
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_passive_mode_backward_compat(self):
+        """被动模式——evaluate(passive=True) 仅聚合预置 passed，不触发自动执行。"""
+        runner = SparkHarnessRunner(
+            pipeline="mock_pipeline", orchestrator="mock_orchestrator",
+        )
+        case = SparkEvalCase(
+            case_id="passive_test",
+            dimension=SparkEvalDimension.SPARK_CONTRACT_FIDELITY,
+            description="被动模式——即使注入 pipeline 也不自动执行",
+            expected_behavior="读取预置 passed=True",
+            passed=True,
+            developer_spec_md="# test spec",  # 有 spec 但在被动模式下不触发
+        )
+        runner.add_case(case)
+
+        report = runner.evaluate(passive=True)
+
+        assert report.total_cases == 1
+        assert report.total_passed == 1
+        # 验证 actual_result 未被自动驱动器写入 stage_results
+        assert "stage_results" not in case.actual_result
+
+    def test_auto_drive_no_dev_spec_falls_back_to_passive(self):
+        """自动模式——无 developer_spec_md 的 case 保持预置 passed 不变。"""
+        runner = SparkHarnessRunner(
+            pipeline="mock_pipeline", orchestrator="mock_orchestrator",
+        )
+        case = SparkEvalCase(
+            case_id="no_spec_case",
+            dimension=SparkEvalDimension.SPARK_VALIDATOR_COVERAGE,
+            description="无 developer_spec_md——保持被动模式",
+            expected_behavior="passed=False 不变",
+            passed=False,
+        )
+        runner.add_case(case)
+
+        report = runner.evaluate()
+
+        assert report.total_cases == 1
+        assert report.total_passed == 0  # passed=False 不变
