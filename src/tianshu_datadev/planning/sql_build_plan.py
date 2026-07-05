@@ -712,8 +712,6 @@ class SqlBuildPlanBuilder:
                     )
                 plan_steps.append(project)
             else:
-                is_merge_step = isinstance(cs.source, list) and len(cs.source) > 0
-
                 if not cs.metrics and not cs.case_when:
                     # ── 无聚合步骤（透传导流）：透传所有上游列 ──
                     has_upstream = not (len(sources) == 1 and sources[0] == "input")
@@ -1156,7 +1154,9 @@ class SqlBuildPlanBuilder:
             alias=case_when.output_column,
         )
 
-    def _build_compute_step_passthrough(self, cs, default_table_ref: str = "") -> list[AliasExpr]:  # ComputeStep
+    def _build_compute_step_passthrough(
+        self, cs, default_table_ref: str = ""
+    ) -> list[AliasExpr]:  # ComputeStep
         """为中间 ComputeStep 构建透传投影——输出 GROUP BY 键 + 所有指标列。
 
         default_table_ref 用于合流步骤（多源 merge）时消除列歧义。

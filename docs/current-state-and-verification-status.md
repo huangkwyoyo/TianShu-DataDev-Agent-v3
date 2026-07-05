@@ -1,6 +1,6 @@
 # 项目当前状态与验证进度 — TianShu DataDev Agent v3
 
-> 文档版本：2026-07-05 | 最后更新：2026-07-05 Phase 9C-R16b 边界硬化完成
+> 文档版本：2026-07-05 | 最后更新：2026-07-05 Case 06 全链路验证完成
 > 本文是项目当前实施状态的**唯一权威文档**。各 Phase 设计文档（docs/00-09、docs/roadmap/）描述的是目标设计，实际建成状态以本文为准。
 
 ## 1. Phase 进度矩阵
@@ -22,7 +22,7 @@
 | 7B | 物理链路——双引擎验证 | ✅ | ✅ | ✅ | 11/11 真实 Spark 通过 |
 | 7C | 物理链路扩展 + 安全加固 | ✅ | ✅ | ✅ | 窗口双引擎 + SQL 加固 |
 | 8 | 编排硬化 + Harness | ✅ | ✅ | ✅ | Orchestrator + Review Package + 5 维度 |
-| 9A | 生产级串联升级 | ✅ | ✅ | ✅ | 9A1-9A3 + 9A5 完成，9A4 阻塞-待业务方 |
+| 9A | 生产级串联升级 | ✅ | ✅ | ✅ | 9A1-9A3 + 9A5 完成，9A4 NYC 01/06 完成，Case 06 B 类遗留 |
 | 9B | 前端回归 + 可观测性 | ✅ | ✅ | ✅ | R11/R15 消除，2026-07-05 |
 | 9B-P0 | Snapshot Builder 集成到 Pipeline | ✅ | ✅ | ✅ | R10 消除，可选注入+全链路覆盖，2026-07-05 |
 | 9C | DOM E2E 交互测试 | ✅ | ✅ | ✅ | 6/6 Playwright 测试通过，2026-07-05 |
@@ -30,8 +30,9 @@
 | 9C-R16b | table_paths 边界硬化 | ✅ | ✅ | ✅ | None/{} 语义区分 + E2E 模式开关，2026-07-05 |
 | 9B-P1 | provenance.yml 显式断言 | ✅ | ✅ | ✅ | snapshot_manifest_hash 测试覆盖矩阵补全，2026-07-05 |
 | 9A4-NYC | 真实业务样本——NYC 案例 01 | ✅ | ✅ | ✅ | SQL 全链路 + Spark 双链，11/11 测试通过，2026-07-05 |
+| 10-Case06 | SqlProgram 多语句 DAG——NYC Case 06 | ✅ | 🟡 | 🟡 | 跨域融合 7 步 DAG，_temp_* 串联，比率计算/CASE WHEN 待后续 Phase |
 
-**当前测试基线**：661 passed / 11 skipped（api/spark/artifacts 后端子集）+ 23 passed（前端冒烟全量）+ 6 passed / 0 skipped（Playwright E2E），ruff/tsc/build 零告警
+**当前测试基线**：734 passed / 11 skipped / 3 xfailed（api/spark/artifacts 后端子集）+ 23 passed（前端冒烟全量）+ 6 passed / 0 skipped（Playwright E2E），ruff/tsc/build 零告警
 
 ## 2. C1-C4 业务集成验证
 
@@ -50,7 +51,7 @@
 |:----:|------|:----:|------|
 | R5 | ~~桥接函数替代完整 SQL Pipeline~~ | 已消除 | Phase 9A1-9A3 + 9A5 已升级为真实 Pipeline 全链路 |
 | R6 | ~~Harness Runner 为结果聚合器~~ | 已消除 | Phase 9A3 已升级为自动评测驱动器 |
-| R7 | 真实业务样本缺失——NYC 案例 01 已接入，剩余 5/6 个场景待接入 | B | 待业务方提供（9A4 部分完成） |
+| R7 | 真实业务样本缺失——NYC 案例 01/06 已接入（Case 06 A 类完成 + B 类遗留），剩余 4/6 个场景待接入 | B | 待业务方提供（9A4 部分完成），Case 06 比率计算/CASE WHEN 待后续 Phase |
 | R8 | ~~LLM 生产环境持续验证未配置~~ | 已消除 | 2026-07-05——`scripts/real_llm_regression.py` + `TIANSHU_RUN_REAL_LLM=1` 门禁就绪 |
 | R10 | ~~Snapshot Builder 未集成到 REVIEW_READY 流程~~ | 已消除 | Phase 9B-P0 已将 SnapshotBuilder.build() 接入 Pipeline.run_all()，snapshot hash 写入 provenance.yml |
 | R11 | ~~前端无自动化测试框架~~ | 已消除 | Phase 9B 源码级 + Phase 9C Playwright E2E |
@@ -90,8 +91,12 @@ DeveloperSpec (.md 项目书)
 
 ## 5. 下一步方向（Phase 10+）
 
-1. **真实业务样本端到端验证（9A4）**——NYC 案例 01 已完成（1/6），剩余 5 个企业场景待接入（阻塞于业务方提供样本）
+1. **真实业务样本端到端验证（9A4）**——NYC 案例 01 已完成（1/6），案例 06 A 类完成 + B 类遗留，剩余 4 个企业场景待接入（阻塞于业务方提供样本）
 2. **生产环境 LLM 验证**——已就绪（R8），`TIANSHU_RUN_REAL_LLM=1 python scripts/real_llm_regression.py --output llm_reports/verify_$(date +%Y%m%d).json`
+3. **Case 06 遗留工作**（C 类→后续 Phase）：
+   - `compute_ratios` 步骤的比率计算（crash_per_million_trips = total_crashes / total_trip_count * 1e6）
+   - `risk_label` 步骤的 CASE WHEN 输出支持
+   - `violation_county` 代码映射的方案通用化（当前硬编码 NYC 5 个代码）
 
 ## 6. 关键文档索引
 

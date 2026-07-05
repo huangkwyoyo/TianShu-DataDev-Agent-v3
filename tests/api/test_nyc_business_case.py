@@ -1046,12 +1046,10 @@ class TestNYCCase06SqlPipeline:
     def test_sql_program_has_seven_statements(self, nyc06_spec_md):
         """SqlProgram 应包含 7 个 statement——对应 7 个 compute_steps。"""
         from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
-        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
         from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
 
         parser = DeveloperSpecParser()
         spec = parser.parse(nyc06_spec_md)
-        manifest = build_manifest_from_spec(spec)
 
         builder = SqlBuildPlanBuilder()
         plans = builder.build_from_steps(spec, None)
@@ -1062,14 +1060,12 @@ class TestNYCCase06SqlPipeline:
     def test_no_cte_in_compiled_sql(self, nyc06_spec_md):
         """编译产物中不得出现 WITH ... AS（CTE 禁止）。"""
         from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
-        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
-        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
         from tianshu_datadev.planning.program_factory import build_sql_program_from_compute_steps
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
         from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
 
         parser = DeveloperSpecParser()
         spec = parser.parse(nyc06_spec_md)
-        manifest = build_manifest_from_spec(spec)
 
         builder = SqlBuildPlanBuilder()
         plans = builder.build_from_steps(spec, None)
@@ -1078,8 +1074,6 @@ class TestNYCCase06SqlPipeline:
         ).hexdigest()[:8]
         sql_program = build_sql_program_from_compute_steps(plans, spec, chain_id)
 
-        # 通过 compile_program 编译——取最后一条 FINAL SQL
-        compiler = DuckDbSqlCompiler()
         # compile_program 需 table_mapping——使用 auto 映射
         table_mapping = {}
         for t in spec.input_tables:
@@ -1192,8 +1186,6 @@ class TestNYCCase06SqlPipeline:
         cleanup_status 已在 ProgramExecutionResult 中记录，但 Pipeline.run_all()
         当前未暴露此状态。
         """
-        import duckdb
-
         pipeline = Pipeline()
         result = pipeline.run_all(nyc06_spec_md, table_paths=nyc06_csv_paths)
 
