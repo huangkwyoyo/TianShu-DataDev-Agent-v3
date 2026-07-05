@@ -20,12 +20,43 @@ from .pipeline import Pipeline
 from .routes import api_router
 
 
+def _discover_csv_fixtures() -> dict[str, str]:
+    """自动发现 tests/fixtures/ 目录下的 CSV fixture 文件。
+
+    以文件名（不含扩展名）为 key、绝对路径为 value，构建 DuckDB 所需的
+    table_paths 映射。在 E2E 测试环境中，前端不传 table_paths 参数，
+    Pipeline 会回退到此默认映射。
+
+    扫描范围：tests/fixtures/ 及所有子目录中的 *.csv 文件。
+
+    Returns:
+        {表名: CSV 绝对路径} 映射字典——目录不存在时返回空字典
+    """
+    import glob
+
+    # 从当前文件位置推导仓库根目录（app.py → api → tianshu_datadev → src → repo_root）
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    )
+    fixtures_dir = os.path.join(repo_root, "tests", "fixtures")
+    if not os.path.isdir(fixtures_dir):
+        return {}
+
+    mapping: dict[str, str] = {}
+    for csv_file in glob.glob(
+        os.path.join(fixtures_dir, "**", "*.csv"), recursive=True
+    ):
+        table_name = os.path.splitext(os.path.basename(csv_file))[0]
+        mapping[table_name] = os.path.abspath(csv_file)
+    return mapping
+
+
 def create_app(pipeline: Pipeline | None = None) -> FastAPI:
     """创建 FastAPI 应用实例。
 
     Args:
         pipeline: 可选的 Pipeline 实例（测试时可注入 mock）。
-                  若为 None，使用默认 Pipeline。
+                  若为 None，使用默认 Pipeline（含 CSV fixture 自动发现）。
 
     Returns:
         配置完成的 FastAPI 应用
@@ -45,8 +76,10 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    # 注入流水线
-    app.state.pipeline = pipeline or Pipeline()
+    # 注入流水线——未显式传入时自动发现 CSV fixture 文件
+    if pipeline is None:
+        pipeline = Pipeline(default_table_paths=_discover_csv_fixtures())
+    app.state.pipeline = pipeline
 
     # 注册异常处理器
     register_error_handlers(app)

@@ -87,3 +87,27 @@ Task 5: complete (全量回归验收 + 文档更新)
   Final: 588 passed / 11 skipped (api/spark 全量), frontend smoke 23 passed, Playwright E2E 4 passed / 2 skipped (table_paths 跳过), ruff/tsc/build/git diff clean
   R11: 已消除（Playwright E2E 补充——源码级 + E2E 双重覆盖）
   R16: 新增残留风险——table_paths 环境缺失
+Task 5: complete (commits 5d45b24..3bb52b2, review clean)
+Final: 588 passed / 11 skipped, frontend smoke 23 passed, E2E 4 passed / 2 skipped, ruff/tsc/build/git diff clean
+R11: 已消除（源码级 + Playwright E2E 双重覆盖）
+R16: 新增——table_paths 环境缺失，2 个 E2E 测试标记 test.skip()
+
+## Phase 9C-R16 Progress
+Started: 2026-07-05
+Base commit: 3bb52b2
+Task: complete (R16 消除——table_paths 自动发现 + PipelineStageIndicator dot-ok 修复)
+  - Pipeline.default_table_paths 回退参数 + 7 处方法适配
+  - create_app() CSV fixture 自动发现
+  - playwright.config.ts 修正模块路径（main→app factory）
+  - PipelineStageIndicator: skipped 阶段视为非失败完成态
+  - spec-editor + spark-verify 两个 test.skip() 移除
+  - Backend: 588 passed / 11 skipped (zero regression)
+  - E2E: 6 passed / 0 skipped
+  - Frontend smoke: 23 passed
+  - ruff/tsc/build/git diff: clean
+
+## Phase 9C Final Review
+Final review: CLEAN (0 Critical, 0 Important, 0 Minor)
+Non-blocking observations:
+- frontend/test-results/ 建议加入 .gitignore
+- error-display.spec.ts 测试名略有歧义（实际测试 PipelineStageIndicator 而非 ErrorDisplay）

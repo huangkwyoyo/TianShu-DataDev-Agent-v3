@@ -25,9 +25,10 @@
 | 9A | 生产级串联升级 | ✅ | ✅ | ✅ | 9A1-9A3 + 9A5 完成，9A4 阻塞-待业务方 |
 | 9B | 前端回归 + 可观测性 | ✅ | ✅ | ✅ | R11/R15 消除，2026-07-05 |
 | 9B-P0 | Snapshot Builder 集成到 Pipeline | ✅ | ✅ | ✅ | R10 消除，可选注入+全链路覆盖，2026-07-05 |
-| 9C | DOM E2E 交互测试 | ✅ | ✅ | ✅ | 4/6 Playwright 测试通过（2 因 table_paths 环境缺失跳过），2026-07-05 |
+| 9C | DOM E2E 交互测试 | ✅ | ✅ | ✅ | 6/6 Playwright 测试通过，2026-07-05 |
+| 9C-R16 | table_paths 环境配置补齐 | ✅ | ✅ | ✅ | R16 消除，CSV fixture 自动发现，2026-07-05 |
 
-**当前测试基线**：588 passed / 11 skipped（api/spark 后端子集）+ 23 passed（前端冒烟全量）+ 4 passed / 2 skipped（Playwright E2E），ruff/tsc/build 零告警
+**当前测试基线**：588 passed / 11 skipped（api/spark 后端子集）+ 23 passed（前端冒烟全量）+ 6 passed / 0 skipped（Playwright E2E），ruff/tsc/build 零告警
 
 ## 2. C1-C4 业务集成验证
 
@@ -51,7 +52,7 @@
 | R10 | ~~Snapshot Builder 未集成到 REVIEW_READY 流程~~ | 已消除 | Phase 9B-P0 已将 SnapshotBuilder.build() 接入 Pipeline.run_all()，snapshot hash 写入 provenance.yml |
 | R11 | ~~前端无自动化测试框架~~ | 已消除 | Phase 9B 源码级 + Phase 9C Playwright E2E |
 | R15 | ~~SQL 成功态 pipeline_stages 为空~~ | 已消除 | handleRunAll 成功路径注入全成功阶段——SQL 指示灯始终可见 |
-| R16 | Playwright E2E 缺少 table_paths 配置（DuckDB CSV 文件路径） | B | 2 个 E2E 测试标记为 test.skip()，待后续 Phase 补齐配置后启用 |
+| R16 | ~~Playwright E2E 缺少 table_paths 配置~~ | 已消除 | Phase 9C-R16：create_app() 自动发现 CSV fixture + Pipeline default_table_paths 回退 |
 
 ## 4. 当前架构全景
 

@@ -23,7 +23,11 @@ node_modules/
 
 # 运行时产物
 generated/review_packages/
+frontend/generated/
 
 # CodeGraph 索引
 .codegraph/
 frontend/dist/
+
+# Playwright E2E 测试运行时产物
+frontend/test-results/

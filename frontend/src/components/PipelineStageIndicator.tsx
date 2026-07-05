@@ -81,12 +81,14 @@ export function PipelineStageIndicator({ stages, error, title, testId }: Props) 
   // 计算摘要信息
   const failedStage = stages.find(s => s.status === 'failed');
   const hasFailure = !!failedStage;
+  // 全部完成——所有阶段均为 ok 或 skipped（非失败终态）
+  const allDone = stages.length > 0 && stages.every(s => s.status === 'ok' || s.status === 'skipped');
   const allOk = stages.length > 0 && stages.every(s => s.status === 'ok');
   const failedName = failedStage ? (STAGE_CN[failedStage.stage] || failedStage.stage) : '';
 
-  // 状态圆点颜色
-  const dotClass = hasFailure ? 'dot-error' : allOk ? 'dot-ok' : 'dot-loading';
-  const summaryText = hasFailure ? `${failedName}失败` : allOk ? '全部成功' : '处理中';
+  // 状态圆点颜色——skipped 是非失败完成态，应与 ok 同等对待
+  const dotClass = hasFailure ? 'dot-error' : allDone ? 'dot-ok' : 'dot-loading';
+  const summaryText = hasFailure ? `${failedName}失败` : allOk ? '全部成功' : allDone ? '已完成' : '处理中';
 
   return (
     <div className="pipeline-indicator" ref={ref} data-testid={testId}>

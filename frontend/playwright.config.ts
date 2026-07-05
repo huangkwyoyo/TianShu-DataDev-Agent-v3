@@ -13,7 +13,7 @@ export default defineConfig({
   },
   webServer: [
     {
-      command: 'python -m uvicorn tianshu_datadev.api.main:app --host 127.0.0.1 --port 8000',
+      command: 'python -m uvicorn tianshu_datadev.api.app:create_app --factory --host 127.0.0.1 --port 8000',
       port: 8000,
       timeout: 30000,
       reuseExistingServer: true,
