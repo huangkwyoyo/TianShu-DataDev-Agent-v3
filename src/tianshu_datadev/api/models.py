@@ -409,3 +409,37 @@ class HealthResponse(StrictModel):
     status: str  # "ok" | "degraded"
     version: str
     pipeline_ready: bool
+
+
+# ════════════════════════════════════════════
+# Spark 管线验证——POST /api/spark/verify
+# ════════════════════════════════════════════
+
+
+class SparkVerifyRequest(StrictModel):
+    """POST /api/spark/verify 请求体——传入 Pipeline 产出的 request_id。"""
+
+    request_id: str  # Pipeline run_all 返回的 request_id
+
+
+class SparkStageItem(StrictModel):
+    """Spark 管线单个阶段结果——供前端 PipelineStageIndicator 渲染。"""
+
+    stage: str  # 阶段名（MAPPER / DEVELOPER / COMPILER / VALIDATOR / COMPARATOR / PHYSICAL_VERIFIER）
+    status: str  # 阶段状态（"ok" / "failed" / "skipped"）
+
+
+class SparkVerifyResponse(StrictModel):
+    """POST /api/spark/verify 响应——Spark 管线 6 阶段结果 + REVIEW_READY 判定。
+
+    成功路径返回 spark_stages + review_ready；
+    失败路径（artifacts 缺失/不完整/执行异常）通过 HTTP 错误码返回。
+    """
+
+    request_id: str  # 回显请求的 request_id
+    spark_stages: list[SparkStageItem] = []  # Spark 6 阶段结果列表
+    overall_status: str = ""  # SparkPipelineStatus 字符串值
+    comparator_status: str = ""  # 对比器状态字符串
+    review_ready: bool = False  # REVIEW_READY 判定——所有关键阶段通过的标志
+    package_id: str = ""  # SparkReviewPackage ID
+    errors: list[str] = []  # 错误信息列表（成功时为空）
