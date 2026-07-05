@@ -44,3 +44,15 @@ Task 3: complete (验收 + 文档更新)
 Final: 582 passed / 11 skipped (api/spark 子集), frontend smoke 23 passed all, ruff/tsc/build/git diff clean
 R11: 已消除（前端源码级回归测试覆盖按钮/指示灯/错误路径）
 R15: 已消除（SQL 指示灯成功态 green dot + 8 阶段全部 ✅）
+
+## Phase 9B-P0 Progress
+Started: 2026-07-05
+Base commit: 27ad156
+Task 1: complete (commits 27ad156..3685226, review clean)
+Task 2: complete (commits 3685226..da71d42, review clean)
+  Minor: ComputeSteps + 公共路径 Snapshot 代码块重复（B2 已知取舍）
+Task 3: complete (commits da71d42..20f876a, review clean)
+Task 4: complete (commits 20f876a..70c5dfc..48c5a41, fix round for tmpdir/import/hardcoded-path)
+Task 5: complete (全量回归 + 文档更新)
+Final: 587 passed / 11 skipped, frontend smoke 23 passed, ruff/tsc/build/git diff clean
+R10: 已消除（Snapshot Builder 已集成到 Pipeline.run_all()，可选注入+build+provenance hash 全链路覆盖）
