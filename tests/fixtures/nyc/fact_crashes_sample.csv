@@ -1,0 +1,31 @@
+crash_id,borough,persons_injured,persons_killed,contributing_factor_1,crash_date_key
+1,Manhattan,2,0,Driver Inattention/Distraction,20250115
+2,Manhattan,1,0,Failure to Yield Right-of-Way,20250220
+3,Manhattan,0,0,Driver Inattention/Distraction,20250310
+4,Manhattan,3,1,Unsafe Speed,20250405
+5,Manhattan,1,0,Traffic Control Disregarded,20250512
+6,Queens,1,0,Driver Inattention/Distraction,20250118
+7,Queens,2,0,Failure to Yield Right-of-Way,20250225
+8,Queens,0,0,Driver Inattention/Distraction,20250315
+9,Queens,1,0,Unsafe Speed,20250410
+10,Queens,0,0,Traffic Control Disregarded,20250520
+11,Brooklyn,2,1,Driver Inattention/Distraction,20250120
+12,Brooklyn,1,0,Failure to Yield Right-of-Way,20250228
+13,Brooklyn,0,0,Driver Inattention/Distraction,20250318
+14,Brooklyn,1,0,Unsafe Speed,20250412
+15,Brooklyn,0,0,Traffic Control Disregarded,20250522
+16,Bronx,1,0,Driver Inattention/Distraction,20250122
+17,Bronx,0,0,Failure to Yield Right-of-Way,20250301
+18,Bronx,1,0,Driver Inattention/Distraction,20250320
+19,Bronx,0,0,Unsafe Speed,20250415
+20,Bronx,2,1,Traffic Control Disregarded,20250525
+21,Staten Island,0,0,Driver Inattention/Distraction,20250125
+22,Staten Island,1,0,Failure to Yield Right-of-Way,20250305
+23,Staten Island,0,0,Driver Inattention/Distraction,20250322
+24,Staten Island,0,0,Unsafe Speed,20250418
+25,Staten Island,1,0,Traffic Control Disregarded,20250528
+26,Manhattan,1,0,Driver Inattention/Distraction,20250601
+27,Queens,0,0,Failure to Yield Right-of-Way,20250605
+28,Brooklyn,1,0,Driver Inattention/Distraction,20250610
+29,Bronx,0,0,Unsafe Speed,20250615
+30,Manhattan,2,0,Driver Inattention/Distraction,20250620

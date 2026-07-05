@@ -167,3 +167,19 @@ Task: complete (Comparator 状态收口——双重根因修复 + 显式断言)
   - 测试基线: 661 passed / 11 skipped (+2 新测试，零退化)
   - ruff/git diff: clean
   - NYC 案例 01 Spark 双链路逻辑等价: 已点亮 (comparator_report.status=LOGIC_EQUIVALENT)
+
+## R8 Progress
+Started: 2026-07-05
+Base commit: 5d5553a
+Task 1: complete (commits 5d5553a..af6be79)
+Task 2: complete (commits af6be79..11d32bc)
+Task 3: complete (commits 11d32bc..2cadc8f)
+Task 4: complete (verification: 850 passed / 11 skipped, ruff clean, gate OK)
+Task 5: complete (commits 2cadc8f..b4300d5)
+Final: 850 passed, 11 skipped, ruff clean, gate OK
+
+## Phase 10 Case06 DAG Progress
+Started: 2026-07-05
+Base commit: b4300d5
+Task 1: complete (commits b4300d5..af3dd48, review clean — spec ✅ quality Approved)
+Task 2: complete (无需改动——Contract 提取已在 compute_steps 分支完整实现: pipeline.py L1116-1118 extract_v1 + L1201 _store_result + L1633 export_artifacts)

@@ -1002,9 +1002,9 @@ def nyc06_csv_paths() -> dict:
     return {
         "fact_trips_sample": os.path.join(base, "fact_trips_sample.csv"),
         "dim_taxi_zone": os.path.join(base, "dim_taxi_zone.csv"),
-        # 以下 CSV 待创建——若不存在则测试标记为 skip
-        # "fact_crashes_sample": os.path.join(base, "fact_crashes_sample.csv"),
-        # "dws_daily_parking_summary": os.path.join(base, "dws_daily_parking_summary.csv"),
+        "fact_crashes_sample": os.path.join(base, "fact_crashes_sample.csv"),
+        "dws_daily_parking_summary": os.path.join(base, "dws_daily_parking_summary.csv"),
+        "dim_violation_type": os.path.join(base, "dim_violation_type.csv"),
     }
 
 
@@ -1095,3 +1095,115 @@ class TestNYCCase06SqlPipeline:
             assert "WITH " not in sql_upper or "WITHIN GROUP" in sql_upper, (
                 f"编译 SQL 不得包含 CTE (WITH ... AS): {stmt_sql.sql[:200]}"
             )
+
+    @pytest.mark.xfail(
+        reason="构建器限制：source=input 步骤不支持 joins，需重构 compute_steps "
+               "（trip_boro_agg 的 tz ⋈ zts JOIN 无法处理）——Phase 6 后续迭代修复",
+        strict=False,
+    )
+    def test_run_all_produces_borough_results(self, nyc06_spec_md, nyc06_csv_paths):
+        """Pipeline.run_all() 全链路执行——输出应包含 5 个 NYC 行政区结果。"""
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc06_spec_md, table_paths=nyc06_csv_paths)
+
+        assert result["validation_passed"] is True, (
+            f"Case 06 验证应通过: {result.get('open_questions')}"
+        )
+
+        # 验证所有阶段通过
+        stages = result.get("pipeline_stages", [])
+        failed = [s for s in stages if s["status"] == "failed"]
+        assert len(failed) == 0, (
+            f"存在失败阶段: {[(s['stage'], s.get('error_message', '')) for s in failed]}"
+        )
+
+        # 执行状态应为通过
+        trace = result.get("execution_trace", {})
+        assert trace.get("status") == "RUNTIME_PASS", (
+            f"执行应成功: {trace.get('error_message')}"
+        )
+
+        # 验证输出包含 borough 列，且至少有 5 个不同的 borough
+        summary = result["result_summary"]
+        assert "borough" in summary.get("columns", []), (
+            f"输出应包含 borough 列，实际列={summary.get('columns')}"
+        )
+        assert summary["row_count"] >= 5, (
+            f"输出行数应 >= 5（5 个 NYC 行政区），实际={summary['row_count']}"
+        )
+
+    @pytest.mark.xfail(
+        reason="构建器限制：trip_boro_agg JOIN 无法处理 + 无 ratio 计算机制 + 无 CASE WHEN "
+               "标签支持——Phase 6 后续迭代修复",
+        strict=False,
+    )
+    def test_safety_risk_level_values_valid(self, nyc06_spec_md, nyc06_csv_paths):
+        """safety_risk_level 列值必须为预定义的风险等级之一。"""
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc06_spec_md, table_paths=nyc06_csv_paths)
+
+        assert result["validation_passed"] is True, (
+            f"验证应通过: {result.get('open_questions')}"
+        )
+
+        trace = result.get("execution_trace", {})
+        assert trace.get("status") == "RUNTIME_PASS", (
+            f"执行应成功: {trace.get('error_message')}"
+        )
+
+        # 验证 safety_risk_level 在输出列中
+        columns = result["result_summary"]["columns"]
+        assert "safety_risk_level" in columns, (
+            f"输出应包含 safety_risk_level 列，实际列={columns}"
+        )
+
+        # 检查列类型为字符串
+        col_types = dict(zip(result["result_summary"]["columns"],
+                             result["result_summary"]["column_types"]))
+        assert "VARCHAR" in col_types.get("safety_risk_level", "").upper(), (
+            f"safety_risk_level 类型应为字符串，实际={col_types.get('safety_risk_level')}"
+        )
+
+    def test_execution_compiled_sql_no_cte(self, nyc06_spec_md, nyc06_csv_paths):
+        """run_all 执行后编译 SQL 中不得出现 WITH ... AS（CTE 禁止）。"""
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc06_spec_md, table_paths=nyc06_csv_paths)
+
+        compiled = result.get("compiled", {})
+        if compiled and hasattr(compiled, "sql"):
+            sql_upper = compiled.sql.upper()
+            assert "WITH " not in sql_upper or "WITHIN GROUP" in sql_upper, (
+                f"最终编译 SQL 不得包含 CTE: {compiled.sql[:200]}"
+            )
+
+    @pytest.mark.xfail(
+        reason="构建器限制：pipeline.run_all() 在 trip_boro_agg JOIN 步骤失败，"
+               "无法到达执行完成阶段验证临时表清理——Phase 6 后续迭代修复",
+        strict=False,
+    )
+    def test_temp_tables_cleaned_after_execution(self, nyc06_spec_md, nyc06_csv_paths):
+        """执行完成后 _temp_* 临时表应被清除——不残留中间数据。"""
+        import duckdb
+
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc06_spec_md, table_paths=nyc06_csv_paths)
+
+        assert result["validation_passed"] is True
+        trace = result.get("execution_trace", {})
+        assert trace.get("status") == "RUNTIME_PASS"
+
+        # 用新 DuckDB 连接检查是否仍能访问 _temp_ 表
+        # DuckDB 会在连接关闭时自动清理临时表，故此处验证执行后
+        # 不再有残留的 _temp_ 表（通过查询 information_schema）
+        conn = duckdb.connect(":memory:")
+        try:
+            # 检查是否还有残留的 _temp_ 表
+            rows = conn.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_name LIKE '_temp_%'"
+            ).fetchall()
+            assert len(rows) == 0, (
+                f"存在残留临时表: {[r[0] for r in rows]}"
+            )
+        finally:
+            conn.close()

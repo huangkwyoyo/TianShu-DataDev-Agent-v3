@@ -12,7 +12,7 @@ spec:
   summary: "区域安全合规画像——融合停车违章频率与事故严重度，产出区域风险等级标签"
 
   source_tables:
-    - name: gold.dim_taxi_zone
+    - name: dim_taxi_zone
       alias: tz
       row_count: 265
       role: dim
@@ -28,25 +28,29 @@ spec:
           type: varchar
           nullable: false
 
-    - name: gold.dws_zone_trip_summary
+    - name: fact_trips_sample
       alias: zts
-      row_count: 263
+      row_count: 5000
       role: fact
       key_columns:
+        - name: trip_id
+          type: varchar
+          nullable: false
+      time_field: pickup_at
+      business_columns:
         - name: pickup_location_id
           type: integer
           nullable: false
-      business_columns:
-        - name: trip_count
-          type: bigint
-          nullable: false
-        - name: total_fare_amount
-          type: decimal(18,2)
+        - name: total_amount
+          type: decimal(12,2)
+          nullable: true
+        - name: fare_amount
+          type: decimal(12,2)
           nullable: true
 
-    - name: gold.fact_crashes
+    - name: fact_crashes_sample
       alias: fc
-      row_count: 1655065
+      row_count: 30
       role: fact
       time_field: crash_date_key
       key_columns:
@@ -67,11 +71,11 @@ spec:
           type: varchar
           nullable: true
 
-    - name: gold.dws_daily_parking_summary
+    - name: dws_daily_parking_summary
       alias: dps
-      row_count: 1247
+      row_count: 20
       role: fact
-      time_field: issue_date
+      time_field: date_key
       key_columns:
         - name: date_key
           type: integer
@@ -87,7 +91,7 @@ spec:
           type: decimal(18,2)
           nullable: false
 
-    - name: gold.dim_violation_type
+    - name: dim_violation_type
       alias: vt
       row_count: 100
       role: dim
@@ -143,7 +147,7 @@ spec:
     - step_name: trip_boro_agg
       source: input
       output_alias: trip_boro_agg
-      description: "行程数据——dim_taxi_zone JOIN dws_zone_trip_summary 后按 borough 聚合"
+      description: "行程数据——dim_taxi_zone JOIN fact_trips_sample 后按 borough 聚合"
       group_by: [borough]
       joins:
         - left_table: tz
@@ -153,12 +157,12 @@ spec:
           join_type: LEFT
       metrics:
         - metric_name: total_trip_count
-          aggregation: SUM
-          input_column: trip_count
+          aggregation: COUNT
+          input_column: trip_id
           alias: total_trip_count
         - metric_name: total_fare
           aggregation: SUM
-          input_column: total_fare_amount
+          input_column: total_amount
           alias: total_fare
 
     - step_name: trip_crash_join

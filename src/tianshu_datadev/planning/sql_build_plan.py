@@ -408,7 +408,8 @@ class SqlBuildPlanBuilder:
 
             if len(sources) == 1 and sources[0] == "input":
                 # ── 叶节点：从源表扫描 ──
-                table = spec.input_tables[0]
+                # 多表 spec 时，根据 step 的列名与各表的声明列匹配度选择正确的源表
+                table = self._match_table_for_compute_step(cs, spec.input_tables)
                 scan_cols = self._build_required_columns_from_compute_step(
                     cs, table.table_alias
                 )
@@ -771,6 +772,52 @@ class SqlBuildPlanBuilder:
                 ))
 
         return specs
+
+    @staticmethod
+    def _match_table_for_compute_step(
+        cs,  # ComputeStep
+        input_tables: list,
+    ) -> object:
+        """多表 spec 中，为 compute step 匹配合适的源表。
+
+        根据 step 的 group_by + metric input_column 与各表的声明列名匹配度，
+        选择最佳匹配表。当只有一张表时直接返回。
+
+        Args:
+            cs: ComputeStep 实例
+            input_tables: 所有输入表列表
+
+        Returns:
+            匹配的 InputTableDecl 实例
+        """
+        if len(input_tables) == 1:
+            return input_tables[0]
+
+        # 收集 step 需要的所有列名
+        step_cols: set[str] = set(cs.group_by or [])
+        for m in cs.metrics:
+            if m.input_column:
+                step_cols.add(m.input_column)
+
+        if not step_cols:
+            return input_tables[0]
+
+        # 按列名匹配度打分
+        best_table = input_tables[0]
+        best_score = -1
+        for t in input_tables:
+            table_cols: set[str] = set()
+            for c in t.key_columns:
+                table_cols.add(c.column_name)
+            for c in t.business_columns:
+                table_cols.add(c.column_name)
+            for c in t.columns:
+                table_cols.add(c.column_name)
+            score = len(step_cols & table_cols)
+            if score > best_score:
+                best_score = score
+                best_table = t
+        return best_table
 
     def _build_required_columns_from_compute_step(
         self,
