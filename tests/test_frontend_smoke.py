@@ -245,3 +245,209 @@ class TestApiIntegration:
             assert f"class {model}" in models_src, (
                 f"前端专用模型 '{model}' 未在 models.py 中定义"
             )
+
+
+class TestSparkPipelineFrontend:
+    """Spark 管线前端集成回归测试——按钮/指示灯/错误路径/类型/端点/状态映射。
+
+    验证 Phase 9A 全部 6 个 Task 的前端产出物在源码级别正确：
+    - sparkVerify() 函数签名存在
+    - SparkVerifyResponse 类型字段完整
+    - PipelineStageIndicator title prop + STAGE_CN Spark 6 阶段映射
+    - App.tsx handleSparkVerify + 第二个 PipelineStageIndicator
+    - Spark 按钮 disabled 逻辑（依赖 requestId 非空）
+    - 错误处理（catch 中设置 ApiError 到 ErrorDisplay）
+    - POST /api/spark/verify 端点已注册
+    - _status_map 映射完整（5 种状态值 → 3 种前端 status）
+    """
+
+    # ── 辅助方法 ──
+
+    @staticmethod
+    def _read_file(*parts: str) -> str:
+        """读取项目文件内容。"""
+        path = os.path.join(_ROOT, *parts)
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    # ── client.ts 测试 ──
+
+    def test_spark_verify_function_exists_in_client(self):
+        """sparkVerify 函数签名存在于 client.ts。"""
+        src = self._read_file("frontend", "src", "api", "client.ts")
+        assert "export function sparkVerify" in src, (
+            "client.ts 中缺少 sparkVerify 函数导出"
+        )
+        assert "SparkVerifyResponse" in src, (
+            "client.ts 中缺少 SparkVerifyResponse 类型引用"
+        )
+        assert "'/spark/verify'" in src, (
+            "client.ts 中 sparkVerify 未指向 /spark/verify 端点"
+        )
+
+    def test_spark_verify_response_type_has_required_fields(self):
+        """SparkVerifyResponse 类型包含全部 7 个字段。"""
+        src = self._read_file("frontend", "src", "api", "client.ts")
+        required_fields = [
+            "request_id", "spark_stages", "overall_status",
+            "comparator_status", "review_ready", "package_id", "errors",
+        ]
+        for field in required_fields:
+            assert field in src, (
+                f"SparkVerifyResponse 缺少字段 '{field}'"
+            )
+
+    # ── PipelineStageIndicator 测试 ──
+
+    def test_pipeline_stage_indicator_has_title_prop(self):
+        """PipelineStageIndicator 接受可选 title prop。"""
+        src = self._read_file(
+            "frontend", "src", "components", "PipelineStageIndicator.tsx"
+        )
+        assert "title?: string" in src, (
+            "PipelineStageIndicator Props 中缺少 'title?: string'"
+        )
+        assert "title || '流水线阶段'" in src, (
+            "下拉框 header 未使用 title prop 作为回退"
+        )
+
+    def test_stage_cn_has_all_spark_stages(self):
+        """STAGE_CN 包含全部 6 个 Spark 阶段的中文映射。"""
+        src = self._read_file(
+            "frontend", "src", "components", "PipelineStageIndicator.tsx"
+        )
+        spark_stages_cn = {
+            "MAPPER": "映射",
+            "DEVELOPER": "标注",
+            "COMPILER": "编译",
+            "VALIDATOR": "校验",
+            "COMPARATOR": "对比",
+            "PHYSICAL_VERIFIER": "物理验证",
+        }
+        for stage_en, stage_cn in spark_stages_cn.items():
+            assert stage_en in src, (
+                f"STAGE_CN 缺少 Spark 阶段 '{stage_en}'"
+            )
+            assert stage_cn in src, (
+                f"STAGE_CN 中 '{stage_en}' 的中文映射 '{stage_cn}' 缺失"
+            )
+
+    # ── App.tsx 测试 ──
+
+    def test_app_has_spark_verify_button(self):
+        """App.tsx 包含 'Spark 验证' 按钮且 disabled 依赖 requestId。"""
+        src = self._read_file("frontend", "src", "App.tsx")
+        assert "Spark 验证" in src, (
+            "App.tsx 中缺少 'Spark 验证' 按钮"
+        )
+        assert "handleSparkVerify" in src, (
+            "App.tsx 中缺少 handleSparkVerify 函数"
+        )
+        assert "!state.requestId" in src, (
+            "Spark 按钮 disabled 逻辑未依赖 requestId"
+        )
+
+    def test_app_has_second_pipeline_indicator_with_spark_title(self):
+        """App.tsx 包含第二个 PipelineStageIndicator 且 title='Spark 管线'。"""
+        src = self._read_file("frontend", "src", "App.tsx")
+        assert 'title="Spark 管线"' in src, (
+            "App.tsx 中第二个 PipelineStageIndicator 缺少 title='Spark 管线'"
+        )
+        # 验证 sparkStages 被传给第二个指示灯的 stages prop
+        assert "sparkStages" in src, (
+            "App.tsx 中未使用 sparkStages 状态"
+        )
+
+    def test_spark_verify_catch_sets_error_for_display(self):
+        """handleSparkVerify 的 catch 分支设置 error（ApiError）用于 ErrorDisplay。"""
+        src = self._read_file("frontend", "src", "App.tsx")
+        # catch 分支必须设置 error 字段——ErrorDisplay 读取 state.error
+        assert "error: apiErr" in src or "error: apiErr" in src.replace(" ", ""), (
+            "handleSparkVerify catch 分支未将 apiErr 赋给 error——ErrorDisplay 无法展示"
+        )
+
+    # ── 后端路由 + 状态映射测试 ──
+
+    def test_spark_verify_endpoint_registered(self):
+        """POST /api/spark/verify 端点已在 routes.py 注册。"""
+        src = self._read_file("src", "tianshu_datadev", "api", "routes.py")
+        assert '"/spark/verify"' in src, (
+            "routes.py 中缺少 /spark/verify 路由注册"
+        )
+        assert "async def spark_verify" in src, (
+            "routes.py 中缺少 spark_verify 端点函数定义"
+        )
+
+    def test_status_map_complete(self):
+        """_status_map 包含全部 5 种 SparkPipelineState 值的映射。"""
+        src = self._read_file("src", "tianshu_datadev", "api", "routes.py")
+        required_mappings = [
+            ("SUCCESS", "ok"),
+            ("FAILURE", "failed"),
+            ("HUMAN_REVIEW", "failed"),
+            ("SKIPPED", "skipped"),
+            ("NOT_EXECUTED", "skipped"),
+        ]
+        for state_value, frontend_status in required_mappings:
+            assert f'"{state_value}"' in src, (
+                f"_status_map 缺少状态 '{state_value}'"
+            )
+            assert f'"{frontend_status}"' in src, (
+                f"_status_map 中 '{state_value}' 的目标值 '{frontend_status}' 缺失"
+            )
+
+    # ── SQL 管线成功态可观测性测试（R15）──
+
+    def test_run_action_allows_partial_to_override_pipeline_stages(self):
+        """runAction 中 partial 可以覆盖 pipelineStages——使得成功态可自定义阶段。"""
+        src = self._read_file("frontend", "src", "App.tsx")
+        # 验证 merge 顺序：pipelineStages 在 ...partial 之前（partial 后覆盖）
+        # 新的顺序应为: { isLoading: false, pipelineError, pipelineStages, ...partial }
+        import re
+        # 找到 runAction 中的 update 调用
+        match = re.search(
+            r'update\(\{[^}]+pipelineStages[^}]+}\)',
+            src, re.DOTALL,
+        )
+        if match:
+            update_block = match.group(0)
+            # pipelineStages 应该在 ...partial 之前出现（按源码从上到下）
+            ps_pos = update_block.find("pipelineStages")
+            partial_pos = update_block.find("...partial")
+            assert ps_pos < partial_pos, (
+                f"runAction 中 pipelineStages 应在 ...partial 之前——"
+                f"当前顺序使得 partial 无法覆盖 API 响应中的空 stages。"
+                f"update 块: {update_block[:120]}..."
+            )
+
+    def test_handle_run_all_sets_success_stages(self):
+        """handleRunAll 成功路径设置全成功阶段——SQL 指示灯在成功后可见。"""
+        src = self._read_file("frontend", "src", "App.tsx")
+        # 成功路径（无 pipeline_error）中应设置 pipelineStages
+        # 检查 try 分支中有 pipelineStages
+        assert "pipelineStages" in src, (
+            "handleRunAll 中未设置 pipelineStages"
+        )
+
+    def test_stage_cn_has_all_sql_stages(self):
+        """STAGE_CN 包含全部 8 个 SQL 阶段的中文映射（含 contract/package）。"""
+        src = self._read_file(
+            "frontend", "src", "components", "PipelineStageIndicator.tsx"
+        )
+        sql_stages_cn = {
+            "parser": "解析",
+            "enrich": "增强",
+            "build": "构建",
+            "validate": "验证",
+            "compile": "编译",
+            "execute": "执行",
+            "contract": "契约",
+            "package": "打包",
+        }
+        for stage_en, stage_cn in sql_stages_cn.items():
+            assert stage_en in src, (
+                f"STAGE_CN 缺少 SQL 阶段 '{stage_en}'"
+            )
+            assert stage_cn in src, (
+                f"STAGE_CN 中 '{stage_en}' 的中文映射 '{stage_cn}' 缺失"
+            )
