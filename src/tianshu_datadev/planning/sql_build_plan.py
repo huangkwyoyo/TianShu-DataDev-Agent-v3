@@ -16,6 +16,7 @@ from pydantic import Field
 
 from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer
 from tianshu_datadev.developer_spec.models import (
+    InputTableDecl,
     OpenQuestion,
     ParsedDeveloperSpec,
     StrictModel,
@@ -407,24 +408,101 @@ class SqlBuildPlanBuilder:
             )
 
             if len(sources) == 1 and sources[0] == "input":
-                # ── 叶节点：从源表扫描 ──
-                # 多表 spec 时，根据 step 的列名与各表的声明列匹配度选择正确的源表
-                table = self._match_table_for_compute_step(cs, spec.input_tables)
-                scan_cols = self._build_required_columns_from_compute_step(
-                    cs, table.table_alias
-                )
-                scan = ScanStep(
-                    step_id=SqlBuildPlan.generate_step_id(
-                        "scan", {"step": cs.step_name, "table": table.source_table}
-                    ),
-                    table_ref=table.table_alias,
-                    required_columns=scan_cols,
-                    estimated_row_count=table.row_count,
-                )
-                plan_steps.append(scan)
-                # 源表预过滤
-                for f in table.filters:
-                    plan_steps.append(self._build_filter_step(f, table.table_alias))
+                if cs.joins:
+                    # ── 多源 Join 场景：source="input" + joins → 需 Join 多张源表后再聚合 ──
+                    table_map = {t.table_alias: t for t in spec.input_tables}
+                    for j_idx, jd in enumerate(cs.joins):
+                        left_table = table_map.get(jd.left_table)
+                        right_table = table_map.get(jd.right_table)
+                        if not left_table or not right_table:
+                            raise ValueError(
+                                f"compute_step '{cs.step_name}' 的 Join 声明引用了不存在的表: "
+                                f"left='{jd.left_table}', right='{jd.right_table}'"
+                            )
+
+                        if j_idx == 0:
+                            # 第一对 Join：扫描左右表
+                            left_cols = self._build_columns_for_input_step_table(
+                                cs, left_table, extra_cols=[jd.left_key]
+                            )
+                            left_scan = ScanStep(
+                                step_id=SqlBuildPlan.generate_step_id(
+                                    "scan", {"step": cs.step_name, "table": left_table.source_table}
+                                ),
+                                table_ref=left_table.table_alias,
+                                required_columns=left_cols,
+                                estimated_row_count=left_table.row_count,
+                            )
+                            plan_steps.append(left_scan)
+                            for f in left_table.filters:
+                                plan_steps.append(self._build_filter_step(
+                                    f, left_table.table_alias
+                                ))
+
+                        right_cols = self._build_columns_for_input_step_table(
+                            cs, right_table, extra_cols=[jd.right_key]
+                        )
+                        right_scan = ScanStep(
+                            step_id=SqlBuildPlan.generate_step_id(
+                                "scan_r", {"step": cs.step_name, "table": right_table.source_table}
+                            ),
+                            table_ref=right_table.table_alias,
+                            required_columns=right_cols,
+                            estimated_row_count=right_table.row_count,
+                        )
+                        plan_steps.append(right_scan)
+                        for f in right_table.filters:
+                            plan_steps.append(self._build_filter_step(
+                                f, right_table.table_alias
+                            ))
+
+                        # JoinStep——JoinType 枚举值兼容（INNER/LEFT/RIGHT 共用 .value）
+                        join_step = JoinStep(
+                            step_id=SqlBuildPlan.generate_step_id("join", {
+                                "step": cs.step_name,
+                                "left": jd.left_table,
+                                "right": jd.right_table,
+                                "left_key": jd.left_key,
+                                "right_key": jd.right_key,
+                            }),
+                            right_table_ref=right_table.table_alias,
+                            join_type=JoinType(jd.join_type.value.upper()),
+                            join_keys=[(
+                                ColumnRef(
+                                    table_ref=left_table.table_alias,
+                                    column_name=jd.left_key,
+                                    normalized_name=self._normalizer.normalize(jd.left_key),
+                                ),
+                                ColumnRef(
+                                    table_ref=right_table.table_alias,
+                                    column_name=jd.right_key,
+                                    normalized_name=self._normalizer.normalize(jd.right_key),
+                                ),
+                            )],
+                            relationship_ref=(
+                                f"compute_steps:{cs.step_name}:"
+                                f"{jd.left_table}:{jd.right_table}"
+                            ),
+                        )
+                        plan_steps.append(join_step)
+                else:
+                    # ── 单表扫描（原有逻辑）──
+                    table = self._match_table_for_compute_step(cs, spec.input_tables)
+                    scan_cols = self._build_required_columns_from_compute_step(
+                        cs, table.table_alias
+                    )
+                    scan = ScanStep(
+                        step_id=SqlBuildPlan.generate_step_id(
+                            "scan", {"step": cs.step_name, "table": table.source_table}
+                        ),
+                        table_ref=table.table_alias,
+                        required_columns=scan_cols,
+                        estimated_row_count=table.row_count,
+                    )
+                    plan_steps.append(scan)
+                    # 源表预过滤
+                    for f in table.filters:
+                        plan_steps.append(self._build_filter_step(f, table.table_alias))
 
             elif len(sources) == 1:
                 # ── 线性步骤：从单个上游 _temp 表扫描 ──
@@ -564,10 +642,36 @@ class SqlBuildPlanBuilder:
             # ── AggregateStep ──
             # 合流步骤有 case_when 时跳过聚合——CASE WHEN 已替代聚合逻辑
             if cs.metrics and not cs.case_when:
-                st = "" if isinstance(cs.source, list) else (
-                    cs.source if cs.source != "input" else ""
-                )
-                agg = self._build_aggregate_from_compute_step(cs, source_table=st)
+                # 合流步骤（source 为列表）：GROUP BY 各列可能来自不同上游源，
+                # 需要按列消歧——仅对重叠列（多个源都有）加表前缀
+                if isinstance(cs.source, list) and len(cs.source) > 0:
+                    agg = self._build_aggregate_from_compute_step(cs, source_table="")
+                    # 构建列名→上游源列表映射
+                    col_sources: dict[str, list[str]] = {}
+                    for src in sources:
+                        for uc in step_outputs.get(src, []):
+                            name = uc.column_name
+                            if name not in col_sources:
+                                col_sources[name] = []
+                            col_sources[name].append(src)
+                    # 逐列修正 GROUP BY 表前缀——仅重叠列需要消歧
+                    agg.group_keys = [
+                        ColumnRef(
+                            table_ref=(
+                                make_temp_name(chain_id, col_sources[gk.column_name][0])
+                                if len(col_sources.get(gk.column_name, [])) > 1
+                                else ""
+                            ),
+                            column_name=gk.column_name,
+                            normalized_name=gk.normalized_name,
+                        )
+                        for gk in agg.group_keys
+                    ]
+                else:
+                    st = "" if isinstance(cs.source, list) else (
+                        cs.source if cs.source != "input" else ""
+                    )
+                    agg = self._build_aggregate_from_compute_step(cs, source_table=st)
                 plan_steps.append(agg)
 
             # ── WindowStep（仅最终步骤，聚合后、投影前）──
@@ -608,7 +712,57 @@ class SqlBuildPlanBuilder:
                     )
                 plan_steps.append(project)
             else:
-                proj_cols = self._build_compute_step_passthrough(cs)
+                is_merge_step = isinstance(cs.source, list) and len(cs.source) > 0
+
+                if not cs.metrics and not cs.case_when:
+                    # ── 无聚合步骤（透传导流）：透传所有上游列 ──
+                    has_upstream = not (len(sources) == 1 and sources[0] == "input")
+                    if has_upstream:
+                        # 构建列名→源列表映射，用于检测重叠列（如 borough 存在于多个上游）
+                        col_sources: dict[str, list[str]] = {}
+                        for src in sources:
+                            for uc in step_outputs.get(src, []):
+                                name = uc.column_name
+                                if name not in col_sources:
+                                    col_sources[name] = []
+                                col_sources[name].append(src)
+
+                        proj_cols = []
+                        seen: set[str] = set()
+                        for src in sources:
+                            temp_ref = make_temp_name(chain_id, src)
+                            for uc in step_outputs.get(src, []):
+                                name = uc.column_name
+                                normalized = uc.normalized_name or self._normalizer.normalize(name)
+                                if normalized not in seen:
+                                    seen.add(normalized)
+                                    # 重叠列（多个源都有）：用第一个源的 temp_ref 消歧
+                                    # 唯一列：不设 table_ref（DuckDB 自动解析）
+                                    src_list = col_sources.get(name, [src])
+                                    use_ref = (
+                                        make_temp_name(chain_id, src_list[0])
+                                        if len(src_list) > 1 else ""
+                                    )
+                                    proj_cols.append(AliasExpr(
+                                        expression=ColumnRef(
+                                            table_ref=use_ref,
+                                            column_name=name,
+                                            normalized_name=normalized,
+                                        ),
+                                        alias=name,
+                                    ))
+                    else:
+                        # source="input" 且无聚合——使用标准透传（仅 group_by）
+                        proj_cols = self._build_compute_step_passthrough(cs)
+                else:
+                    # 有聚合（metrics 或 case_when）：标准透传（group_by + metric aliases）
+                    proj_table_ref = ""
+                    if is_merge_step:
+                        proj_table_ref = make_temp_name(chain_id, cs.source[0])
+                    proj_cols = self._build_compute_step_passthrough(
+                        cs, default_table_ref=proj_table_ref,
+                    )
+
                 plan_steps.append(ProjectStep(
                     step_id=SqlBuildPlan.generate_step_id(
                         "project", {"step": cs.step_name, "intermediate": True}
@@ -777,11 +931,13 @@ class SqlBuildPlanBuilder:
     def _match_table_for_compute_step(
         cs,  # ComputeStep
         input_tables: list,
-    ) -> object:
+    ) -> InputTableDecl:
         """多表 spec 中，为 compute step 匹配合适的源表。
 
         根据 step 的 group_by + metric input_column 与各表的声明列名匹配度，
         选择最佳匹配表。当只有一张表时直接返回。
+        t.columns 始终为空（仅 key_columns + business_columns 被填充），
+        因此不参与匹配。
 
         Args:
             cs: ComputeStep 实例
@@ -802,16 +958,15 @@ class SqlBuildPlanBuilder:
         if not step_cols:
             return input_tables[0]
 
-        # 按列名匹配度打分
-        best_table = input_tables[0]
+        # 按列名匹配度打分——仅使用 key_columns + business_columns
+        # t.columns 始终为 []，不参与匹配
+        best_table: InputTableDecl = input_tables[0]
         best_score = -1
         for t in input_tables:
             table_cols: set[str] = set()
             for c in t.key_columns:
                 table_cols.add(c.column_name)
             for c in t.business_columns:
-                table_cols.add(c.column_name)
-            for c in t.columns:
                 table_cols.add(c.column_name)
             score = len(step_cols & table_cols)
             if score > best_score:
@@ -844,6 +999,53 @@ class SqlBuildPlanBuilder:
         for gb in cs.group_by:
             _add(gb)
 
+        return cols
+
+    def _build_columns_for_input_step_table(
+        self, cs, table: InputTableDecl, extra_cols: list[str] | None = None,
+    ) -> list[ColumnRef]:
+        """为 source="input" + joins 场景构建单源表的扫描列。
+
+        从 compute_step 的 group_by + metrics 中筛选出该表拥有的列，
+        外加额外的列（如 Join 键）。仅包含 key_columns + business_columns 中声明的列。
+
+        Args:
+            cs: ComputeStep 实例
+            table: 目标 InputTableDecl
+            extra_cols: 额外需要的列名列表（如 Join 键）
+
+        Returns:
+            该表需要扫描的 ColumnRef 列表
+        """
+        # 该表所有已声明列名的归一化集合
+        declared: set[str] = set()
+        for c in table.key_columns:
+            declared.add(c.normalized_name)
+        for c in table.business_columns:
+            declared.add(c.normalized_name)
+
+        # 从 group_by + metrics 收集所有需要的列
+        needed: set[str] = set(cs.group_by or [])
+        for m in cs.metrics:
+            if m.input_column:
+                needed.add(m.input_column)
+        if extra_cols:
+            for c in extra_cols:
+                if c:
+                    needed.add(c)
+
+        # 只保留该表拥有的列——用 sorted 保证确定性
+        cols: list[ColumnRef] = []
+        seen: set[str] = set()
+        for col_name in sorted(needed):
+            normalized = self._normalizer.normalize(col_name)
+            if normalized in declared and normalized not in seen:
+                seen.add(normalized)
+                cols.append(ColumnRef(
+                    table_ref=table.table_alias,
+                    column_name=col_name,
+                    normalized_name=normalized,
+                ))
         return cols
 
     def _build_aggregate_from_compute_step(self, cs, source_table: str = "") -> AggregateStep:  # ComputeStep
@@ -957,8 +1159,10 @@ class SqlBuildPlanBuilder:
             alias=case_when.output_column,
         )
 
-    def _build_compute_step_passthrough(self, cs) -> list[AliasExpr]:  # ComputeStep
+    def _build_compute_step_passthrough(self, cs, default_table_ref: str = "") -> list[AliasExpr]:  # ComputeStep
         """为中间 ComputeStep 构建透传投影——输出 GROUP BY 键 + 所有指标列。
+
+        default_table_ref 用于合流步骤（多源 merge）时消除列歧义。
 
         下游步骤可通过列名引用这些列作为 input_column 或 group_by。
         """
@@ -972,7 +1176,7 @@ class SqlBuildPlanBuilder:
                 seen.add(gb_norm)
                 proj_cols.append(AliasExpr(
                     expression=ColumnRef(
-                        table_ref="",
+                        table_ref=default_table_ref,
                         column_name=gb,
                         normalized_name=gb_norm,
                     ),
@@ -987,7 +1191,7 @@ class SqlBuildPlanBuilder:
                 seen.add(alias_norm)
                 proj_cols.append(AliasExpr(
                     expression=ColumnRef(
-                        table_ref="",
+                        table_ref=default_table_ref,
                         column_name=alias,
                         normalized_name=alias_norm,
                     ),
@@ -1002,7 +1206,7 @@ class SqlBuildPlanBuilder:
                 seen.add(cw_norm)
                 proj_cols.append(AliasExpr(
                     expression=ColumnRef(
-                        table_ref="",
+                        table_ref=default_table_ref,
                         column_name=cw_col,
                         normalized_name=cw_norm,
                     ),

@@ -559,6 +559,7 @@ class ComputeStep(StrictModel):
     output_alias: str = ""  # 产出别名——Builder 据此命名 _temp 表（如 "_temp_<alias>"）
     # ── Phase 6 新增字段 ──
     case_when: CaseWhenDecl | None = None  # 合并步骤的 CASE WHEN 逻辑——仅合流步骤（source 为列表）有效
+    joins: list[JoinDecl] | None = None  # 源表间的 Join 声明——当 source="input" 且需多表 Join 时使用
 
     @field_validator("source", mode="before")
     @classmethod

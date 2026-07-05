@@ -1019,12 +1019,38 @@ class DeveloperSpecParser:
                     variants=self._parse_metric_variants(rm.get("variants", [])),
                 ))
 
+            # 解析此步骤的源表 Join 声明（当 source="input" 且需多表 Join 时）
+            raw_joins = raw.get("joins", [])
+            step_joins: list[JoinDecl] = []
+            if raw_joins:
+                for rj in raw_joins:
+                    if not isinstance(rj, dict):
+                        continue
+                    join_type_str = str(rj.get("join_type", "INNER")).upper()
+                    try:
+                        join_type = JoinTypeEnum(join_type_str)
+                    except ValueError:
+                        raise ParseError(
+                            ParseErrorCode.E001_YAML_PARSE_FAILED,
+                            f"compute_step '{step_name}' 的 Join 声明中不支持的 Join 类型 "
+                            f"'{join_type_str}'——允许: {[j.value for j in JoinTypeEnum]}",
+                            field_ref=step_name,
+                        ) from None
+                    step_joins.append(JoinDecl(
+                        left_table=rj.get("left_table", ""),
+                        right_table=rj.get("right_table", ""),
+                        left_key=rj.get("left_key", ""),
+                        right_key=rj.get("right_key", ""),
+                        join_type=join_type,
+                    ))
+
             steps.append(ComputeStep(
                 step_name=step_name,
                 source=source_raw,  # Pydantic validator 会归一化单元素列表
                 group_by=group_by,
                 metrics=step_metrics,
                 output_alias=output_alias,
+                joins=step_joins if step_joins else None,
             ))
             step_names.add(step_name)
 

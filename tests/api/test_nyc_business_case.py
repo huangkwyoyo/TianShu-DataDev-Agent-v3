@@ -1097,8 +1097,9 @@ class TestNYCCase06SqlPipeline:
             )
 
     @pytest.mark.xfail(
-        reason="构建器限制：source=input 步骤不支持 joins，需重构 compute_steps "
-               "（trip_boro_agg 的 tz ⋈ zts JOIN 无法处理）——Phase 6 后续迭代修复",
+        reason="已知限制：compute_ratios 步骤不支持比率计算（crash_per_million_trips = "
+               "total_crashes / total_trip_count * 1e6）和 risk_label 步骤不支持 CASE WHEN "
+               "输出——Task 4 已修复 source=input + joins 和合并步骤列透传，比率/CASE WHEN 遗留到后续 Phase",
         strict=False,
     )
     def test_run_all_produces_borough_results(self, nyc06_spec_md, nyc06_csv_paths):
@@ -1133,8 +1134,8 @@ class TestNYCCase06SqlPipeline:
         )
 
     @pytest.mark.xfail(
-        reason="构建器限制：trip_boro_agg JOIN 无法处理 + 无 ratio 计算机制 + 无 CASE WHEN "
-               "标签支持——Phase 6 后续迭代修复",
+        reason="已知限制：risk_label 步骤的 CASE WHEN（safety_risk_level）和 "
+               "compute_ratios 步骤的比率计算均未实现——遗留到后续 Phase",
         strict=False,
     )
     def test_safety_risk_level_values_valid(self, nyc06_spec_md, nyc06_csv_paths):
@@ -1177,12 +1178,20 @@ class TestNYCCase06SqlPipeline:
             )
 
     @pytest.mark.xfail(
-        reason="构建器限制：pipeline.run_all() 在 trip_boro_agg JOIN 步骤失败，"
-               "无法到达执行完成阶段验证临时表清理——Phase 6 后续迭代修复",
+        reason="已知限制：DuckDBExecutor.execute_program() 的内部连接不对外暴露，"
+               "且当前 pipeline 因比率计算/CASE WHEN 未实现无法全链路通过。"
+               "temp 表清理由 DuckDBExecutor 的 finally 块保证（连接关闭即自动清理），"
+               "外部新建 :memory: 连接无法检查内部临时表——需后续 Phase 暴露 cleanup_status",
         strict=False,
     )
     def test_temp_tables_cleaned_after_execution(self, nyc06_spec_md, nyc06_csv_paths):
-        """执行完成后 _temp_* 临时表应被清除——不残留中间数据。"""
+        """执行完成后 _temp_* 临时表应被清除——不残留中间数据。
+
+        注意：DuckDB :memory: 连接是隔离的，新建连接无法看到旧连接的临时表。
+        DuckDBExecutor.execute_program() 的 finally 块始终执行 DROP _temp_ 表清理，
+        cleanup_status 已在 ProgramExecutionResult 中记录，但 Pipeline.run_all()
+        当前未暴露此状态。
+        """
         import duckdb
 
         pipeline = Pipeline()
@@ -1192,18 +1201,6 @@ class TestNYCCase06SqlPipeline:
         trace = result.get("execution_trace", {})
         assert trace.get("status") == "RUNTIME_PASS"
 
-        # 用新 DuckDB 连接检查是否仍能访问 _temp_ 表
-        # DuckDB 会在连接关闭时自动清理临时表，故此处验证执行后
-        # 不再有残留的 _temp_ 表（通过查询 information_schema）
-        conn = duckdb.connect(":memory:")
-        try:
-            # 检查是否还有残留的 _temp_ 表
-            rows = conn.execute(
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_name LIKE '_temp_%'"
-            ).fetchall()
-            assert len(rows) == 0, (
-                f"存在残留临时表: {[r[0] for r in rows]}"
-            )
-        finally:
-            conn.close()
+        # 验证 Pipeline 内部清理机制存在——DuckDBExecutor 的 finally 块保证清理
+        # 临时表在连接关闭时由 DuckDB 自动清理，新建连接无法检测
+        # 此测试需后续 Phase 暴露 cleanup_status 后改为直接断言
