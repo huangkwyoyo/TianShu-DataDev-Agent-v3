@@ -233,7 +233,7 @@ async def spark_verify(request: Request, body: SparkVerifyRequest):
     - SPARK_VERIFY_FAILED (500)：Orchestrator 执行过程中发生未预期异常
     """
     # 映射 SparkPipelineState 值 → 前端 status
-    _STATUS_MAP = {
+    _status_map = {
         "SUCCESS": "ok",
         "FAILURE": "failed",
         "HUMAN_REVIEW": "failed",
@@ -307,7 +307,7 @@ async def spark_verify(request: Request, body: SparkVerifyRequest):
         for stage_name, result in state.stage_results.items():
             spark_stages.append(SparkStageItem(
                 stage=stage_name,
-                status=_STATUS_MAP.get(result, "skipped"),
+                status=_status_map.get(result, "skipped"),
             ))
 
         # ── Step 7: 构造响应 ──
