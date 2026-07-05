@@ -191,7 +191,15 @@ export default function App() {
     runAction(
       () => runAll(state.markdownText),
       async (result) => {
-        // 执行成功后尝试获取 package
+        // 如果管线执行失败（Validator 阻断等），不尝试获取 package
+        // pipeline_error 和 pipeline_stages 由 runAction 自动提取并展示在 PipelineStageIndicator
+        if (result.pipeline_error) {
+          return {
+            requestId: result.request_id,
+            activePanel: 'sql' as Panel,
+          };
+        }
+        // 管线成功——尝试获取 package
         try {
           const pkg = await getPackageRich(result.request_id);
           return {
