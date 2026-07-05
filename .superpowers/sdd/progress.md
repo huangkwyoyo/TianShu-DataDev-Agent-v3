@@ -80,3 +80,10 @@ Base commit: e250d3c
 Task 1: complete (commits e250d3c..21cccd4, review clean)
 Task 2: complete (commits 21cccd4..fadad6b, review clean)
 Task 3: complete (commits fadad6b..bf7d199, review clean)
+Task 4: complete (commits bf7d199..757d08c..5d45b24, fix round for waitForExecutionComplete dot-ok/dot-error distinction)
+  Minor: table_paths 环境缺失——spec-editor 成功路径 + spark-verify 成功路径标记为 test.skip()
+  Minor: waitForExecutionComplete 早期返回边缘情况
+Task 5: complete (全量回归验收 + 文档更新)
+  Final: 588 passed / 11 skipped (api/spark 全量), frontend smoke 23 passed, Playwright E2E 4 passed / 2 skipped (table_paths 跳过), ruff/tsc/build/git diff clean
+  R11: 已消除（Playwright E2E 补充——源码级 + E2E 双重覆盖）
+  R16: 新增残留风险——table_paths 环境缺失

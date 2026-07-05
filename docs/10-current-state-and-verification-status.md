@@ -1,6 +1,6 @@
 # 项目当前状态与验证进度 — TianShu DataDev Agent v3
 
-> 文档版本：2026-07-05 | 最后更新：2026-07-05 Phase 9A5 REVIEW_READY 终验收完成
+> 文档版本：2026-07-05 | 最后更新：2026-07-05 Phase 9C DOM E2E 验收完成
 > 本文是项目当前实施状态的**唯一权威文档**。各 Phase 设计文档（docs/00-09、docs/roadmap/）描述的是目标设计，实际建成状态以本文为准。
 
 ## 1. Phase 进度矩阵
@@ -25,8 +25,9 @@
 | 9A | 生产级串联升级 | ✅ | ✅ | ✅ | 9A1-9A3 + 9A5 完成，9A4 阻塞-待业务方 |
 | 9B | 前端回归 + 可观测性 | ✅ | ✅ | ✅ | R11/R15 消除，2026-07-05 |
 | 9B-P0 | Snapshot Builder 集成到 Pipeline | ✅ | ✅ | ✅ | R10 消除，可选注入+全链路覆盖，2026-07-05 |
+| 9C | DOM E2E 交互测试 | ✅ | ✅ | ✅ | 4/6 Playwright 测试通过（2 因 table_paths 环境缺失跳过），2026-07-05 |
 
-**当前测试基线**：587 passed / 11 skipped（api/spark 后端子集）+ 23 passed（前端冒烟全量），ruff/tsc/build 零告警
+**当前测试基线**：588 passed / 11 skipped（api/spark 后端子集）+ 23 passed（前端冒烟全量）+ 4 passed / 2 skipped（Playwright E2E），ruff/tsc/build 零告警
 
 ## 2. C1-C4 业务集成验证
 
@@ -48,8 +49,9 @@
 | R7 | 真实业务样本缺失——所有测试使用手工构造 Contract | B | 待业务方提供（9A4 阻塞） |
 | R8 | LLM 生产环境持续验证未配置 | C | 待 API key |
 | R10 | ~~Snapshot Builder 未集成到 REVIEW_READY 流程~~ | 已消除 | Phase 9B-P0 已将 SnapshotBuilder.build() 接入 Pipeline.run_all()，snapshot hash 写入 provenance.yml |
-| R11 | ~~前端无自动化测试框架~~ | 已消除 | Phase 9B 已补充源码级回归测试（test_frontend_smoke.py +12 tests） |
+| R11 | ~~前端无自动化测试框架~~ | 已消除 | Phase 9B 源码级 + Phase 9C Playwright E2E |
 | R15 | ~~SQL 成功态 pipeline_stages 为空~~ | 已消除 | handleRunAll 成功路径注入全成功阶段——SQL 指示灯始终可见 |
+| R16 | Playwright E2E 缺少 table_paths 配置（DuckDB CSV 文件路径） | B | 2 个 E2E 测试标记为 test.skip()，待后续 Phase 补齐配置后启用 |
 
 ## 4. 当前架构全景
 
@@ -82,11 +84,11 @@ DeveloperSpec (.md 项目书)
                                                             └─ review_ready ★ REVIEW_READY 判定
 ```
 
-## 5. 下一步方向（Phase 9C+）
+## 5. 下一步方向（Phase 10+）
 
 1. **真实业务样本端到端验证（9A4）**——6 个企业场景的 DeveloperSpec → 双管线全链路（阻塞于业务方提供样本）
 2. **生产环境 LLM 验证**——API key 配置 + 持续验证链路
-3. **Phase 9C+**——DOM 交互测试（Playwright/Cypress）或更高级别集成验证
+3. **环境配置完善**——补齐 table_paths（DuckDB CSV 文件路径）以启用 Playwright E2E 全 6 测试
 4. **provenance.yml 显式断言**——Phase 9B-P1 补全 snapshot_manifest_hash 的直接测试覆盖
 
 ## 6. 关键文档索引
