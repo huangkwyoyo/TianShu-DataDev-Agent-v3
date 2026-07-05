@@ -278,11 +278,13 @@ export default function App() {
           <PipelineStageIndicator
             stages={state.pipelineStages}
             error={state.pipelineError}
+            testId="run-all-status"
           />
           <PipelineStageIndicator
             stages={state.sparkStages}
             error={null}
             title="Spark 管线"
+            testId="spark-status"
           />
           <span className="app-version">v0.1.0 | dry_run 模式 | 不做生产执行</span>
         </div>

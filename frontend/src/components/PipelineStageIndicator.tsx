@@ -20,6 +20,8 @@ interface Props {
   error: PipelineError | null;
   /** 指示灯标题——默认"流水线阶段"，Spark 侧传入"Spark 管线" */
   title?: string;
+  /** Phase 9C: E2E 测试定位——根元素 data-testid 属性 */
+  testId?: string;
 }
 
 /** 阶段英文 → 中文映射 */
@@ -57,7 +59,7 @@ function stageIcon(status: string): string {
  * 折叠时显示一个圆点 + 简短状态文字（如"执行失败"）。
  * 点击展开显示各阶段详情，再次点击或点击外部收起。
  */
-export function PipelineStageIndicator({ stages, error, title }: Props) {
+export function PipelineStageIndicator({ stages, error, title, testId }: Props) {
   const [expanded, setExpanded] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -87,7 +89,7 @@ export function PipelineStageIndicator({ stages, error, title }: Props) {
   const summaryText = hasFailure ? `${failedName}失败` : allOk ? '全部成功' : '处理中';
 
   return (
-    <div className="pipeline-indicator" ref={ref}>
+    <div className="pipeline-indicator" ref={ref} data-testid={testId}>
       <button
         className="pipeline-trigger"
         onClick={() => setExpanded(!expanded)}
@@ -99,7 +101,7 @@ export function PipelineStageIndicator({ stages, error, title }: Props) {
       </button>
 
       {expanded && (
-        <div className="pipeline-dropdown">
+        <div className="pipeline-dropdown" data-testid="stage-list">
           <div className="pipeline-dropdown-header">{title || '流水线阶段'}</div>
           {stages.map((s) => (
             <div

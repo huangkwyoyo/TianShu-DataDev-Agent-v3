@@ -26,7 +26,7 @@ export function ErrorDisplay({ error, onDismiss }: Props) {
     isApiUnavailable ? 'var(--red)' : 'var(--border)';
 
   return (
-    <div className="error-display" style={{ borderColor }}>
+    <div className="error-display" style={{ borderColor }} data-testid="error-display">
       <div className="error-content">
         <div className="error-code">
           [{error.error_code}]
