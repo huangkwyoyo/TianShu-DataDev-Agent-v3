@@ -157,3 +157,101 @@
 | C4 | B-D4 桥接级已点亮 | 否 | 否 | D4 桥接级已点亮——完整 SQL Pipeline 生产级验证待后续 Phase |
 | R3 | 已消除 | — | — | 2026-07-04 已修复 |
 | R4 | 已消除 | — | — | — |
+| 9A1 | B-低风险 | 否 | 否 | 2026-07-05 已完成——PipelineArtifactBundle + export_artifacts() 就绪 |
+| 9A2 | B-低风险 | 否 | 否 | 2026-07-05 已完成——桥接函数标记 deprecated + 真实 SqlBuildPlan 驱动 COMPARATOR |
+| 9A3 | B-低风险 | 否 | 否 | 2026-07-05 已完成——Lite→V1 适配层 + Harness 自动驱动器 |
+
+---
+## Phase 9A3: Harness 自动驱动器 + Lite→V1 适配收口 ✅ 已完成
+
+- **风险等级**：B（低风险——纯数据流适配 + Harness 升级，不改核心推理链路）
+- **完成时间**：2026-07-05
+- **影响范围**：
+  - `src/tianshu_datadev/spark/contract_adapter.py`——**新建**：`adapt_lite_to_v1()` 确定性适配函数
+  - `src/tianshu_datadev/harness/spark_eval.py`——`SparkEvalCase` 新增 `developer_spec_md` 字段 + `SparkHarnessRunner` 升级为自动/被动双模式
+  - `tests/spark/test_spark_eval.py`——新增 `TestContractAdapter`（3 测试）+ `TestC4AutoDrive`（4 测试）
+  - `tests/spark/test_orchestrator.py`——`test_comparator_with_real_sql_pipeline_plan` 改用适配器
+- **产出**：
+  - `adapt_lite_to_v1(lite)` → `DataTransformContractV1`：无损确定性适配，14 个公共字段直接复制，5 个 V1 独有字段填入安全默认值
+  - `SparkHarnessRunner(pipeline, orchestrator)`：注入 Pipeline + Orchestrator 后 `evaluate()` 自动执行全链路
+  - `evaluate(passive=True)`：向后兼容——仅聚合预置 `case.passed`
+- **验收证据**（2026-07-05）：
+  - 新增 7 个测试全绿（3 适配器 + 4 自动驱动器）
+  - 全量回归 617 passed, 11 skipped，零退化（+7 vs 610 基线）
+  - ruff 零告警，git diff --check 干净
+- **核心突破**：
+  - **Lite/V1 收口**：9A2 的手工 V1 构造已全部替换为 `adapt_lite_to_v1(bundle.data_transform_contract)`
+  - **自动驱动器就绪**：`TestC4AutoDrive.test_auto_drive_full_pipeline_mapper_to_comparator` 证明 Harness 可自动完成全链路评测
+  - **测试零手工 V1 绕过**：`test_orchestrator.py` 和 `test_spark_eval.py` 中所有涉及真实 Pipeline 的测试均使用适配器
+- **不可碰边界守住了**：
+  - ✅ 未修改 DataTransformContract schema（Lite / V1 模型零改动）
+  - ✅ 未修改 SQL Pipeline 的 SpecEnricher / RelationshipPlanner / SqlBuildPlanBuilder
+  - ✅ 未修改 PlanComparator 核心判定规则
+  - ✅ 未删除 `contract_to_sql_steps()`（保持 deprecated）
+  - ✅ 未接入真实 LLM / 生产数据 / Spark 物理执行
+- **残留风险**：
+  - `adapt_lite_to_v1()` 的 V1 独有字段（case_when_labels / window_specs）默认为空——当真实 Pipeline 产出多语句 SqlProgram 时，`extract_v1()` 路径直接产出 V1，不需要适配器。适配器仅用于单表非 ComputeSteps 路径
+  - Harness 自动驱动器的 table_paths 通过 `case.actual_result` 传递——未来可升级为正式字段
+- **下一轮行动**：9A4 真实业务样本验证（阻塞-待业务方）或 9A5 REVIEW_READY 终验收
+- **状态**：✅ 已完成——Lite/V1 适配收口 + Harness 自动驱动器就绪，可进入 9A4 或 9A5
+
+---
+## Phase 9A2: 桥接函数替换 ✅ 已完成
+
+- **风险等级**：B（低风险——新增集成测试，不改变现有逻辑路径）
+- **完成时间**：2026-07-05
+- **影响范围**：
+  - `src/tianshu_datadev/spark/contract_sql_bridge.py`——`contract_to_sql_steps()` 标记 `@deprecated`
+  - `tests/spark/test_orchestrator.py`——新增 `test_comparator_with_real_sql_pipeline_plan`
+  - `tests/spark/test_spark_eval.py`——新增 `test_d4_with_real_sql_pipeline_plan`
+- **产出**：
+  - Orchestrator COMPARATOR 可接收真实 SQL Pipeline 产出的 SqlBuildPlan（通过 `export_artifacts().sql_build_plan`）
+  - D4 LOGIC_EQUIVALENCE 新增生产级验证用例（真实 SqlBuildPlan 驱动——而非桥接函数）
+  - 桥接函数保留为向后兼容 fallback，已有 3 个桥接级 D4 测试不受影响
+- **验收证据**（2026-07-05）：
+  - 新增 2 个集成测试全绿（Orchestrator + 真实 SqlBuildPlan、D4 + 真实 SqlBuildPlan）
+  - 既有桥接级 D4 测试 3/3 全绿（向后兼容）
+  - 全量回归通过，ruff 零告警
+- **关键发现**：
+  - `DataTransformContractLite`（`extract(plan)` 产出）不能被 Mapper 直接消费——Mapper 需要 `DataTransformContractV1`
+  - 9A2 集成测试中手动构造 `DataTransformContractV1` 供 Mapper 使用，真实 SqlBuildPlan 供 Comparator 使用
+  - 这是 9A3 需要处理的适配问题——Lite → V1 转换或 Mapper 扩展
+- **不可碰边界守住了**：
+  - ✅ 未删除 `contract_to_sql_steps()`
+  - ✅ 未修改 `Orchestrator.run()` / `_run_comparator()` 逻辑
+  - ✅ 未修改 `PlanComparator.compare()` 接口
+  - ✅ 未修改 `SqlBuildPlanBuilder` 构建逻辑
+  - ✅ 未接入真实 LLM / 生产数据
+- **残留风险**：
+  - ~~`DataTransformContractLite` 与 Mapper 的类型不兼容~~ → **已于 9A3 收口**：`adapt_lite_to_v1()` 确定性适配层就绪
+  - 桥接函数仍被 3 个已有 D4 测试使用——后续 Phase 可迁移到真实 Pipeline
+- **下一轮行动**：已完成——9A3 Harness Runner 自动驱动器完成
+- **状态**：✅ 已完成——真实 SqlBuildPlan 驱动 COMPARATOR 就绪
+
+---
+## Phase 9A1: SQL Pipeline 中间产物导出 ✅ 已完成
+
+- **风险等级**：B（低风险——纯数据流改造，新增导出方法，不改现有执行逻辑）
+- **完成时间**：2026-07-05
+- **影响范围**：`src/tianshu_datadev/api/pipeline.py`（新增 `PipelineArtifactBundle` 模型 + `Pipeline.export_artifacts()` 方法）
+- **产出**：
+  - `PipelineArtifactBundle`——含 request_id / spec_hash / sql_build_plan / data_transform_contract / compiled_sql / execution_trace / result_summary 的结构化导出包
+  - `Pipeline.export_artifacts(request_id) -> PipelineArtifactBundle | None`——从 `_results` 内存缓存导出中间产物
+- **验收证据**（2026-07-05）：
+  - 新增 7 个测试全绿（含 run_all 导出 / 未知 request_id / TTL 过期 / execute 导出 / build_plan 部分字段 / spec_hash 一致性 / plan_id 一致性）
+  - 全量回归 608 passed, 11 skipped，零退化
+  - ruff 零告警，git diff --check 干净
+- **字段覆盖**：
+  - `sql_build_plan`：所有 Pipeline 路径（build_plan/execute/run_all）均产出
+  - `compiled_sql`：execute/run_all 单表路径产出
+  - `execution_trace` / `result_summary`：execute/run_all 成功路径产出
+  - `data_transform_contract`：仅 run_all ComputeSteps 路径产出（其余路径为 None）
+- **不可碰边界守住了**：
+  - ✅ 未修改 `run_all()` / `execute()` / `build_plan()` 的现有执行逻辑
+  - ✅ 未修改 `_results` 的写入时机和内容
+  - ✅ 未新增文件 I/O
+  - ✅ 未引入真实 LLM / 生产数据 / 凭据
+- **残留风险**：
+  - ~~`data_transform_contract` 在 non-ComputeSteps 路径为 `DataTransformContractLite`，Mapper 需要 `DataTransformContractV1`~~ → **已于 9A3 收口**：`adapt_lite_to_v1()` 确定性适配层就绪
+- **下一轮行动**：已完成——9A2 桥接函数替换 + 9A3 适配收口完成
+- **状态**：✅ 已完成——9A1 中间产物导出就绪
