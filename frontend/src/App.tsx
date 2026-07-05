@@ -20,11 +20,13 @@ import {
   executeRich,
   runAll,
   getPackageRich,
+  sparkVerify,
   ApiError,
   SpecRichResponse,
   PlanRichResponse,
   ExecuteRichResponse,
   PackageRichResponse,
+  SparkVerifyResponse,
   TemplateFull,
 } from './api/client';
 import './App.css';
@@ -49,6 +51,10 @@ interface AppState {
   planResult: PlanRichResponse | null;
   executeResult: ExecuteRichResponse | null;
   packageResult: PackageRichResponse | null;
+
+  // Spark 管线验证结果
+  sparkStages: StageInfo[];
+  sparkVerifyResult: SparkVerifyResponse | null;
 }
 
 export default function App() {
@@ -64,6 +70,8 @@ export default function App() {
     planResult: null,
     executeResult: null,
     packageResult: null,
+    sparkStages: [],
+    sparkVerifyResult: null,
   });
 
   /** 更新部分状态 */
@@ -217,6 +225,30 @@ export default function App() {
     );
   };
 
+  /** Spark 管线验证 */
+  const handleSparkVerify = () => {
+    if (!state.requestId) {
+      update({ error: { error_code: 'NO_REQUEST_ID', message: '请先执行全流程 Run-All 生成 request_id', field_ref: null } });
+      return;
+    }
+    update({ isLoading: true, error: null });
+    sparkVerify(state.requestId)
+      .then((result) => {
+        update({
+          isLoading: false,
+          sparkStages: result.spark_stages,
+          sparkVerifyResult: result,
+        });
+      })
+      .catch((err) => {
+        const apiErr: ApiError =
+          err && typeof err === 'object' && 'error_code' in err
+            ? (err as ApiError)
+            : { error_code: 'NETWORK_ERROR', message: String(err), field_ref: null };
+        update({ isLoading: false, error: apiErr, sparkStages: [], sparkVerifyResult: null });
+      });
+  };
+
   const hasContent = state.markdownText.trim().length > 0;
 
   return (
@@ -227,6 +259,11 @@ export default function App() {
           <PipelineStageIndicator
             stages={state.pipelineStages}
             error={state.pipelineError}
+          />
+          <PipelineStageIndicator
+            stages={state.sparkStages}
+            error={null}
+            title="Spark 管线"
           />
           <span className="app-version">v0.1.0 | dry_run 模式 | 不做生产执行</span>
         </div>
@@ -273,6 +310,13 @@ export default function App() {
               onClick={handleRunAll}
             >
               全流程 Run-All
+            </button>
+            <button
+              className="btn btn-accent"
+              disabled={!state.requestId || state.isLoading}
+              onClick={handleSparkVerify}
+            >
+              Spark 验证
             </button>
             {state.isLoading && <span className="loading-indicator">处理中...</span>}
           </div>
