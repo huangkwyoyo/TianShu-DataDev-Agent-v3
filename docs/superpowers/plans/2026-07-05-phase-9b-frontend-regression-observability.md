@@ -29,7 +29,7 @@
 | `tests/test_frontend_smoke.py` | 新增 Spark 管线前端集成回归测试类 | 修改（追加 ~120 行） |
 | `frontend/src/App.tsx` | 修改 `runAction` 合并顺序 + `handleRunAll` 成功态阶段注入 | 修改（~15 行改动） |
 | `frontend/src/components/PipelineStageIndicator.tsx` | STAGE_CN 补全 SQL 侧 `contract` / `package` 阶段映射 | 修改（+2 行） |
-| `docs/10-current-state-and-verification-status.md` | 更新 Phase 9B 状态 | 修改（~5 行改动） |
+| `docs/current-state-and-verification-status.md` | 更新 Phase 9B 状态 | 修改（~5 行改动） |
 | `.superpowers/sdd/progress.md` | 更新进度账本 | 修改（~3 行追加） |
 
 ---
@@ -433,7 +433,7 @@ git commit -m "fix(frontend): STAGE_CN 补全 SQL 侧 contract/package 阶段中
 ### Task 3: 验收 + 文档更新
 
 **Files:**
-- Modify: `docs/10-current-state-and-verification-status.md`——更新 Phase 9B 状态 + R11/R15 处置
+- Modify: `docs/current-state-and-verification-status.md`——更新 Phase 9B 状态 + R11/R15 处置
 - Modify: `.superpowers/sdd/progress.md`——追加 Phase 9B 进度
 
 - [ ] **Step 1: 全量后端回归**
@@ -478,7 +478,7 @@ git diff --check
 
 - [ ] **Step 6: 更新项目状态文档**
 
-在 `docs/10-current-state-and-verification-status.md` 中：
+在 `docs/current-state-and-verification-status.md` 中：
 
 **改动点 1**：更新 Phase 进度矩阵——追加 Phase 9B 行：
 
@@ -513,7 +513,7 @@ R15: 已消除（SQL 指示灯成功态 green dot + 8 阶段全部 ✅）
 - [ ] **Step 8: 提交**
 
 ```bash
-git add docs/10-current-state-and-verification-status.md .superpowers/sdd/progress.md
+git add docs/current-state-and-verification-status.md .superpowers/sdd/progress.md
 git commit -m "docs: Phase 9B 完成——更新项目状态 + 进度账本，R11/R15 消除"
 ```
 

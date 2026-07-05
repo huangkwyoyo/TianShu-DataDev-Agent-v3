@@ -1,6 +1,6 @@
 # Spark-first Phase 6-8 完整设计方案
 
-> 状态：设计完成，待实施 | 日期：2026-07-03
+> 状态：已完成（Phase 6-8 全部实施通过）| 日期：2026-07-03
 > 前置：Phase 5（SparkPlan IR + mapper.py + plan_equivalence.py）已完成，45 个测试通过
 
 ---

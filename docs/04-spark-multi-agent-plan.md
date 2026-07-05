@@ -1,6 +1,6 @@
 # Phase 6 受控 PySpark DSL — TianShu DataDev Agent v3
 
-> 文档版本：2026-07-03 设计完成版 | 实施状态：已完成（2026-07-04）。当前项目状态见 `docs/10-current-state-and-verification-status.md`
+> 文档版本：2026-07-03 设计完成版 | 实施状态：已完成（2026-07-04）。当前项目状态见 `docs/current-state-and-verification-status.md`
 > 完整设计：`docs/superpowers/specs/2026-07-03-spark-first-phase-6-8-design.md` §1
 > 实施计划：`docs/superpowers/specs/2026-07-03-spark-first-phase-6-8-implementation-plan.md` Phase 6A/6B/6C
 

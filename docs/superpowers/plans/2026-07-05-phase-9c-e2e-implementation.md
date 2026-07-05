@@ -689,7 +689,7 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 ### Task 5: 全量回归验收 + 文档更新
 
 **Files:**
-- Modify: `docs/10-current-state-and-verification-status.md` — 添加 Phase 9C 行 + 更新残留风险
+- Modify: `docs/current-state-and-verification-status.md` — 添加 Phase 9C 行 + 更新残留风险
 - Modify: `.superpowers/sdd/progress.md` — SDD 进度记录（如使用 SDD 执行）
 
 **Interfaces:**
@@ -733,7 +733,7 @@ git diff --check
 
 - [ ] **Step 5: 更新项目状态仪表盘**
 
-修改 `docs/10-current-state-and-verification-status.md`：
+修改 `docs/current-state-and-verification-status.md`：
 
 **Phase 进度矩阵——添加 Phase 9C 行：**
 
@@ -766,7 +766,7 @@ git diff --check
 - [ ] **Step 7: 提交**
 
 ```bash
-git add docs/10-current-state-and-verification-status.md
+git add docs/current-state-and-verification-status.md
 git commit -m "docs: Phase 9C DOM E2E 测试完成——状态仪表盘更新
 
 - Phase 进度矩阵新增 9C 行

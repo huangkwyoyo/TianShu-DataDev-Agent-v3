@@ -146,7 +146,7 @@ Phase 0 实际已有 22 个 pytest 用例，超过原定 `≤10` 预算。进入
 
 ### Phase 5-8
 
-Phase 5-8 已全部实施并回归通过（2026-07-04）。当前测试基线：552 passed / 11 skipped。详细状态见 `docs/10-current-state-and-verification-status.md`。
+Phase 5-8 已全部实施并回归通过（2026-07-04）。当前测试基线：552 passed / 11 skipped。详细状态见 `docs/current-state-and-verification-status.md`。
 
 - Phase 5：PlanEquivalence 规则、DataTransformContract v1——已完成。
 - Phase 6：受控 PySpark DSL（9 种 step 编译）、Static Validator（E601-E608 全错误码）——已完成。

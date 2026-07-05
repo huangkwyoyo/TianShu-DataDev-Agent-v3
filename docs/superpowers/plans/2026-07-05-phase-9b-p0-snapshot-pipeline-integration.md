@@ -522,7 +522,7 @@ git commit -m "test(snapshot): Phase 9B-P0——Pipeline + SnapshotBuilder 集�
 ### Task 5: 全量回归 + 文档更新 + 风险收口
 
 **Files:**
-- Modify: `docs/10-current-state-and-verification-status.md`——更新 Phase 进度
+- Modify: `docs/current-state-and-verification-status.md`——更新 Phase 进度
 - Modify: `.superpowers/sdd/progress.md`——追加 Phase 9B-P0 进度
 
 - [ ] **Step 1: 全量后端回归**
@@ -567,7 +567,7 @@ git diff --check
 
 - [ ] **Step 6: 更新项目状态文档**
 
-在 `docs/10-current-state-and-verification-status.md` 中：
+在 `docs/current-state-and-verification-status.md` 中：
 
 **改动点 1**：Phase 进度矩阵追加 Phase 9B-P0 行：
 
@@ -582,7 +582,7 @@ git diff --check
 - [ ] **Step 7: 提交**
 
 ```bash
-git add docs/10-current-state-and-verification-status.md .superpowers/sdd/progress.md
+git add docs/current-state-and-verification-status.md .superpowers/sdd/progress.md
 git commit -m "docs: Phase 9B-P0 完成——Snapshot Builder 集成到 Pipeline.run_all()"
 ```
 
