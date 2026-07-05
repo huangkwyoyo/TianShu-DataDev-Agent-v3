@@ -1323,3 +1323,57 @@ class TestHintMutualExclusion:
         assert col.metric_hint is None
         assert col.computed_hint is None
         assert col.window_hint is None
+
+
+# ════════════════════════════════════════════
+# Phase 9A4: label_table / detail_table 空 metrics 推断抑制
+# ════════════════════════════════════════════
+
+
+class TestEnricherEmptyMetricsSuppression:
+    """显式空 metrics: [] 时跳过输出列兜底 SUM 推断——避免将透传列误判为 SUM 聚合。
+    结构化 hint（metric_hint/computed_hint/window_hint）始终处理。"""
+
+    def test_empty_metrics_no_inference(self):
+        """metrics: [] → 无结构化 hint 时 inferred_metrics 应为空。"""
+        spec = TestStructuredHints._make_spec_with_hint_columns([
+            OutputColumnDecl(name="name", type="varchar", description="a name"),
+            OutputColumnDecl(name="value", type="double", description="a value"),
+        ])
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
+
+        manifest = build_manifest_from_spec(spec)
+        enricher = SpecEnricher()
+        enriched = enricher.enrich(spec, manifest)
+
+        # 核心断言：metrics 显式为空时不得推断 SUM
+        assert len(enriched.inferred_metrics) == 0, (
+            f"空 metrics: [] 不应推断 SUM 聚合，"
+            f"实际 inferred_metrics={[(m.alias, m.aggregation) for m in enriched.inferred_metrics]}"
+        )
+
+    def test_structured_hints_still_processed(self):
+        """即使 metrics: []，结构化 metric_hint 仍应被处理。"""
+        col = OutputColumnDecl(
+            name="total_amount",
+            type="decimal",
+            metric_hint=MetricDecl(
+                metric_name="total_amount",
+                aggregation=AggregationType.SUM,
+                input_column="amount",
+                alias="total_amount",
+            ),
+        )
+        spec = TestStructuredHints._make_spec_with_hint_columns([col])
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
+
+        manifest = build_manifest_from_spec(spec)
+        enricher = SpecEnricher()
+        enriched = enricher.enrich(spec, manifest)
+
+        # 结构化 hint 即使 metrics 为空也应被处理
+        assert len(enriched.inferred_metrics) == 1, (
+            f"结构化 hint 应在 metrics: [] 时仍被处理，"
+            f"实际 inferred_metrics={[(m.alias, m.aggregation) for m in enriched.inferred_metrics]}"
+        )
+        assert enriched.inferred_metrics[0].aggregation == AggregationType.SUM

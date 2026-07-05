@@ -731,6 +731,11 @@ class FakeSpecEnricher:
             if m.input_column:
                 declared_columns.add(m.input_column)
 
+        # 若指标列表显式为空——程序员明确声明了"无需聚合"
+        # （label_table / detail_table），跳过兜底 SUM 推断，
+        # 但结构化 hint（metric_hint/computed_hint/window_hint）仍需处理
+        metrics_explicitly_empty = len(spec.metrics) == 0
+
         # 收集 output_columns 中的指标列（非维度列、非 grain 列）
         grain_set: set[str] = set(spec.output_spec.grain)
         output_metric_cols: list[OutputColumnDecl] = [
@@ -763,6 +768,10 @@ class FakeSpecEnricher:
                     continue
 
             # 兜底：从描述文本推断聚合类型
+            # 若 metrics 显式声明为空（label_table / detail_table），
+            # 跳过兜底推断——透传列不应被 SUM 误判
+            if metrics_explicitly_empty:
+                continue
             agg_type, needs_distinct = _infer_aggregation_type(
                 spec.description, col_name
             )
