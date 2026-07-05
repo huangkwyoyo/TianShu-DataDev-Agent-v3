@@ -30,7 +30,7 @@
 | 9C-R16b | table_paths 边界硬化 | ✅ | ✅ | ✅ | None/{} 语义区分 + E2E 模式开关，2026-07-05 |
 | 9B-P1 | provenance.yml 显式断言 | ✅ | ✅ | ✅ | snapshot_manifest_hash 测试覆盖矩阵补全，2026-07-05 |
 | 9A4-NYC | 真实业务样本——NYC 案例 01-05 | ✅ | ✅ | 🟡 | Case 01-04 SQL+Spark 双链 LOGIC_EQUIVALENT，Case 05 Comparator NOT_COVERED（窗口函数），2026-07-05 |
-| 10-Case06 | SqlProgram 多语句 DAG——NYC Case 06 | ✅ | ✅ | ✅ | 跨域融合 7 步 DAG，比率计算/CASE WHEN/Comparator 归一化完成，2 xfail 转正，Spark 测试内容级对齐待后续 Phase（1 xfail） |
+| 10-Case06 | SqlProgram 多语句 DAG——NYC Case 06 | ✅ | ✅ | ✅ | 跨域融合 7 步 DAG，比率计算/CASE WHEN/Comparator 归一化完成，2 xfail 转正，Task 9 豁免（8 个测试覆盖），Spark 测试内容级对齐待后续 Phase（1 xfail） |
 
 **当前测试基线**：852 passed / 11 skipped / 1 xfailed / 1 xpassed（api/spark/artifacts/harness 全量后端）+ 23 passed（前端冒烟全量）+ 6 passed / 0 skipped（Playwright E2E），ruff/tsc/build 零告警
 

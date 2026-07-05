@@ -187,6 +187,12 @@
   - scan/join/aggregate 内容级差异——SQL DAG 的 `_temp_*` 表引用与 Mapper 别名不匹配
   - 待后续 Phase 引入 plan 级别对齐（scan 过滤、join 重排、引用归一化）
 - **处置建议**：SQL 管线 B 类收口完成（全部执行通过），Spark 双链 Comparator 框架就绪（归一化已减少步数差异），内容级对齐留待后续 Phase
+- **Task 9 豁免**：Orchestrator 集成测试（原方案 Task 9）已豁免——归一化已有 8 个测试覆盖：
+  - 单元测试：`TestNormalizeDagSteps`（3 个——aggregate 合并/project 合并/类型保留）
+  - 集成测试：`TestPlanComparatorMultiStatementFlatten`（SqlProgram 扁平化 + 多语句对比）
+  - 业务测试：`TestNYCCase06SparkDualChain`（3 个——严格等价/不崩溃/Contract 提取）
+  - Orchestrator 测试：`TestOrchestratorSqlProgramIntegration`（2 个——SqlProgram 分派/向后兼容）
+  - 额外 Orchestrator 级测试不会增加新的证据价值——豁免合理
 
 ---
 

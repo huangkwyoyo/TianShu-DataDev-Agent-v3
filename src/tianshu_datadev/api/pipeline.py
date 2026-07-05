@@ -136,6 +136,9 @@ class PipelineArtifactBundle(StrictModel):
     snapshot_manifest: SnapshotManifest | None = None
     # ── Phase 10: Case06 SqlProgram 多语句 DAG ──
     sql_program: SqlProgram | None = None
+    # ── Final Hardening: SqlProgram 执行 cleanup 状态 ──
+    program_cleanup_status: str | None = None   # "success" | "partial_failure"
+    program_cleanup_error: str | None = None     # cleanup 阶段的错误信息（成功时为空）
 
 
 class Pipeline:
@@ -1029,6 +1032,9 @@ class Pipeline:
         trace = None
         summary = None
         execution_trace = None
+        # ── Final Hardening: cleanup 状态（ComputeSteps / 多跳链路径会在赋值后覆盖）──
+        program_cleanup_status: str | None = None
+        program_cleanup_error: str | None = None
         plan_questions: list = []
         val_questions: list = []
         passed = False
@@ -1080,6 +1086,9 @@ class Pipeline:
                     program_result.results[-1].summary
                     if program_result and program_result.results else None
                 )
+                # ── Final Hardening: 捕获 cleanup 状态 ──
+                program_cleanup_status = program_result.cleanup_status if program_result else None
+                program_cleanup_error = program_result.cleanup_error if program_result else None
 
                 # ── Contract 提取（执行状态检查之前——contract 不依赖执行结果）──
                 extractor = DataTransformContractExtractor()
@@ -1100,6 +1109,9 @@ class Pipeline:
                         "trace": execution_trace,
                         "summary": execution_summary,
                         "table_mapping": table_mapping or {},
+                        # ── Final Hardening: cleanup 状态 ──
+                        "program_cleanup_status": program_cleanup_status,
+                        "program_cleanup_error": program_cleanup_error,
                     })
                     error_info = {
                         "stage": "execute",
@@ -1214,6 +1226,9 @@ class Pipeline:
                     "table_mapping": table_mapping or {},
                     # ── Phase 9B-P0 ──
                     "snapshot_manifest": snapshot_manifest,
+                    # ── Final Hardening: cleanup 状态 ──
+                    "program_cleanup_status": program_cleanup_status,
+                    "program_cleanup_error": program_cleanup_error,
                 })
 
                 # ComputeSteps 路径独立返回
@@ -1304,6 +1319,9 @@ class Pipeline:
                     program_result.results[-1].summary
                     if program_result.results else None
                 )
+                # ── Final Hardening: 捕获 cleanup 状态 ──
+                program_cleanup_status = program_result.cleanup_status if program_result else None
+                program_cleanup_error = program_result.cleanup_error if program_result else None
             else:
                 plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
 
@@ -1345,6 +1363,9 @@ class Pipeline:
                     "trace": trace,
                     "summary": summary,
                     "table_mapping": table_mapping or {},
+                    # ── Final Hardening: cleanup 状态 ──
+                    "program_cleanup_status": program_cleanup_status,
+                    "program_cleanup_error": program_cleanup_error,
                 })
                 error_info = {
                     "stage": "execute",
@@ -1510,6 +1531,9 @@ class Pipeline:
             "table_mapping": table_mapping or {},
             # ── Phase 9B-P0 ──
             "snapshot_manifest": snapshot_manifest,
+            # ── Final Hardening: cleanup 状态 ──
+            "program_cleanup_status": program_cleanup_status,
+            "program_cleanup_error": program_cleanup_error,
         })
         self._store_package(request_id, package_manifest)
 
@@ -1663,6 +1687,9 @@ class Pipeline:
             snapshot_manifest=snapshot_manifest,
             # ── Phase 10: Case06 SqlProgram 多语句 DAG ──
             sql_program=data.get("sql_program"),
+            # ── Final Hardening: cleanup 状态 ──
+            program_cleanup_status=data.get("program_cleanup_status"),
+            program_cleanup_error=data.get("program_cleanup_error"),
         )
 
     # ── Phase 4.5B 前端 SPA 专用方法 ──────────────────────

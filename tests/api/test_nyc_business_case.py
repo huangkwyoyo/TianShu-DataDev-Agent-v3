@@ -1160,20 +1160,11 @@ class TestNYCCase06SqlPipeline:
                 f"最终编译 SQL 不得包含 CTE: {compiled.sql[:200]}"
             )
 
-    @pytest.mark.xfail(
-        reason="已知限制：execute 阶段已通过（B 类收口完成），但本测试尚未实现真正的 temp 表"
-               "清理验证——仅断言 execute 成功。DuckDBExecutor.execute_program() 的内部连接"
-               "不对外暴露，外部新建 :memory: 连接无法检查内部临时表。"
-               "需后续 Phase 暴露 cleanup_status 后改为直接断言。",
-        strict=False,
-    )
     def test_temp_tables_cleaned_after_execution(self, nyc06_spec_md, nyc06_csv_paths):
         """执行完成后 _temp_* 临时表应被清除——不残留中间数据。
 
-        注意：DuckDB :memory: 连接是隔离的，新建连接无法看到旧连接的临时表。
-        DuckDBExecutor.execute_program() 的 finally 块始终执行 DROP _temp_ 表清理，
-        cleanup_status 已在 ProgramExecutionResult 中记录，但 Pipeline.run_all()
-        当前未暴露此状态。
+        Pipeline 通过 export_artifacts() 暴露 program_cleanup_status，
+        直接断言 executor 的 cleanup 结果为 "success"。
         """
         pipeline = Pipeline()
         result = pipeline.run_all(nyc06_spec_md, table_paths=nyc06_csv_paths)
@@ -1182,9 +1173,15 @@ class TestNYCCase06SqlPipeline:
         trace = result.get("execution_trace", {})
         assert trace.get("status") == "RUNTIME_PASS"
 
-        # 验证 Pipeline 内部清理机制存在——DuckDBExecutor 的 finally 块保证清理
-        # 临时表在连接关闭时由 DuckDB 自动清理，新建连接无法检测
-        # 此测试需后续 Phase 暴露 cleanup_status 后改为直接断言
+        # 通过 export_artifacts 获取 cleanup 状态
+        bundle = pipeline.export_artifacts(result["request_id"])
+        assert bundle is not None, "export_artifacts 不应为 None"
+
+        # 严格断言：cleanup 必须成功
+        assert bundle.program_cleanup_status == "success", (
+            f"临时表清理应成功，实际 cleanup_status={bundle.program_cleanup_status}，"
+            f"cleanup_error={bundle.program_cleanup_error}"
+        )
 
 
 # ════════════════════════════════════════════
