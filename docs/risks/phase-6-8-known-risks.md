@@ -167,24 +167,26 @@
 
 ---
 
-## Case06-Comparator: 多语句 DAG Spark Comparator 框架就绪 🟡
+## Case06-Comparator: 多语句 DAG Spark Comparator——B 类收口完成，内容级对齐待后续 🟢
 
-- **风险等级**：B（验证框架已建立，严格断言因 B 类遗留被 block）
+- **风险等级**：B（归一化已实现，内容级差异仍需后续 Phase）
 - **发现时间**：2026-07-05 全局收尾审计
-- **收口时间**：2026-07-05 Phase 10 Case06 Comparator 缺口收口
-- **影响范围**：`tests/api/test_nyc_business_case.py`——已新增 `TestNYCCase06SparkDualChain`
+- **收口时间**：2026-07-05 Case06 B 类功能收口——比率计算/CASE WHEN/Comparator 归一化
+- **影响范围**：`tests/api/test_nyc_business_case.py`——`TestNYCCase06SparkDualChain`
 - **当前状态**：
   - ✅ `PlanComparator.compare_program()`——SqlProgram 多语句扁平化对比已实现
+  - ✅ `PlanComparator._normalize_dag_steps()`——DAG 归一化（aggregate 3→1, project 7→1）
   - ✅ `Orchestrator.run()`——接受 `SqlProgram | SqlBuildPlan`，自动分派
   - ✅ `Pipeline.export_artifacts()`——暴露 `sql_program` 字段
-  - ✅ `TestNYCCase06SparkDualChain`——3 个测试（1 xfail + 2 通过）
-  - ✅ `_flatten_sql_program_steps()`——过滤 `_temp_*` scan，保留语义 step
-  - 🟡 `test_spark_orchestrator_logic_equivalence`——xfail(strict=True)
-  - 🟡 防御性测试通过——Comparator 全链路不崩溃（LOGIC_MISMATCH 为正确诊断信号）
+  - ✅ `TestNYCCase06SparkDualChain`——3 个测试
+  - ✅ 比率计算（compute_ratios）实现——SqlRawExpression 全链路（Spec → Builder → Compiler）
+  - ✅ CASE WHEN（risk_label）实现——WhenBranch 字符串模式支持复杂布尔条件
+  - ✅ 2 个 xfail 转正：`test_run_all_produces_borough_results` / `test_safety_risk_level_values_valid`
+  - 🟡 `test_spark_orchestrator_logic_equivalence`——xfail(strict=True)：归一化有效但 scan/join/aggregate 内容级差异（_temp_* 引用 vs Mapper 别名）仍需更深层对齐
 - **阻塞因素**：
-  - SQL 侧扁平化步骤与 Mapper 产出的 SparkPlan 存在结构不对称——Mapper 从 V1 Contract 独立生成拓扑
-  - 待后续 Phase 引入 plan-level 拓扑对齐后，严格断言可转正
-- **处置建议**：框架已就绪，后续 Phase 重点对齐 SQL/Spark 两侧 plan 拓扑
+  - scan/join/aggregate 内容级差异——SQL DAG 的 `_temp_*` 表引用与 Mapper 别名不匹配
+  - 待后续 Phase 引入 plan 级别对齐（scan 过滤、join 重排、引用归一化）
+- **处置建议**：SQL 管线 B 类收口完成（全部执行通过），Spark 双链 Comparator 框架就绪（归一化已减少步数差异），内容级对齐留待后续 Phase
 
 ---
 
@@ -199,7 +201,7 @@
 | R3 | 已消除 | — | — | 2026-07-04 已修复 |
 | R4 | 已消除 | — | — | — |
 | Case05-Comp | C | 否 | 否 | 窗口函数 Comparator NOT_COVERED——待后续 Phase 升级为严格断言 |
-| Case06-Comp | B | 否 | 否 | 多语句 DAG Spark Comparator 缺失——待 Case 06 B 类收口后补齐 |
+| Case06-Comp | B | 否 | 否 | B 类收口完成——比率/CASE WHEN/归一化已实现，内容级对齐待后续 Phase |
 | 9A1 | B-低风险 | 否 | 否 | 2026-07-05 已完成——PipelineArtifactBundle + export_artifacts() 就绪 |
 | 9A2 | B-低风险 | 否 | 否 | 2026-07-05 已完成——桥接函数标记 deprecated + 真实 SqlBuildPlan 驱动 COMPARATOR |
 | 9A3 | B-低风险 | 否 | 否 | 2026-07-05 已完成——Lite→V1 适配层 + Harness 自动驱动器 |
