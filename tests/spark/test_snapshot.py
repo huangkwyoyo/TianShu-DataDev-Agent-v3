@@ -837,3 +837,54 @@ class TestSnapshotPipelineIntegration:
         pipeline = Pipeline()
         assert pipeline._snapshot_builder is None
         assert pipeline._snapshot_provider is None
+
+    # ── Phase 9B-P1: provenance.yml 显式 snapshot_manifest_hash 断言 ──
+
+    def test_provenance_yml_contains_snapshot_manifest_hash(self, local_fixture_provider):
+        """provenance.yml 中 snapshot_manifest_hash 非空——验收标准 #3 显式覆盖。"""
+        import re
+        import tempfile
+
+        # 使用独立临时目录作为 Pipeline 的输出根目录——便于定位 provenance.yml
+        out_dir = tempfile.mkdtemp(prefix="tianshu_prov_")
+        snap_dir = tempfile.mkdtemp(prefix="tianshu_snap_")
+        snapshot_builder = SnapshotBuilder(output_dir=snap_dir)
+
+        pipeline = Pipeline(
+            base_output_dir=out_dir,
+            snapshot_builder=snapshot_builder,
+            snapshot_provider=local_fixture_provider,
+        )
+        md = self._read_fixture("golden/golden_passing.md")
+        fixture_dir = self._tests_dir()
+        table_paths = {
+            "test_fact": os.path.join(fixture_dir, "fixtures", "sql", "test_fact.csv"),
+            "order_info": os.path.join(fixture_dir, "fixtures", "order_info.csv"),
+        }
+
+        result = pipeline.run_all(md, table_paths=table_paths)
+        request_id = result["request_id"]
+
+        # 读取生成的 provenance.yml
+        prov_path = os.path.join(out_dir, request_id, "provenance.yml")
+        assert os.path.isfile(prov_path), (
+            f"provenance.yml 未生成于预期路径: {prov_path}"
+        )
+        with open(prov_path, "r", encoding="utf-8") as f:
+            prov_content = f.read()
+
+        # 提取 snapshot_manifest_hash——应为 64 位 hex 字符串
+        match = re.search(r"snapshot_manifest_hash:\s*\"?([0-9a-f]+)\"?", prov_content)
+        assert match is not None, (
+            f"provenance.yml 中未找到 snapshot_manifest_hash 字段\n"
+            f"文件内容: {prov_content[:500]}"
+        )
+        snapshot_hash = match.group(1)
+        assert len(snapshot_hash) == 64, (
+            f"snapshot_manifest_hash 应为 64 位 hex，实际长度: {len(snapshot_hash)}"
+        )
+        assert snapshot_hash != "", "snapshot_manifest_hash 不应为空"
+
+        # 清理
+        shutil.rmtree(out_dir, ignore_errors=True)
+        shutil.rmtree(snap_dir, ignore_errors=True)
