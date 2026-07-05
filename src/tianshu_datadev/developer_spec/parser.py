@@ -1116,9 +1116,18 @@ class DeveloperSpecParser:
     # ── 辅助方法 ──
 
     def _check_forbidden_sql_fields(self, raw: dict, context: str) -> None:
-        """检查字典中是否出现了禁止的自由 SQL 字段名。"""
+        """检查字典中是否出现了禁止的自由 SQL 字段名。
+
+        compute_steps[*].expressions[*] 中的 expression 字段是合法例外——
+        它属于 ComputeStepExpression 类型化模型，不是自由 SQL 逃逸字段。
+        """
+        # 检测是否在合法 expressions 上下文中（compute_steps[N].expressions[M]）
+        _is_expression_item = ".expressions[" in context
         for key in raw:
             if key in self._FORBIDDEN_SQL_FIELDS:
+                # expression 字段在 ComputeStepExpression 中是合法类型化字段
+                if key == "expression" and _is_expression_item:
+                    continue
                 raise ParseError(
                     ParseErrorCode.E007_FREE_SQL_FIELD,
                     f"在 '{context}' 中发现禁止字段 '{key}'——"

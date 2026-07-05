@@ -194,11 +194,26 @@ spec:
       output_alias: compute_ratios
       description: "归一化指标计算——每百万行程事故率、每千行程违章率"
       group_by: [borough]
+      expressions:
+        - name: crash_per_million_trips
+          expression: "total_crashes * 1000000.0 / NULLIF(total_trip_count, 0)"
+          type: double
+        - name: violation_per_thousand_trips
+          expression: "total_violations * 1000.0 / NULLIF(total_trip_count, 0)"
+          type: double
 
     - step_name: risk_label
       source: [compute_ratios]
       output_alias: risk_label
       description: "CASE WHEN 风险等级标签 + 最终输出"
+      case_when:
+        output_column: safety_risk_level
+        branches:
+          - when: "crash_per_million_trips >= 800 OR violation_per_thousand_trips >= 15"
+            then: "高风险"
+          - when: "crash_per_million_trips < 300 AND violation_per_thousand_trips < 5"
+            then: "低风险"
+        else_label: "中风险"
 
   output_columns:
     - name: borough
