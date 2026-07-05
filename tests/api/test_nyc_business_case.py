@@ -1201,10 +1201,12 @@ class TestNYCCase06SparkDualChain:
     """
 
     @pytest.mark.xfail(
-        reason="已知限制：DAG 归一化（_normalize_dag_steps）已将 aggregate 3→1 和 project 7→1，"
-               "但 scan/join/aggregate 的内容级差异（_temp_* 表引用与 Mapper 别名）导致仍为 "
-               "LOGIC_MISMATCH。需更深层的 plan 级别对齐（scan 过滤、join 重排等）。"
-               "一旦后续 Phase 补齐内容级对齐，此 xfail 应自然转正。",
+        reason="已知限制：B 类收口已完成（比率计算/CASE WHEN/Comparator 归一化），"
+               "DAG 归一化（_normalize_dag_steps）有效——aggregate 3→1、project 7→1，"
+               "步数差异已消除。但 scan/join/aggregate 的内容级差异"
+               "（_temp_* 表引用 vs Mapper 别名）导致仍为 LOGIC_MISMATCH。"
+               "需独立 Phase 引入 plan 级别内容对齐（scan 别名重映射、join 引用归一化）。"
+               "一旦内容级对齐完成，此 xfail 应自然转正。",
         strict=True,
     )
     def test_spark_orchestrator_logic_equivalence(self, nyc06_spec_md, nyc06_csv_paths):
