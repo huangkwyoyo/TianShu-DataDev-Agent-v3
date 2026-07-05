@@ -26,6 +26,7 @@ from tianshu_datadev.planning.sql_build_plan import (
     SqlBuildPlan,
     StepNode,
 )
+from tianshu_datadev.planning.sql_program import SqlProgram
 from tianshu_datadev.spark.annotations import AnnotationWarning
 from tianshu_datadev.spark.models import SparkPlan
 from tianshu_datadev.spark.plan_equivalence import (
@@ -272,7 +273,267 @@ class PlanComparator:
             annotation_warnings=list(warnings or []),
         )
 
+    def compare_program(
+        self,
+        sql_program: SqlProgram,
+        spark_plan: SparkPlan,
+        annotations: list | None = None,     # noqa: ARG002 保留接口，Phase 8 消费
+        warnings: list[AnnotationWarning] | None = None,
+        enabled_step_types: set[str] | None = None,
+    ) -> PlanComparisonReport:
+        """多语句 SqlProgram ↔ SparkPlan 逻辑对比入口。
+
+        将所有 SqlStatement 的 SqlBuildPlan steps 扁平化为单一步骤列表，
+        过滤 _temp_ 表 scan（内部管道——Spark 侧无对应），然后委托给核心
+        compare_plans() 引擎执行等价对比。
+
+        这是 Case06 等 ComputeSteps 路径的唯一对比入口。
+
+        Args:
+            sql_program: 多语句 SqlProgram（含 N 个 SqlStatement）
+            spark_plan: Spark 侧的 SparkPlan
+            annotations: 语义标注列表（Phase 8 消费，Phase 7 仅穿传）
+            warnings: AnnotationWarning 列表（携带但不影响 verdict）
+            enabled_step_types: 覆盖此实例默认的启用类型
+
+        Returns:
+            PlanComparisonReport——完整对比报告
+        """
+        effective_enabled = enabled_step_types or self._enabled_types
+
+        # Step 1：扁平化 SqlProgram 所有 statement 的 step——过滤 _temp_* scan
+        sql_steps_data = self._flatten_sql_program_steps(sql_program)
+        spark_steps_data = self._extract_spark_step_data(spark_plan)
+
+        # Step 1.3：DAG 归一化——合并多个 aggregate/project step
+        # 使 SQL DAG 的多语句结构与 Mapper 从平铺 Contract 生成的
+        # 单 aggregate/单 project 结构对齐——消除拓扑不对称
+        sql_steps_data = self._normalize_dag_steps(sql_steps_data)
+
+        # Step 1.5：规范化 BETWEEN 右值——SQL 侧和 Spark 侧序列化格式不同
+        self._normalize_between_rights(sql_steps_data)
+        self._normalize_between_rights(spark_steps_data)
+
+        # Step 2：计算 hash
+        sql_plan_hash = self._compute_sql_program_hash(sql_program)
+        spark_plan_hash = SparkPlan.compute_plan_hash(spark_plan)
+
+        # Step 3：分类 step——已覆盖 vs 未覆盖
+        covered_sql: list[dict[str, Any]] = []
+        covered_spark: list[dict[str, Any]] = []
+        uncovered_types: set[str] = set()
+
+        for s in sql_steps_data:
+            stype = self._normalize_type(s.get("step_type", ""))
+            if stype in effective_enabled:
+                covered_sql.append(s)
+            else:
+                uncovered_types.add(stype)
+
+        for s in spark_steps_data:
+            stype = self._normalize_type(s.get("step_type", ""))
+            if stype in effective_enabled:
+                covered_spark.append(s)
+            else:
+                uncovered_types.add(stype)
+
+        # Step 4：执行已覆盖类型的结构等价对比
+        equivalence_result: PlanEquivalenceResult
+        if covered_sql or covered_spark:
+            equivalence_result = compare_plans(
+                sql_steps=covered_sql,
+                spark_steps=covered_spark,
+                sql_plan_hash=sql_plan_hash,
+                spark_plan_hash=spark_plan_hash,
+            )
+        else:
+            # 无可对比的 step——全部 NOT_EXECUTED
+            equivalence_result = PlanEquivalenceResult(
+                sql_plan_hash=sql_plan_hash,
+                spark_plan_hash=spark_plan_hash,
+                step_results=[],
+                overall_verdict=EquivalenceVerdict.UNSUPPORTED_COMPARISON,
+            )
+
+        # Step 5：对未覆盖类型补充 NOT_EXECUTED 结果
+        for utype in sorted(uncovered_types):
+            already_covered = any(
+                r.step_type == utype for r in equivalence_result.step_results
+            )
+            if not already_covered:
+                equivalence_result.step_results.append(
+                    StepEquivalenceResult(
+                        step_type=utype,
+                        verdict=EquivalenceVerdict.UNSUPPORTED_COMPARISON,
+                        sql_count=self._count_type(sql_steps_data, utype),
+                        spark_count=self._count_type(spark_steps_data, utype),
+                        detail=f"Phase 7A 未覆盖 {utype} 类型的逻辑对比",
+                    )
+                )
+
+        # Step 6：映射 verdict → ComparisonStatus
+        status = self._map_status(
+            equivalence_result.overall_verdict,
+            has_uncovered=len(uncovered_types) > 0,
+        )
+
+        # Step 7：生成 report_id
+        report_id = self._generate_report_id(
+            contract_hash=sql_program.spec_id,
+            sql_plan_hash=sql_plan_hash,
+            spark_plan_hash=spark_plan_hash,
+        )
+
+        return PlanComparisonReport(
+            report_id=report_id,
+            contract_hash=sql_program.spec_id,
+            sql_plan_hash=sql_plan_hash,
+            spark_plan_hash=spark_plan_hash,
+            status=status,
+            step_results=equivalence_result.step_results,
+            unsupported_types=equivalence_result.unsupported_types,
+            uncovered_step_types=sorted(uncovered_types),
+            annotation_warnings=list(warnings or []),
+        )
+
     # ── 内部方法 ──
+
+    @staticmethod
+    def _flatten_sql_program_steps(
+        sql_program: SqlProgram,
+    ) -> list[dict[str, Any]]:
+        """从 SqlProgram 扁平化所有 step 数据。
+
+        规则：
+        1. 按拓扑顺序遍历所有 SqlStatement.plan.steps
+        2. 跳过 scan step 中 table_ref 以 _temp_ 开头的（DAG 内部管道）
+        3. 保留所有源表 scan 和所有语义 step（filter/aggregate/join/project/…）
+        4. 对每个 step 做与单 Plan 路径一致的扁平化（_normalize_step_dict）
+        5. 递归提取子查询中的嵌套 step（_flatten_steps）
+        """
+        all_steps: list[dict[str, Any]] = []
+
+        # 按拓扑顺序遍历——确保步骤顺序确定性
+        order = (
+            sql_program.topological_order
+            if sql_program.topological_order
+            else [s.statement_id for s in sql_program.statements]
+        )
+        statement_by_id = {s.statement_id: s for s in sql_program.statements}
+
+        for stmt_id in order:
+            stmt = statement_by_id.get(stmt_id)
+            if stmt is None:
+                continue
+            for step in stmt.plan.steps:
+                step_dict = step.model_dump(mode="json", exclude_none=True)
+                # 扁平化——与单 Plan 路径一致的归一化
+                step_dict = PlanComparator._normalize_step_dict(step_dict)
+                # 递归提取子查询中的嵌套 step
+                PlanComparator._flatten_steps(step, all_steps)
+
+                # 过滤 _temp_* scan：DAG 内部管道——Spark 侧通过变量传递 DataFrame，
+                # 不存在临时表概念，这些 scan 不应参与对比
+                step_type = step_dict.get("step_type", "")
+                if step_type == "scan":
+                    table_ref = step_dict.get("table_ref", "")
+                    if isinstance(table_ref, str) and table_ref.startswith("_temp_"):
+                        continue  # 跳过 _temp_ 中间表 scan
+
+                all_steps.append(step_dict)
+
+        return all_steps
+
+    @staticmethod
+    def _normalize_dag_steps(
+        sql_steps: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """将 DAG 扁平化产生的多个同类型 step 合并为单一步骤。
+
+        合并规则：
+        1. aggregate：合并所有 group_keys（去重）+ 合并所有 metrics（去重按 alias）
+        2. project：合并所有 columns（去重按 alias）
+        3. 其他类型（scan/filter/join/case_when/sort/limit）：保持原样
+
+        此归一化使 SQL DAG 的多语句结构与 Mapper 从平铺 Contract
+        生成的单 aggregate/单 project 结构对齐。
+
+        Args:
+            sql_steps: _flatten_sql_program_steps() 产出的扁平化步骤
+
+        Returns:
+            归一化后的步骤列表——aggregate 和 project 各最多一个
+        """
+        result: list[dict[str, Any]] = []
+        agg_group_keys: list[str] = []
+        agg_metrics: list[dict[str, Any]] = []
+        proj_columns: list[dict[str, Any]] = []
+        seen_agg_aliases: set[str] = set()
+        seen_proj_aliases: set[str] = set()
+        has_aggregate = False
+        has_project = False
+
+        for step in sql_steps:
+            stype = step.get("step_type", "")
+            if stype == "aggregate":
+                has_aggregate = True
+                # 合并 group_keys（去重）
+                for gk in step.get("group_keys", []):
+                    if gk not in agg_group_keys:
+                        agg_group_keys.append(gk)
+                # 合并 metrics（去重按 alias）
+                for m in step.get("metrics", []):
+                    alias = m.get("alias", "")
+                    if alias not in seen_agg_aliases:
+                        seen_agg_aliases.add(alias)
+                        agg_metrics.append(m)
+            elif stype == "project":
+                has_project = True
+                for col in step.get("columns", []):
+                    alias = col.get("alias", "")
+                    if alias not in seen_proj_aliases:
+                        seen_proj_aliases.add(alias)
+                        proj_columns.append(col)
+            else:
+                result.append(step)
+
+        # 将合并后的 aggregate 插入 result（放在 scan/filter/join/read 之后）
+        if has_aggregate:
+            merged_agg = {
+                "step_type": "aggregate",
+                "group_keys": agg_group_keys,
+                "metrics": agg_metrics,
+            }
+            # 找到最后一个 scan/filter/join/read 的位置，aggregate 插入其后
+            insert_pos = 0
+            for i, s in enumerate(result):
+                if s.get("step_type") in ("scan", "filter", "join", "read"):
+                    insert_pos = i + 1
+            result.insert(insert_pos, merged_agg)
+
+        # 将合并后的 project 追加到末尾
+        if has_project:
+            result.append({
+                "step_type": "project",
+                "columns": proj_columns,
+            })
+
+        return result
+
+    @staticmethod
+    def _compute_sql_program_hash(sql_program: SqlProgram) -> str:
+        """计算 SqlProgram 的确定性 hash——基于程序结构而非单一 plan。
+
+        与 SqlBuildPlan.generate_plan_hash() 对应，但覆盖多语句 DAG 的
+        完整结构：program_id + statement_ids + topological_order。
+        """
+        program_data = {
+            "program_id": sql_program.program_id,
+            "statement_ids": [s.statement_id for s in sql_program.statements],
+            "topological_order": sql_program.topological_order,
+        }
+        content = json.dumps(program_data, sort_keys=True, default=str)
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
 
     @staticmethod
     def _extract_sql_step_data(sql_plan: SqlBuildPlan) -> list[dict[str, Any]]:
