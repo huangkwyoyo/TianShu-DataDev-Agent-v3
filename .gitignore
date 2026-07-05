@@ -26,3 +26,4 @@ generated/review_packages/
 
 # CodeGraph 索引
 .codegraph/
+frontend/dist/
