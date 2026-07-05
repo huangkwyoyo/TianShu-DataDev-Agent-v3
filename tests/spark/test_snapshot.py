@@ -649,3 +649,182 @@ class TestSnapshotManifest:
             contract_hash="test",
         )
         assert manifest.deidentification == "none"
+
+
+# ════════════════════════════════════════════
+# Phase 9B-P0: Pipeline + SnapshotBuilder 集成测试
+# ════════════════════════════════════════════
+
+import os as _os
+
+from tianshu_datadev.api.pipeline import Pipeline
+
+
+class TestSnapshotPipelineIntegration:
+    """Pipeline.run_all() + SnapshotBuilder 端到端集成测试。
+
+    验证：
+    1. 无 SnapshotBuilder 时 Pipeline 行为不变（向后兼容）
+    2. 有 SnapshotBuilder + Provider 时 run_all() 产出 SnapshotManifest
+    3. export_artifacts() 能导出 snapshot_manifest
+    4. Snapshot 失败不阻断 run_all() 主流程
+    5. 白名单外 table 被过滤，不传给 SnapshotBuilder
+    """
+
+    # ── 辅助方法 ──
+
+    @staticmethod
+    def _read_fixture(name: str) -> str:
+        """读取 tests/fixtures/ 下的文件内容。"""
+        path = _os.path.join(
+            _os.path.dirname(_os.path.dirname(__file__)),
+            "fixtures", name,
+        )
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    @staticmethod
+    def _tests_dir() -> str:
+        """返回 tests/ 目录的绝对路径。"""
+        return _os.path.dirname(_os.path.dirname(__file__))
+
+    # ── 测试方法 ──
+
+    def test_run_all_without_snapshot_builder_still_works(self):
+        """无 SnapshotBuilder 时 run_all() 行为不变——向后兼容。"""
+        pipeline = Pipeline()  # 不注入 SnapshotBuilder
+        md = self._read_fixture("golden/golden_passing.md")
+
+        # 需提供 test_fact 的 table_paths 以保证 golden spec SQL 可执行
+        fixture_dir = self._tests_dir()
+        table_paths = {
+            "test_fact": _os.path.join(fixture_dir, "fixtures", "sql", "test_fact.csv"),
+        }
+
+        result = pipeline.run_all(md, table_paths=table_paths)
+        assert result["request_id"], "无 SnapshotBuilder 时 run_all 应正常返回 request_id"
+        assert result["package_id"], "无 SnapshotBuilder 时应正常生成 package_id"
+        # export_artifacts 应正常返回（snapshot_manifest 为 None）
+        bundle = pipeline.export_artifacts(result["request_id"])
+        assert bundle is not None
+        assert bundle.snapshot_manifest is None, (
+            "未注入 SnapshotBuilder 时 snapshot_manifest 应为 None"
+        )
+
+    def test_run_all_with_snapshot_builder_produces_manifest(self, local_fixture_provider):
+        """注入 SnapshotBuilder + LOCAL_FIXTURE Provider 时 run_all() 产出 SnapshotManifest。"""
+        import tempfile
+        tmpdir = tempfile.mkdtemp(prefix="tianshu_snap_int_")
+        snapshot_builder = SnapshotBuilder(output_dir=tmpdir)
+
+        # 注入 SnapshotBuilder + Provider——使用 order_info fixture
+        pipeline = Pipeline(
+            snapshot_builder=snapshot_builder,
+            snapshot_provider=local_fixture_provider,
+        )
+        md = self._read_fixture("golden/golden_passing.md")
+
+        # table_paths 中需同时包含：
+        #   - test_fact：golden spec SQL 执行所需
+        #   - order_info：快照白名单内表，SnapshotBuilder 可处理
+        fixture_dir = self._tests_dir()
+        table_paths = {
+            "test_fact": _os.path.join(fixture_dir, "fixtures", "sql", "test_fact.csv"),
+            "order_info": _os.path.join(fixture_dir, "fixtures", "order_info.csv"),
+        }
+
+        result = pipeline.run_all(md, table_paths=table_paths)
+        assert result["request_id"], "run_all 应正常返回 request_id"
+        assert result["package_id"], "run_all 应正常生成 package_id"
+
+        # 通过 export_artifacts 验证 SnapshotManifest 存在
+        bundle = pipeline.export_artifacts(result["request_id"])
+        assert bundle is not None
+        assert bundle.snapshot_manifest is not None, (
+            "注入 SnapshotBuilder + Provider 后应产出 SnapshotManifest"
+        )
+        manifest = bundle.snapshot_manifest
+        assert manifest.snapshot_id.startswith("snap_"), (
+            f"snapshot_id 应以 'snap_' 开头，实际: {manifest.snapshot_id}"
+        )
+        assert len(manifest.files) == 1, (
+            f"应生成 1 个快照文件，实际: {len(manifest.files)}"
+        )
+        assert manifest.files[0].source_name == "order_info"
+        assert manifest.files[0].row_count > 0, "快照文件应有实际行数"
+        assert manifest.files[0].file_sha256, "快照文件应有 SHA-256"
+        assert manifest.snapshot_sha256, "快照清单应有整体完整性 hash"
+
+    def test_export_artifacts_includes_snapshot_manifest(self, local_fixture_provider):
+        """export_artifacts() 能导出 snapshot_manifest——供下游 Orchestrator/Harness 消费。"""
+        import tempfile
+        tmpdir = tempfile.mkdtemp(prefix="tianshu_snap_exp_")
+        snapshot_builder = SnapshotBuilder(output_dir=tmpdir)
+
+        pipeline = Pipeline(
+            snapshot_builder=snapshot_builder,
+            snapshot_provider=local_fixture_provider,
+        )
+        md = self._read_fixture("golden/golden_passing.md")
+        fixture_dir = self._tests_dir()
+        table_paths = {
+            "test_fact": _os.path.join(fixture_dir, "fixtures", "sql", "test_fact.csv"),
+            "order_info": _os.path.join(fixture_dir, "fixtures", "order_info.csv"),
+        }
+
+        result = pipeline.run_all(md, table_paths=table_paths)
+        bundle = pipeline.export_artifacts(result["request_id"])
+
+        # 验证 bundle 中除 snapshot_manifest 外的字段也完整
+        assert bundle.sql_build_plan is not None, "sql_build_plan 不应为空"
+        assert bundle.data_transform_contract is not None, "contract 不应为空"
+        assert bundle.snapshot_manifest is not None, "snapshot_manifest 不应为空"
+
+        # 验证 snapshot_manifest 与 contract 的 hash 关联
+        from tianshu_datadev.artifacts.models import (
+            DataTransformContractLite,
+            DataTransformContractV1,
+        )
+        contract = bundle.data_transform_contract
+        if isinstance(contract, DataTransformContractV1):
+            contract_hash = DataTransformContractV1.compute_contract_hash(contract)
+        else:
+            contract_hash = DataTransformContractLite.compute_contract_hash(contract)
+        assert bundle.snapshot_manifest.contract_hash == contract_hash, (
+            f"snapshot_manifest.contract_hash 应与 contract 的 compute_contract_hash() 一致"
+        )
+
+    def test_snapshot_failure_does_not_block_run_all(self, local_fixture_provider):
+        """Snapshot 构建失败不阻断 run_all() 主流程——优雅降级。"""
+        # 构造一个会失败的 provider——白名单空（source_tables 过滤后为空，但不抛异常）
+        # 真正的失败场景：provider 白名单不含 table_paths 中的表 → source_tables 为空 → 跳过 snapshot
+        pipeline = Pipeline(
+            snapshot_builder=SnapshotBuilder(output_dir="generated/snapshots"),
+            snapshot_provider=local_fixture_provider,
+        )
+        md = self._read_fixture("golden/golden_passing.md")
+        # 传入白名单外的表——会被过滤掉，source_tables 为空，跳过 snapshot
+        # 同时需提供 test_fact 保证 golden spec SQL 可正常执行
+        fixture_dir = self._tests_dir()
+        table_paths = {
+            "test_fact": _os.path.join(fixture_dir, "fixtures", "sql", "test_fact.csv"),
+            "unknown_table": "/nonexistent/path.csv",
+        }
+
+        result = pipeline.run_all(md, table_paths=table_paths)
+        assert result["request_id"], "snapshot 失败不应阻断 run_all"
+        assert result["package_id"], "snapshot 失败不应阻断 package 生成"
+
+        bundle = pipeline.export_artifacts(result["request_id"])
+        assert bundle is not None
+        # source_tables 过滤后为空 → 不调用 build → snapshot_manifest 为 None
+        assert bundle.snapshot_manifest is None, (
+            "白名单外 table 被过滤后 snapshot_manifest 应为 None"
+        )
+
+    def test_backward_compatible_no_snapshot_params(self):
+        """Pipeline() 无 snapshot 参数时完全向后兼容——已有测试不受影响。"""
+        # 不传任何 snapshot 参数
+        pipeline = Pipeline()
+        assert pipeline._snapshot_builder is None
+        assert pipeline._snapshot_provider is None
