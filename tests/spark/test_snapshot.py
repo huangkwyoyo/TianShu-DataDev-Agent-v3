@@ -14,9 +14,11 @@
 from __future__ import annotations
 
 import os
+import shutil
 
 import pytest
 
+from tianshu_datadev.api.pipeline import Pipeline
 from tianshu_datadev.spark.snapshot import (
     SamplingSpec,
     SnapshotBuilder,
@@ -655,10 +657,6 @@ class TestSnapshotManifest:
 # Phase 9B-P0: Pipeline + SnapshotBuilder 集成测试
 # ════════════════════════════════════════════
 
-import os as _os
-
-from tianshu_datadev.api.pipeline import Pipeline
-
 
 class TestSnapshotPipelineIntegration:
     """Pipeline.run_all() + SnapshotBuilder 端到端集成测试。
@@ -676,8 +674,8 @@ class TestSnapshotPipelineIntegration:
     @staticmethod
     def _read_fixture(name: str) -> str:
         """读取 tests/fixtures/ 下的文件内容。"""
-        path = _os.path.join(
-            _os.path.dirname(_os.path.dirname(__file__)),
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
             "fixtures", name,
         )
         with open(path, "r", encoding="utf-8") as f:
@@ -686,7 +684,7 @@ class TestSnapshotPipelineIntegration:
     @staticmethod
     def _tests_dir() -> str:
         """返回 tests/ 目录的绝对路径。"""
-        return _os.path.dirname(_os.path.dirname(__file__))
+        return os.path.dirname(os.path.dirname(__file__))
 
     # ── 测试方法 ──
 
@@ -698,7 +696,7 @@ class TestSnapshotPipelineIntegration:
         # 需提供 test_fact 的 table_paths 以保证 golden spec SQL 可执行
         fixture_dir = self._tests_dir()
         table_paths = {
-            "test_fact": _os.path.join(fixture_dir, "fixtures", "sql", "test_fact.csv"),
+            "test_fact": os.path.join(fixture_dir, "fixtures", "sql", "test_fact.csv"),
         }
 
         result = pipeline.run_all(md, table_paths=table_paths)
@@ -729,8 +727,8 @@ class TestSnapshotPipelineIntegration:
         #   - order_info：快照白名单内表，SnapshotBuilder 可处理
         fixture_dir = self._tests_dir()
         table_paths = {
-            "test_fact": _os.path.join(fixture_dir, "fixtures", "sql", "test_fact.csv"),
-            "order_info": _os.path.join(fixture_dir, "fixtures", "order_info.csv"),
+            "test_fact": os.path.join(fixture_dir, "fixtures", "sql", "test_fact.csv"),
+            "order_info": os.path.join(fixture_dir, "fixtures", "order_info.csv"),
         }
 
         result = pipeline.run_all(md, table_paths=table_paths)
@@ -755,6 +753,9 @@ class TestSnapshotPipelineIntegration:
         assert manifest.files[0].file_sha256, "快照文件应有 SHA-256"
         assert manifest.snapshot_sha256, "快照清单应有整体完整性 hash"
 
+        # 清理临时目录
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
     def test_export_artifacts_includes_snapshot_manifest(self, local_fixture_provider):
         """export_artifacts() 能导出 snapshot_manifest——供下游 Orchestrator/Harness 消费。"""
         import tempfile
@@ -768,8 +769,8 @@ class TestSnapshotPipelineIntegration:
         md = self._read_fixture("golden/golden_passing.md")
         fixture_dir = self._tests_dir()
         table_paths = {
-            "test_fact": _os.path.join(fixture_dir, "fixtures", "sql", "test_fact.csv"),
-            "order_info": _os.path.join(fixture_dir, "fixtures", "order_info.csv"),
+            "test_fact": os.path.join(fixture_dir, "fixtures", "sql", "test_fact.csv"),
+            "order_info": os.path.join(fixture_dir, "fixtures", "order_info.csv"),
         }
 
         result = pipeline.run_all(md, table_paths=table_paths)
@@ -791,15 +792,20 @@ class TestSnapshotPipelineIntegration:
         else:
             contract_hash = DataTransformContractLite.compute_contract_hash(contract)
         assert bundle.snapshot_manifest.contract_hash == contract_hash, (
-            f"snapshot_manifest.contract_hash 应与 contract 的 compute_contract_hash() 一致"
+            "snapshot_manifest.contract_hash 应与 contract 的 compute_contract_hash() 一致"
         )
+
+        # 清理临时目录
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_snapshot_failure_does_not_block_run_all(self, local_fixture_provider):
         """Snapshot 构建失败不阻断 run_all() 主流程——优雅降级。"""
+        import tempfile
+        tmpdir = tempfile.mkdtemp(prefix="tianshu_snap_fail_")
         # 构造一个会失败的 provider——白名单空（source_tables 过滤后为空，但不抛异常）
         # 真正的失败场景：provider 白名单不含 table_paths 中的表 → source_tables 为空 → 跳过 snapshot
         pipeline = Pipeline(
-            snapshot_builder=SnapshotBuilder(output_dir="generated/snapshots"),
+            snapshot_builder=SnapshotBuilder(output_dir=tmpdir),
             snapshot_provider=local_fixture_provider,
         )
         md = self._read_fixture("golden/golden_passing.md")
@@ -807,7 +813,7 @@ class TestSnapshotPipelineIntegration:
         # 同时需提供 test_fact 保证 golden spec SQL 可正常执行
         fixture_dir = self._tests_dir()
         table_paths = {
-            "test_fact": _os.path.join(fixture_dir, "fixtures", "sql", "test_fact.csv"),
+            "test_fact": os.path.join(fixture_dir, "fixtures", "sql", "test_fact.csv"),
             "unknown_table": "/nonexistent/path.csv",
         }
 
@@ -821,6 +827,9 @@ class TestSnapshotPipelineIntegration:
         assert bundle.snapshot_manifest is None, (
             "白名单外 table 被过滤后 snapshot_manifest 应为 None"
         )
+
+        # 清理临时目录
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_backward_compatible_no_snapshot_params(self):
         """Pipeline() 无 snapshot 参数时完全向后兼容——已有测试不受影响。"""
