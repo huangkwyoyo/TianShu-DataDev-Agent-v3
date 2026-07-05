@@ -31,6 +31,8 @@ const STAGE_CN: Record<string, string> = {
   validate: '验证',
   compile: '编译',
   execute: '执行',
+  contract: '契约',   // SQL 侧新增——契约阶段
+  package: '打包',    // SQL 侧新增——打包阶段
   // Spark 侧（新增）
   MAPPER: '映射',
   DEVELOPER: '标注',
