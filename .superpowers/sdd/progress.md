@@ -183,3 +183,5 @@ Started: 2026-07-05
 Base commit: b4300d5
 Task 1: complete (commits b4300d5..af3dd48, review clean — spec ✅ quality Approved)
 Task 2: complete (无需改动——Contract 提取已在 compute_steps 分支完整实现: pipeline.py L1116-1118 extract_v1 + L1201 _store_result + L1633 export_artifacts)
+Task 3: complete (commits af3dd48..df185c1, review clean — spec ✅ quality Approved)
+Task 4: complete (commits df185c1..e0c2a77, review clean — spec ✅ quality Approved, 1 Important latent bug to fix)

@@ -756,12 +756,9 @@ class SqlBuildPlanBuilder:
                         proj_cols = self._build_compute_step_passthrough(cs)
                 else:
                     # 有聚合（metrics 或 case_when）：标准透传（group_by + metric aliases）
-                    proj_table_ref = ""
-                    if is_merge_step:
-                        proj_table_ref = make_temp_name(chain_id, cs.source[0])
-                    proj_cols = self._build_compute_step_passthrough(
-                        cs, default_table_ref=proj_table_ref,
-                    )
+                    # 合流场景下不设 table_ref——列消歧已在 AggregateStep/CaseWhenStep 的
+                    # group_keys 处理中完成，此处的 ProjectStep 读取聚合结果表而非上游临时表
+                    proj_cols = self._build_compute_step_passthrough(cs)
 
                 plan_steps.append(ProjectStep(
                     step_id=SqlBuildPlan.generate_step_id(
