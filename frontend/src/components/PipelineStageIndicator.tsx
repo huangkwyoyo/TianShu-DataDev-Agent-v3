@@ -18,16 +18,26 @@ export interface PipelineError {
 interface Props {
   stages: StageInfo[];
   error: PipelineError | null;
+  /** 指示灯标题——默认"流水线阶段"，Spark 侧传入"Spark 管线" */
+  title?: string;
 }
 
 /** 阶段英文 → 中文映射 */
 const STAGE_CN: Record<string, string> = {
+  // SQL 侧（已有）
   parser: '解析',
   enrich: '增强',
   build: '构建',
   validate: '验证',
   compile: '编译',
   execute: '执行',
+  // Spark 侧（新增）
+  MAPPER: '映射',
+  DEVELOPER: '标注',
+  COMPILER: '编译',
+  VALIDATOR: '校验',
+  COMPARATOR: '对比',
+  PHYSICAL_VERIFIER: '物理验证',
 };
 
 /** 状态 → 图标映射 */
@@ -45,7 +55,7 @@ function stageIcon(status: string): string {
  * 折叠时显示一个圆点 + 简短状态文字（如"执行失败"）。
  * 点击展开显示各阶段详情，再次点击或点击外部收起。
  */
-export function PipelineStageIndicator({ stages, error }: Props) {
+export function PipelineStageIndicator({ stages, error, title }: Props) {
   const [expanded, setExpanded] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -88,7 +98,7 @@ export function PipelineStageIndicator({ stages, error }: Props) {
 
       {expanded && (
         <div className="pipeline-dropdown">
-          <div className="pipeline-dropdown-header">流水线阶段</div>
+          <div className="pipeline-dropdown-header">{title || '流水线阶段'}</div>
           {stages.map((s) => (
             <div
               key={s.stage}
