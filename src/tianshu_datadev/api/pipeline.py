@@ -1095,6 +1095,44 @@ class Pipeline:
                 extractor = DataTransformContractExtractor()
                 contract = extractor.extract_v1(sql_program)
 
+                # ── Phase 9B-P0: Snapshot 阶段（可选——仅当注入 SnapshotBuilder + Provider 时执行）──
+                # 必须在 contract 提取之后——依赖 contract 的 hash
+                snapshot_manifest = None
+                if self._snapshot_builder is not None and self._snapshot_provider is not None:
+                    try:
+                        # 计算 contract_hash——使用 Contract 模型的静态方法
+                        from tianshu_datadev.artifacts.models import (
+                            DataTransformContractLite as _Lite,
+                        )
+                        from tianshu_datadev.artifacts.models import (
+                            DataTransformContractV1 as _V1,  # noqa: N814
+                        )
+                        if isinstance(contract, _V1):
+                            contract_hash = _V1.compute_contract_hash(contract)
+                        else:
+                            contract_hash = _Lite.compute_contract_hash(contract)
+
+                        # 从 table_paths 推导 source_tables——与 provider 白名单交集
+                        source_tables = list(table_paths.keys()) if table_paths else []
+                        allowlisted = set(self._snapshot_provider.allowlisted_tables)
+                        source_tables = [t for t in source_tables if t in allowlisted]
+
+                        if source_tables:
+                            snapshot_manifest = self._snapshot_builder.build(
+                                contract_hash=contract_hash,
+                                source_tables=source_tables,
+                                provider=self._snapshot_provider,
+                            )
+                            logger.info(
+                                "Snapshot 构建成功——snapshot_id=%s，文件数=%d",
+                                snapshot_manifest.snapshot_id,
+                                len(snapshot_manifest.files),
+                            )
+                    except Exception as snap_err:
+                        # Snapshot 失败不阻断主流程——记录日志，继续 Package
+                        logger.warning("Snapshot 构建失败（非阻断）：%s", snap_err)
+                        snapshot_manifest = None
+
                 stage = "package"
                 request_id = self._gen_request_id(spec)
                 package_inputs = PackageInputs(
@@ -1141,6 +1179,8 @@ class Pipeline:
                     "parsed_spec": spec,
                     "manifest": manifest,
                     "table_mapping": table_mapping or {},
+                    # ── Phase 9B-P0 ──
+                    "snapshot_manifest": snapshot_manifest,
                 })
 
                 # ComputeSteps 路径独立返回
@@ -1307,6 +1347,44 @@ class Pipeline:
             else:
                 contract = contract_extractor.extract(plan)
 
+            # ── Phase 9B-P0: Snapshot 阶段（可选——仅当注入 SnapshotBuilder + Provider 时执行）──
+            # 必须在 contract 提取之后——依赖 contract 的 hash
+            snapshot_manifest = None
+            if self._snapshot_builder is not None and self._snapshot_provider is not None:
+                try:
+                    # 计算 contract_hash——使用 Contract 模型的静态方法
+                    from tianshu_datadev.artifacts.models import (
+                        DataTransformContractLite as _Lite,
+                    )
+                    from tianshu_datadev.artifacts.models import (
+                        DataTransformContractV1 as _V1,  # noqa: N814
+                    )
+                    if isinstance(contract, _V1):
+                        contract_hash = _V1.compute_contract_hash(contract)
+                    else:
+                        contract_hash = _Lite.compute_contract_hash(contract)
+
+                    # 从 table_paths 推导 source_tables——与 provider 白名单交集
+                    source_tables = list(table_paths.keys()) if table_paths else []
+                    allowlisted = set(self._snapshot_provider.allowlisted_tables)
+                    source_tables = [t for t in source_tables if t in allowlisted]
+
+                    if source_tables:
+                        snapshot_manifest = self._snapshot_builder.build(
+                            contract_hash=contract_hash,
+                            source_tables=source_tables,
+                            provider=self._snapshot_provider,
+                        )
+                        logger.info(
+                            "Snapshot 构建成功——snapshot_id=%s，文件数=%d",
+                            snapshot_manifest.snapshot_id,
+                            len(snapshot_manifest.files),
+                        )
+                except Exception as snap_err:
+                    # Snapshot 失败不阻断主流程——记录日志，继续 Package
+                    logger.warning("Snapshot 构建失败（非阻断）：%s", snap_err)
+                    snapshot_manifest = None
+
             stage = "package"
             request_id = self._gen_request_id(spec)
             packager = ReviewPackageBuilder(self._base_output_dir)
@@ -1395,6 +1473,8 @@ class Pipeline:
             "summary": summary,
             "contract": contract,
             "table_mapping": table_mapping or {},
+            # ── Phase 9B-P0 ──
+            "snapshot_manifest": snapshot_manifest,
         })
         self._store_package(request_id, package_manifest)
 
@@ -1529,6 +1609,9 @@ class Pipeline:
         # 提取 compiled——execute/run_all 单表路径存储为 "compiled"
         compiled = data.get("compiled")
 
+        # ── Phase 9B-P0: 提取 snapshot_manifest ──
+        snapshot_manifest = data.get("snapshot_manifest")
+
         return PipelineArtifactBundle(
             request_id=request_id,
             spec_hash=spec_hash,
@@ -1537,6 +1620,8 @@ class Pipeline:
             compiled_sql=compiled,
             execution_trace=data.get("trace"),
             result_summary=data.get("summary"),
+            # ── Phase 9B-P0 ──
+            snapshot_manifest=snapshot_manifest,
         )
 
     # ── Phase 4.5B 前端 SPA 专用方法 ──────────────────────
