@@ -29,8 +29,9 @@
 | 9C-R16 | table_paths 环境配置补齐 | ✅ | ✅ | ✅ | R16 消除，CSV fixture 自动发现，2026-07-05 |
 | 9C-R16b | table_paths 边界硬化 | ✅ | ✅ | ✅ | None/{} 语义区分 + E2E 模式开关，2026-07-05 |
 | 9B-P1 | provenance.yml 显式断言 | ✅ | ✅ | ✅ | snapshot_manifest_hash 测试覆盖矩阵补全，2026-07-05 |
+| 9A4-NYC | 真实业务样本——NYC 案例 01 | ✅ | ✅ | ✅ | SQL 全链路 + Spark 双链，11/11 测试通过，2026-07-05 |
 
-**当前测试基线**：601 passed / 11 skipped（api/spark/artifacts 后端子集）+ 23 passed（前端冒烟全量）+ 6 passed / 0 skipped（Playwright E2E），ruff/tsc/build 零告警
+**当前测试基线**：659 passed / 11 skipped（api/spark/artifacts 后端子集）+ 23 passed（前端冒烟全量）+ 6 passed / 0 skipped（Playwright E2E），ruff/tsc/build 零告警
 
 ## 2. C1-C4 业务集成验证
 
@@ -49,7 +50,7 @@
 |:----:|------|:----:|------|
 | R5 | ~~桥接函数替代完整 SQL Pipeline~~ | 已消除 | Phase 9A1-9A3 + 9A5 已升级为真实 Pipeline 全链路 |
 | R6 | ~~Harness Runner 为结果聚合器~~ | 已消除 | Phase 9A3 已升级为自动评测驱动器 |
-| R7 | 真实业务样本缺失——所有测试使用手工构造 Contract | B | 待业务方提供（9A4 阻塞） |
+| R7 | 真实业务样本缺失——NYC 案例 01 已接入，剩余 5/6 个场景待接入 | B | 待业务方提供（9A4 部分完成） |
 | R8 | LLM 生产环境持续验证未配置 | C | 待 API key |
 | R10 | ~~Snapshot Builder 未集成到 REVIEW_READY 流程~~ | 已消除 | Phase 9B-P0 已将 SnapshotBuilder.build() 接入 Pipeline.run_all()，snapshot hash 写入 provenance.yml |
 | R11 | ~~前端无自动化测试框架~~ | 已消除 | Phase 9B 源码级 + Phase 9C Playwright E2E |
@@ -89,7 +90,7 @@ DeveloperSpec (.md 项目书)
 
 ## 5. 下一步方向（Phase 10+）
 
-1. **真实业务样本端到端验证（9A4）**——6 个企业场景的 DeveloperSpec → 双管线全链路（阻塞于业务方提供样本）
+1. **真实业务样本端到端验证（9A4）**——NYC 案例 01 已完成（1/6），剩余 5 个企业场景待接入（阻塞于业务方提供样本）
 2. **生产环境 LLM 验证**——API key 配置 + 持续验证链路
 
 ## 6. 关键文档索引
