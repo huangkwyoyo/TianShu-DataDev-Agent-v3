@@ -41,7 +41,12 @@ class SparkEvalDimension(str, Enum):
 
 
 class SparkEvalCase(StrictModel):
-    """单个 Spark 评测用例——含输入、预期行为和实际结果。"""
+    """单个 Spark 评测用例——含输入、预期行为和实际结果。
+
+    Phase 9A3 新增 developer_spec_md 字段——供自动驱动器模式使用。
+    提供 developer_spec_md 的用例在 evaluate() 时自动走 Pipeline → Orchestrator 全链路；
+    未提供的用例回退到被动模式（读取预置的 case.passed）。
+    """
 
     case_id: str                                   # 用例唯一标识
     dimension: SparkEvalDimension                  # 所属评测维度
@@ -49,6 +54,7 @@ class SparkEvalCase(StrictModel):
     expected_behavior: str                         # 预期行为描述
     actual_result: dict = Field(default_factory=dict)   # 实际评测数据
     passed: bool = False                           # 是否通过
+    developer_spec_md: str = ""                    # 9A3 新增：完整 DeveloperSpec Markdown 文本
 
 
 # ════════════════════════════════════════════════
@@ -90,15 +96,40 @@ class SparkHarnessRunner:
 
     评测器不修改被测系统——只读取、验证、报告。
 
+    两种模式：
+    - **自动模式（Phase 9A3 新增）**：注入 Pipeline + Orchestrator 后，
+      evaluate() 对每个含 developer_spec_md 的 case 自动执行全链路——
+      Pipeline.run_all() → export_artifacts() → adapt_lite_to_v1() →
+      Orchestrator.run() → 读取 stage_results 自动判定 passed。
+    - **被动模式（向后兼容）**：evaluate(passive=True) 仅聚合预置的 case.passed，
+      与 Phase 8 行为一致。
+
     使用方式：
-        runner = SparkHarnessRunner()
-        runner.add_case(case)
+        # 自动模式
+        runner = SparkHarnessRunner(pipeline=pipeline, orchestrator=orchestrator)
+        runner.add_case(case)  # case 需含 developer_spec_md
         report = runner.evaluate()
+
+        # 被动模式
+        runner = SparkHarnessRunner()
+        runner.add_case(case)  # case.passed 已预置
+        report = runner.evaluate(passive=True)
     """
 
-    def __init__(self) -> None:
-        """初始化评测执行器。"""
+    def __init__(
+        self,
+        pipeline: object | None = None,        # Pipeline | None
+        orchestrator: object | None = None,    # SparkOrchestrator | None
+    ) -> None:
+        """初始化评测执行器。
+
+        Args:
+            pipeline: Pipeline 实例——提供时启用自动模式（evaluate() 自动执行全链路）。
+            orchestrator: SparkOrchestrator 实例——与 pipeline 配合使用。
+        """
         self._cases: list[SparkEvalCase] = []
+        self._pipeline = pipeline
+        self._orchestrator = orchestrator
 
     def add_case(self, case: SparkEvalCase) -> None:
         """添加评测用例。
@@ -108,15 +139,29 @@ class SparkHarnessRunner:
         """
         self._cases.append(case)
 
-    def evaluate(self) -> SparkEvalReport:
+    def evaluate(self, passive: bool = False) -> SparkEvalReport:
         """执行全部评测用例并产出报告。
+
+        两种模式：
+        - 自动模式（passive=False 且注入 pipeline + orchestrator）：
+          对每个含 developer_spec_md 的 case 自动执行 Pipeline → Orchestrator 全链路，
+          从 SparkPipelineState.stage_results 自动判定 passed。
+        - 被动模式（passive=True 或未注入 pipeline）：
+          仅聚合预置的 case.passed（Phase 8 行为，向后兼容）。
+
+        Args:
+            passive: True 时强制被动模式（仅聚合预置 passed），忽略 pipeline/orchestrator。
 
         Returns:
             SparkEvalReport——含 5 维度汇总结果
         """
+        # ── 自动模式：Pipeline → Orchestrator 全链路 ──
+        if not passive and self._pipeline is not None and self._orchestrator is not None:
+            self._execute_auto_mode()
+
+        # ── 聚合报告（自动/被动共用）──
         report_id = SparkEvalReport.generate_report_id()
 
-        # 按维度分组
         dimension_results: dict[str, dict] = {}
         for dim in SparkEvalDimension:
             dim_cases = [c for c in self._cases if c.dimension == dim]
@@ -141,6 +186,108 @@ class SparkHarnessRunner:
             total_cases=total_cases,
             overall_pass_rate=total_passed / total_cases if total_cases > 0 else 0.0,
         )
+
+    def _execute_auto_mode(self) -> None:
+        """自动模式——对每个含 developer_spec_md 的 case 执行全链路评测。
+
+        对每个 case：
+        1. Pipeline.run_all(markdown_text) → request_id
+        2. Pipeline.export_artifacts(request_id) → bundle
+        3. adapt_lite_to_v1(bundle.data_transform_contract) → V1 contract
+        4. Orchestrator.run(contract=v1, sql_plan=bundle.sql_build_plan) → state
+        5. 从 state.stage_results 自动判定 case.passed
+
+        不含 developer_spec_md 的 case 保持原样（被动模式兼容）。
+        Pipeline 执行异常时 case 标记为 failed，错误信息写入 actual_result。
+        """
+        import tempfile
+
+        from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+
+        for case in self._cases:
+            if not case.developer_spec_md:
+                # 无 DeveloperSpec 文本——保持被动模式
+                continue
+
+            tmpdir = tempfile.mkdtemp()
+            try:
+                # 从 actual_result 读取可选的 table_paths / table_mapping
+                table_paths: dict = case.actual_result.get("table_paths", {})
+                table_mapping: dict = case.actual_result.get("table_mapping", {})
+
+                # Step 1: Pipeline 执行
+                pipeline = self._pipeline
+                result = pipeline.run_all(
+                    case.developer_spec_md,
+                    table_paths=table_paths,
+                    table_mapping=table_mapping,
+                )
+                request_id = result["request_id"]
+
+                # Step 2: 导出中间产物
+                bundle = pipeline.export_artifacts(request_id)
+                if bundle is None:
+                    case.passed = False
+                    case.actual_result["error"] = "export_artifacts 返回 None"
+                    continue
+
+                # Step 3: 适配 contract（Lite → V1）
+                raw_contract = bundle.data_transform_contract
+                if raw_contract is None:
+                    case.passed = False
+                    case.actual_result["error"] = (
+                        "data_transform_contract 为 None——"
+                        "Pipeline 未产出 contract"
+                    )
+                    continue
+
+                from tianshu_datadev.artifacts.models import DataTransformContractV1
+                if isinstance(raw_contract, DataTransformContractV1):
+                    v1_contract = raw_contract
+                else:
+                    v1_contract = adapt_lite_to_v1(raw_contract)
+
+                # Step 4: Orchestrator 执行
+                orchestrator = self._orchestrator
+                state = orchestrator.run(
+                    contract=v1_contract,
+                    sql_plan=bundle.sql_build_plan,
+                )
+
+                # Step 5: 自动判定 passed——基于 stage_results
+                stage_results = dict(state.stage_results)
+                case.actual_result["stage_results"] = stage_results
+                case.actual_result["overall_status"] = (
+                    state.overall_status.value
+                    if hasattr(state.overall_status, "value")
+                    else str(state.overall_status)
+                )
+
+                # 判定规则：MAPPER + COMPILER + VALIDATOR + COMPARATOR 均为 SUCCESS
+                # （DEVELOPER 和 PHYSICAL_VERIFIER 可 SKIPPED）
+                critical_stages = {
+                    "MAPPER", "COMPILER", "VALIDATOR", "COMPARATOR",
+                }
+                all_critical_ok = all(
+                    stage_results.get(s, "NOT_EXECUTED") == "SUCCESS"
+                    for s in critical_stages
+                )
+                case.passed = all_critical_ok
+
+                # 记录 comparator 结果（若存在）
+                if state.comparator_report is not None:
+                    case.actual_result["comparator_status"] = (
+                        state.comparator_report.status.value
+                        if hasattr(state.comparator_report.status, "value")
+                        else str(state.comparator_report.status)
+                    )
+
+            except Exception as e:
+                case.passed = False
+                case.actual_result["error"] = str(e)
+            finally:
+                import shutil
+                shutil.rmtree(tmpdir, ignore_errors=True)
 
     def evaluate_dimension(
         self,
