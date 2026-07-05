@@ -841,9 +841,11 @@ class TestSnapshotPipelineIntegration:
     # ── Phase 9B-P1: provenance.yml 显式 snapshot_manifest_hash 断言 ──
 
     def test_provenance_yml_contains_snapshot_manifest_hash(self, local_fixture_provider):
-        """provenance.yml 中 snapshot_manifest_hash 非空——验收标准 #3 显式覆盖。"""
+        """provenance.yml 中 snapshot_manifest_hash 非空且值正确——验收标准 #3 显式覆盖。"""
         import re
         import tempfile
+
+        from tianshu_datadev.artifacts.provenance import compute_json_hash
 
         # 使用独立临时目录作为 Pipeline 的输出根目录——便于定位 provenance.yml
         out_dir = tempfile.mkdtemp(prefix="tianshu_prov_")
@@ -865,6 +867,14 @@ class TestSnapshotPipelineIntegration:
         result = pipeline.run_all(md, table_paths=table_paths)
         request_id = result["request_id"]
 
+        # 获取实际的 snapshot_manifest——用于验证 hash 正确性
+        bundle = pipeline.export_artifacts(request_id)
+        assert bundle is not None
+        assert bundle.snapshot_manifest is not None, (
+            "注入 SnapshotBuilder + Provider 后 snapshot_manifest 不应为空"
+        )
+        manifest_dict = bundle.snapshot_manifest.model_dump()
+
         # 读取生成的 provenance.yml
         prov_path = os.path.join(out_dir, request_id, "provenance.yml")
         assert os.path.isfile(prov_path), (
@@ -874,7 +884,7 @@ class TestSnapshotPipelineIntegration:
             prov_content = f.read()
 
         # 提取 snapshot_manifest_hash——应为 64 位 hex 字符串
-        match = re.search(r"snapshot_manifest_hash:\s*\"?([0-9a-f]+)\"?", prov_content)
+        match = re.search(r"snapshot_manifest_hash:\s*\"([0-9a-f]+)\"", prov_content)
         assert match is not None, (
             f"provenance.yml 中未找到 snapshot_manifest_hash 字段\n"
             f"文件内容: {prov_content[:500]}"
@@ -883,8 +893,56 @@ class TestSnapshotPipelineIntegration:
         assert len(snapshot_hash) == 64, (
             f"snapshot_manifest_hash 应为 64 位 hex，实际长度: {len(snapshot_hash)}"
         )
-        assert snapshot_hash != "", "snapshot_manifest_hash 不应为空"
+
+        # ★ 显式正确性断言——provenance.yml 中的 hash 必须与 compute_json_hash 一致
+        expected_hash = compute_json_hash(manifest_dict)
+        assert snapshot_hash == expected_hash, (
+            f"snapshot_manifest_hash 不正确\n"
+            f"  provenance.yml 中: {snapshot_hash}\n"
+            f"  compute_json_hash: {expected_hash}"
+        )
 
         # 清理
         shutil.rmtree(out_dir, ignore_errors=True)
         shutil.rmtree(snap_dir, ignore_errors=True)
+
+    def test_snapshot_manifest_hash_empty_when_no_snapshot_integration(self):
+        """不注入 SnapshotBuilder 时 provenance.yml 中 snapshot_manifest_hash 必须为空——生产默认路径。"""
+        import tempfile
+
+        out_dir = tempfile.mkdtemp(prefix="tianshu_prov_nosnap_")
+
+        # 不注入 SnapshotBuilder——模拟生产默认路径
+        pipeline = Pipeline(base_output_dir=out_dir)
+        md = self._read_fixture("golden/golden_passing.md")
+        fixture_dir = self._tests_dir()
+        table_paths = {
+            "test_fact": os.path.join(fixture_dir, "fixtures", "sql", "test_fact.csv"),
+        }
+
+        result = pipeline.run_all(md, table_paths=table_paths)
+        request_id = result["request_id"]
+
+        # 确认 snapshot_manifest 为 None
+        bundle = pipeline.export_artifacts(request_id)
+        assert bundle is not None
+        assert bundle.snapshot_manifest is None, (
+            "未注入 SnapshotBuilder 时 snapshot_manifest 应为 None"
+        )
+
+        # 读取 provenance.yml 并验证 hash 为空
+        prov_path = os.path.join(out_dir, request_id, "provenance.yml")
+        assert os.path.isfile(prov_path), (
+            f"provenance.yml 未生成于预期路径: {prov_path}"
+        )
+        with open(prov_path, "r", encoding="utf-8") as f:
+            prov_content = f.read()
+
+        # 显式验证——无快照时字段存在但值为空
+        assert 'snapshot_manifest_hash: ""' in prov_content, (
+            "未注入 SnapshotBuilder 时 snapshot_manifest_hash 应为空字符串\n"
+            f"实际内容: {prov_content[:500]}"
+        )
+
+        # 清理
+        shutil.rmtree(out_dir, ignore_errors=True)

@@ -28,8 +28,9 @@
 | 9C | DOM E2E 交互测试 | ✅ | ✅ | ✅ | 6/6 Playwright 测试通过，2026-07-05 |
 | 9C-R16 | table_paths 环境配置补齐 | ✅ | ✅ | ✅ | R16 消除，CSV fixture 自动发现，2026-07-05 |
 | 9C-R16b | table_paths 边界硬化 | ✅ | ✅ | ✅ | None/{} 语义区分 + E2E 模式开关，2026-07-05 |
+| 9B-P1 | provenance.yml 显式断言 | ✅ | ✅ | ✅ | snapshot_manifest_hash 测试覆盖矩阵补全，2026-07-05 |
 
-**当前测试基线**：594 passed / 11 skipped（api/spark 后端子集）+ 23 passed（前端冒烟全量）+ 6 passed / 0 skipped（Playwright E2E），ruff/tsc/build 零告警
+**当前测试基线**：601 passed / 11 skipped（api/spark/artifacts 后端子集）+ 23 passed（前端冒烟全量）+ 6 passed / 0 skipped（Playwright E2E），ruff/tsc/build 零告警
 
 ## 2. C1-C4 业务集成验证
 
@@ -90,7 +91,6 @@ DeveloperSpec (.md 项目书)
 
 1. **真实业务样本端到端验证（9A4）**——6 个企业场景的 DeveloperSpec → 双管线全链路（阻塞于业务方提供样本）
 2. **生产环境 LLM 验证**——API key 配置 + 持续验证链路
-3. **provenance.yml 显式断言**——Phase 9B-P1 补全 snapshot_manifest_hash 的直接测试覆盖
 
 ## 6. 关键文档索引
 

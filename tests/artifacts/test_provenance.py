@@ -100,6 +100,7 @@ class TestProvenance:
             "optimized_plan_hash:",
             "data_transform_contract_hash:",
             "execution_trace_hash:",
+            "snapshot_manifest_hash:",
             "compiler_version:",
             "validator_version:",
             "retry_count:",
@@ -146,3 +147,72 @@ class TestProvenance:
         assert "sql_build_plan:" in yml
         assert "sql_artifact:" in yml
         assert "data_transform_contract:" in yml
+
+    def test_snapshot_manifest_hash_empty_when_none(self):
+        """无快照时 snapshot_manifest_hash 必须为空字符串——不传 snapshot_manifest 时不应有 hash。"""
+        inputs = _build_minimal_inputs()
+        # _build_minimal_inputs() 不设 snapshot_manifest——默认 None
+        yml, _ = generate_provenance(inputs)
+
+        # 验证字段存在且值为空（provenance.yml 中应写 snapshot_manifest_hash: ""）
+        assert 'snapshot_manifest_hash: ""' in yml, (
+            "无快照时 snapshot_manifest_hash 应为空字符串，"
+            "不应有任何非空 hash 值"
+        )
+
+    def test_snapshot_manifest_hash_deterministic(self):
+        """相同 snapshot_manifest → 相同 hash——溯源链要求确定性。"""
+        # 构造一个模拟的 snapshot_manifest dict
+        snapshot_dict = {
+            "snapshot_id": "snap_test_det_001",
+            "contract_hash": "abc123",
+            "files": [
+                {
+                    "source_name": "order_info",
+                    "file_path": "/tmp/snap/order_info.parquet",
+                    "format": "parquet",
+                    "row_count": 100,
+                    "file_sha256": "a" * 64,
+                },
+            ],
+            "snapshot_sha256": "b" * 64,
+        }
+
+        inputs1 = PackageInputs(
+            request_id="det_001",
+            original_spec_md="test",
+            parsed_spec={"spec_hash": "abc"},
+            source_manifest={"manifest_id": "m1"},
+            sql_build_plan={"plan_id": "p1"},
+            sql_artifact={"artifact_id": "a1", "compiled_sql": {"sql_sha256": "c" * 64}},
+            data_transform_contract={"contract_id": "dtc_1"},
+            snapshot_manifest=snapshot_dict,
+        )
+        inputs2 = PackageInputs(
+            request_id="det_001",
+            original_spec_md="test",
+            parsed_spec={"spec_hash": "abc"},
+            source_manifest={"manifest_id": "m1"},
+            sql_build_plan={"plan_id": "p1"},
+            sql_artifact={"artifact_id": "a1", "compiled_sql": {"sql_sha256": "c" * 64}},
+            data_transform_contract={"contract_id": "dtc_1"},
+            snapshot_manifest=dict(snapshot_dict),  # 独立拷贝——内容相同
+        )
+
+        yml1, sha1 = generate_provenance(inputs1)
+        yml2, sha2 = generate_provenance(inputs2)
+
+        # YAML 内容必须完全一致
+        assert yml1 == yml2, "相同输入 → provenance.yml 内容应完全一致"
+        # SHA-256 必须一致
+        assert sha1 == sha2, "相同输入 → provenance SHA-256 应一致"
+
+        # 显式验证 hash 非空——有 snapshot 时不应为空
+        import re
+        match = re.search(r'snapshot_manifest_hash:\s*"([0-9a-f]*)"', yml1)
+        assert match is not None, "provenance.yml 中必须有 snapshot_manifest_hash 字段"
+        hash_val = match.group(1)
+        assert len(hash_val) == 64, (
+            f"snapshot_manifest_hash 应为 64 位 hex，实际: {len(hash_val)}"
+        )
+        assert hash_val != "", "有 snapshot 时 hash 不应为空"

@@ -2,7 +2,7 @@
 
 ## 项目状态快速入口
 
-**了解项目当前状态，首先阅读 `docs/current-state-and-verification-status.md`**——包含 Phase 进度矩阵、C1-C4 验证状态、当前测试基线（594 passed / 11 skipped）、残留风险、下一步方向。
+**了解项目当前状态，首先阅读 `docs/current-state-and-verification-status.md`**——包含 Phase 进度矩阵、C1-C4 验证状态、当前测试基线（601 passed / 11 skipped）、残留风险、下一步方向。
 
 ## 代码规范
 

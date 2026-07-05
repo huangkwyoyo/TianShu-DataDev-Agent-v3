@@ -124,3 +124,17 @@ Final review: CLEAN (0 Critical, 0 Important, 0 Minor)
 Non-blocking observations:
 - frontend/test-results/ 建议加入 .gitignore
 - error-display.spec.ts 测试名略有歧义（实际测试 PipelineStageIndicator 而非 ErrorDisplay）
+
+## Phase 9B-P1 补全 Progress (provenance.yml 显式断言)
+Started: 2026-07-05
+Base commit: de562d9
+Task: complete (snapshot_manifest_hash 显式断言——补全测试覆盖矩阵)
+  - tests/artifacts/test_provenance.py:
+    - required_fields 列表追加 snapshot_manifest_hash
+    - 新增 test_snapshot_manifest_hash_empty_when_none（无快照→空字符串）
+    - 新增 test_snapshot_manifest_hash_deterministic（同输入→同 hash）
+  - tests/spark/test_snapshot.py:
+    - 加固 test_provenance_yml_contains_snapshot_manifest_hash（补上 compute_json_hash 正确性断言）
+    - 新增 test_snapshot_manifest_hash_empty_when_no_snapshot_integration（生产路径无快照→空 hash）
+  - 测试基线: 601 passed / 11 skipped (+3 新测试，零退化)
+  - ruff/tsc/build/git diff: clean
