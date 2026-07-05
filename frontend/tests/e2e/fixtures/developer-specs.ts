@@ -61,6 +61,15 @@ export const MANUAL_SUMMARY_SPEC = '```markdown\n' +
 /**
  * 无效 Spec——不包含 fenced code block，触发 Parser 阶段的 ParseError。
  * 用于错误展示路径测试（PipelineStageIndicator dot-error 态）。
+ *
+ * 错误类型说明：
+ * - 解析器错误（Parser Error）：Spec 格式不满足 Parser 要求（如缺少 fenced code block），
+ *   在解析阶段立即失败。stages 中包含第一个失败阶段（解析阶段）的信息。
+ * - 运行时错误（Runtime Error）：Spec 格式正确、解析通过，但在执行阶段失败
+ *   （如 DuckDB 找不到 test_fact 表），stages 中 execute 阶段标记为 failed。
+ *
+ * 两者最终都表现为 PipelineStageIndicator 的 dot-error 态，区别在于出错阶段不同。
+ * 当前 INVALID_SPEC 测试的是解析器错误路径。
  */
 export const INVALID_SPEC = '# 无效项目书\n' +
 '## 数据源\n' +

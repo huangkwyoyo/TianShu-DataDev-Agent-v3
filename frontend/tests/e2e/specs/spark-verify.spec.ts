@@ -33,4 +33,43 @@ test.describe('Spark 验证路径', () => {
     const errorText = await errorDisplay.textContent();
     expect(errorText).toMatch(/SPARK_ARTIFACTS_INCOMPLETE|spark.*contract/i);
   });
+
+  /**
+   * Spark 验证成功路径测试。
+   *
+   * 当前 E2E 环境中未配置 table_paths（DuckDB CSV 路径），Run-All 在 execute 阶段
+   * 因找不到 test_fact 表而返回 pipeline_error，导致 request_id 虽被设置但管线状态
+   * 非完成态（dot-error），无法进入 Spark 验证成功路径（SPARK_VERIFIED）。
+   *
+   * 待后端配置 table_paths 后，此测试应：
+   * 1. Run-All 全部成功（dot-ok）
+   * 2. 点击 Spark 验证
+   * 3. 等待 spark-status 出现并检查 dot-ok
+   * 4. 断言 Spark 验证通过
+   */
+  test.skip('Spark验证 — 成功路径（需 table_paths 配置）', async ({ page }) => {
+    await waitForBackend(page);
+
+    const textarea = page.locator('.spec-editor textarea');
+    await textarea.fill(MANUAL_SUMMARY_SPEC.trim());
+    await page.getByRole('button', { name: '全流程 Run-All' }).click();
+
+    // 等待 SQL 管线全部成功（dot-ok）
+    const runAllStatus = page.locator('[data-testid="run-all-status"]');
+    await expect(runAllStatus).toBeVisible({ timeout: 30000 });
+    const runAllDot = runAllStatus.locator('.status-dot');
+    await expect(runAllDot).toHaveClass(/dot-ok/);
+
+    // 点击 Spark 验证按钮
+    await page.getByRole('button', { name: 'Spark 验证' }).click();
+
+    // 等待 Spark 验证完成并检查成功状态
+    const sparkResult = await waitForExecutionComplete(page, 30000);
+    expect(sparkResult).toBe('success');
+
+    const sparkStatus = page.locator('[data-testid="spark-status"]');
+    await expect(sparkStatus).toBeVisible();
+    const sparkDot = sparkStatus.locator('.status-dot');
+    await expect(sparkDot).toHaveClass(/dot-ok/);
+  });
 });

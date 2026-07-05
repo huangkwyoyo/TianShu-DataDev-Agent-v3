@@ -56,3 +56,27 @@ Task 4: complete (commits 20f876a..70c5dfc..48c5a41, fix round for tmpdir/import
 Task 5: complete (全量回归 + 文档更新)
 Final: 587 passed / 11 skipped, frontend smoke 23 passed, ruff/tsc/build/git diff clean
 R10: 已消除（Snapshot Builder 已集成到 Pipeline.run_all()，可选注入+build+provenance hash 全链路覆盖）
+
+## Phase 9B-P1 Progress
+Started: 2026-07-05
+Base commit: 7d34731
+Task 1: complete (commits 7d34731..e250d3c)
+  provenance.yml snapshot_manifest_hash 显式断言——验收标准 #3 直接覆盖
+Final: 588 passed / 11 skipped (api/spark 全量), frontend smoke 23 passed, ruff/tsc/build/git diff clean
+
+## Phase 9C Progress
+Started: 2026-07-05
+Base commit: e250d3c
+Task 1: complete (commit 21cccd4)
+  - 安装 @playwright/test + Chromium 浏览器
+  - playwright.config.ts: webServer 启动 FastAPI + Vite
+  - fixtures/developer-specs.ts: 模板名称 + 手工 Spec（两类分离）
+  - helpers/api.ts: waitForBackend + waitForExecutionComplete
+Final: tsc zero errors, playwright config validated
+
+## Phase 9C Progress
+Started: 2026-07-05
+Base commit: e250d3c
+Task 1: complete (commits e250d3c..21cccd4, review clean)
+Task 2: complete (commits 21cccd4..fadad6b, review clean)
+Task 3: complete (commits fadad6b..bf7d199, review clean)
