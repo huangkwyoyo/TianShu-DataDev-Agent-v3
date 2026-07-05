@@ -395,3 +395,5 @@ class PackageInputs(StrictModel):
     retry_count: int = 0  # 返工轮次
     sql_program: dict | None = None  # SqlProgram.model_dump()——含 intent，供 review.md 和 provenance 使用
     sql_program_artifact: dict | None = None  # SqlProgramArtifact.model_dump()——多语句编译产物
+    # ── Phase 9B-P0: Snapshot 集成 ──
+    snapshot_manifest: dict | None = None  # SnapshotManifest.model_dump()——可选

@@ -79,7 +79,8 @@ def generate_provenance(
     data_transform_contract_hash = compute_json_hash(inputs.data_transform_contract)
     execution_trace_hash = compute_json_hash(inputs.execution_trace) if inputs.execution_trace else ""
     result_summary_hash = compute_json_hash(inputs.result_summary) if inputs.result_summary else ""
-    snapshot_manifest_hash = ""  # Phase 2 无快照
+    # ── Phase 9B-P0: 从 PackageInputs 计算 snapshot manifest hash ──
+    snapshot_manifest_hash = compute_json_hash(inputs.snapshot_manifest) if inputs.snapshot_manifest else ""
 
     # 构建环境指纹
     env_fingerprint = _build_environment_fingerprint()

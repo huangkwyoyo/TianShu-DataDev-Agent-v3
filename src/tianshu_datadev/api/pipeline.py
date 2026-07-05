@@ -1161,6 +1161,8 @@ class Pipeline:
                     retry_count=0,
                     sql_program=sql_program.model_dump(),                    # SqlProgram 元数据
                     sql_program_artifact=program_artifact.model_dump(),      # 编译产物元数据
+                    # ── Phase 9B-P0 ──
+                    snapshot_manifest=snapshot_manifest.model_dump() if snapshot_manifest else None,
                 )
                 packager = ReviewPackageBuilder()
                 package_manifest = packager.build(package_inputs)
@@ -1415,6 +1417,8 @@ class Pipeline:
                     if program_artifact is not None
                     else None
                 ),
+                # ── Phase 9B-P0 ──
+                snapshot_manifest=snapshot_manifest.model_dump() if snapshot_manifest else None,
                 # 编译产物元数据（单表路径为 None）
             )
             package_manifest = packager.build(package_inputs)
