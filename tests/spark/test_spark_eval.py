@@ -1623,3 +1623,324 @@ class TestC4AutoDrive:
 
         assert report.total_cases == 1
         assert report.total_passed == 0  # passed=False 不变
+
+
+# ════════════════════════════════════════════
+# 9A5: REVIEW_READY 终验收集成测试
+# ════════════════════════════════════════════
+
+
+class TestC4ReviewReady:
+    """9A5 REVIEW_READY——全链路 Pipeline → Orchestrator → ReviewPackage 闭环。
+
+    验证从 DeveloperSpec 到 REVIEW_READY 判定的完整自动化链路：
+    1. Pipeline.run_all() 产出真实 SqlBuildPlan + Contract
+    2. adapt_lite_to_v1() 确定性适配
+    3. Orchestrator.run() 执行 MAPPER → COMPILER → VALIDATOR → COMPARATOR
+    4. SparkReviewBuilder.build() 组装 ReviewPackage + REVIEW_READY 判定
+    5. 最终 review_ready=True 证明全链路可复现通过
+
+    REVIEW_READY 的含义（非技术语言）：
+    "所有自动化检查已通过，材料完整，可进入人工代码审查"。
+    不代表生产上线批准。
+    """
+
+    def test_review_ready_e2e_full_chain(self):
+        """REVIEW_READY 端到端——单表 DeveloperSpec 全链路闭环验证。
+
+        执行完整链路：
+        DeveloperSpec.md → Pipeline.run_all() → export_artifacts()
+        → adapt_lite_to_v1() → Orchestrator.run(contract, sql_plan)
+        → SparkReviewBuilder.build() → SparkReviewPackage.review_ready=True
+        """
+        try:
+            import duckdb  # noqa: F401
+        except ImportError:
+            pytest.skip("DuckDB 未安装")
+
+        import os
+        import tempfile
+
+        from tianshu_datadev.api.pipeline import Pipeline
+        from tianshu_datadev.artifacts.models import DataTransformContractV1
+        from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+        from tianshu_datadev.spark.orchestrator import SparkOrchestrator
+        from tianshu_datadev.spark.review_builder import SparkReviewBuilder
+
+        # ── 准备：读取 golden fixture ──
+        root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        spec_path = os.path.join(
+            root, "tests", "fixtures", "golden", "golden_passing.md"
+        )
+        csv_path = os.path.abspath(
+            os.path.join(root, "tests", "fixtures", "sql", "test_fact.csv")
+        )
+        with open(spec_path, "r", encoding="utf-8") as f:
+            markdown_text = f.read()
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            # ── Step 1: Pipeline 执行 ──
+            pipeline = Pipeline(base_output_dir=tmpdir, adapter=None)
+            result = pipeline.run_all(
+                markdown_text,
+                table_paths={"test_fact": csv_path},
+                table_mapping={"tf": "test_fact"},
+            )
+            request_id = result["request_id"]
+
+            # ── Step 2: 导出中间产物 ──
+            bundle = pipeline.export_artifacts(request_id)
+            assert bundle is not None, "export_artifacts 不应返回 None"
+            assert bundle.sql_build_plan is not None, "SqlBuildPlan 不应为 None"
+            assert bundle.data_transform_contract is not None, (
+                "data_transform_contract 不应为 None"
+            )
+
+            # ── Step 3: Contract 适配（Lite → V1）──
+            raw_contract = bundle.data_transform_contract
+            if isinstance(raw_contract, DataTransformContractV1):
+                v1_contract = raw_contract
+            else:
+                v1_contract = adapt_lite_to_v1(raw_contract)
+            assert v1_contract.contract_id.startswith("dtc_v1_"), (
+                f"适配后的 contract_id 应以 dtc_v1_ 开头，"
+                f"实际: {v1_contract.contract_id}"
+            )
+
+            # ── Step 4: Orchestrator 执行 ──
+            orchestrator = SparkOrchestrator()
+            state = orchestrator.run(
+                contract=v1_contract,
+                sql_plan=bundle.sql_build_plan,
+            )
+
+            # ── 验证：4 个关键阶段 SUCCESS ──
+            critical_stages = {
+                "MAPPER", "COMPILER", "VALIDATOR", "COMPARATOR",
+            }
+            for stage in critical_stages:
+                assert state.stage_results[stage] == "SUCCESS", (
+                    f"阶段 {stage} 应为 SUCCESS，"
+                    f"实际: {state.stage_results[stage]}，"
+                    f"errors: {state.errors}"
+                )
+
+            # ── 验证：DEVELOPER + PHYSICAL_VERIFIER SKIPPED（预期行为）──
+            assert state.stage_results["DEVELOPER"] == "SKIPPED", (
+                "DEVELOPER 应 SKIPPED（未注入 llm_call）"
+            )
+            assert state.stage_results["PHYSICAL_VERIFIER"] == "SKIPPED", (
+                "PHYSICAL_VERIFIER 应 SKIPPED（无 Spark 运行时）"
+            )
+
+            # ── 验证：全局状态为 LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED ──
+            assert state.overall_status == (
+                SparkPipelineStatus.LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED
+            ), f"整体状态应为 LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED，实际: {state.overall_status}"
+
+            # ── Step 5: 构建 ReviewPackage ──
+            builder = SparkReviewBuilder()
+            pkg = builder.build(state)
+
+            # ── 验证：ReviewPackage 结构完整 ──
+            assert pkg.package_id.startswith("pkg_"), (
+                f"package_id 应以 pkg_ 开头，实际: {pkg.package_id}"
+            )
+            assert pkg.provenance.contract_hash != "", (
+                "provenance 中 contract_hash 不应为空"
+            )
+            assert pkg.provenance.spark_plan_hash != "", (
+                "provenance 中 spark_plan_hash 不应为空"
+            )
+            assert pkg.provenance.compiled_code_sha256 != "", (
+                "provenance 中 compiled_code_sha256 不应为空"
+            )
+            assert pkg.overall_status == "LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED"
+
+            # ── 验证：9A5 新增字段 ──
+            assert pkg.stage_results, "stage_results 不应为空"
+            for stage in critical_stages:
+                assert pkg.stage_results[stage] == "SUCCESS", (
+                    f"pkg.stage_results[{stage}] 应为 SUCCESS"
+                )
+
+            # ── 验证：对比器状态 ──
+            assert pkg.comparator_status != "", (
+                "comparator_status 不应为空（COMPARATOR 已执行）"
+            )
+            assert pkg.comparator_status in (
+                "LOGIC_EQUIVALENT", "NOT_COVERED",
+            ), f"comparator_status 应为 LOGIC_EQUIVALENT 或 NOT_COVERED，实际: {pkg.comparator_status}"
+
+            # ── ★ 核心断言：REVIEW_READY 判定 ──
+            assert pkg.review_ready is True, (
+                f"REVIEW_READY 应为 True——所有关键阶段已通过，"
+                f"stage_results={dict(pkg.stage_results)}，"
+                f"comparator_status={pkg.comparator_status}，"
+                f"errors={state.errors}"
+            )
+
+            # ── 验证：repair_info 不含 FAILURE ──
+            for info in pkg.repair_info:
+                assert "FAILURE" not in info, (
+                    f"repair_info 中不应包含 FAILURE: {info}"
+                )
+
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_review_ready_package_deterministic(self):
+        """同一 state → 同一 ReviewPackage（含 review_ready 判定确定性）。"""
+        try:
+            import duckdb  # noqa: F401
+        except ImportError:
+            pytest.skip("DuckDB 未安装")
+
+        import os
+        import tempfile
+
+        from tianshu_datadev.api.pipeline import Pipeline
+        from tianshu_datadev.artifacts.models import DataTransformContractV1
+        from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+        from tianshu_datadev.spark.orchestrator import SparkOrchestrator
+        from tianshu_datadev.spark.review_builder import SparkReviewBuilder
+
+        root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        spec_path = os.path.join(
+            root, "tests", "fixtures", "golden", "golden_passing.md"
+        )
+        csv_path = os.path.abspath(
+            os.path.join(root, "tests", "fixtures", "sql", "test_fact.csv")
+        )
+        with open(spec_path, "r", encoding="utf-8") as f:
+            markdown_text = f.read()
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            pipeline = Pipeline(base_output_dir=tmpdir, adapter=None)
+            result1 = pipeline.run_all(
+                markdown_text,
+                table_paths={"test_fact": csv_path},
+                table_mapping={"tf": "test_fact"},
+            )
+            bundle1 = pipeline.export_artifacts(result1["request_id"])
+            raw = bundle1.data_transform_contract
+            v1 = (
+                raw if isinstance(raw, DataTransformContractV1)
+                else adapt_lite_to_v1(raw)
+            )
+
+            orchestrator = SparkOrchestrator()
+            state1 = orchestrator.run(contract=v1, sql_plan=bundle1.sql_build_plan)
+
+            # ── 二次执行同一合约 ──
+            state2 = orchestrator.run(contract=v1, sql_plan=bundle1.sql_build_plan)
+
+            builder = SparkReviewBuilder()
+            pkg1 = builder.build(state1)
+            pkg2 = builder.build(state2)
+
+            # 两次构建的 package_id 应一致（基于相同 hash 输入）
+            assert pkg1.package_id == pkg2.package_id, (
+                f"同一合约应产出一致 package_id，"
+                f"pkg1={pkg1.package_id}，pkg2={pkg2.package_id}"
+            )
+            # REVIEW_READY 判定应一致
+            assert pkg1.review_ready == pkg2.review_ready, (
+                "同一合约 REVIEW_READY 判定应一致"
+            )
+            assert pkg1.review_ready is True
+
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_review_ready_missing_contract_not_ready(self):
+        """无 contract 时 Orchestrator 各阶段 SKIPPED → review_ready=False。"""
+        orchestrator = SparkOrchestrator()
+        state = orchestrator.run(contract_hash="no_contract_hash")
+
+        builder = SparkReviewBuilder()
+        pkg = builder.build(state)
+
+        assert pkg.review_ready is False, (
+            f"无 contract 时 review_ready 应为 False，实际: {pkg.review_ready}"
+        )
+        assert pkg.stage_results["MAPPER"] in ("SKIPPED", "NOT_EXECUTED")
+        assert pkg.package_id.startswith("pkg_"), (
+            "即使 review_ready=False，package_id 仍应有效"
+        )
+
+    def test_review_ready_report_contains_all_provenance(self):
+        """REVIEW_READY 通过的 ReviewPackage 包含完整溯源链。"""
+        try:
+            import duckdb  # noqa: F401
+        except ImportError:
+            pytest.skip("DuckDB 未安装")
+
+        import os
+        import tempfile
+
+        from tianshu_datadev.api.pipeline import Pipeline
+        from tianshu_datadev.artifacts.models import DataTransformContractV1
+        from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+        from tianshu_datadev.spark.orchestrator import SparkOrchestrator
+        from tianshu_datadev.spark.review_builder import SparkReviewBuilder
+
+        root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        spec_path = os.path.join(
+            root, "tests", "fixtures", "golden", "golden_passing.md"
+        )
+        csv_path = os.path.abspath(
+            os.path.join(root, "tests", "fixtures", "sql", "test_fact.csv")
+        )
+        with open(spec_path, "r", encoding="utf-8") as f:
+            markdown_text = f.read()
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            pipeline = Pipeline(base_output_dir=tmpdir, adapter=None)
+            result = pipeline.run_all(
+                markdown_text,
+                table_paths={"test_fact": csv_path},
+                table_mapping={"tf": "test_fact"},
+            )
+            bundle = pipeline.export_artifacts(result["request_id"])
+            raw = bundle.data_transform_contract
+            v1 = (
+                raw if isinstance(raw, DataTransformContractV1)
+                else adapt_lite_to_v1(raw)
+            )
+
+            orchestrator = SparkOrchestrator()
+            state = orchestrator.run(contract=v1, sql_plan=bundle.sql_build_plan)
+
+            builder = SparkReviewBuilder()
+            pkg = builder.build(state)
+
+            assert pkg.review_ready is True
+
+            # 验证 provenance 链完整性
+            prov = pkg.provenance
+            assert prov.contract_hash, "contract_hash 不应为空"
+            assert prov.spark_plan_hash, "spark_plan_hash 不应为空"
+            assert prov.compiled_code_sha256, "compiled_code_sha256 不应为空"
+            # annotation_hash / snapshot_id / verification_report_id 可为空
+            # ——DEVELOPER 和 PHYSICAL_VERIFIER 当前 SKIPPED
+
+            # 验证 hash 链顺序
+            prov_data = prov.model_dump()
+            keys = list(prov_data.keys())
+            assert keys.index("contract_hash") < keys.index("spark_plan_hash")
+            assert keys.index("spark_plan_hash") < keys.index("compiled_code_sha256")
+
+            # 验证 comparator_status 已记录
+            assert pkg.comparator_status in (
+                "LOGIC_EQUIVALENT", "NOT_COVERED",
+            )
+
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)

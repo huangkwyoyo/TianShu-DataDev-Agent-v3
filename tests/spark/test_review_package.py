@@ -6,11 +6,13 @@
 - SparkProvenance 完整 hash 链
 - SparkReviewPackage 统一交付物模型
 - SparkReviewBuilder 从 PipelineState 构建 ReviewPackage
+- Phase 9A5：REVIEW_READY 判定——stage_results + comparator_status → review_ready
 """
 
 from __future__ import annotations
 
 from tianshu_datadev.spark.orchestrator import (
+    SparkPipelineStage,
     SparkPipelineState,
     SparkPipelineStatus,
 )
@@ -253,3 +255,230 @@ class TestSparkReviewBuilder:
         pkg = builder.build(state)
         assert pkg.overall_status == "REPAIR_NEEDED"
         assert len(pkg.repair_info) > 0
+
+
+# ════════════════════════════════════════════
+# Phase 9A5：REVIEW_READY 判定测试
+# ════════════════════════════════════════════
+
+
+class TestReviewReady:
+    """Phase 9A5——REVIEW_READY 终验收判定逻辑。"""
+
+    def test_review_package_has_review_ready_fields(self):
+        """SparkReviewPackage 包含 9A5 新增的 review_ready 相关字段。"""
+        from tianshu_datadev.spark.review_package import SparkProvenance
+
+        prov = SparkProvenance(
+            contract_hash="abc123",
+            spark_plan_hash="def456",
+            compiled_code_sha256="jkl012",
+        )
+        pkg = SparkReviewPackage(
+            package_id="pkg_001",
+            provenance=prov,
+            overall_status="ALL_CONSISTENT",
+        )
+        # 验证新字段存在且有默认值
+        assert hasattr(pkg, "stage_results")
+        assert hasattr(pkg, "comparator_status")
+        assert hasattr(pkg, "review_ready")
+        assert pkg.stage_results == {}
+        assert pkg.comparator_status == ""
+        assert pkg.review_ready is False
+
+    def test_review_ready_all_critical_passed(self):
+        """所有关键阶段 SUCCESS + LOGIC_EQUIVALENT → review_ready=True。"""
+        builder = SparkReviewBuilder()
+        state = SparkPipelineState(
+            contract_hash="test_hash",
+            spark_plan_hash="plan_hash_123",
+            compiled_code_sha256="code_hash_789",
+        )
+        # 设置所有关键阶段为 SUCCESS
+        for stage in ["MAPPER", "COMPILER", "VALIDATOR", "COMPARATOR"]:
+            state.record_stage_result(
+                SparkPipelineStage(stage), "SUCCESS",
+            )
+        state.derive_overall_status()
+
+        # 设置对比器报告为 LOGIC_EQUIVALENT
+        from tianshu_datadev.spark.plan_comparator import (
+            ComparisonStatus,
+            PlanComparisonReport,
+        )
+        report = PlanComparisonReport(
+            report_id="rpt_001",
+            contract_hash="test_hash",
+            sql_plan_hash="sql_hash_001",
+            spark_plan_hash="spark_hash_001",
+            status=ComparisonStatus.LOGIC_EQUIVALENT,
+        )
+        object.__setattr__(state, "comparator_report", report)
+
+        pkg = builder.build(state)
+        assert pkg.review_ready is True
+        assert pkg.stage_results["MAPPER"] == "SUCCESS"
+        assert pkg.stage_results["COMPILER"] == "SUCCESS"
+        assert pkg.stage_results["VALIDATOR"] == "SUCCESS"
+        assert pkg.stage_results["COMPARATOR"] == "SUCCESS"
+        assert pkg.comparator_status == "LOGIC_EQUIVALENT"
+
+    def test_review_ready_false_when_mapper_fails(self):
+        """MAPPER 阶段 FAILURE → review_ready=False。"""
+        builder = SparkReviewBuilder()
+        state = SparkPipelineState(
+            contract_hash="test_hash",
+            spark_plan_hash="",
+            compiled_code_sha256="",
+        )
+        # COMPILER/VALIDATOR/COMPARATOR 都 SUCCESS，但 MAPPER 是 NOT_EXECUTED
+        state.record_stage_result(SparkPipelineStage.MAPPER, "FAILURE")
+        state.record_stage_result(SparkPipelineStage.COMPILER, "SUCCESS")
+        state.record_stage_result(SparkPipelineStage.VALIDATOR, "SUCCESS")
+        state.record_stage_result(SparkPipelineStage.COMPARATOR, "SUCCESS")
+        state.derive_overall_status()
+
+        pkg = builder.build(state)
+        assert pkg.review_ready is False
+        assert pkg.stage_results["MAPPER"] == "FAILURE"
+
+    def test_review_ready_false_when_comparator_mismatch(self):
+        """对比器状态为 UNKNOWN_TYPE_MISMATCH → review_ready=False。"""
+        builder = SparkReviewBuilder()
+        state = SparkPipelineState(
+            contract_hash="test_hash",
+            spark_plan_hash="plan_hash_123",
+            compiled_code_sha256="code_hash_789",
+        )
+        for stage in ["MAPPER", "COMPILER", "VALIDATOR", "COMPARATOR"]:
+            state.record_stage_result(
+                SparkPipelineStage(stage), "SUCCESS",
+            )
+        state.derive_overall_status()
+
+        # 设置对比报告为不匹配
+        from tianshu_datadev.spark.plan_comparator import (
+            ComparisonStatus,
+            PlanComparisonReport,
+        )
+        report = PlanComparisonReport(
+            report_id="rpt_002",
+            contract_hash="test_hash",
+            sql_plan_hash="sql_hash_001",
+            spark_plan_hash="spark_hash_001",
+            status=ComparisonStatus.LOGIC_MISMATCH,
+        )
+        object.__setattr__(state, "comparator_report", report)
+
+        pkg = builder.build(state)
+        assert pkg.review_ready is False
+        assert pkg.comparator_status == "LOGIC_MISMATCH"
+
+    def test_review_ready_skipped_stages_dont_affect(self):
+        """DEVELOPER 和 PHYSICAL_VERIFIER SKIPPED 不影响 review_ready。"""
+        builder = SparkReviewBuilder()
+        state = SparkPipelineState(
+            contract_hash="test_hash",
+            spark_plan_hash="plan_hash_123",
+            compiled_code_sha256="code_hash_789",
+        )
+        for stage in ["MAPPER", "COMPILER", "VALIDATOR", "COMPARATOR"]:
+            state.record_stage_result(
+                SparkPipelineStage(stage), "SUCCESS",
+            )
+        # DEVELOPER 和 PHYSICAL_VERIFIER 保持 SKIPPED 或 NOT_EXECUTED
+        state.record_stage_result(SparkPipelineStage.DEVELOPER, "SKIPPED")
+        state.derive_overall_status()
+
+        from tianshu_datadev.spark.plan_comparator import (
+            ComparisonStatus,
+            PlanComparisonReport,
+        )
+        report = PlanComparisonReport(
+            report_id="rpt_003",
+            contract_hash="test_hash",
+            sql_plan_hash="sql_hash_001",
+            spark_plan_hash="spark_hash_001",
+            status=ComparisonStatus.LOGIC_EQUIVALENT,
+        )
+        object.__setattr__(state, "comparator_report", report)
+
+        pkg = builder.build(state)
+        # DEVELOPER SKIPPED 不影响判定
+        assert pkg.stage_results["DEVELOPER"] == "SKIPPED"
+        assert pkg.review_ready is True
+
+    def test_build_review_ready_with_external_report(self):
+        """build_review_ready() 接受外部 comparator_report——不修改原 state。"""
+        builder = SparkReviewBuilder()
+        state = SparkPipelineState(
+            contract_hash="test_hash",
+            spark_plan_hash="plan_hash_123",
+            compiled_code_sha256="code_hash_789",
+        )
+        for stage in ["MAPPER", "COMPILER", "VALIDATOR", "COMPARATOR"]:
+            state.record_stage_result(
+                SparkPipelineStage(stage), "SUCCESS",
+            )
+        state.derive_overall_status()
+
+        # state 本身无 comparator_report
+        assert state.comparator_report is None
+
+        from tianshu_datadev.spark.plan_comparator import (
+            ComparisonStatus,
+            PlanComparisonReport,
+        )
+        external_report = PlanComparisonReport(
+            report_id="rpt_ext",
+            contract_hash="test_hash",
+            sql_plan_hash="sql_hash_001",
+            spark_plan_hash="spark_hash_001",
+            status=ComparisonStatus.LOGIC_EQUIVALENT,
+        )
+
+        pkg = builder.build_review_ready(
+            state, comparator_report=external_report,
+        )
+        assert pkg.review_ready is True
+        assert pkg.comparator_status == "LOGIC_EQUIVALENT"
+
+        # 验证 state 未被污染
+        assert state.comparator_report is None
+
+    def test_build_review_ready_no_report_not_ready(self):
+        """无对比报告时 review_ready=False（关键阶段仍检查）。"""
+        builder = SparkReviewBuilder()
+        state = SparkPipelineState(
+            contract_hash="test_hash",
+            spark_plan_hash="plan_hash_123",
+            compiled_code_sha256="code_hash_789",
+        )
+        for stage in ["MAPPER", "COMPILER", "VALIDATOR", "COMPARATOR"]:
+            state.record_stage_result(
+                SparkPipelineStage(stage), "SUCCESS",
+            )
+        state.derive_overall_status()
+
+        # 无 comparator_report 但所有关键阶段通过 → 仍可通过
+        pkg = builder.build(state)
+        assert pkg.review_ready is True
+        assert pkg.comparator_status == ""
+
+    def test_review_ready_package_id_includes_new_fields(self):
+        """9A5 新增字段不影响 package_id 的确定性——同一 state 产出一致 ID。"""
+        builder = SparkReviewBuilder()
+        state = SparkPipelineState(
+            contract_hash="test_hash",
+            spark_plan_hash="plan_hash_123",
+            compiled_code_sha256="code_hash_789",
+        )
+        for stage in ["MAPPER", "COMPILER", "VALIDATOR", "COMPARATOR"]:
+            state.record_stage_result(SparkPipelineStage(stage), "SUCCESS")
+
+        pkg1 = builder.build(state)
+        pkg2 = builder.build(state)
+        assert pkg1.package_id == pkg2.package_id
+        # 两次 build 的 review_ready 应一致
+        assert pkg1.review_ready == pkg2.review_ready

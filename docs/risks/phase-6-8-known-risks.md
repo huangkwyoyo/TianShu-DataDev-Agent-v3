@@ -1,7 +1,7 @@
 # Phase 6-8 已知风险登记
 
-> 日期：2026-07-04 | 最后更新：2026-07-04 C4 D4 桥接级点亮——同一 Contract 双管线逻辑对比纳入 Harness
-> 状态：C1 已点亮（11/11），C2 架构已收口（复用 llm.adapters + PromptManager，mock 路径可回归），C3 已点亮（桥接生产化 + Orchestrator 集成），C4 全 5 维度桥接级已点亮（D1/D2/D3/D4/D5）
+> 日期：2026-07-05 | 最后更新：2026-07-05 Phase 9A5 REVIEW_READY 终验收完成——全链路 Pipeline → ReviewPackage 审查级闭环
+> 状态：C1-C4 全部点亮，9A1-9A3 + 9A5 已完成（9A4 阻塞-待业务方），629 passed / 11 skipped
 
 ---
 
@@ -160,6 +160,7 @@
 | 9A1 | B-低风险 | 否 | 否 | 2026-07-05 已完成——PipelineArtifactBundle + export_artifacts() 就绪 |
 | 9A2 | B-低风险 | 否 | 否 | 2026-07-05 已完成——桥接函数标记 deprecated + 真实 SqlBuildPlan 驱动 COMPARATOR |
 | 9A3 | B-低风险 | 否 | 否 | 2026-07-05 已完成——Lite→V1 适配层 + Harness 自动驱动器 |
+| 9A5 | B-低风险 | 否 | 否 | 2026-07-05 已完成——ReviewPackage 增强 + REVIEW_READY 判定 + 端到端闭环验证 |
 
 ---
 ## Phase 9A3: Harness 自动驱动器 + Lite→V1 适配收口 ✅ 已完成
@@ -193,7 +194,53 @@
   - `adapt_lite_to_v1()` 的 V1 独有字段（case_when_labels / window_specs）默认为空——当真实 Pipeline 产出多语句 SqlProgram 时，`extract_v1()` 路径直接产出 V1，不需要适配器。适配器仅用于单表非 ComputeSteps 路径
   - Harness 自动驱动器的 table_paths 通过 `case.actual_result` 传递——未来可升级为正式字段
 - **下一轮行动**：9A4 真实业务样本验证（阻塞-待业务方）或 9A5 REVIEW_READY 终验收
-- **状态**：✅ 已完成——Lite/V1 适配收口 + Harness 自动驱动器就绪，可进入 9A4 或 9A5
+- **状态**：✅ 已完成——Lite/V1 适配收口 + Harness 自动驱动器就绪
+
+---
+## Phase 9A5: REVIEW_READY 终验收 + 审查级闭环 ✅ 已完成
+
+- **风险等级**：B（低风险——模型增强 + 判定逻辑 + 端到端验证，不改核心推理链路）
+- **完成时间**：2026-07-05
+- **影响范围**：
+  - `src/tianshu_datadev/spark/review_package.py`——`SparkReviewPackage` 新增 `stage_results` / `comparator_status` / `review_ready` 字段
+  - `src/tianshu_datadev/spark/review_builder.py`——`SparkReviewBuilder.build()` 自动填充 9A5 字段 + 新增 `build_review_ready()` 显式 REVIEW_READY 装配 + `_compute_review_ready()` 判定方法
+  - `tests/spark/test_review_package.py`——新增 `TestReviewReady`（8 测试）：字段存在性/判定逻辑/外部报告/确定性/边界条件
+  - `tests/spark/test_spark_eval.py`——新增 `TestC4ReviewReady`（4 测试）：全链路闭环/确定性/缺失 contract/完整 provenance
+- **产出**：
+  - `SparkReviewPackage.review_ready: bool`：REVIEW_READY 判定——MAPPER + COMPILER + VALIDATOR + COMPARATOR 均为 SUCCESS + comparator 为 LOGIC_EQUIVALENT
+  - `SparkReviewPackage.stage_results: dict`：透传全部 6 阶段执行结果
+  - `SparkReviewPackage.comparator_status: str`：透传 ComparisonStatus 值
+  - `SparkReviewBuilder._compute_review_ready()`：确定性判定方法——关键阶段全 SUCCESS + 对比器 LOGIC_EQUIVALENT → True
+  - `SparkReviewBuilder.build_review_ready()`：接受外部 comparator_report 的显式装配入口
+- **REVIEW_READY 判定规则**：
+  1. MAPPER + COMPILER + VALIDATOR + COMPARATOR 均为 SUCCESS（DEVELOPER / PHYSICAL_VERIFIER 可 SKIPPED）
+  2. comparator_status 为 LOGIC_EQUIVALENT 或 NOT_COVERED（有空对比报告时）
+  3. 以上两条同时满足 → `review_ready = True`
+- **验收证据**（2026-07-05）：
+  - 新增 12 个测试全绿（8 模型/判定 + 4 端到端）
+  - 全量回归 629 passed, 11 skipped，零退化（+12 vs 617 基线）
+  - ruff 零告警，git diff --check 干净
+  - 端到端验证：`test_review_ready_e2e_full_chain` 证明 DeveloperSpec → Pipeline → Orchestrator → ReviewPackage → REVIEW_READY=True 全链路闭环可复现
+- **核心突破**：
+  - **审查级闭环就绪**：从原始 DeveloperSpec 到 REVIEW_READY 判定的全自动化链路已打通
+  - **判定确定性**：同一合约多次构建产出一致 package_id + review_ready 判定
+  - **向后兼容**：`build()` 旧接口不变——已有 14 个 ReviewPackage 测试零退化
+- **不可碰边界守住了**：
+  - ✅ 未修改 DataTransformContract schema
+  - ✅ 未修改 SQL Pipeline 的 SpecEnricher / RelationshipPlanner / SqlBuildPlanBuilder
+  - ✅ 未修改 PlanComparator 核心判定规则
+  - ✅ 未删除 `contract_to_sql_steps()`
+  - ✅ 未接入真实 LLM / 生产数据 / Spark 物理执行
+  - ✅ 未将 REVIEW_READY 表述为生产上线批准
+- **REVIEW_READY 的含义（非技术语言）**：
+  - **代表**：所有自动化检查已通过，材料（SqlBuildPlan + Contract + SparkPlan + PlanComparisonReport + ReviewPackage）已完整组装，可进入人工代码审查
+  - **不代表**：生产上线批准、业务逻辑正确性验证、性能 SLA 承诺、安全合规认证
+- **残留风险**：
+  - R7：真实业务样本缺失——9A4 阻塞于业务方，当前所有测试使用手工构造样本
+  - R8：LLM 生产环境持续验证未配置——Fake Adapter 覆盖全部 pytest
+  - R10：Snapshot Builder 未集成到 REVIEW_READY 流程——Snapshot Builder 有独立可调用接口但 `Pipeline.run_all()` 未调用
+- **下一轮行动**：Phase 9A 全部子阶段（9A1-9A3 + 9A5）已完成，9A4 继续阻塞于业务方。可进入 Phase 9B 或更高级别的集成验证
+- **状态**：✅ 已完成——REVIEW_READY 审查级闭环就绪
 
 ---
 ## Phase 9A2: 桥接函数替换 ✅ 已完成

@@ -1290,7 +1290,7 @@ class Pipeline:
                     ),
                 }
 
-            # ── 公共阶段：Contract + Package（非 ComputeSteps 路径） ──
+            # ── 公共阶段：Contract + Package（所有路径——ComputeSteps 和非 ComputeSteps）──
             stage = "contract"
             contract_extractor = DataTransformContractExtractor()
             if len(sql_program.statements) > 1:
@@ -1514,7 +1514,7 @@ class Pipeline:
         if parsed_spec is not None:
             spec_hash = getattr(parsed_spec, "spec_hash", "")
 
-        # 提取 contract——仅 ComputeSteps 路径的 run_all 存储了 contract
+        # 提取 contract——Phase 9A1 已修复：run_all / execute / build_plan 所有路径均存储 contract
         contract = data.get("contract")
 
         # 提取 compiled——execute/run_all 单表路径存储为 "compiled"

@@ -1,6 +1,6 @@
 # 方案书索引
 
-> 最后更新：2026-07-05 | 当前阶段：Phase 9B-9A3 完成 → 9A4 真实业务样本 或 9A5 REVIEW_READY
+> 最后更新：2026-07-05 | 当前阶段：Phase 9B-9A5 完成 → Phase 9 收尾 或 Phase 9B
 
 ## 执行链路（按序号阅读）
 
@@ -23,7 +23,7 @@ Phase 6-8 骨架验收                   业务集成前置准备               
                                                                                                            │
                                                                                                            └──→ 07-phase-9a-production-pipeline-plan
                                                                                                                 Phase 9A 生产级串联方案
-                                                                                                                9A1 ✅ → 9A2 ✅ → 9A3 ✅
+                                                                                                                9A1 ✅ → 9A2 ✅ → 9A3 ✅ → 9A5 ✅
 ```
 
 ## 文档清单
@@ -60,4 +60,4 @@ Phase 6-8 骨架验收                   业务集成前置准备               
 | 2026-07-05 | **9A2 桥接函数替换** | contract_to_sql_steps 标记 deprecated + 真实 SqlBuildPlan 驱动 COMPARATOR，+2 集成测试全绿，610 passed/11 skipped |
 | 2026-07-05 | **9A3 Harness 自动驱动器 + Lite→V1 适配收口** | adapt_lite_to_v1() + HarnessRunner 双模式，7 测试全绿，617 passed/11 skipped |
 | ⬜ | 9A4 真实业务样本 | 待业务方提供样本 |
-| ⬜ | 9A5 REVIEW_READY 终验收 | 待 9A3 完成后执行 |
+| 2026-07-05 | **9A5 REVIEW_READY 终验收** | ReviewPackage 增强 + REVIEW_READY 判定 + 端到端闭环，12 测试全绿，629 passed/11 skipped |

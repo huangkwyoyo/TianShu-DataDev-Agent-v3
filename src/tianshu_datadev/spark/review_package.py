@@ -60,6 +60,11 @@ class SparkReviewPackage(StrictModel):
     """Phase 8 统一交付物——组合 provenance + cross-references + 验证结论。
 
     不含 SQL 文本——所有引用均通过 ID。
+
+    Phase 9A5 新增 REVIEW_READY 相关字段：
+    - stage_results：各阶段执行结果（来自 SparkPipelineState）
+    - comparator_status：对比器状态摘要（来自 PlanComparisonReport）
+    - review_ready：REVIEW_READY 判定——所有关键阶段通过 + 逻辑等价
     """
 
     package_id: str                                          # 确定性包 ID
@@ -71,3 +76,12 @@ class SparkReviewPackage(StrictModel):
     repair_info: list[str] = Field(                          # 修复建议（如有）
         default_factory=list,
     )
+    # ── Phase 9A5 新增：REVIEW_READY 终验收字段 ──
+    stage_results: dict[str, str] = Field(                   # 各阶段执行结果
+        default_factory=dict,
+        description="来自 SparkPipelineState.stage_results——MAPPER/DEVELOPER/COMPILER/"
+                    "VALIDATOR/COMPARATOR/PHYSICAL_VERIFIER 的执行结果",
+    )
+    comparator_status: str = ""                              # 对比器状态（ComparisonStatus 值）
+    review_ready: bool = False                               # REVIEW_READY 判定——
+                                                              # 所有关键阶段 SUCCESS + 逻辑等价

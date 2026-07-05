@@ -1,6 +1,6 @@
 # 项目当前状态与验证进度 — TianShu DataDev Agent v3
 
-> 文档版本：2026-07-04 | 最后更新：2026-07-04 C4 D4 桥接级点亮
+> 文档版本：2026-07-05 | 最后更新：2026-07-05 Phase 9A5 REVIEW_READY 终验收完成
 > 本文是项目当前实施状态的**唯一权威文档**。各 Phase 设计文档（docs/00-09、docs/roadmap/）描述的是目标设计，实际建成状态以本文为准。
 
 ## 1. Phase 进度矩阵
@@ -22,8 +22,9 @@
 | 7B | 物理链路——双引擎验证 | ✅ | ✅ | ✅ | 11/11 真实 Spark 通过 |
 | 7C | 物理链路扩展 + 安全加固 | ✅ | ✅ | ✅ | 窗口双引擎 + SQL 加固 |
 | 8 | 编排硬化 + Harness | ✅ | ✅ | ✅ | Orchestrator + Review Package + 5 维度 |
+| 9A | 生产级串联升级 | ✅ | ✅ | ✅ | 9A1-9A3 + 9A5 完成，9A4 阻塞-待业务方 |
 
-**当前测试基线**：552 passed / 11 skipped（全量回归，零退化，ruff 零告警）
+**当前测试基线**：629 passed / 11 skipped（全量回归，零退化，ruff 零告警）
 
 ## 2. C1-C4 业务集成验证
 
@@ -32,18 +33,19 @@
 | C1 | 真实 Spark 物理验证 | 已消除 | ✅ 11/11 通过 | PySpark 4.1.2，DuckDB ↔ PySpark 一致性 100% |
 | C2 | LLM 基础设施架构收口 | 已消除 | ✅ 收口完成 | 重复文件已删除，18/18 测试全绿，DeepSeek 3/3 验证 |
 | C3 | Comparator 真实逻辑对比 | 已消除 | ✅ 桥接+集成 | 30/30 测试全绿，Orchestrator COMPARATOR 集成 |
-| C4 | Harness 5 维度评测 | B（D4 桥接级） | ✅ 全 5 维度 | D1/D2/D3/D4/D5 共 27/27 测试全绿 |
+| C4 | Harness 5 维度评测 | 已消除 | ✅ 全 5 维度 | D1/D2/D3/D4/D5 共 31/31 测试全绿 |
 
-**D4 重要说明**：D4 LOGIC_EQUIVALENCE 当前为**桥接级验证**——使用确定性桥接函数 `contract_to_sql_steps()` 将 Contract 映射为 SqlBuildPlan，而非经过 SQL Pipeline 的 SpecEnricher → SqlBuildPlanBuilder 完整链路。它验证的核心命题是"同一份结构化合同两边生成结果是否对得上"，不是完整 SQL Pipeline 的生产级验收。
+**D4 重要说明（2026-07-05 更新）**：D4 LOGIC_EQUIVALENCE 已从**桥接级**升级到**生产级**（Phase 9A1-9A3 + 9A5）。当前使用 Pipeline.run_all() → export_artifacts() → adapt_lite_to_v1() → Orchestrator.run() → PlanComparator → ReviewBuilder → REVIEW_READY 判定的全链路闭环。`contract_to_sql_steps()` 保留为向后兼容路径（deprecated）。
 
 ## 3. 残留风险
 
 | 编号 | 说明 | 等级 | 处置 |
 |:----:|------|:----:|------|
-| R5 | 桥接函数替代完整 SQL Pipeline——D4 需从桥接级升级到生产级 | B | Phase 9+ |
-| R6 | Harness Runner 为结果聚合器——需升级为自动评测驱动器 | B | Phase 9+ |
-| R7 | 真实业务样本缺失——所有测试使用手工构造 Contract | B | 待业务方提供 |
-| R8 | LLM 生产环境持续验证未配置——DeepSeek 开发环境一次性通过 | C | 待 API key |
+| R5 | ~~桥接函数替代完整 SQL Pipeline~~ | 已消除 | Phase 9A1-9A3 + 9A5 已升级为真实 Pipeline 全链路 |
+| R6 | ~~Harness Runner 为结果聚合器~~ | 已消除 | Phase 9A3 已升级为自动评测驱动器 |
+| R7 | 真实业务样本缺失——所有测试使用手工构造 Contract | B | 待业务方提供（9A4 阻塞） |
+| R8 | LLM 生产环境持续验证未配置 | C | 待 API key |
+| R10 | Snapshot Builder 未集成到 REVIEW_READY 流程 | B | Snapshot Builder 有可调用接口，待 Pipeline 集成 |
 
 ## 4. 当前架构全景
 
@@ -51,24 +53,37 @@
 DeveloperSpec (.md 项目书)
     │
     ├─ SQL 管线（确定性，生产可用）
-    │   Parser → SourceManifest → SqlBuildPlan → Compiler → DuckDB → Review Package
+    │   Pipeline.run_all() → Parser → SourceManifest → SqlBuildPlan → Compiler → DuckDB
+    │       │
+    │       └─ export_artifacts() → PipelineArtifactBundle
+    │           ├─ sql_build_plan (真实 SqlBuildPlan)
+    │           └─ data_transform_contract
+    │               │
+    │               └─ adapt_lite_to_v1() → DataTransformContractV1
     │
-    └─ Spark 管线（确定性 + 桥接验证）
-        DataTransformContract → Mapper → SparkPlan → Compiler → Validator
-                                    │                      │
-                                    └── PlanComparator ────┘  ← 双管线逻辑对比
-                                         PhysicalVerifier      ← 双引擎物理对比
-                                         Orchestrator          ← 6 阶段编排
-                                         Harness 5 维度        ← 评测框架
+    └─ Spark 管线（确定性，生产级验证）
+        DataTransformContractV1 → Mapper → SparkPlan → Compiler → Validator
+                                        │                      │
+                                        └── PlanComparator ────┘  ← 双管线逻辑对比
+                                             PhysicalVerifier      ← 双引擎物理对比
+                                             Orchestrator          ← 6 阶段编排
+                                             Harness 5 维度        ← 评测框架
+                                                  │
+                                                  └─ SparkReviewBuilder.build()
+                                                         │
+                                                         └─ SparkReviewPackage
+                                                            ├─ provenance (完整溯源链)
+                                                            ├─ stage_results (6 阶段结果)
+                                                            ├─ comparator_status (对比器状态)
+                                                            └─ review_ready ★ REVIEW_READY 判定
 ```
 
-## 5. 下一步方向（Phase 9+）
+## 5. 下一步方向（Phase 9B+）
 
-1. **SQL Pipeline 生产级串联**——桥接函数替换为 SpecEnricher → SqlBuildPlanBuilder 真实产出
-2. **Harness Runner 自动评测驱动器**——从手动填入 `case.passed` 升级为自动执行+判定
-3. **真实业务样本端到端验证**——6 个企业场景的 DeveloperSpec → 双管线全链路
-4. **生产环境 LLM 验证**——API key 配置 + 持续验证链路
-5. **REVIEW_READY 最终验收**——Snapshot Builder + 双引擎 Executor + 自动交叉验证全串联
+1. **真实业务样本端到端验证（9A4）**——6 个企业场景的 DeveloperSpec → 双管线全链路（阻塞于业务方提供样本）
+2. **Snapshot Builder 集成到 Pipeline**——将 `SnapshotBuilder.build()` 接入 `Pipeline.run_all()` 流程
+3. **生产环境 LLM 验证**——API key 配置 + 持续验证链路
+4. **Phase 9B**——更高级别的集成验证或架构演进
 
 ## 6. 关键文档索引
 
