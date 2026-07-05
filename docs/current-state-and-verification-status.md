@@ -1,6 +1,6 @@
 # 项目当前状态与验证进度 — TianShu DataDev Agent v3
 
-> 文档版本：2026-07-05 | 最后更新：2026-07-05 Case06 B 类收口完成——比率计算/CASE WHEN/Comparator 归一化，2 xfail 转正，852 passed
+> 文档版本：2026-07-05 Final Hardening | 最后更新：2026-07-05 Case06 B 类收口完成——比率计算/CASE WHEN/Comparator 归一化，2 xfail 转正，852 passed
 > 本文是项目当前实施状态的**唯一权威文档**。各 Phase 设计文档（docs/00-09、docs/roadmap/）描述的是目标设计，实际建成状态以本文为准。
 
 ## 1. Phase 进度矩阵
@@ -30,9 +30,9 @@
 | 9C-R16b | table_paths 边界硬化 | ✅ | ✅ | ✅ | None/{} 语义区分 + E2E 模式开关，2026-07-05 |
 | 9B-P1 | provenance.yml 显式断言 | ✅ | ✅ | ✅ | snapshot_manifest_hash 测试覆盖矩阵补全，2026-07-05 |
 | 9A4-NYC | 真实业务样本——NYC 案例 01-05 | ✅ | ✅ | 🟡 | Case 01-04 SQL+Spark 双链 LOGIC_EQUIVALENT，Case 05 Comparator NOT_COVERED（窗口函数），2026-07-05 |
-| 10-Case06 | SqlProgram 多语句 DAG——NYC Case 06 | ✅ | ✅ | ✅ | 跨域融合 7 步 DAG，比率计算/CASE WHEN/Comparator 归一化完成，2 xfail 转正，Task 9 豁免（8 个测试覆盖），Spark 测试内容级对齐待后续 Phase（1 xfail） |
+| 10-Case06 | SqlProgram 多语句 DAG——NYC Case 06 | ✅ | ✅ | ✅ | 跨域融合 7 步 DAG，比率计算/CASE WHEN/Comparator 归一化完成，3 xfail 转正（含 XPASS 清零），Task 9 豁免（8 个测试覆盖），Spark 测试内容级对齐待独立 Phase（1 xfail） |
 
-**当前测试基线**：852 passed / 11 skipped / 1 xfailed / 1 xpassed（api/spark/artifacts/harness 全量后端）+ 23 passed（前端冒烟全量）+ 6 passed / 0 skipped（Playwright E2E），ruff/tsc/build 零告警
+**当前测试基线**：853 passed / 11 skipped / 1 xfailed / 0 xpassed（api/spark/artifacts/harness 全量后端）+ 23 passed（前端冒烟全量）+ 6 passed / 0 skipped（Playwright E2E），ruff/tsc/build 零告警（Final Hardening——XPASS 清零，cleanup_status 真实断言）
 
 ## 2. C1-C4 业务集成验证
 
@@ -51,7 +51,7 @@
 |:----:|------|:----:|------|
 | R5 | ~~桥接函数替代完整 SQL Pipeline~~ | 已消除 | Phase 9A1-9A3 + 9A5 已升级为真实 Pipeline 全链路 |
 | R6 | ~~Harness Runner 为结果聚合器~~ | 已消除 | Phase 9A3 已升级为自动评测驱动器 |
-| R7 | 真实业务样本——NYC 案例 01-06 全部完成。Case 06 B 类收口完成（比率计算/CASE WHEN/Comparator 归一化），Spark Comparator LOGIC_EQUIVALENT 仍 xfail——归一化有效但 scan/join/aggregate 内容级差异需更深层 plan 级别对齐 | B | Case 06 Spark 双链 LOGIC_EQUIVALENT 待后续 Phase（Plan 级别对齐） |
+| R7 | 真实业务样本——NYC 案例 01-06 全部完成。Case 06 B 类收口完成 + XPASS 清零（cleanup_status 真实断言）。归一化有效消除步数差异（aggregate 3→1, project 7→1），Spark Comparator LOGIC_EQUIVALENT 仍 xfail——scan/join/aggregate 内容级差异（_temp_* vs Mapper 别名）需独立 Phase plan 级别对齐 | B | Case 06 Spark 双链 LOGIC_EQUIVALENT 待独立 Phase（Plan 级别内容对齐） |
 | R8 | ~~LLM 生产环境验证~~ | 已消除 | 2026-07-05 真实 LLM 验证 8/8 通过，100% pass rate，31,517 tokens，269.7s，DeepSeek v4-pro，报告：`llm_reports/verify_20260705.json`（已脱敏） |
 | R9 | Case 05 Spark Comparator 窗口函数 NOT_COVERED——仅排除 LOGIC_MISMATCH，未证明等价 | C | 窗口函数（ROW_NUMBER）Comparator 覆盖待完善 |
 | R10 | ~~Snapshot Builder 未集成到 REVIEW_READY 流程~~ | 已消除 | Phase 9B-P0 已将 SnapshotBuilder.build() 接入 Pipeline.run_all()，snapshot hash 写入 provenance.yml |
@@ -99,6 +99,11 @@ DeveloperSpec (.md 项目书)
 5. **Case 06 遗留工作**（C 类→后续 Phase）：
    - `violation_county` 代码映射的方案通用化（当前硬编码 NYC 5 个代码）
    - `test_temp_tables_cleaned_after_execution` 真正的 temp 表清理验证（需 Pipeline 暴露 cleanup_status）
+6. **Final Hardening 完成**（2026-07-05）——XPASS 清零（cleanup_status 真实断言）、Task 9 豁免登记、853 passed / 0 xpassed。核心平台可宣布"完成版"。
+7. **后续独立 Phase**：
+   - **Case06 内容级对齐**：plan 级别 scan/join/aggregate 引用归一化（_temp_* → Mapper 别名），使 Comparator 严格 LOGIC_EQUIVALENT
+   - **Case05 窗口函数 Comparator**：WindowStep（ROW_NUMBER）等价判定规则——从 NOT_COVERED 升级到严格断言
+   - **violation_county 代码映射通用化**：当前硬编码 NYC 5 个代码，需方案通用化
 
 ## 6. 关键文档索引
 

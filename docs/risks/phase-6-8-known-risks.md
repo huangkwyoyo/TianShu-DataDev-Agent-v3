@@ -186,7 +186,7 @@
 - **阻塞因素**：
   - scan/join/aggregate 内容级差异——SQL DAG 的 `_temp_*` 表引用与 Mapper 别名不匹配
   - 待后续 Phase 引入 plan 级别对齐（scan 过滤、join 重排、引用归一化）
-- **处置建议**：SQL 管线 B 类收口完成（全部执行通过），Spark 双链 Comparator 框架就绪（归一化已减少步数差异），内容级对齐留待后续 Phase
+- **处置建议**：SQL 管线 B 类收口完成（全部执行通过）+ XPASS 清零（cleanup_status 真实断言）。Spark 双链 Comparator 框架就绪（归一化已消除步数差异）。内容级对齐（_temp_* 引用 vs Mapper 别名）登记为独立 C 类后续 Phase——工作量估计 1-2 天。
 - **Task 9 豁免**：Orchestrator 集成测试（原方案 Task 9）已豁免——归一化已有 8 个测试覆盖：
   - 单元测试：`TestNormalizeDagSteps`（3 个——aggregate 合并/project 合并/类型保留）
   - 集成测试：`TestPlanComparatorMultiStatementFlatten`（SqlProgram 扁平化 + 多语句对比）
@@ -207,7 +207,7 @@
 | R3 | 已消除 | — | — | 2026-07-04 已修复 |
 | R4 | 已消除 | — | — | — |
 | Case05-Comp | C | 否 | 否 | 窗口函数 Comparator NOT_COVERED——待后续 Phase 升级为严格断言 |
-| Case06-Comp | B | 否 | 否 | B 类收口完成——比率/CASE WHEN/归一化已实现，内容级对齐待后续 Phase |
+| Case06-Comp | B→C | 否 | 否 | B 类收口完成 + XPASS 清零。内容级对齐（_temp_* vs Mapper 别名）登记为独立 C 类后续 Phase |
 | 9A1 | B-低风险 | 否 | 否 | 2026-07-05 已完成——PipelineArtifactBundle + export_artifacts() 就绪 |
 | 9A2 | B-低风险 | 否 | 否 | 2026-07-05 已完成——桥接函数标记 deprecated + 真实 SqlBuildPlan 驱动 COMPARATOR |
 | 9A3 | B-低风险 | 否 | 否 | 2026-07-05 已完成——Lite→V1 适配层 + Harness 自动驱动器 |
