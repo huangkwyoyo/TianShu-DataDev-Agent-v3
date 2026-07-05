@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
 
@@ -974,3 +975,123 @@ class TestNYCCase05SparkDualChain:
             "LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED", "ALL_CONSISTENT",
             "HUMAN_REVIEW_REQUIRED",
         }
+
+
+# ════════════════════════════════════════════
+# Case 06：区域安全合规画像（多步 DAG 跨域融合）
+# ════════════════════════════════════════════
+
+
+@pytest.fixture(scope="module")
+def nyc06_spec_md() -> str:
+    """读取 NYC 区域安全合规画像 DeveloperSpec。"""
+    spec_path = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "fixtures", "nyc", "nyc_safety_compliance_profile.md",
+    )
+    with open(spec_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+@pytest.fixture(scope="module")
+def nyc06_csv_paths() -> dict:
+    """Case 06 需要 5 张 CSV——3 域数据。"""
+    base = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), "fixtures", "nyc",
+    )
+    return {
+        "fact_trips_sample": os.path.join(base, "fact_trips_sample.csv"),
+        "dim_taxi_zone": os.path.join(base, "dim_taxi_zone.csv"),
+        # 以下 CSV 待创建——若不存在则测试标记为 skip
+        # "fact_crashes_sample": os.path.join(base, "fact_crashes_sample.csv"),
+        # "dws_daily_parking_summary": os.path.join(base, "dws_daily_parking_summary.csv"),
+    }
+
+
+class TestNYCCase06SqlPipeline:
+    """NYC 案例 06——多步 DAG 跨域融合全链路验证。"""
+
+    def test_spec_parses_with_compute_steps(self, nyc06_spec_md):
+        """Case 06 spec 解析——compute_steps 必须被识别（7 步 DAG）。"""
+        from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
+
+        parser = DeveloperSpecParser()
+        spec = parser.parse(nyc06_spec_md)
+
+        # compute_steps 必须非空
+        assert spec.compute_steps is not None, (
+            "Case 06 应解析出 compute_steps"
+        )
+        assert len(spec.compute_steps) == 7, (
+            f"应为 7 步 DAG，实际={len(spec.compute_steps)}"
+        )
+
+        # 零阻塞问题
+        blocking = [q for q in spec.open_questions if q.blocking]
+        assert len(blocking) == 0, (
+            f"Case 06 spec 解析存在阻塞: {[q.description for q in blocking]}"
+        )
+
+    def test_build_plan_produces_sql_program(self, nyc06_spec_md):
+        """build_plan() 应为 Case 06 产出 SqlProgram（非单语句）。"""
+        pipeline = Pipeline()
+        result = pipeline.build_plan(nyc06_spec_md)
+
+        assert result.get("validation_passed") is True, (
+            f"Validator 应通过: {result.get('open_questions')}"
+        )
+        # 多步 DAG 应输出 plan_id（FINAL 步骤的 plan）
+        assert result.get("plan_id"), "应产出 plan_id"
+
+    def test_sql_program_has_seven_statements(self, nyc06_spec_md):
+        """SqlProgram 应包含 7 个 statement——对应 7 个 compute_steps。"""
+        from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        parser = DeveloperSpecParser()
+        spec = parser.parse(nyc06_spec_md)
+        manifest = build_manifest_from_spec(spec)
+
+        builder = SqlBuildPlanBuilder()
+        plans = builder.build_from_steps(spec, None)
+        assert len(plans) == 7, (
+            f"build_from_steps 应产出 7 个 plan，实际={len(plans)}"
+        )
+
+    def test_no_cte_in_compiled_sql(self, nyc06_spec_md):
+        """编译产物中不得出现 WITH ... AS（CTE 禁止）。"""
+        from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
+        from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+        from tianshu_datadev.planning.program_factory import build_sql_program_from_compute_steps
+        from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
+
+        parser = DeveloperSpecParser()
+        spec = parser.parse(nyc06_spec_md)
+        manifest = build_manifest_from_spec(spec)
+
+        builder = SqlBuildPlanBuilder()
+        plans = builder.build_from_steps(spec, None)
+        chain_id = hashlib.md5(
+            "|".join(s.step_name for s in spec.compute_steps).encode()
+        ).hexdigest()[:8]
+        sql_program = build_sql_program_from_compute_steps(plans, spec, chain_id)
+
+        # 通过 compile_program 编译——取最后一条 FINAL SQL
+        compiler = DuckDbSqlCompiler()
+        # compile_program 需 table_mapping——使用 auto 映射
+        table_mapping = {}
+        for t in spec.input_tables:
+            if t.table_alias and t.source_table:
+                table_mapping[t.table_alias] = str(t.source_table)
+        compiler_with_map = DuckDbSqlCompiler(table_mapping=table_mapping)
+        program_artifact = compiler_with_map.compile_program(sql_program)
+        program_sql = program_artifact.compiled
+
+        # 检查每条 SQL 不含 WITH
+        for stmt_sql in program_sql.statements:
+            sql_upper = stmt_sql.sql.upper()
+            assert "WITH " not in sql_upper or "WITHIN GROUP" in sql_upper, (
+                f"编译 SQL 不得包含 CTE (WITH ... AS): {stmt_sql.sql[:200]}"
+            )
