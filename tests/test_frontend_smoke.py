@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 # 项目根目录
 _ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -362,7 +363,7 @@ class TestSparkPipelineFrontend:
         """handleSparkVerify 的 catch 分支设置 error（ApiError）用于 ErrorDisplay。"""
         src = self._read_file("frontend", "src", "App.tsx")
         # catch 分支必须设置 error 字段——ErrorDisplay 读取 state.error
-        assert "error: apiErr" in src or "error: apiErr" in src.replace(" ", ""), (
+        assert "error: apiErr" in src, (
             "handleSparkVerify catch 分支未将 apiErr 赋给 error——ErrorDisplay 无法展示"
         )
 
@@ -403,7 +404,6 @@ class TestSparkPipelineFrontend:
         src = self._read_file("frontend", "src", "App.tsx")
         # 验证 merge 顺序：pipelineStages 在 ...partial 之前（partial 后覆盖）
         # 新的顺序应为: { isLoading: false, pipelineError, pipelineStages, ...partial }
-        import re
         # 找到 runAction 中的 update 调用
         match = re.search(
             r'update\(\{[^}]+pipelineStages[^}]+}\)',
