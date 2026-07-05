@@ -487,6 +487,22 @@ class Pipeline:
             ),
         }
 
+    # ── table_paths 解析辅助 ──────────────────────────
+
+    def _resolve_table_paths(
+        self, table_paths: dict[str, str] | None,
+    ) -> dict[str, str]:
+        """解析 table_paths 参数——区分 None（未传）和 {}（显式传空）。
+
+        None → 回退到 self._default_table_paths（E2E 环境中的 CSV fixture 自动发现结果）
+        {}   → 不回退，保持空字典（显式声明"不需要任何 CSV 文件"）
+
+        这是 Phase 9C-R16 边界硬化的核心语义：防止显式传 {} 时意外加载测试数据。
+        """
+        if table_paths is not None:
+            return table_paths
+        return self._default_table_paths
+
     # ── 公共方法 ──────────────────────────────────────────
 
     def parse_only(self, markdown_text: str, rich: bool = False) -> dict:
@@ -756,7 +772,7 @@ class Pipeline:
                 program_artifact = compiler.compile_program(sql_program)
 
                 stage = "execute"
-                execute_executor = DuckDBExecutor(table_paths=table_paths or self._default_table_paths)
+                execute_executor = DuckDBExecutor(table_paths=self._resolve_table_paths(table_paths))
                 program_result = execute_executor.execute_program(
                     program_artifact.compiled
                 )
@@ -801,7 +817,7 @@ class Pipeline:
                 program_artifact = compiler.compile_program(sql_program)
 
                 stage = "execute"
-                execute_executor = DuckDBExecutor(table_paths=table_paths or self._default_table_paths)
+                execute_executor = DuckDBExecutor(table_paths=self._resolve_table_paths(table_paths))
                 program_result = execute_executor.execute_program(
                     program_artifact.compiled
                 )
@@ -839,7 +855,7 @@ class Pipeline:
                 compiled = compiler.compile(plan)
 
                 stage = "execute"
-                execute_executor = DuckDBExecutor(table_paths=table_paths or self._default_table_paths)
+                execute_executor = DuckDBExecutor(table_paths=self._resolve_table_paths(table_paths))
                 trace, summary = execute_executor.execute(compiled)
 
             # ── 执行状态检查——RUNTIME_FAIL 阻断，不进入成功路径 ──
@@ -1051,7 +1067,7 @@ class Pipeline:
                 compiled_sql = program_artifact.compiled.statements[-1]
 
                 stage = "execute"
-                executor = DuckDBExecutor(table_paths=table_paths or self._default_table_paths)
+                executor = DuckDBExecutor(table_paths=self._resolve_table_paths(table_paths))
                 program_result = executor.execute_program(
                     program_artifact.compiled
                 )
@@ -1267,7 +1283,7 @@ class Pipeline:
                 compiled_sql = program_artifact.compiled.statements[-1]
 
                 stage = "execute"
-                execute_executor = DuckDBExecutor(table_paths=table_paths or self._default_table_paths)
+                execute_executor = DuckDBExecutor(table_paths=self._resolve_table_paths(table_paths))
                 program_result = execute_executor.execute_program(
                     program_artifact.compiled
                 )
@@ -1304,7 +1320,7 @@ class Pipeline:
                 compiled_sql = artifact.compiled_sql
 
                 stage = "execute"
-                execute_executor = DuckDBExecutor(table_paths=table_paths or self._default_table_paths)
+                execute_executor = DuckDBExecutor(table_paths=self._resolve_table_paths(table_paths))
                 trace, summary = execute_executor.execute(compiled_sql)
 
                 sql_program = build_sql_program(plan, spec.spec_hash)
@@ -1932,7 +1948,7 @@ class Pipeline:
             compiled = compiler.compile(plan)
 
             stage = "execute"
-            executor = DuckDBExecutor(table_paths=table_paths or self._default_table_paths)
+            executor = DuckDBExecutor(table_paths=self._resolve_table_paths(table_paths))
             trace, summary = executor.execute(compiled)
 
             # ── 执行状态检查——RUNTIME_FAIL 阻断，不进入成功路径 ──

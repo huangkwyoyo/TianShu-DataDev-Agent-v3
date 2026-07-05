@@ -106,6 +106,19 @@ Task: complete (R16 消除——table_paths 自动发现 + PipelineStageIndicato
   - Frontend smoke: 23 passed
   - ruff/tsc/build/git diff: clean
 
+## Phase 9C-R16b Progress (边界硬化)
+Started: 2026-07-05
+Base commit: 676b812
+Task: complete (table_paths 边界硬化——None/{} 语义区分 + E2E 模式开关)
+  - Pipeline._resolve_table_paths() 辅助方法：None 回退到默认值，{} 保持空字典
+  - 7 处 DuckDBExecutor 构造统一改为 self._resolve_table_paths(table_paths)
+  - create_app() 仅在 TIANSHU_E2E_MODE=true 时调用 _discover_csv_fixtures()
+  - playwright.config.ts: Python 一行命令在进程内设置环境变量
+  - 新增 tests/api/test_pipeline_table_paths_boundary.py（6 个边界测试）
+  - Backend: 594 passed / 11 skipped (+6 新边界测试，零退化)
+  - E2E: 6 passed / 0 skipped
+  - ruff/tsc/build/git diff: clean
+
 ## Phase 9C Final Review
 Final review: CLEAN (0 Critical, 0 Important, 0 Minor)
 Non-blocking observations:

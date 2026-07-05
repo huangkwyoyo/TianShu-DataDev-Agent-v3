@@ -24,8 +24,10 @@ def _discover_csv_fixtures() -> dict[str, str]:
     """自动发现 tests/fixtures/ 目录下的 CSV fixture 文件。
 
     以文件名（不含扩展名）为 key、绝对路径为 value，构建 DuckDB 所需的
-    table_paths 映射。在 E2E 测试环境中，前端不传 table_paths 参数，
-    Pipeline 会回退到此默认映射。
+    table_paths 映射。
+
+    仅在 TIANSHU_E2E_MODE=true 时由 create_app() 调用，
+    生产路径不触发此函数——避免测试数据泄漏到生产环境。
 
     扫描范围：tests/fixtures/ 及所有子目录中的 *.csv 文件。
 
@@ -56,7 +58,8 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
 
     Args:
         pipeline: 可选的 Pipeline 实例（测试时可注入 mock）。
-                  若为 None，使用默认 Pipeline（含 CSV fixture 自动发现）。
+                  若为 None，使用默认 Pipeline。
+                  CSV fixture 自动发现仅在 TIANSHU_E2E_MODE=true 时启用。
 
     Returns:
         配置完成的 FastAPI 应用
@@ -76,9 +79,13 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    # 注入流水线——未显式传入时自动发现 CSV fixture 文件
+    # 注入流水线——未显式传入时仅在 E2E 测试模式下自动发现 CSV fixture 文件
+    # 生产路径不扫描 tests/fixtures/，避免测试数据泄漏到生产环境
     if pipeline is None:
-        pipeline = Pipeline(default_table_paths=_discover_csv_fixtures())
+        if os.environ.get("TIANSHU_E2E_MODE") == "true":
+            pipeline = Pipeline(default_table_paths=_discover_csv_fixtures())
+        else:
+            pipeline = Pipeline()
     app.state.pipeline = pipeline
 
     # 注册异常处理器
