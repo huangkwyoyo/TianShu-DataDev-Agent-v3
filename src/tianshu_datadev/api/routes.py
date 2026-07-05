@@ -27,6 +27,9 @@ from .models import (
     ParseSpecRequest,
     PlanRequest,
     RunAllRequest,
+    SparkStageItem,
+    SparkVerifyRequest,
+    SparkVerifyResponse,
 )
 
 api_router = APIRouter(prefix="/api")
@@ -206,3 +209,124 @@ async def get_package_rich(request: Request, request_id: str):
             },
         )
     return result
+
+
+# ════════════════════════════════════════════
+# Spark 管线验证端点
+# ════════════════════════════════════════════
+
+
+@api_router.post("/spark/verify")
+async def spark_verify(request: Request, body: SparkVerifyRequest):
+    """触发 Spark 管线验证——返回 6 阶段结果 + REVIEW_READY 判定。
+
+    处理流程：
+    1. Pipeline.export_artifacts(request_id) → 提取 SqlBuildPlan + Contract
+    2. adapt_lite_to_v1() → 将 Lite 契约升级为 V1
+    3. SparkOrchestrator.run(contract=v1, sql_plan=sql_build_plan) → 执行全链路
+    4. SparkReviewBuilder.build(state) → REVIEW_READY 判定
+    5. 将 SparkPipelineState.stage_results 映射为前端 status 字符串
+
+    错误码：
+    - SPARK_ARTIFACTS_NOT_FOUND (404)：request_id 对应的 artifacts 不存在或已过期
+    - SPARK_ARTIFACTS_INCOMPLETE (422)：sql_build_plan 或 data_transform_contract 为 None
+    - SPARK_VERIFY_FAILED (500)：Orchestrator 执行过程中发生未预期异常
+    """
+    # 映射 SparkPipelineState 值 → 前端 status
+    _STATUS_MAP = {
+        "SUCCESS": "ok",
+        "FAILURE": "failed",
+        "HUMAN_REVIEW": "failed",
+        "SKIPPED": "skipped",
+        "NOT_EXECUTED": "skipped",
+    }
+
+    pipeline = request.app.state.pipeline
+
+    # ── Step 1: 导出 artifacts ──
+    bundle = pipeline.export_artifacts(body.request_id)
+    if bundle is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error_code": "SPARK_ARTIFACTS_NOT_FOUND",
+                "message": (
+                    f"request_id '{body.request_id}' 对应的 artifacts 不存在或已过期。"
+                    f"请先执行全流程 Run-All 生成 artifacts。"
+                ),
+                "field_ref": "request_id",
+            },
+        )
+
+    # ── Step 2: 校验 artifacts 完整性 ──
+    if bundle.sql_build_plan is None or bundle.data_transform_contract is None:
+        missing_parts: list[str] = []
+        if bundle.sql_build_plan is None:
+            missing_parts.append("sql_build_plan")
+        if bundle.data_transform_contract is None:
+            missing_parts.append("data_transform_contract")
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error_code": "SPARK_ARTIFACTS_INCOMPLETE",
+                "message": (
+                    f"request_id '{body.request_id}' 的 artifacts 不完整："
+                    f"缺少 {', '.join(missing_parts)}。"
+                    f"请使用全流程 Run-All（而非仅 build_plan 或 execute）生成完整 artifacts。"
+                ),
+                "field_ref": "request_id",
+            },
+        )
+
+    # ── Step 3: Contract 适配（Lite → V1）──
+    try:
+        from tianshu_datadev.artifacts.models import DataTransformContractV1
+        from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+        from tianshu_datadev.spark.orchestrator import SparkOrchestrator
+        from tianshu_datadev.spark.review_builder import SparkReviewBuilder
+
+        raw_contract = bundle.data_transform_contract
+        if isinstance(raw_contract, DataTransformContractV1):
+            v1_contract = raw_contract
+        else:
+            v1_contract = adapt_lite_to_v1(raw_contract)
+
+        # ── Step 4: 执行 Spark Orchestrator ──
+        orchestrator = SparkOrchestrator()
+        state = orchestrator.run(
+            contract=v1_contract,
+            sql_plan=bundle.sql_build_plan,
+        )
+
+        # ── Step 5: REVIEW_READY 判定 ──
+        builder = SparkReviewBuilder()
+        pkg = builder.build(state)
+
+        # ── Step 6: 映射阶段状态 → 前端格式 ──
+        spark_stages: list[SparkStageItem] = []
+        for stage_name, result in state.stage_results.items():
+            spark_stages.append(SparkStageItem(
+                stage=stage_name,
+                status=_STATUS_MAP.get(result, "skipped"),
+            ))
+
+        # ── Step 7: 构造响应 ──
+        return SparkVerifyResponse(
+            request_id=body.request_id,
+            spark_stages=spark_stages,
+            overall_status=pkg.overall_status,
+            comparator_status=pkg.comparator_status,
+            review_ready=pkg.review_ready,
+            package_id=pkg.package_id,
+            errors=list(state.errors),
+        )
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error_code": "SPARK_VERIFY_FAILED",
+                "message": f"Spark 管线验证执行异常：{e}",
+                "field_ref": None,
+            },
+        )
