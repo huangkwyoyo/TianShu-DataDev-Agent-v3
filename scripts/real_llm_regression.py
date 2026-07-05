@@ -1,7 +1,7 @@
 """真实 LLM 回归验证——使用 AnthropicAdapter 对 4 个任务的 Prompt 模板进行端到端验证。
 
 用法：
-    python scripts/real_llm_regression.py
+    TIANSHU_RUN_REAL_LLM=1 python scripts/real_llm_regression.py [--model MODEL] [--task TASK] [--json]
 
 前提：
     - .env 中已配置 DEEPSEEK_API_KEY
@@ -733,6 +733,23 @@ def _log(msg: str, verbose: bool) -> None:
 # ════════════════════════════════════════════
 
 if __name__ == "__main__":
+    import os
+
+    # ── 安全门禁：必须显式设置 TIANSHU_RUN_REAL_LLM=1 才能执行真实调用 ──
+    if os.environ.get("TIANSHU_RUN_REAL_LLM") != "1":
+        print(
+            "错误：真实 LLM 调用需要显式授权。\n"
+            "请设置环境变量 TIANSHU_RUN_REAL_LLM=1 后再执行。\n"
+            "示例：TIANSHU_RUN_REAL_LLM=1 python scripts/real_llm_regression.py\n"
+            "\n"
+            "此门禁确保：\n"
+            "1. 真实 LLM 调用不会在 pytest 中意外触发（pytest 使用 FakeLLMAdapter）\n"
+            "2. API key 不会被无意识地消费\n"
+            "3. 每次真实调用都是有意的、可审计的操作",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     import argparse
 
     parser = argparse.ArgumentParser(
