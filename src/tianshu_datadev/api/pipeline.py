@@ -17,6 +17,7 @@ from tianshu_datadev.artifacts.contract_extractor import DataTransformContractEx
 from tianshu_datadev.artifacts.packager import PackageInputs, ReviewPackageBuilder
 from tianshu_datadev.developer_spec.models import (
     ParsedDeveloperSpec,
+    StrictModel,
 )
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
 from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
@@ -31,14 +32,22 @@ from tianshu_datadev.planning.spec_enricher import SpecEnricher
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan, SqlBuildPlanBuilder
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
 from tianshu_datadev.sql.executor import DuckDBExecutor
-from tianshu_datadev.sql.models import ExecutionStatus, SqlArtifact
+from tianshu_datadev.sql.models import (
+    CompiledSql,
+    ExecutionStatus,
+    ExecutionTrace,
+    ResultSummary,
+    SqlArtifact,
+)
 from tianshu_datadev.sql.validator import SqlBuildPlanValidator
 
 if TYPE_CHECKING:
+    from tianshu_datadev.artifacts.models import DataTransformContractLite, DataTransformContractV1
     from tianshu_datadev.developer_spec.models import OpenQuestion, ParseWarning, SourceManifest
     from tianshu_datadev.llm.adapters.base import ProviderAdapter
     from tianshu_datadev.planning.relationship_hypothesis import RelationshipHypothesis
     from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan
+    from tianshu_datadev.sql.models import CompiledSql, ExecutionTrace, ResultSummary
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +97,38 @@ def _auto_table_mapping(spec: ParsedDeveloperSpec) -> dict[str, str]:
         if t.table_alias and t.source_table:
             mapping[t.table_alias] = str(t.source_table)
     return mapping
+
+
+# ════════════════════════════════════════════
+# Phase 9A1: PipelineArtifactBundle——中间产物导出模型
+# ════════════════════════════════════════════
+
+
+class PipelineArtifactBundle(StrictModel):
+    """Pipeline 中间产物导出包——将 _results 缓存中的结构化 artifact 暴露给下游消费。
+
+    由 Pipeline.export_artifacts(request_id) 创建。
+    不同 Pipeline 路径产出的 artifact 不同——字段为 None 表示该路径未产出对应产物。
+
+    字段说明：
+    - request_id: Pipeline 请求 ID（与 run_all/execute 返回值一致）
+    - spec_hash: 来源 DeveloperSpec 的 hash
+    - sql_build_plan: SQL Pipeline 产出的 SqlBuildPlan（build_plan/execute/run_all 路径均产出）
+    - data_transform_contract: 数据转换契约（run_all 路径产出——单表为 DataTransformContractLite，
+      多语句为 DataTransformContractV1；execute/build_plan 路径不产出）
+    - compiled_sql: DuckDB Compiler 编译产物（execute/run_all 路径产出）
+    - execution_trace: DuckDB 执行追踪（execute/run_all 成功路径产出）
+    - result_summary: 执行结果摘要（execute/run_all 成功路径产出）
+    """
+
+    request_id: str
+    spec_hash: str = ""
+    sql_build_plan: SqlBuildPlan | None = None
+    # 接受 Lite（extract(plan) 产出）和 V1（extract_v1(sql_program) 产出）两种类型
+    data_transform_contract: DataTransformContractLite | DataTransformContractV1 | None = None
+    compiled_sql: CompiledSql | None = None
+    execution_trace: ExecutionTrace | None = None
+    result_summary: ResultSummary | None = None
 
 
 class Pipeline:
@@ -1343,6 +1384,7 @@ class Pipeline:
             "compiled": compiled_sql,
             "trace": trace,
             "summary": summary,
+            "contract": contract,
             "table_mapping": table_mapping or {},
         })
         self._store_package(request_id, package_manifest)
@@ -1440,6 +1482,53 @@ class Pipeline:
         else:
             base["artifacts"] = [a.model_dump() for a in manifest.artifacts]
         return base
+
+    # ── Phase 9A1: 中间产物导出 ──────────────────────────
+
+    def export_artifacts(self, request_id: str) -> PipelineArtifactBundle | None:
+        """导出指定 request_id 的 Pipeline 中间产物——供下游 Spark Orchestrator / Harness Runner 消费。
+
+        从 _results 内存缓存中提取指定请求的结构化 artifact（SqlBuildPlan / DataTransformContract /
+        CompiledSql / ExecutionTrace / ResultSummary），封装为 PipelineArtifactBundle。
+
+        Pipeline 各路径产出的 artifact 不同——缺失字段为 None：
+        - build_plan: 仅有 sql_build_plan
+        - execute: 有 sql_build_plan + compiled_sql + trace + summary（无 contract）
+        - run_all（非 ComputeSteps）: 有 sql_build_plan + compiled_sql + trace + summary + contract
+        - run_all（ComputeSteps）: 有 sql_build_plan + data_transform_contract + sql_artifact
+
+        Args:
+            request_id: Pipeline 请求 ID（run_all/execute/build_plan 返回值中的 request_id）
+
+        Returns:
+            PipelineArtifactBundle——含所有已缓存的结构化产物；缓存不存在或 TTL 过期时返回 None
+        """
+        self._purge_expired()
+        data = self._results.get(request_id)
+        if data is None:
+            return None
+
+        # 提取 spec_hash——从 ParsedDeveloperSpec 获取
+        spec_hash = ""
+        parsed_spec = data.get("parsed_spec")
+        if parsed_spec is not None:
+            spec_hash = getattr(parsed_spec, "spec_hash", "")
+
+        # 提取 contract——仅 ComputeSteps 路径的 run_all 存储了 contract
+        contract = data.get("contract")
+
+        # 提取 compiled——execute/run_all 单表路径存储为 "compiled"
+        compiled = data.get("compiled")
+
+        return PipelineArtifactBundle(
+            request_id=request_id,
+            spec_hash=spec_hash,
+            sql_build_plan=data.get("plan"),
+            data_transform_contract=contract,
+            compiled_sql=compiled,
+            execution_trace=data.get("trace"),
+            result_summary=data.get("summary"),
+        )
 
     # ── Phase 4.5B 前端 SPA 专用方法 ──────────────────────
 
@@ -1848,3 +1937,12 @@ def _safe_enum_value(obj, attr: str) -> str:
     if hasattr(val, "value"):
         return val.value
     return str(val)
+
+
+# ── Phase 9A1: 延迟重建 PipelineArtifactBundle——确保 Contract 类型已导入 ──
+from tianshu_datadev.artifacts.models import (  # noqa: E402
+    DataTransformContractLite,
+    DataTransformContractV1,
+)
+
+PipelineArtifactBundle.model_rebuild()

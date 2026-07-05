@@ -445,3 +445,161 @@ class TestPipelineValidationBlocking:
             assert "question_id" in q
             assert "description" in q
             assert q["blocking"] is True
+
+
+# ════════════════════════════════════════════════
+# Phase 9A1: Pipeline.export_artifacts() 测试
+# ════════════════════════════════════════════════
+
+
+class TestPipelineExportArtifacts:
+    """Pipeline.export_artifacts()——从 _results 缓存导出中间产物。"""
+
+    def test_export_after_run_all_returns_bundle(self, pipeline, golden_spec_passing):
+        """run_all 成功后 export_artifacts 返回非空 PipelineArtifactBundle。"""
+        try:
+            import duckdb  # noqa: F401
+        except ImportError:
+            pytest.skip("DuckDB 未安装")
+        import os
+        csv_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv")
+        )
+        result = pipeline.run_all(
+            golden_spec_passing,
+            table_mapping={"tf": "test_fact"},
+            table_paths={"test_fact": csv_path},
+        )
+        request_id = result["request_id"]
+
+        bundle = pipeline.export_artifacts(request_id)
+
+        # bundle 不为 None
+        assert bundle is not None
+        # request_id 一致
+        assert bundle.request_id == request_id
+        # spec_hash 非空
+        assert bundle.spec_hash != ""
+        # SqlBuildPlan 已缓存——应非空
+        assert bundle.sql_build_plan is not None
+        # DataTransformContract 已缓存——应非空（9A2 桥接替换的关键输入）
+        assert bundle.data_transform_contract is not None
+        assert bundle.data_transform_contract.contract_id != ""
+        assert len(bundle.data_transform_contract.input_tables) > 0
+        # CompiledSql 已缓存——应非空
+        assert bundle.compiled_sql is not None
+        # ExecutionTrace 已缓存——应非空
+        assert bundle.execution_trace is not None
+        # ResultSummary 已缓存——应非空
+        assert bundle.result_summary is not None
+
+    def test_export_unknown_request_id_returns_none(self, pipeline):
+        """未执行过的 request_id 返回 None。"""
+        bundle = pipeline.export_artifacts("req_nonexistent")
+        assert bundle is None
+
+    def test_export_after_ttl_expiry_returns_none(self, pipeline, golden_spec_passing):
+        """TTL 过期清理后 export_artifacts 返回 None。"""
+        try:
+            import duckdb  # noqa: F401
+        except ImportError:
+            pytest.skip("DuckDB 未安装")
+        import os
+        csv_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv")
+        )
+        result = pipeline.run_all(
+            golden_spec_passing,
+            table_mapping={"tf": "test_fact"},
+            table_paths={"test_fact": csv_path},
+        )
+        request_id = result["request_id"]
+
+        # 设置 TTL 为负值——使 _purge_expired 的 now - ts > -1 恒成立，立即清理所有条目
+        pipeline._ttl_seconds = -1
+        # export_artifacts 内部调用 _purge_expired——应清理并返回 None
+        bundle = pipeline.export_artifacts(request_id)
+        assert bundle is None
+
+    def test_export_after_execute_returns_bundle(self, pipeline, golden_spec_passing):
+        """execute() 成功后 export_artifacts 同样可导出产物。"""
+        try:
+            import duckdb  # noqa: F401
+        except ImportError:
+            pytest.skip("DuckDB 未安装")
+        import os
+        csv_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv")
+        )
+        result = pipeline.execute(
+            golden_spec_passing,
+            table_mapping={"tf": "test_fact"},
+            table_paths={"test_fact": csv_path},
+        )
+        request_id = result["request_id"]
+
+        bundle = pipeline.export_artifacts(request_id)
+
+        assert bundle is not None
+        assert bundle.sql_build_plan is not None
+        assert bundle.compiled_sql is not None
+        assert bundle.execution_trace is not None
+        assert bundle.result_summary is not None
+
+    def test_export_after_build_plan_has_plan_but_no_execution(self, pipeline, golden_spec_passing):
+        """build_plan 只到 plan 阶段——compiled/trace/summary 应为 None。"""
+        result = pipeline.build_plan(golden_spec_passing)
+        request_id = result["request_id"]
+
+        bundle = pipeline.export_artifacts(request_id)
+
+        assert bundle is not None
+        assert bundle.sql_build_plan is not None
+        # build_plan 不执行编译和执行——这些字段应为 None
+        assert bundle.compiled_sql is None
+        assert bundle.execution_trace is None
+        assert bundle.result_summary is None
+
+    def test_export_bundle_spec_hash_matches_parsed_spec(self, pipeline, golden_spec_passing):
+        """bundle.spec_hash 与 _results 中 ParsedDeveloperSpec.spec_hash 一致。"""
+        try:
+            import duckdb  # noqa: F401
+        except ImportError:
+            pytest.skip("DuckDB 未安装")
+        import os
+        csv_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv")
+        )
+        result = pipeline.run_all(
+            golden_spec_passing,
+            table_mapping={"tf": "test_fact"},
+            table_paths={"test_fact": csv_path},
+        )
+        request_id = result["request_id"]
+
+        bundle = pipeline.export_artifacts(request_id)
+        saved = pipeline._results[request_id]
+        parsed_spec = saved["parsed_spec"]
+
+        assert bundle.spec_hash == parsed_spec.spec_hash
+
+    def test_export_bundle_plan_id_matches(self, pipeline, golden_spec_passing):
+        """bundle.sql_build_plan.plan_id 与 run_all 返回的 plan_id 一致。"""
+        try:
+            import duckdb  # noqa: F401
+        except ImportError:
+            pytest.skip("DuckDB 未安装")
+        import os
+        csv_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv")
+        )
+        result = pipeline.run_all(
+            golden_spec_passing,
+            table_mapping={"tf": "test_fact"},
+            table_paths={"test_fact": csv_path},
+        )
+        request_id = result["request_id"]
+
+        bundle = pipeline.export_artifacts(request_id)
+
+        assert bundle.sql_build_plan.plan_id == result["plan_id"]
