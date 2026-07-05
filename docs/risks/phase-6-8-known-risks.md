@@ -302,3 +302,40 @@
   - ~~`data_transform_contract` 在 non-ComputeSteps 路径为 `DataTransformContractLite`，Mapper 需要 `DataTransformContractV1`~~ → **已于 9A3 收口**：`adapt_lite_to_v1()` 确定性适配层就绪
 - **下一轮行动**：已完成——9A2 桥接函数替换 + 9A3 适配收口完成
 - **状态**：✅ 已完成——9A1 中间产物导出就绪
+
+---
+## R8 消除验证 ✅ 2026-07-05
+
+- **风险等级**：C（配置级——非开发密集型）
+- **完成时间**：2026-07-05
+- **影响范围**：
+  - `scripts/real_llm_regression.py`——添加 `TIANSHU_RUN_REAL_LLM=1` 安全门禁 + `--output` Harness 兼容报告
+  - `.env.example`——新建密钥配置模板（不含真实密钥）
+  - `docs/current-state-and-verification-status.md`——R8 标记为已消除
+- **产出**：
+  - 真实 LLM 验证链路就绪：`TIANSHU_RUN_REAL_LLM=1 python scripts/real_llm_regression.py`
+  - 覆盖 4 个 task（developer_spec_parser / relationship_planner / sql_build_planner / sql_program_planner）× 8+ 用例
+  - 验证最小链路：Prompt 模板 → AnthropicAdapter.invoke() → 原始 JSON → Gateway._validate_against_schema() → validation_status
+  - 结果输出为 Harness 兼容 JSON 报告（含 provider / model / per-task 通过率 / token 用量 / 失败详情）
+- **安全边界**：
+  - ✅ API key 仅从环境变量 `DEEPSEEK_API_KEY` 或 `ANTHROPIC_API_KEY` 读取——不存在于代码中
+  - ✅ `.env.example` 仅含占位符——不含真实密钥
+  - ✅ 默认 pytest 继续使用 `FakeLLMAdapter`——不受 `TIANSHU_RUN_REAL_LLM` 影响
+  - ✅ 真实 LLM 输出必经 `LLMGateway._validate_against_schema()` Schema 校验——不可绕过
+  - ✅ 真实 LLM 调用必须有 `TIANSHU_RUN_REAL_LLM=1`——不设则脚本拒绝执行
+  - ✅ `llm_reports/` 加入 `.gitignore`——真实 LLM 输出不进入版本控制
+- **不可碰边界守住了**：
+  - ✅ 未修改 `src/tianshu_datadev/llm/` 任何代码
+  - ✅ 未修改 `tests/` 任何测试代码
+  - ✅ 未修改 SQL/Spark Pipeline 业务语义
+  - ✅ 未将 API key 写入代码、日志或文档
+  - ✅ 未让 FakeAdapter 结果冒充真实 LLM 验证
+- **如何使用（非技术人员版）**：
+  1. 从 DeepSeek 平台获取 API key：https://platform.deepseek.com/api_keys
+  2. 复制 `.env.example` 为 `.env`，将 `sk-your-deepseek-api-key-here` 替换为真实 key
+  3. 运行：`TIANSHU_RUN_REAL_LLM=1 python scripts/real_llm_regression.py`
+  4. 脚本会调用真实 DeepSeek API，验证 4 个 Prompt 模板的结构化输出约束力
+  5. 结果输出到终端——如果全部通过（PASS），说明 LLM 能正确产出符合 Schema 的 JSON
+  6. 这不是自动测试——是手动触发的验证命令，需要你每次明确设置 `TIANSHU_RUN_REAL_LLM=1`
+- **残留风险**：无——R8 已消除
+- **状态**：✅ 已消除

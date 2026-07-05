@@ -51,7 +51,7 @@
 | R5 | ~~桥接函数替代完整 SQL Pipeline~~ | 已消除 | Phase 9A1-9A3 + 9A5 已升级为真实 Pipeline 全链路 |
 | R6 | ~~Harness Runner 为结果聚合器~~ | 已消除 | Phase 9A3 已升级为自动评测驱动器 |
 | R7 | 真实业务样本缺失——NYC 案例 01 已接入，剩余 5/6 个场景待接入 | B | 待业务方提供（9A4 部分完成） |
-| R8 | LLM 生产环境持续验证未配置 | C | 待 API key |
+| R8 | ~~LLM 生产环境持续验证未配置~~ | 已消除 | 2026-07-05——`scripts/real_llm_regression.py` + `TIANSHU_RUN_REAL_LLM=1` 门禁就绪 |
 | R10 | ~~Snapshot Builder 未集成到 REVIEW_READY 流程~~ | 已消除 | Phase 9B-P0 已将 SnapshotBuilder.build() 接入 Pipeline.run_all()，snapshot hash 写入 provenance.yml |
 | R11 | ~~前端无自动化测试框架~~ | 已消除 | Phase 9B 源码级 + Phase 9C Playwright E2E |
 | R15 | ~~SQL 成功态 pipeline_stages 为空~~ | 已消除 | handleRunAll 成功路径注入全成功阶段——SQL 指示灯始终可见 |
@@ -91,7 +91,7 @@ DeveloperSpec (.md 项目书)
 ## 5. 下一步方向（Phase 10+）
 
 1. **真实业务样本端到端验证（9A4）**——NYC 案例 01 已完成（1/6），剩余 5 个企业场景待接入（阻塞于业务方提供样本）
-2. **生产环境 LLM 验证**——API key 配置 + 持续验证链路
+2. **生产环境 LLM 验证**——已就绪（R8），`TIANSHU_RUN_REAL_LLM=1 python scripts/real_llm_regression.py --output llm_reports/verify_$(date +%Y%m%d).json`
 
 ## 6. 关键文档索引
 
