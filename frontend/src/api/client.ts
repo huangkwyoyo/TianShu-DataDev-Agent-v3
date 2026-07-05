@@ -348,3 +348,27 @@ export function runAll(
 export function getPackageRich(requestId: string): Promise<PackageRichResponse> {
   return apiGet(`/package-rich/${requestId}`);
 }
+
+// ── Spark 管线验证 ──
+
+/** Spark 单个阶段结果 */
+export interface SparkStageItem {
+  stage: string;
+  status: 'ok' | 'failed' | 'skipped';
+}
+
+/** Spark 验证响应 */
+export interface SparkVerifyResponse {
+  request_id: string;
+  spark_stages: SparkStageItem[];
+  overall_status: string;
+  comparator_status: string;
+  review_ready: boolean;
+  package_id: string;
+  errors: string[];
+}
+
+/** 触发 Spark 管线验证——传入 Pipeline Run-All 产出的 request_id */
+export function sparkVerify(requestId: string): Promise<SparkVerifyResponse> {
+  return apiPost<SparkVerifyResponse>('/spark/verify', { request_id: requestId });
+}
