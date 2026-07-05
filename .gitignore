@@ -31,3 +31,6 @@ frontend/dist/
 
 # Playwright E2E 测试运行时产物
 frontend/test-results/
+
+# 真实 LLM 回归验证报告输出
+llm_reports/

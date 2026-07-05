@@ -777,6 +777,11 @@ if __name__ == "__main__":
         dest="output_json",
         help="以 JSON 格式输出结果",
     )
+    parser.add_argument(
+        "--output",
+        default="",
+        help="将验证结果写入指定 JSON 文件（Harness 兼容格式）",
+    )
     args = parser.parse_args()
 
     # 如果指定了 --task，过滤用例
@@ -788,6 +793,10 @@ if __name__ == "__main__":
         REGRESSION_CASES.clear()
         REGRESSION_CASES[args.task] = original[args.task]
 
+    # 为 Harness 报告准备适配器元数据
+    load_dotenv()
+    adapter = AnthropicAdapter(model=args.model or None)
+
     summary = run_real_llm_regression(
         model=args.model,
         temperature=args.temperature,
@@ -796,6 +805,52 @@ if __name__ == "__main__":
 
     if args.output_json:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+    # ── 输出 Harness 兼容的 JSON 报告 ──
+    if args.output:
+        import datetime as _dt
+
+        report = {
+            "harness": "real_llm_verification",
+            "provider": adapter.provider_name(),
+            "model": args.model or adapter._model,
+            "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "environment": {
+                "has_api_key": bool(adapter._api_key),
+                "base_url": adapter._base_url,
+            },
+            "summary": {
+                "total": summary["total"],
+                "passed": summary["passed"],
+                "failed": summary["failed"],
+                "errors": summary["errors"],
+                "pass_rate": summary["pass_rate"],
+                "total_tokens": summary["total_tokens"],
+                "total_latency_ms": summary["total_latency_ms"],
+            },
+            "per_task": {},
+            "failures": [
+                r for r in summary["results"]
+                if r["status"] != "passed"
+            ],
+        }
+        # 按 task 分组统计
+        for task_name in REGRESSION_CASES:
+            task_results = [r for r in summary["results"] if r["task"] == task_name]
+            task_passed = sum(1 for r in task_results if r["status"] == "passed")
+            report["per_task"][task_name] = {
+                "total": len(task_results),
+                "passed": task_passed,
+                "pass_rate": task_passed / max(len(task_results), 1),
+            }
+        # 写入文件
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"\n报告已写入：{output_path}", flush=True)
 
     # 退出码：全部通过 → 0，否则 → 1
     sys.exit(0 if summary["failed"] == 0 and summary["errors"] == 0 else 1)
