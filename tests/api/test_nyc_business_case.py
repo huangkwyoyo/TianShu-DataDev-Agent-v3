@@ -632,3 +632,160 @@ class TestNYCCase02SparkDualChain:
             f"overall_status 应为逻辑一致，"
             f"实际 overall_status={state.overall_status}"
         )
+
+
+# ════════════════════════════════════════════
+# Case 03：停车违章明细宽表（detail_table + LEFT JOIN）
+# ════════════════════════════════════════════
+
+
+@pytest.fixture(scope="module")
+def nyc03_spec_md() -> str:
+    """读取 NYC 停车违章明细宽表 DeveloperSpec。"""
+    spec_path = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "fixtures", "nyc", "nyc_parking_violation_detail.md",
+    )
+    with open(spec_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+@pytest.fixture(scope="module")
+def nyc03_csv_paths() -> dict:
+    """Case 03 需要两张 CSV：事实表 + 维度表。"""
+    base = os.path.join(os.path.dirname(os.path.dirname(__file__)), "fixtures", "nyc")
+    return {
+        "fact_parking_violations_sample": os.path.join(base, "fact_parking_violations_sample.csv"),
+        "dim_violation_type": os.path.join(base, "dim_violation_type.csv"),
+    }
+
+
+class TestNYCCase03SqlPipeline:
+    """NYC 案例 03——detail_table + LEFT JOIN SQL 管线全链路验证。"""
+
+    def test_spec_parses_with_left_join(self, nyc03_spec_md):
+        """detail_table + LEFT JOIN 解析零错误。"""
+        from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
+
+        parser = DeveloperSpecParser()
+        spec = parser.parse(nyc03_spec_md)
+
+        blocking = [q for q in spec.open_questions if q.blocking]
+        assert len(blocking) == 0, (
+            f"Case 03 spec 解析存在阻塞: {[q.description for q in blocking]}"
+        )
+
+        # 两表 LEFT JOIN
+        assert len(spec.input_tables) == 2
+        assert spec.joins is not None
+        assert len(spec.joins) == 1
+        assert spec.joins[0].join_type.value == "LEFT"
+
+    def test_run_all_completes_all_stages(self, nyc03_spec_md, nyc03_csv_paths):
+        """detail_table + LEFT JOIN Pipeline.run_all() 全阶段通过。"""
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc03_spec_md, table_paths=nyc03_csv_paths)
+
+        assert result["validation_passed"] is True
+        stages = result.get("pipeline_stages", [])
+        failed = [s for s in stages if s["status"] == "failed"]
+        assert len(failed) == 0, (
+            f"存在失败阶段: {[(s['stage'], s.get('error_message', '')) for s in failed]}"
+        )
+
+    def test_left_join_preserves_all_fact_rows(self, nyc03_spec_md, nyc03_csv_paths):
+        """LEFT JOIN 不丢失事实表行——输出行数 = min(输入行数, LIMIT)。"""
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc03_spec_md, table_paths=nyc03_csv_paths)
+
+        trace = result.get("execution_trace", {})
+        assert trace.get("status") == "RUNTIME_PASS"
+        assert trace["row_count"] == 3000, (
+            f"LIMIT 3000 应输出 3000 行，实际={trace['row_count']}"
+        )
+
+    def test_violation_description_is_populated(self, nyc03_spec_md, nyc03_csv_paths):
+        """LEFT JOIN 后 violation_description 应全部有值——所有 violation_code 均匹配字典。"""
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc03_spec_md, table_paths=nyc03_csv_paths)
+
+        null_counts = result["result_summary"]["null_counts"]
+        assert null_counts.get("violation_description", 0) == 0, (
+            "LEFT JOIN 后 violation_description 不应有 NULL——"
+            "所有抽样 violation_code 均应匹配字典"
+        )
+
+    def test_output_columns_match_spec(self, nyc03_spec_md, nyc03_csv_paths):
+        """输出列符合 DevSpec 声明。"""
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc03_spec_md, table_paths=nyc03_csv_paths)
+
+        columns = set(result["result_summary"]["columns"])
+        expected = {"summons_number", "violation_description", "plate_id",
+                    "registration_state", "is_duplicate_summons"}
+        assert columns == expected, (
+            f"输出列: {columns} != {expected}"
+        )
+
+
+class TestNYCCase03ContractExtraction:
+    """NYC 案例 03——detail_table + LEFT JOIN 的 Contract 提取。"""
+
+    def test_contract_is_extracted(self, nyc03_spec_md, nyc03_csv_paths):
+        """detail_table 也能导出 DataTransformContract。"""
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc03_spec_md, table_paths=nyc03_csv_paths)
+        bundle = pipeline.export_artifacts(result["request_id"])
+        assert bundle is not None
+        assert bundle.data_transform_contract is not None
+
+    def test_contract_is_deterministic(self, nyc03_spec_md, nyc03_csv_paths):
+        """相同 detail_table spec → 相同 contract hash。"""
+        pipeline1 = Pipeline()
+        result1 = pipeline1.run_all(nyc03_spec_md, table_paths=nyc03_csv_paths)
+        bundle1 = pipeline1.export_artifacts(result1["request_id"])
+
+        pipeline2 = Pipeline()
+        result2 = pipeline2.run_all(nyc03_spec_md, table_paths=nyc03_csv_paths)
+        bundle2 = pipeline2.export_artifacts(result2["request_id"])
+
+        c1, c2 = bundle1.data_transform_contract, bundle2.data_transform_contract
+        if isinstance(c1, DataTransformContractV1):
+            h1 = DataTransformContractV1.compute_contract_hash(c1)
+            h2 = DataTransformContractV1.compute_contract_hash(c2)
+        else:
+            h1 = DataTransformContractLite.compute_contract_hash(c1)
+            h2 = DataTransformContractLite.compute_contract_hash(c2)
+        assert h1 == h2, f"相同 spec → 相同 contract hash: {h1} != {h2}"
+
+
+class TestNYCCase03SparkDualChain:
+    """NYC 案例 03——detail_table Spark 双管线逻辑验证。"""
+
+    def test_spark_orchestrator_logic_equivalence(
+        self, nyc03_spec_md, nyc03_csv_paths,
+    ):
+        """detail_table + LEFT JOIN Spark Orchestrator 逻辑等价。"""
+        pytest.importorskip("pyspark", reason="PySpark 环境不可用")
+
+        from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+        from tianshu_datadev.spark.orchestrator import SparkOrchestrator
+        from tianshu_datadev.spark.plan_comparator import ComparisonStatus
+
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc03_spec_md, table_paths=nyc03_csv_paths)
+        bundle = pipeline.export_artifacts(result["request_id"])
+
+        contract_v1 = adapt_lite_to_v1(bundle.data_transform_contract)
+        orchestrator = SparkOrchestrator()
+        state = orchestrator.run(
+            contract=contract_v1, sql_plan=bundle.sql_build_plan,
+        )
+
+        assert state.comparator_report is not None
+        assert state.comparator_report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+            f"Case 03 应为 LOGIC_EQUIVALENT，实际={state.comparator_report.status}"
+        )
+        assert state.overall_status.value in {
+            "LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED", "ALL_CONSISTENT",
+        }
