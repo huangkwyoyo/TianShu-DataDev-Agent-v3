@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from tianshu_datadev.llm.adapters.base import ProviderAdapter
     from tianshu_datadev.planning.relationship_hypothesis import RelationshipHypothesis
     from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan
+    from tianshu_datadev.spark.snapshot import SnapshotBuilder, SnapshotManifest, SnapshotSourceProvider
     from tianshu_datadev.sql.models import CompiledSql, ExecutionTrace, ResultSummary
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,8 @@ class PipelineArtifactBundle(StrictModel):
     compiled_sql: CompiledSql | None = None
     execution_trace: ExecutionTrace | None = None
     result_summary: ResultSummary | None = None
+    # ── Phase 9B-P0: Snapshot 集成 ──
+    snapshot_manifest: SnapshotManifest | None = None
 
 
 class Pipeline:
@@ -149,6 +152,9 @@ class Pipeline:
         self,
         base_output_dir: str = "generated/review_packages",
         adapter: ProviderAdapter | None = None,
+        # ── Phase 9B-P0: Snapshot 集成（可选）──
+        snapshot_builder: SnapshotBuilder | None = None,
+        snapshot_provider: SnapshotSourceProvider | None = None,
     ):
         """初始化流水线。
 
@@ -165,6 +171,9 @@ class Pipeline:
         # adapter=None 时退化为纯规则/显式声明模式（确定性）
         self._relationship_planner = RelationshipPlanner(adapter=adapter)
         self._spec_enricher = SpecEnricher(adapter=adapter)
+        # ── Phase 9B-P0: Snapshot 集成（可选）──
+        self._snapshot_builder = snapshot_builder
+        self._snapshot_provider = snapshot_provider
 
     # ── 缓存生命周期管理 ──────────────────────────────
 
@@ -1944,5 +1953,6 @@ from tianshu_datadev.artifacts.models import (  # noqa: E402
     DataTransformContractLite,
     DataTransformContractV1,
 )
+from tianshu_datadev.spark.snapshot import SnapshotManifest  # noqa: E402
 
 PipelineArtifactBundle.model_rebuild()
