@@ -213,7 +213,7 @@ spec:
             then: "高风险"
           - when: "crash_per_million_trips < 300 AND violation_per_thousand_trips < 5"
             then: "低风险"
-        else_label: "中风险"
+        else_value: "中风险"
 
   output_columns:
     - name: borough

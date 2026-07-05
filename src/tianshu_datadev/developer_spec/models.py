@@ -507,16 +507,23 @@ class OutputSpecDecl(StrictModel):
 class CaseWhenBranchDecl(StrictModel):
     """CASE WHEN 分支声明——合并步骤中单条 WHEN-THEN 规则。
 
-    用于 ComputeStep.case_when 中描述条件选择逻辑：
-    WHEN condition_column condition_operator condition_value THEN result_column
-
-    result_column 引用上游分支步骤的指标 alias（如 "vip_amount"）。
+    支持两种模式（根据字段存在性自动选择）：
+    1. 字符串模式（when/then）——用于复杂布尔表达式，如 risk_label
+       WHEN crash_per_million_trips >= 800 OR violation_per_thousand_trips >= 15 THEN '高风险'
+       when 直接写入 SQL WHEN 子句——通过 Compiler SqlRawExpression 校验
+    2. 类型化模式（condition_column/condition_operator/condition_value/result_column）——
+       用于简单单列比较，如 WHEN status = 'VIP' THEN vip_amount
     """
 
-    condition_column: str  # 条件列名（必须在 _temp 表中存在）
-    condition_operator: str  # "=" | "!=" | ">" | "<" | ">=" | "<=" | "IN"
-    condition_value: str  # 条件值（如 "VIP"）
-    result_column: str  # THEN 取值——引用上游步骤的指标 alias
+    # ── 字符串模式（复杂布尔条件）──
+    when: str | None = None  # 条件表达式字符串（如 "a >= 800 OR b >= 15"）
+    then: str | None = None  # 结果标签字符串（如 "高风险"）
+
+    # ── 类型化模式（简单单列比较）──
+    condition_column: str | None = None  # 条件列名（必须在 _temp 表中存在）
+    condition_operator: str | None = None  # "=" | "!=" | ">" | "<" | ">=" | "<=" | "IN"
+    condition_value: str | None = None  # 条件值（如 "VIP"）
+    result_column: str | None = None  # THEN 取值——引用上游步骤的指标 alias
 
 
 class CaseWhenDecl(StrictModel):
@@ -534,6 +541,18 @@ class CaseWhenDecl(StrictModel):
 # ════════════════════════════════════════════
 # 分步计算声明（Phase 5+ Spec Schema 扩展）
 # ════════════════════════════════════════════
+
+
+class ComputeStepExpression(StrictModel):
+    """compute_step 中的派生表达式——如 crash_per_million_trips = total_crashes * 1e6 / total_trip_count。
+
+    表达式字符串通过 Compiler SqlRawExpression 安全校验后直接渲染到 SELECT 子句，
+    避免在 Builder 中构建表达式 AST。
+    """
+
+    name: str  # 输出列名（如 crash_per_million_trips）
+    expression: str  # 算术表达式字符串（如 "total_crashes * 1000000.0 / NULLIF(total_trip_count, 0)"）
+    type: str = "double"  # 输出列类型
 
 
 class ComputeStep(StrictModel):
@@ -556,6 +575,8 @@ class ComputeStep(StrictModel):
     source: str | list[str] = "input"  # "input" / step_name / [step_a, step_b]——数据来源
     group_by: list[str] = []  # GROUP BY 列名列表
     metrics: list[MetricDecl] = []  # 此步骤的聚合指标（复用已有模型）
+    # ── Phase 6/7 新增字段 ──
+    expressions: list[ComputeStepExpression] = []  # 派生表达式——用于 compute_ratios 等比率计算步骤
     output_alias: str = ""  # 产出别名——Builder 据此命名 _temp 表（如 "_temp_<alias>"）
     # ── Phase 6 新增字段 ──
     case_when: CaseWhenDecl | None = None  # 合并步骤的 CASE WHEN 逻辑——仅合流步骤（source 为列表）有效
