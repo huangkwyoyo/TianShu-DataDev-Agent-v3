@@ -96,8 +96,8 @@ export default function App() {
     }
   };
 
-  /** 清除错误和流水线阶段状态 */
-  const clearError = () => update({ error: null, pipelineError: null, pipelineStages: [] });
+  /** 清除错误状态——保留 pipelineStages 以便指示灯持续可见 */
+  const clearError = () => update({ error: null, pipelineError: null });
 
   /** 通用 API 调用包装——支持同步和异步回调。
    *  自动从响应中提取 pipeline_error / pipeline_stages 用于阶段指示灯。 */
@@ -115,9 +115,9 @@ export default function App() {
       const partial = await onSuccess(result);
       update({
         isLoading: false,
-        ...partial,
         pipelineError: plError,
         pipelineStages: plStages,
+        ...partial,
       });
     } catch (err) {
       const apiErr: ApiError =
@@ -217,6 +217,17 @@ export default function App() {
             packageResult: pkg,
             requestId: result.request_id,
             activePanel: 'package' as Panel,
+            // SQL 管线成功——设置全部 8 阶段为 ok，使指示灯在成功后仍然可见
+            pipelineStages: [
+              { stage: 'parser', status: 'ok' },
+              { stage: 'enrich', status: 'ok' },
+              { stage: 'build', status: 'ok' },
+              { stage: 'validate', status: 'ok' },
+              { stage: 'compile', status: 'ok' },
+              { stage: 'execute', status: 'ok' },
+              { stage: 'contract', status: 'ok' },
+              { stage: 'package', status: 'ok' },
+            ],
           };
         } catch {
           return {
