@@ -14,25 +14,56 @@ export const TEMPLATE_NAMES = {
 } as const;
 
 /**
- * 有效手工 Spec——引用 test_fact 表，确保在测试数据库中可执行
- * 对应后端 tests/fixtures/sql/test_fact.csv
+ * 有效手工 Spec——引用 test_fact 表，使用 Parser 所需的 fenced code block 格式。
+ * 注意：E2E 环境中未配置 table_paths，Run-All 会在 execute 阶段因 DuckDB 找不到
+ * test_fact 表而返回 pipeline_error，但 request_id 仍被正确设置。
  */
-export const MANUAL_SUMMARY_SPEC = `
-# 用户行为汇总表
-## 数据源
-- test_fact
-## 输出
-- 汇总表：每日用户行为汇总，按日期和事件类型分组，计数去重用户
-`;
+export const MANUAL_SUMMARY_SPEC = '```markdown\n' +
+'---\n' +
+'spec:\n' +
+'  type: aggregate_table\n' +
+'  target_table: test.aggregated\n' +
+'  target_grain: [stat_date]\n' +
+'  summary: "手工 Spec——按日期分组计数"\n' +
+'  source_tables:\n' +
+'    - name: test_fact\n' +
+'      alias: tf\n' +
+'      row_count: ~10万\n' +
+'      role: fact\n' +
+'      time_field: event_time\n' +
+'      key_columns:\n' +
+'        - name: id\n' +
+'          type: bigint\n' +
+'          nullable: false\n' +
+'      business_columns:\n' +
+'        - name: event_time\n' +
+'          type: timestamp\n' +
+'          nullable: false\n' +
+'  metrics:\n' +
+'    - metric_name: cnt\n' +
+'      aggregation: COUNT\n' +
+'      input_column: id\n' +
+'      alias: cnt\n' +
+'  dimensions:\n' +
+'    - dimension_name: stat_date\n' +
+'      column_ref: stat_date\n' +
+'  output_columns:\n' +
+'    - name: stat_date\n' +
+'      type: date\n' +
+'    - name: cnt\n' +
+'      type: bigint\n' +
+'---\n' +
+'# 用户行为汇总表\n' +
+'## 业务目标\n' +
+'测试手工 Spec——按日期统计事件数。\n' +
+'```\n';
 
 /**
- * 无效 Spec——引用不存在的数据源，触发 RUNTIME_FAIL 错误
- * 用于错误展示路径测试
+ * 无效 Spec——不包含 fenced code block，触发 Parser 阶段的 ParseError。
+ * 用于错误展示路径测试（PipelineStageIndicator dot-error 态）。
  */
-export const INVALID_SPEC = `
-# 无效项目书
-## 数据源
-- not_existing_table
-## 输出
-- 明细表：读取不存在的数据源
-`;
+export const INVALID_SPEC = '# 无效项目书\n' +
+'## 数据源\n' +
+'- not_existing_table\n' +
+'## 输出\n' +
+'- 明细表：读取不存在的数据源\n';
