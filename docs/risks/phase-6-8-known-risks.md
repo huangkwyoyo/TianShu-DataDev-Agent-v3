@@ -147,6 +147,47 @@
 
 ---
 
+## Case05-Comparator: 窗口函数 Comparator NOT_COVERED 🟡
+
+- **风险等级**：C（功能缺口——不影响核心平台，仅影响 Case 05 的双链等价判定）
+- **发现时间**：2026-07-05 全局收尾审计
+- **影响范围**：`tests/api/test_nyc_business_case.py::TestNYCCase05SparkDualChain`
+- **问题描述**：
+  - Case 05（INNER JOIN + ROW_NUMBER 窗口函数）的 Spark Comparator 使用**宽松断言**
+  - 断言为 `!= LOGIC_MISMATCH`（排除逻辑矛盾），而非严格的 `== LOGIC_EQUIVALENT`
+  - 接受 `HUMAN_REVIEW_REQUIRED` 作为通过状态
+  - 根因：`PlanComparator` 对 `WindowStep`（ROW_NUMBER）的对比规则尚未实现等价判定
+  - Case 01-04 的断言均为严格 `== LOGIC_EQUIVALENT`——Case 05 是唯一的宽松断言案例
+- **对比证据**（2026-07-05）：
+  - Case 01-04：`assert state.comparator_report.status == ComparisonStatus.LOGIC_EQUIVALENT` ✅
+  - Case 05：`assert state.comparator_report.status != ComparisonStatus.LOGIC_MISMATCH` ⚠️
+  - Case 05：`assert state.overall_status.value in {..., "HUMAN_REVIEW_REQUIRED"}` ⚠️
+- **处置建议**：后续 Phase 实现 WindowStep 的 Comparator 等价判定规则，将 Case 05 升级为严格断言
+- **状态**：🟡 NOT_COVERED——窗口函数 Comparator 规则待完善
+
+---
+
+## Case06-Comparator: 多语句 DAG Spark Comparator 框架就绪 🟡
+
+- **风险等级**：B（验证框架已建立，严格断言因 B 类遗留被 block）
+- **发现时间**：2026-07-05 全局收尾审计
+- **收口时间**：2026-07-05 Phase 10 Case06 Comparator 缺口收口
+- **影响范围**：`tests/api/test_nyc_business_case.py`——已新增 `TestNYCCase06SparkDualChain`
+- **当前状态**：
+  - ✅ `PlanComparator.compare_program()`——SqlProgram 多语句扁平化对比已实现
+  - ✅ `Orchestrator.run()`——接受 `SqlProgram | SqlBuildPlan`，自动分派
+  - ✅ `Pipeline.export_artifacts()`——暴露 `sql_program` 字段
+  - ✅ `TestNYCCase06SparkDualChain`——3 个测试（1 xfail + 2 通过）
+  - ✅ `_flatten_sql_program_steps()`——过滤 `_temp_*` scan，保留语义 step
+  - 🟡 `test_spark_orchestrator_logic_equivalence`——xfail(strict=True)
+  - 🟡 防御性测试通过——Comparator 全链路不崩溃（LOGIC_MISMATCH 为正确诊断信号）
+- **阻塞因素**：
+  - SQL 侧扁平化步骤与 Mapper 产出的 SparkPlan 存在结构不对称——Mapper 从 V1 Contract 独立生成拓扑
+  - 待后续 Phase 引入 plan-level 拓扑对齐后，严格断言可转正
+- **处置建议**：框架已就绪，后续 Phase 重点对齐 SQL/Spark 两侧 plan 拓扑
+
+---
+
 ## 风险矩阵
 
 | 编号 | 等级 | 阻塞骨架验收？ | 阻塞业务集成？ | 处置时机 |
@@ -157,6 +198,8 @@
 | C4 | B-D4 桥接级已点亮 | 否 | 否 | D4 桥接级已点亮——完整 SQL Pipeline 生产级验证待后续 Phase |
 | R3 | 已消除 | — | — | 2026-07-04 已修复 |
 | R4 | 已消除 | — | — | — |
+| Case05-Comp | C | 否 | 否 | 窗口函数 Comparator NOT_COVERED——待后续 Phase 升级为严格断言 |
+| Case06-Comp | B | 否 | 否 | 多语句 DAG Spark Comparator 缺失——待 Case 06 B 类收口后补齐 |
 | 9A1 | B-低风险 | 否 | 否 | 2026-07-05 已完成——PipelineArtifactBundle + export_artifacts() 就绪 |
 | 9A2 | B-低风险 | 否 | 否 | 2026-07-05 已完成——桥接函数标记 deprecated + 真实 SqlBuildPlan 驱动 COMPARATOR |
 | 9A3 | B-低风险 | 否 | 否 | 2026-07-05 已完成——Lite→V1 适配层 + Harness 自动驱动器 |
@@ -237,7 +280,7 @@
   - **不代表**：生产上线批准、业务逻辑正确性验证、性能 SLA 承诺、安全合规认证
 - **残留风险**：
   - R7：真实业务样本缺失——9A4 阻塞于业务方，当前所有测试使用手工构造样本
-  - R8：LLM 生产环境持续验证未配置——Fake Adapter 覆盖全部 pytest
+  - ~~R8：LLM 生产环境持续验证~~——2026-07-05 已消除，8/8 真实 LLM 验证通过，`llm_reports/verify_20260705.json`
   - R10：Snapshot Builder 未集成到 REVIEW_READY 流程——Snapshot Builder 有独立可调用接口但 `Pipeline.run_all()` 未调用
 - **下一轮行动**：Phase 9A 全部子阶段（9A1-9A3 + 9A5）已完成，9A4 继续阻塞于业务方。可进入 Phase 9B 或更高级别的集成验证
 - **状态**：✅ 已完成——REVIEW_READY 审查级闭环就绪
@@ -304,38 +347,21 @@
 - **状态**：✅ 已完成——9A1 中间产物导出就绪
 
 ---
-## R8 消除验证 ✅ 2026-07-05
+## R8 真实 LLM 生产环境验证 ✅ 已消除
 
-- **风险等级**：C（配置级——非开发密集型）
-- **完成时间**：2026-07-05
-- **影响范围**：
-  - `scripts/real_llm_regression.py`——添加 `TIANSHU_RUN_REAL_LLM=1` 安全门禁 + `--output` Harness 兼容报告
-  - `.env.example`——新建密钥配置模板（不含真实密钥）
-  - `docs/current-state-and-verification-status.md`——R8 标记为已消除
-- **产出**：
-  - 真实 LLM 验证链路就绪：`TIANSHU_RUN_REAL_LLM=1 python scripts/real_llm_regression.py`
-  - 覆盖 4 个 task（developer_spec_parser / relationship_planner / sql_build_planner / sql_program_planner）× 8+ 用例
-  - 验证最小链路：Prompt 模板 → AnthropicAdapter.invoke() → 原始 JSON → Gateway._validate_against_schema() → validation_status
-  - 结果输出为 Harness 兼容 JSON 报告（含 provider / model / per-task 通过率 / token 用量 / 失败详情）
-- **安全边界**：
-  - ✅ API key 仅从环境变量 `DEEPSEEK_API_KEY` 或 `ANTHROPIC_API_KEY` 读取——不存在于代码中
-  - ✅ `.env.example` 仅含占位符——不含真实密钥
-  - ✅ 默认 pytest 继续使用 `FakeLLMAdapter`——不受 `TIANSHU_RUN_REAL_LLM` 影响
-  - ✅ 真实 LLM 输出必经 `LLMGateway._validate_against_schema()` Schema 校验——不可绕过
-  - ✅ 真实 LLM 调用必须有 `TIANSHU_RUN_REAL_LLM=1`——不设则脚本拒绝执行
-  - ✅ `llm_reports/` 加入 `.gitignore`——真实 LLM 输出不进入版本控制
-- **不可碰边界守住了**：
-  - ✅ 未修改 `src/tianshu_datadev/llm/` 任何代码
-  - ✅ 未修改 `tests/` 任何测试代码
-  - ✅ 未修改 SQL/Spark Pipeline 业务语义
-  - ✅ 未将 API key 写入代码、日志或文档
-  - ✅ 未让 FakeAdapter 结果冒充真实 LLM 验证
-- **如何使用（非技术人员版）**：
-  1. 从 DeepSeek 平台获取 API key：https://platform.deepseek.com/api_keys
-  2. 复制 `.env.example` 为 `.env`，将 `sk-your-deepseek-api-key-here` 替换为真实 key
-  3. 运行：`TIANSHU_RUN_REAL_LLM=1 python scripts/real_llm_regression.py`
-  4. 脚本会调用真实 DeepSeek API，验证 4 个 Prompt 模板的结构化输出约束力
-  5. 结果输出到终端——如果全部通过（PASS），说明 LLM 能正确产出符合 Schema 的 JSON
-  6. 这不是自动测试——是手动触发的验证命令，需要你每次明确设置 `TIANSHU_RUN_REAL_LLM=1`
-- **残留风险**：无——R8 已消除
-- **状态**：✅ 已消除
+- **风险等级**：已消除（2026-07-05 真实验证完成）
+- **完成时间**：2026-07-05（脚本就绪 + 真实验证通过）
+- **验证证据**：
+  - **执行命令**：`TIANSHU_RUN_REAL_LLM=1 python scripts/real_llm_regression.py --output llm_reports/verify_20260705.json`
+  - **结果**：8/8 全部 PASS，0 FAIL，0 ERROR，100% pass rate
+  - **Provider**：Anthropic 兼容端点（api.deepseek.com），Model：deepseek-v4-pro
+  - **Token**：31,517 total | **耗时**：269.7s（4 tasks × 2 cases each）
+  - **报告**：`llm_reports/verify_20260705.json`——已脱敏，仅含 provider/model/pass_rate/token/latency，不含 API key
+  - **覆盖**：developer_spec_parser (2/2) / relationship_planner (2/2) / sql_build_planner (2/2) / sql_program_planner (2/2)
+- **安全边界已验证**：
+  - ✅ API key 仅从 `.env` 文件经 `load_dotenv()` 加载——不存在于代码中
+  - ✅ 真实 LLM 输出经 `LLMGateway._validate_against_schema()` Schema 校验——不可绕过
+  - ✅ `TIANSHU_RUN_REAL_LLM=1` 门禁正常——不设则脚本拒绝执行
+  - ✅ `llm_reports/` 已在 `.gitignore`——真实 LLM 输出不进入版本控制
+  - ✅ JSON 报告不含 API key——仅含 provider/model/pass_rate/token/latency
+- **状态**：✅ 已消除——真实 LLM 生产环境验证完成，R8 风险消除

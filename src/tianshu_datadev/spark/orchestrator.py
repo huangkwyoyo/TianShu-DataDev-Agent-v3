@@ -25,6 +25,7 @@ from tianshu_datadev.developer_spec.models import StrictModel
 if TYPE_CHECKING:
     from tianshu_datadev.artifacts.models import DataTransformContractV1
     from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan
+    from tianshu_datadev.planning.sql_program import SqlProgram
     from tianshu_datadev.spark.plan_comparator import PlanComparisonReport
 
 # ════════════════════════════════════════════
@@ -227,7 +228,7 @@ class SparkOrchestrator:
         self,
         contract_hash: str = "",
         contract: "DataTransformContractV1 | None" = None,
-        sql_plan: "SqlBuildPlan | None" = None,
+        sql_plan: "SqlBuildPlan | SqlProgram | None" = None,
         stage_failures: dict[str, str] | None = None,
         retry_count: int = 0,
     ) -> SparkPipelineState:
@@ -240,8 +241,9 @@ class SparkOrchestrator:
         Args:
             contract_hash: 来源 Contract 的 hash 值（测试注入模式必填）
             contract: DataTransformContractV1 实例（真实执行模式必填）
-            sql_plan: SqlBuildPlan 实例（可选）。
-                      提供时 COMPARATOR 阶段使用 sql_plan + spark_plan 执行真实逻辑对比。
+            sql_plan: SqlBuildPlan 或 SqlProgram 实例（可选）。
+                      提供 SqlProgram 时 COMPARATOR 使用 compare_program() 执行多语句 DAG 对比。
+                      提供 SqlBuildPlan 时 COMPARATOR 使用 compare() 执行单 Plan 对比。
                       不提供时 COMPARATOR 标记 SKIPPED。
             stage_failures: 阶段失败注入（测试用）——key 为阶段名，value 为错误信息。
                             None 时走真实执行或默认成功。
@@ -427,13 +429,26 @@ class SparkOrchestrator:
             state.errors.append(f"[VALIDATOR] 校验异常：{e}")
 
     def _run_comparator(self, stage: SparkPipelineStage, state: SparkPipelineState) -> None:
-        """执行 COMPARATOR 阶段——SQL ↔ Spark 逻辑对比（需 SqlBuildPlan + SparkPlan）。"""
+        """执行 COMPARATOR 阶段——SQL ↔ Spark 逻辑对比（需 SqlBuildPlan/SqlProgram + SparkPlan）。
+
+        根据 sql_plan 类型自动分发：
+        - SqlProgram → compare_program()（多语句 DAG 扁平化对比）
+        - SqlBuildPlan → compare()（单 Plan 对比，向后兼容）
+        """
         if self._cached_sql_plan is not None and self._cached_plan is not None:
             try:
+                from tianshu_datadev.planning.sql_program import SqlProgram
                 from tianshu_datadev.spark.plan_comparator import PlanComparator
 
                 comparator = PlanComparator()
-                report = comparator.compare(self._cached_sql_plan, self._cached_plan)
+                if isinstance(self._cached_sql_plan, SqlProgram):
+                    report = comparator.compare_program(
+                        self._cached_sql_plan, self._cached_plan,
+                    )
+                else:
+                    report = comparator.compare(
+                        self._cached_sql_plan, self._cached_plan,
+                    )
                 state.record_stage_result(stage, "SUCCESS")
                 state.comparator_report = report  # 存储报告供后续 Review Package 使用
             except Exception as e:
@@ -443,7 +458,7 @@ class SparkOrchestrator:
             state.record_stage_result(stage, "SKIPPED")
             missing = []
             if self._cached_sql_plan is None:
-                missing.append("SqlBuildPlan")
+                missing.append("SqlBuildPlan/SqlProgram")
             if self._cached_plan is None:
                 missing.append("SparkPlan")
             state.errors.append(

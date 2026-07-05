@@ -30,6 +30,7 @@ from tianshu_datadev.planning.program_factory import (
 from tianshu_datadev.planning.relationship_planner import RelationshipPlanner
 from tianshu_datadev.planning.spec_enricher import SpecEnricher
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan, SqlBuildPlanBuilder
+from tianshu_datadev.planning.sql_program import SqlProgram
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
 from tianshu_datadev.sql.executor import DuckDBExecutor
 from tianshu_datadev.sql.models import (
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
     from tianshu_datadev.llm.adapters.base import ProviderAdapter
     from tianshu_datadev.planning.relationship_hypothesis import RelationshipHypothesis
     from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan
+    from tianshu_datadev.planning.sql_program import SqlProgram
     from tianshu_datadev.spark.snapshot import SnapshotBuilder, SnapshotManifest, SnapshotSourceProvider
     from tianshu_datadev.sql.models import CompiledSql, ExecutionTrace, ResultSummary
 
@@ -132,6 +134,8 @@ class PipelineArtifactBundle(StrictModel):
     result_summary: ResultSummary | None = None
     # ── Phase 9B-P0: Snapshot 集成 ──
     snapshot_manifest: SnapshotManifest | None = None
+    # ── Phase 10: Case06 SqlProgram 多语句 DAG ──
+    sql_program: SqlProgram | None = None
 
 
 class Pipeline:
@@ -1077,6 +1081,10 @@ class Pipeline:
                     if program_result and program_result.results else None
                 )
 
+                # ── Contract 提取（执行状态检查之前——contract 不依赖执行结果）──
+                extractor = DataTransformContractExtractor()
+                contract = extractor.extract_v1(sql_program)
+
                 # ── 执行状态检查——RUNTIME_FAIL 阻断 ──
                 if execution_trace is not None \
                         and isinstance(execution_trace.status, ExecutionStatus) \
@@ -1087,6 +1095,8 @@ class Pipeline:
                         "manifest": manifest,
                         "plan": plan,
                         "compiled": program_artifact,
+                        "contract": contract,
+                        "sql_program": sql_program,
                         "trace": execution_trace,
                         "summary": execution_summary,
                         "table_mapping": table_mapping or {},
@@ -1114,8 +1124,6 @@ class Pipeline:
                     }
 
                 stage = "contract"
-                extractor = DataTransformContractExtractor()
-                contract = extractor.extract_v1(sql_program)
 
                 # ── Phase 9B-P0: Snapshot 阶段（可选——仅当注入 SnapshotBuilder + Provider 时执行）──
                 # 必须在 contract 提取之后——依赖 contract 的 hash
@@ -1201,6 +1209,7 @@ class Pipeline:
                     "contract": contract,
                     "plan": plan,
                     "parsed_spec": spec,
+                    "sql_program": sql_program,             # SqlProgram 实例——供 Spark Comparator 多语句对比
                     "manifest": manifest,
                     "table_mapping": table_mapping or {},
                     # ── Phase 9B-P0 ──
@@ -1633,7 +1642,11 @@ class Pipeline:
         contract = data.get("contract")
 
         # 提取 compiled——execute/run_all 单表路径存储为 "compiled"
+        # 防御：ComputeSteps 失败路径存储 SqlProgramArtifact 而非 CompiledSql，
+        # 此处仅当类型匹配时才传递，否则置 None
         compiled = data.get("compiled")
+        if compiled is not None and not isinstance(compiled, CompiledSql):
+            compiled = None
 
         # ── Phase 9B-P0: 提取 snapshot_manifest ──
         snapshot_manifest = data.get("snapshot_manifest")
@@ -1648,6 +1661,8 @@ class Pipeline:
             result_summary=data.get("summary"),
             # ── Phase 9B-P0 ──
             snapshot_manifest=snapshot_manifest,
+            # ── Phase 10: Case06 SqlProgram 多语句 DAG ──
+            sql_program=data.get("sql_program"),
         )
 
     # ── Phase 4.5B 前端 SPA 专用方法 ──────────────────────

@@ -1161,16 +1161,16 @@ class DeveloperSpecParser:
             )
 
         exprs: list[ComputeStepExpression] = []
-        for ei, re in enumerate(raw_exprs):
-            if not isinstance(re, dict):
+        for ei, raw_expr in enumerate(raw_exprs):
+            if not isinstance(raw_expr, dict):
                 raise ParseError(
                     ParseErrorCode.E001_YAML_PARSE_FAILED,
                     f"compute_step '{step_name}' 的 expressions[{ei}] 必须是字典",
                 )
             exprs.append(ComputeStepExpression(
-                name=re.get("name", ""),
-                expression=re.get("expression", ""),
-                type=re.get("type", "double"),
+                name=raw_expr.get("name", ""),
+                expression=raw_expr.get("expression", ""),
+                type=raw_expr.get("type", "double"),
             ))
         return exprs
 

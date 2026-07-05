@@ -819,3 +819,165 @@ class TestOrchestratorSkeletonE2E:
         finally:
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ════════════════════════════════════════════
+# Phase 10 Case06——Orchestrator SqlProgram 集成测试
+# ════════════════════════════════════════════
+
+
+class TestOrchestratorSqlProgramIntegration:
+    """Orchestrator 接受 SqlProgram 作为 Comparator 输入——多语句 DAG 对比。"""
+
+    def test_comparator_with_sql_program_uses_compare_program(self):
+        """注入 SqlProgram → _run_comparator 分派到 compare_program() → SUCCESS。"""
+        from tianshu_datadev.planning.models import (
+            AliasExpr,
+            ColumnRef,
+            Predicate,
+            PredicateOperator,
+        )
+        from tianshu_datadev.planning.sql_build_plan import (
+            FilterStep,
+            ProjectStep,
+            ScanStep,
+            SqlBuildPlan,
+        )
+        from tianshu_datadev.planning.sql_program import (
+            SqlProgram,
+            SqlStatement,
+            StatementKind,
+        )
+        from tianshu_datadev.spark.models import (
+            SparkFilterStep,
+            SparkPlan,
+            SparkProjectColumn,
+            SparkProjectStep,
+            SparkReadStep,
+        )
+
+        orchestrator = SparkOrchestrator()
+        state = SparkPipelineState(contract_hash="test_sqlprogram_hash")
+
+        # 构造最小 SqlProgram（单语句——STANDALONE，scan + filter + project）
+        sql_plan = SqlBuildPlan(
+            plan_id="test_prog_plan",
+            spec_hash="test_prog_spec",
+            steps=[
+                ScanStep(
+                    step_type="scan", step_id="scan_t",
+                    table_ref="t",
+                    required_columns=[
+                        ColumnRef(table_ref="t", column_name="id", normalized_name="id"),
+                    ],
+                ),
+                FilterStep(
+                    step_type="filter", step_id="filter_001",
+                    predicate=Predicate(
+                        left=ColumnRef(table_ref="t", column_name="id", normalized_name="id"),
+                        operator=PredicateOperator.GT,
+                        right=ColumnRef(table_ref="t", column_name="threshold", normalized_name="threshold"),
+                    ),
+                ),
+                ProjectStep(
+                    step_type="project", step_id="proj_001",
+                    columns=[
+                        AliasExpr(
+                            expression=ColumnRef(table_ref="t", column_name="id", normalized_name="id"),
+                            alias="id",
+                        ),
+                    ],
+                ),
+            ],
+        )
+        sql_program = SqlProgram(
+            program_id=SqlProgram.generate_program_id("test_prog_spec"),
+            spec_id="test_prog_spec",
+            statements=[
+                SqlStatement(
+                    statement_id="stmt_0",
+                    plan=sql_plan,
+                    kind=StatementKind.STANDALONE,
+                ),
+            ],
+            topological_order=["stmt_0"],
+        )
+
+        # 构造等价 SparkPlan
+        spark_plan = SparkPlan(
+            plan_id="test_spark_prog_plan",
+            version="v1",
+            source_phase="phase-3",
+            source_contract_hash="test_prog_spec",
+            steps=[
+                SparkReadStep(alias="t", source_name="tbl", input_key="tbl_key"),
+                SparkFilterStep(input_alias="t", operator="GT", left="id", right="threshold"),
+                SparkProjectStep(
+                    input_alias="t",
+                    columns=[SparkProjectColumn(column_name="id", alias="id")],
+                ),
+            ],
+        )
+
+        # 注入缓存——SqlProgram 而非 SqlBuildPlan
+        orchestrator._cached_sql_plan = sql_program
+        orchestrator._cached_plan = spark_plan
+
+        # 执行 COMPARATOR
+        orchestrator._run_comparator(SparkPipelineStage.COMPARATOR, state)
+
+        # 验证：不再 SKIPPED
+        assert state.stage_results["COMPARATOR"] == "SUCCESS", (
+            f"预期 SUCCESS，实际 {state.stage_results['COMPARATOR']}，"
+            f"errors={state.errors}"
+        )
+        assert state.comparator_report is not None, (
+            "SqlProgram 路径应产出 comparator_report"
+        )
+        # 逻辑等价——单语句语义与 SparkPlan 一致
+        from tianshu_datadev.spark.plan_comparator import ComparisonStatus
+        assert state.comparator_report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+            f"预期 LOGIC_EQUIVALENT，实际 {state.comparator_report.status}"
+        )
+
+    def test_comparator_with_sql_build_plan_still_works(self):
+        """SqlBuildPlan 路径向后兼容——注入 SqlBuildPlan 而非 SqlProgram → 走 compare()。"""
+        from tianshu_datadev.planning.models import ColumnRef
+        from tianshu_datadev.planning.sql_build_plan import ScanStep, SqlBuildPlan
+        from tianshu_datadev.spark.models import SparkPlan, SparkReadStep
+
+        orchestrator = SparkOrchestrator()
+        state = SparkPipelineState(contract_hash="test_backward_hash")
+
+        # 构造 SqlBuildPlan（非 SqlProgram）——与已有测试一致
+        sql_plan = SqlBuildPlan(
+            plan_id="test_sql_plan_bw",
+            spec_hash="test_spec_bw",
+            steps=[
+                ScanStep(
+                    step_type="scan",
+                    step_id="scan_t",
+                    table_ref="t",
+                    required_columns=[
+                        ColumnRef(table_ref="t", column_name="id", normalized_name="id"),
+                    ],
+                ),
+            ],
+        )
+        spark_plan = SparkPlan(
+            plan_id="test_spark_plan_bw",
+            version="v1",
+            source_phase="phase-3",
+            source_contract_hash="test_spec_bw",
+            steps=[SparkReadStep(alias="t", source_name="tbl", input_key="tbl_key")],
+        )
+
+        orchestrator._cached_sql_plan = sql_plan
+        orchestrator._cached_plan = spark_plan
+
+        orchestrator._run_comparator(SparkPipelineStage.COMPARATOR, state)
+
+        assert state.stage_results["COMPARATOR"] == "SUCCESS"
+        assert state.comparator_report is not None
+        from tianshu_datadev.spark.plan_comparator import ComparisonStatus
+        assert state.comparator_report.status == ComparisonStatus.LOGIC_EQUIVALENT

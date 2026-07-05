@@ -2172,7 +2172,9 @@ class TestNormalizeDagSteps:
         result = PlanComparator._normalize_dag_steps(steps)
         proj_steps = [s for s in result if s.get("step_type") == "project"]
         assert len(proj_steps) == 1, f"预期 1 个 project，实际 {len(proj_steps)}"
-        assert len(proj_steps[0]["columns"]) == 4  # borough 去重后 4 个唯一列（borough/total_crashes/total_injured/total_killed）
+        # borough 去重后 4 个唯一列
+        # (borough/total_crashes/total_injured/total_killed)
+        assert len(proj_steps[0]["columns"]) == 4
 
     def test_preserves_other_types(self):
         """scan/filter/join/case_when 不受归一化影响——原样保留。"""

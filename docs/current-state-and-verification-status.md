@@ -1,6 +1,6 @@
 # 项目当前状态与验证进度 — TianShu DataDev Agent v3
 
-> 文档版本：2026-07-05 | 最后更新：2026-07-05 Case 06 全链路验证完成
+> 文档版本：2026-07-05 | 最后更新：2026-07-05 R8 真实 LLM 验证完成——8/8 通过，100% pass rate，31,517 tokens
 > 本文是项目当前实施状态的**唯一权威文档**。各 Phase 设计文档（docs/00-09、docs/roadmap/）描述的是目标设计，实际建成状态以本文为准。
 
 ## 1. Phase 进度矩阵
@@ -29,10 +29,10 @@
 | 9C-R16 | table_paths 环境配置补齐 | ✅ | ✅ | ✅ | R16 消除，CSV fixture 自动发现，2026-07-05 |
 | 9C-R16b | table_paths 边界硬化 | ✅ | ✅ | ✅ | None/{} 语义区分 + E2E 模式开关，2026-07-05 |
 | 9B-P1 | provenance.yml 显式断言 | ✅ | ✅ | ✅ | snapshot_manifest_hash 测试覆盖矩阵补全，2026-07-05 |
-| 9A4-NYC | 真实业务样本——NYC 案例 01 | ✅ | ✅ | ✅ | SQL 全链路 + Spark 双链，11/11 测试通过，2026-07-05 |
-| 10-Case06 | SqlProgram 多语句 DAG——NYC Case 06 | ✅ | 🟡 | 🟡 | 跨域融合 7 步 DAG，_temp_* 串联，比率计算/CASE WHEN 待后续 Phase |
+| 9A4-NYC | 真实业务样本——NYC 案例 01-05 | ✅ | ✅ | 🟡 | Case 01-04 SQL+Spark 双链 LOGIC_EQUIVALENT，Case 05 Comparator NOT_COVERED（窗口函数），2026-07-05 |
+| 10-Case06 | SqlProgram 多语句 DAG——NYC Case 06 | ✅ | 🟡 | 🟡 | 跨域融合 7 步 DAG，_temp_* 串联，比率计算/CASE WHEN 待后续 Phase，Spark Comparator 框架就绪（3 测试/1 xfail） |
 
-**当前测试基线**：734 passed / 11 skipped / 3 xfailed（api/spark/artifacts 后端子集）+ 23 passed（前端冒烟全量）+ 6 passed / 0 skipped（Playwright E2E），ruff/tsc/build 零告警
+**当前测试基线**：847 passed / 11 skipped / 4 xfailed（api/spark/artifacts/harness 全量后端）+ 23 passed（前端冒烟全量）+ 6 passed / 0 skipped（Playwright E2E），ruff/tsc/build 零告警
 
 ## 2. C1-C4 业务集成验证
 
@@ -51,8 +51,9 @@
 |:----:|------|:----:|------|
 | R5 | ~~桥接函数替代完整 SQL Pipeline~~ | 已消除 | Phase 9A1-9A3 + 9A5 已升级为真实 Pipeline 全链路 |
 | R6 | ~~Harness Runner 为结果聚合器~~ | 已消除 | Phase 9A3 已升级为自动评测驱动器 |
-| R7 | 真实业务样本缺失——NYC 案例 01/06 已接入（Case 06 A 类完成 + B 类遗留），剩余 4/6 个场景待接入 | B | 待业务方提供（9A4 部分完成），Case 06 比率计算/CASE WHEN 待后续 Phase |
-| R8 | ~~LLM 生产环境持续验证未配置~~ | 已消除 | 2026-07-05——`scripts/real_llm_regression.py` + `TIANSHU_RUN_REAL_LLM=1` 门禁就绪 |
+| R7 | 真实业务样本——NYC 案例 01-05 已完成（Case 01-04 LOGIC_EQUIVALENT，Case 05 NOT_COVERED），Case 06 Comparator 框架就绪（SqlProgram 多语句对比 + TestNYCCase06SparkDualChain），严格断言因 plan 拓扑非对称 xfail，剩余 1 个场景待接入 | B | Case 06 比率计算/CASE WHEN + plan 拓扑对齐待后续 Phase |
+| R8 | ~~LLM 生产环境验证~~ | 已消除 | 2026-07-05 真实 LLM 验证 8/8 通过，100% pass rate，31,517 tokens，269.7s，DeepSeek v4-pro，报告：`llm_reports/verify_20260705.json`（已脱敏） |
+| R9 | Case 05 Spark Comparator 窗口函数 NOT_COVERED——仅排除 LOGIC_MISMATCH，未证明等价 | C | 窗口函数（ROW_NUMBER）Comparator 覆盖待完善 |
 | R10 | ~~Snapshot Builder 未集成到 REVIEW_READY 流程~~ | 已消除 | Phase 9B-P0 已将 SnapshotBuilder.build() 接入 Pipeline.run_all()，snapshot hash 写入 provenance.yml |
 | R11 | ~~前端无自动化测试框架~~ | 已消除 | Phase 9B 源码级 + Phase 9C Playwright E2E |
 | R15 | ~~SQL 成功态 pipeline_stages 为空~~ | 已消除 | handleRunAll 成功路径注入全成功阶段——SQL 指示灯始终可见 |
@@ -91,12 +92,17 @@ DeveloperSpec (.md 项目书)
 
 ## 5. 下一步方向（Phase 10+）
 
-1. **真实业务样本端到端验证（9A4）**——NYC 案例 01 已完成（1/6），案例 06 A 类完成 + B 类遗留，剩余 4 个企业场景待接入（阻塞于业务方提供样本）
-2. **生产环境 LLM 验证**——已就绪（R8），`TIANSHU_RUN_REAL_LLM=1 python scripts/real_llm_regression.py --output llm_reports/verify_$(date +%Y%m%d).json`
-3. **Case 06 遗留工作**（C 类→后续 Phase）：
+1. **真实业务样本端到端验证**——NYC 案例 01-05 已完成（Case 01-04 LOGIC_EQUIVALENT，Case 05 NOT_COVERED），Case 06 A 类完成 + B 类遗留
+2. **Case 05 Comparator 升级**——窗口函数（ROW_NUMBER）Comparator 从 NOT_COVERED 升级到严格等价判定
+3. **Case 06 Spark Comparator 接入**——多语句 DAG 从未走双链验证，需补齐
+4. **生产环境 LLM 验证**——R8 脚本就绪，待 API key 配置后执行：`TIANSHU_RUN_REAL_LLM=1 python scripts/real_llm_regression.py --output llm_reports/verify_$(date +%Y%m%d).json`
+5. **Case 06 遗留工作**（C 类→后续 Phase）：
    - `compute_ratios` 步骤的比率计算（crash_per_million_trips = total_crashes / total_trip_count * 1e6）
    - `risk_label` 步骤的 CASE WHEN 输出支持
    - `violation_county` 代码映射的方案通用化（当前硬编码 NYC 5 个代码）
+6. **Case 06 遗留工作**（B 类→需解锁）：
+   - Builder 对多语句 DAG 的 CaseWhenStep 生成支持
+   - 派生表达式（比率计算）的 compute_step 渲染
 
 ## 6. 关键文档索引
 

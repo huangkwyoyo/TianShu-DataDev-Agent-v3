@@ -815,10 +815,6 @@ if __name__ == "__main__":
             "provider": adapter.provider_name(),
             "model": args.model or adapter._model,
             "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-            "environment": {
-                "has_api_key": bool(adapter._api_key),
-                "base_url": adapter._base_url,
-            },
             "summary": {
                 "total": summary["total"],
                 "passed": summary["passed"],
