@@ -17,3 +17,11 @@ Task 8: complete (commits b835848..fc0cca6, 2 xfail→pass + 1 xfail update)
 Task 9: skipped (normalization covered by unit tests + Case06 integration)
 Task 10: complete (commits fc0cca6..c3c6789, docs update)
 Final: 852 passed, 11 skipped, 1 xfailed, 1 xpassed, ruff clean
+## Final Hardening Progress
+Started: 2026-07-05
+Base commit: c3c6789
+Task A1: complete (commits c3c6789..0cb95b9, XPASS 清零——cleanup_status 暴露)
+Task A2: complete (commits c3c6789..0cb95b9, Task 9 豁免登记)
+Task B1: complete (commit dfefcd7, xfail reason 更新——归一化进展)
+Task B2: complete (commit 25e8c96, 文档同步——Final Hardening 状态仪表盘+风险矩阵)
+Final: 853 passed, 11 skipped, 1 xfailed, 0 xpassed, ruff clean
