@@ -303,6 +303,80 @@ class TestPlanComparatorFilterEquivalence:
 
         assert report.status == ComparisonStatus.LOGIC_MISMATCH
 
+    def test_filter_between_equivalent_different_literal_formats(self):
+        """BETWEEN 右值列表表示形式不同但值相同 → LOGIC_EQUIVALENT。
+
+        SQL 侧 right 是 SqlLiteral 对象列表（model_dump 后为 dict 列表），
+        Spark 侧 right 是 Python repr 字符串（Mapper 直传 ContractPredicate.right）。
+        两种形式在语义上等价——Comparator 应归一化后判定为等价。
+        """
+        from tianshu_datadev.planning.models import Predicate, SqlLiteral
+
+        # SQL 侧：BETWEEN 右值为 SqlLiteral 对象列表
+        sql_predicate = Predicate(
+            left=ColumnRef(
+                table_ref="ft",
+                column_name="pickup_date_key",
+                normalized_name="pickup_date_key",
+            ),
+            operator=PredicateOperator.BETWEEN,
+            right=[
+                SqlLiteral(value="20260101", is_sql_expr=False),
+                SqlLiteral(value="20260331", is_sql_expr=False),
+            ],
+        )
+        sql_filter = FilterStep(
+            step_type="filter",
+            step_id="step_filter_between",
+            predicate=sql_predicate,
+        )
+
+        # Spark 侧：BETWEEN 右值为 Python repr 字符串（模拟 Mapper 产出）
+        spark_filter = SparkFilterStep(
+            step_type=SparkStepType.FILTER,
+            input_alias="ft",
+            operator="BETWEEN",
+            left="ft.pickup_date_key",
+            right="[SqlLiteral(value='20260101', is_sql_expr=False),"
+                  " SqlLiteral(value='20260331', is_sql_expr=False)]",
+        )
+
+        sql_plan = _make_sql_plan([
+            ScanStep(
+                step_type="scan",
+                step_id="scan_ft",
+                table_ref="ft",
+                required_columns=[
+                    ColumnRef(
+                        table_ref="ft",
+                        column_name="pickup_date_key",
+                        normalized_name="pickup_date_key",
+                    ),
+                ],
+            ),
+            sql_filter,
+        ])
+        spark_plan = _make_spark_plan([
+            SparkReadStep(
+                step_type=SparkStepType.READ,
+                alias="ft",
+                source_name="fact_trips",
+                input_key="fact_trips_key",
+            ),
+            spark_filter,
+        ])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        # 关键断言：BETWEEN 右值只是表示形式不同（dict vs SqlLiteral repr），
+        # 值相同 → 应判定为 LOGIC_EQUIVALENT
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+            f"BETWEEN 右值不同表示形式应归一化后等价，"
+            f"实际 status={report.status}，"
+            f"filter_result={[(r.step_type, r.verdict.value, r.detail[:100]) for r in report.step_results]}"
+        )
+
 
 class TestPlanComparatorProjectEquivalence:
     """Project 逻辑等价性对比。"""

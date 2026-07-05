@@ -142,6 +142,57 @@ class TestSparkPipelineState:
         state.derive_overall_status()
         assert state.overall_status == SparkPipelineStatus.LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED
 
+    def test_derive_overall_status_checks_comparator_report_not_just_stage_result(self):
+        """COMPARATOR stage_result=SUCCESS 但 comparator_report.status=LOGIC_MISMATCH
+        时，overall_status 不得显示为逻辑一致。
+
+        这是对 RC2 的回归测试——derive_overall_status() 不能仅检查
+        stage_results["COMPARATOR"] == "SUCCESS"，
+        必须同时验证 comparator_report.status 是否为 LOGIC_EQUIVALENT。
+        """
+        from tianshu_datadev.spark.plan_comparator import (
+            ComparisonStatus,
+            PlanComparisonReport,
+        )
+
+        state = SparkPipelineState(contract_hash="test_hash")
+        # 模拟所有逻辑阶段 SUCCESS（包括 COMPARATOR）
+        for stage in [
+            SparkPipelineStage.MAPPER,
+            SparkPipelineStage.DEVELOPER,
+            SparkPipelineStage.COMPILER,
+            SparkPipelineStage.VALIDATOR,
+            SparkPipelineStage.COMPARATOR,
+        ]:
+            state.record_stage_result(stage, "SUCCESS")
+        # PHYSICAL_VERIFIER 未执行
+        state.record_stage_result(SparkPipelineStage.PHYSICAL_VERIFIER, "NOT_EXECUTED")
+
+        # 注入 comparator_report——status 为 LOGIC_MISMATCH
+        state.comparator_report = PlanComparisonReport(
+            report_id="test_report_mismatch",
+            contract_hash="test_hash",
+            sql_plan_hash="abc123",
+            spark_plan_hash="def456",
+            status=ComparisonStatus.LOGIC_MISMATCH,
+            step_results=[],
+        )
+
+        state.derive_overall_status()
+
+        # 关键断言：comparator_report.status=LOGIC_MISMATCH 时，
+        # overall_status 不得为 LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED
+        # （即不得声称"逻辑一致"）
+        logic_consistent_statuses = {
+            SparkPipelineStatus.LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED,
+            SparkPipelineStatus.ALL_CONSISTENT,
+        }
+        assert state.overall_status not in logic_consistent_statuses, (
+            f"comparator_report.status=LOGIC_MISMATCH 时 "
+            f"overall_status 不得显示为逻辑一致，"
+            f"实际 overall_status={state.overall_status}"
+        )
+
     def test_retry_count_tracking(self):
         """返工计数从 0 开始，可递增。"""
         state = SparkPipelineState(contract_hash="test_hash")

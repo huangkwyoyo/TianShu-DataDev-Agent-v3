@@ -753,6 +753,10 @@ class FakeSpecEnricher:
                 inferred_metrics.append(col.metric_hint)
                 continue
 
+            # 有 window_hint 或 computed_hint 的列不推断为聚合指标
+            if col.window_hint or col.computed_hint:
+                continue
+
             # 次优：从旧 description DSL 解析（兼容模式，触发迁移警告）
             if col.description:
                 warnings.warn(

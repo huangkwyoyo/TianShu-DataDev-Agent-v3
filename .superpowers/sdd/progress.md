@@ -151,3 +151,19 @@ Task: complete (NYC 按行程来源每日聚合——SQL 全链路 + Spark 双�
   - 测试: tests/api/test_nyc_business_case.py (11 个测试——7 SQL + 3 Contract + 1 Spark)
   - 测试基线: 659 passed / 11 skipped (+11 新测试，零退化)
   - ruff/tsc/build/git diff: clean
+
+## Phase 9A4-NYC-01 Comparator 状态收口 Progress
+Started: 2026-07-05
+Base commit: 1f0e9dc
+Task: complete (Comparator 状态收口——双重根因修复 + 显式断言)
+  - RC1: BETWEEN 右值规范化——_flatten_filter_step 新增 list 处理 +
+    _normalize_between_list / _normalize_between_right_string 两个 helper +
+    compare() 中统一调用 _normalize_between_rights
+  - RC2: derive_overall_status() 新增 comparator_report.status 检查——
+    LOGIC_MISMATCH → REPAIR_NEEDED，LOGIC_UNSUPPORTED/NOT_COVERED → HUMAN_REVIEW_REQUIRED
+  - 测试: tests/spark/test_plan_comparator.py +1 (test_filter_between_equivalent_different_literal_formats)
+          tests/spark/test_orchestrator.py +1 (test_derive_overall_status_checks_comparator_report_not_just_stage_result)
+          tests/api/test_nyc_business_case.py 加固 (显式断言 comparator_report.status + overall_status 一致性)
+  - 测试基线: 661 passed / 11 skipped (+2 新测试，零退化)
+  - ruff/git diff: clean
+  - NYC 案例 01 Spark 双链路逻辑等价: 已点亮 (comparator_report.status=LOGIC_EQUIVALENT)

@@ -185,6 +185,11 @@ class PlanComparator:
         sql_steps_data = self._extract_sql_step_data(sql_plan)
         spark_steps_data = self._extract_spark_step_data(spark_plan)
 
+        # Step 1.5：规范化 BETWEEN 右值——SQL 侧和 Spark 侧序列化格式不同，
+        # 需在进入 compare_plans 前统一为规范形式 [v1,v2]
+        self._normalize_between_rights(sql_steps_data)
+        self._normalize_between_rights(spark_steps_data)
+
         # Step 2：计算 hash
         sql_plan_hash = SqlBuildPlan.generate_plan_hash(sql_plan)
         spark_plan_hash = SparkPlan.compute_plan_hash(spark_plan)
@@ -338,6 +343,10 @@ class PlanComparator:
 
         Predicate 模型：left (ColumnRef), operator, right (ColumnRef|SqlLiteral)
         扁平化后 left/right 为字符串，与 plan_equivalence 的 normalize_field_name 兼容。
+
+        BETWEEN 谓词的 right 是一个 SqlLiteral 列表，需逐元素提取 value
+        字段生成规范字符串——避免 SQL 侧 dict 列表和 Spark 侧 Python repr
+        字符串之间的表示形式差异导致误判 NOT_EQUIVALENT。
         """
         predicate = step_dict.pop("predicate", {})
         if not predicate:
@@ -356,6 +365,9 @@ class PlanComparator:
             right_val = PlanComparator._column_ref_to_string(right_val)
         elif right_val is None:
             right_val = ""
+        elif isinstance(right_val, list):
+            # BETWEEN 谓词：right 是 SqlLiteral 列表，逐元素提取 value
+            right_val = PlanComparator._normalize_between_list(right_val)
 
         # 扁平化 operator 保持不变
         operator_val = predicate.get("operator", "")
@@ -532,6 +544,44 @@ class PlanComparator:
         return str(column)
 
     @staticmethod
+    def _normalize_between_list(items: list[Any]) -> str:
+        """将 BETWEEN 右值列表规范化为 [v1,v2] 形式。
+
+        SQL 侧 model_dump(mode='json') 将 SqlLiteral 列表序列化为
+        [{'value': '...', 'is_sql_expr': false}, ...] 格式。
+        此方法逐元素提取 value 字段，生成确定性规范字符串，
+        使 SQL 侧与 Spark 侧（Python repr）可正确比较。
+        """
+        values: list[str] = []
+        for item in items:
+            if isinstance(item, dict):
+                values.append(str(item.get("value", "")))
+            else:
+                values.append(str(item))
+        return "[" + ",".join(values) + "]"
+
+    @staticmethod
+    def _normalize_between_right_string(right_str: str) -> str:
+        """将 Spark 侧的 BETWEEN 右值 Python repr 字符串规范化为 [v1,v2]。
+
+        Spark 侧 Mapper 将 ContractPredicate.right（已是 SqlLiteral 列表的
+        Python repr 字符串）直传给 SparkFilterStep.right。
+        此方法从 repr 字符串中提取 value='...' 部分，生成与
+        _normalize_between_list 一致的规范形式。
+        """
+        import re
+
+        right_str = right_str.strip()
+        if not (right_str.startswith("[") and right_str.endswith("]")):
+            return right_str
+
+        # 从 "SqlLiteral(value='...', ...)" 或 "{'value': '...', ...}" 中提取 value
+        values = re.findall(r"value['\"]?\s*[:=]\s*['\"]?([^'\",}\s)]+)", right_str)
+        if values:
+            return "[" + ",".join(values) + "]"
+        return right_str
+
+    @staticmethod
     def _extract_spark_step_data(spark_plan: SparkPlan) -> list[dict[str, Any]]:
         """从 SparkPlan 提取结构化 step 数据。
 
@@ -545,6 +595,31 @@ class PlanComparator:
     def _normalize_type(self, step_type: str) -> str:
         """将 step 类型名归一化（read → scan 等）。"""
         return self._TYPE_NORMALIZE_MAP.get(step_type, step_type)
+
+    @staticmethod
+    def _normalize_between_rights(steps_data: list[dict[str, Any]]) -> None:
+        """原地规范化所有 filter step 的 BETWEEN 右值。
+
+        SQL 侧的 BETWEEN 右值在 _flatten_filter_step 中已由
+        _normalize_between_list 处理（list → 规范字符串）。
+        此方法处理 Spark 侧——其 right 字段是 Python repr 字符串，
+        需提取 value 后重写为规范形式。
+
+        对非 filter 或非 BETWEEN 的 step 无操作。
+        """
+        for s in steps_data:
+            stype = s.get("step_type", "")
+            if stype != "filter":
+                continue
+            operator = str(s.get("operator", "")).upper()
+            if operator != "BETWEEN":
+                continue
+            right_val = s.get("right", "")
+            if isinstance(right_val, list):
+                # SQL 侧已在 _flatten_filter_step 处理过，此处防御
+                s["right"] = PlanComparator._normalize_between_list(right_val)
+            elif isinstance(right_val, str):
+                s["right"] = PlanComparator._normalize_between_right_string(right_val)
 
     @staticmethod
     def _count_type(

@@ -115,12 +115,14 @@ class SparkPipelineState(StrictModel):
         self.stage_results[stage.value] = result
 
     def derive_overall_status(self) -> None:
-        """根据各阶段结果推导全局状态。
+        """根据各阶段结果和 comparator_report.status 推导全局状态。
 
         规则：
         - retry_count >= 2 → HUMAN_REVIEW_REQUIRED（返工上限）
         - 任意阶段 HUMAN_REVIEW → HUMAN_REVIEW_REQUIRED
         - 任意阶段 FAILURE → REPAIR_NEEDED
+        - COMPARATOR SUCCESS 但 comparator_report.status != LOGIC_EQUIVALENT
+          → REPAIR_NEEDED（逻辑不等价，不得声称一致）
         - PHYSICAL_VERIFIER 未执行但逻辑链路全通过 → LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED
         - 全部 SUCCESS/SKIPPED → ALL_CONSISTENT
         """
@@ -140,6 +142,20 @@ class SparkPipelineState(StrictModel):
         if any(v == "FAILURE" for v in results.values()):
             self.overall_status = SparkPipelineStatus.REPAIR_NEEDED
             return
+
+        # COMPARATOR 阶段——stage_result=SUCCESS 不代表逻辑等价，
+        # 必须检查 comparator_report.status 的实际值
+        if results.get("COMPARATOR") == "SUCCESS" and self.comparator_report is not None:
+            from tianshu_datadev.spark.plan_comparator import ComparisonStatus
+
+            comp_status = self.comparator_report.status
+            if comp_status == ComparisonStatus.LOGIC_MISMATCH:
+                self.overall_status = SparkPipelineStatus.REPAIR_NEEDED
+                return
+            if comp_status in (ComparisonStatus.LOGIC_UNSUPPORTED, ComparisonStatus.NOT_COVERED):
+                self.overall_status = SparkPipelineStatus.HUMAN_REVIEW_REQUIRED
+                return
+            # LOGIC_EQUIVALENT / NOT_EXECUTED → 继续检查物理链路
 
         # 检查逻辑链路 vs 物理链路
         logic_stages = {"MAPPER", "DEVELOPER", "COMPILER", "VALIDATOR", "COMPARATOR"}

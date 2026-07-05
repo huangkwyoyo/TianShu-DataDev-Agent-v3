@@ -31,7 +31,7 @@
 | 9B-P1 | provenance.yml 显式断言 | ✅ | ✅ | ✅ | snapshot_manifest_hash 测试覆盖矩阵补全，2026-07-05 |
 | 9A4-NYC | 真实业务样本——NYC 案例 01 | ✅ | ✅ | ✅ | SQL 全链路 + Spark 双链，11/11 测试通过，2026-07-05 |
 
-**当前测试基线**：659 passed / 11 skipped（api/spark/artifacts 后端子集）+ 23 passed（前端冒烟全量）+ 6 passed / 0 skipped（Playwright E2E），ruff/tsc/build 零告警
+**当前测试基线**：661 passed / 11 skipped（api/spark/artifacts 后端子集）+ 23 passed（前端冒烟全量）+ 6 passed / 0 skipped（Playwright E2E），ruff/tsc/build 零告警
 
 ## 2. C1-C4 业务集成验证
 

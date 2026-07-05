@@ -1293,12 +1293,14 @@ class SqlBuildPlanBuilder:
         steps.append(join_step)
 
         # 5. AggregateStep——如果有指标
+        # 多表 JOIN 后用空 table_ref 让 DuckDB 从 JOIN 结果中自动解析列引用，
+        # 避免左表别名引用右表列（如 ft.borough）的问题
         if spec.metrics:
-            agg = self._build_aggregate_step(spec, left_alias)
+            agg = self._build_aggregate_step(spec, "")
             steps.append(agg)
 
         # 5b. WindowStep——如果有窗口指标（聚合后、投影前）
-        window = self._build_window_step(spec, left_alias)
+        window = self._build_window_step(spec, "")
         if window:
             steps.append(window)
 

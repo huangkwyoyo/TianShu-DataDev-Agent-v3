@@ -789,3 +789,188 @@ class TestNYCCase03SparkDualChain:
         assert state.overall_status.value in {
             "LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED", "ALL_CONSISTENT",
         }
+
+
+# ════════════════════════════════════════════
+# Case 04：Borough 日期维度聚合（2 表 JOIN + 聚合）
+# ════════════════════════════════════════════
+
+
+@pytest.fixture(scope="module")
+def nyc04_csv_paths() -> dict:
+    """Case 04 需要事实表 + 区域维度表。"""
+    base = os.path.join(os.path.dirname(os.path.dirname(__file__)), "fixtures", "nyc")
+    return {
+        "fact_trips_sample": os.path.join(base, "fact_trips_sample.csv"),
+        "dim_taxi_zone": os.path.join(base, "dim_taxi_zone.csv"),
+    }
+
+
+class TestNYCCase04SqlPipeline:
+    """NYC 案例 04——2 表 LEFT JOIN + 多指标聚合。"""
+
+    @pytest.fixture(scope="class")
+    def nyc04_spec_md(self) -> str:
+        spec_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "fixtures", "nyc", "nyc_borough_weekly_agg.md",
+        )
+        with open(spec_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def test_join_and_aggregate(self, nyc04_spec_md, nyc04_csv_paths):
+        """2 表 LEFT JOIN + GROUP BY 3 维 + 4 指标——全链路通过。"""
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc04_spec_md, table_paths=nyc04_csv_paths)
+
+        assert result["validation_passed"] is True
+        trace = result.get("execution_trace", {})
+        assert trace.get("status") == "RUNTIME_PASS"
+        assert trace["row_count"] > 0, "2 表 JOIN 聚合应有产出"
+        # 验证 borough 列有值（非全 NULL——LEFT JOIN 成功关联）
+        columns = set(result["result_summary"]["columns"])
+        assert "borough" in columns
+
+    def test_contract_is_extracted(self, nyc04_spec_md, nyc04_csv_paths):
+        """2 表 JOIN 聚合能导出 Contract。"""
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc04_spec_md, table_paths=nyc04_csv_paths)
+        bundle = pipeline.export_artifacts(result["request_id"])
+        assert bundle is not None
+        assert bundle.data_transform_contract is not None
+
+
+class TestNYCCase04SparkDualChain:
+    """NYC 案例 04——2 表 JOIN Spark 双管线验证。"""
+
+    @pytest.fixture(scope="class")
+    def nyc04_spec_md(self) -> str:
+        spec_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "fixtures", "nyc", "nyc_borough_weekly_agg.md",
+        )
+        with open(spec_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def test_spark_orchestrator_logic_equivalence(
+        self, nyc04_spec_md, nyc04_csv_paths,
+    ):
+        """2 表 JOIN Spark Orchestrator 逻辑等价。"""
+        pytest.importorskip("pyspark", reason="PySpark 环境不可用")
+
+        from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+        from tianshu_datadev.spark.orchestrator import SparkOrchestrator
+        from tianshu_datadev.spark.plan_comparator import ComparisonStatus
+
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc04_spec_md, table_paths=nyc04_csv_paths)
+        bundle = pipeline.export_artifacts(result["request_id"])
+
+        contract_v1 = adapt_lite_to_v1(bundle.data_transform_contract)
+        orchestrator = SparkOrchestrator()
+        state = orchestrator.run(
+            contract=contract_v1, sql_plan=bundle.sql_build_plan,
+        )
+
+        assert state.comparator_report is not None
+        assert state.comparator_report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+            f"Case 04 应为 LOGIC_EQUIVALENT，实际={state.comparator_report.status}"
+        )
+        assert state.overall_status.value in {
+            "LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED", "ALL_CONSISTENT",
+        }
+
+
+# ════════════════════════════════════════════
+# Case 05：Borough Top5 上车区域（INNER JOIN + ROW_NUMBER 窗口函数）
+# ════════════════════════════════════════════
+
+
+@pytest.fixture(scope="module")
+def nyc05_csv_paths() -> dict:
+    """Case 05 需要事实表 + 区域维度表。"""
+    base = os.path.join(os.path.dirname(os.path.dirname(__file__)), "fixtures", "nyc")
+    return {
+        "fact_trips_sample": os.path.join(base, "fact_trips_sample.csv"),
+        "dim_taxi_zone": os.path.join(base, "dim_taxi_zone.csv"),
+    }
+
+
+class TestNYCCase05SqlPipeline:
+    """NYC 案例 05——INNER JOIN + ROW_NUMBER 窗口函数。"""
+
+    @pytest.fixture(scope="class")
+    def nyc05_spec_md(self) -> str:
+        spec_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "fixtures", "nyc", "nyc_borough_top5_zones.md",
+        )
+        with open(spec_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def test_window_function_produces_rank(self, nyc05_spec_md, nyc05_csv_paths):
+        """ROW_NUMBER 窗口函数应在 INNER JOIN 后产生排名列。"""
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc05_spec_md, table_paths=nyc05_csv_paths)
+
+        assert result["validation_passed"] is True
+        trace = result.get("execution_trace", {})
+        assert trace.get("status") == "RUNTIME_PASS"
+        columns = set(result["result_summary"]["columns"])
+        assert "rank_by_count" in columns, (
+            f"窗口函数应产出 rank_by_count 列，实际列={columns}"
+        )
+
+    def test_contract_is_extracted(self, nyc05_spec_md, nyc05_csv_paths):
+        """INNER JOIN + 窗口函数能导出 Contract。"""
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc05_spec_md, table_paths=nyc05_csv_paths)
+        bundle = pipeline.export_artifacts(result["request_id"])
+        assert bundle is not None
+        assert bundle.data_transform_contract is not None
+
+
+class TestNYCCase05SparkDualChain:
+    """NYC 案例 05——INNER JOIN + 窗口函数 Spark 双管线验证。"""
+
+    @pytest.fixture(scope="class")
+    def nyc05_spec_md(self) -> str:
+        spec_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "fixtures", "nyc", "nyc_borough_top5_zones.md",
+        )
+        with open(spec_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def test_spark_orchestrator_logic_equivalence(
+        self, nyc05_spec_md, nyc05_csv_paths,
+    ):
+        """INNER JOIN + 窗口函数 Spark Orchestrator 逻辑等价。"""
+        pytest.importorskip("pyspark", reason="PySpark 环境不可用")
+
+        from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+        from tianshu_datadev.spark.orchestrator import SparkOrchestrator
+        from tianshu_datadev.spark.plan_comparator import ComparisonStatus
+
+        pipeline = Pipeline()
+        result = pipeline.run_all(nyc05_spec_md, table_paths=nyc05_csv_paths)
+        bundle = pipeline.export_artifacts(result["request_id"])
+
+        contract_v1 = adapt_lite_to_v1(bundle.data_transform_contract)
+        orchestrator = SparkOrchestrator()
+        state = orchestrator.run(
+            contract=contract_v1, sql_plan=bundle.sql_build_plan,
+        )
+
+        assert state.comparator_report is not None
+        # 窗口函数（WindowStep）的 Comparator 支持待完善——当前预期 NOT_COVERED
+        # NOT_COVERED → HUMAN_REVIEW_REQUIRED（符合 derive_overall_status 规则）
+        assert state.comparator_report.status != ComparisonStatus.LOGIC_MISMATCH, (
+            f"Case 05 不应为 LOGIC_MISMATCH，"
+            f"实际 status={state.comparator_report.status}"
+        )
+        # NOT_COVERED 触发 HUMAN_REVIEW_REQUIRED——非逻辑错误，是能力覆盖不足
+        assert state.overall_status.value in {
+            "LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED", "ALL_CONSISTENT",
+            "HUMAN_REVIEW_REQUIRED",
+        }
