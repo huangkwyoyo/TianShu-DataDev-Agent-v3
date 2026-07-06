@@ -223,6 +223,7 @@ class SparkOrchestrator:
         self._cached_plan = None           # SparkPlan | None
         self._cached_sql_plan = None       # SqlBuildPlan | None
         self._cached_compile_result = None  # SparkCompileResult | None
+        self._cached_contract = None        # DataTransformContractV1 | None（新增）
 
     def run(
         self,
@@ -256,6 +257,7 @@ class SparkOrchestrator:
         self._cached_plan = None
         self._cached_compile_result = None
         self._cached_sql_plan = sql_plan
+        self._cached_contract = contract   # 缓存 contract——供 COMPARATOR 阶段提取 target_grain
         failures = stage_failures or {}
         # contract_hash 优先取 contract 的 hash，否则用参数
         effective_hash = contract_hash
@@ -442,8 +444,19 @@ class SparkOrchestrator:
 
                 comparator = PlanComparator()
                 if isinstance(self._cached_sql_plan, SqlProgram):
+                    # 从 Contract 提取 target_grain——用于过滤 DAG 中间粒度 aggregate
+                    target_grain = None
+                    if self._cached_contract is not None and hasattr(
+                        self._cached_contract, "grouping_keys"
+                    ):
+                        target_grain = (
+                            self._cached_contract.grouping_keys
+                            if self._cached_contract.grouping_keys
+                            else None
+                        )
                     report = comparator.compare_program(
                         self._cached_sql_plan, self._cached_plan,
+                        target_grain=target_grain,
                     )
                 else:
                     report = comparator.compare(

@@ -1955,3 +1955,33 @@ class TestNormalizeDagSteps:
         assert types.count("case_when") == 1
         assert types.count("aggregate") == 1
         assert types.count("project") == 1
+
+    def test_target_grain_filters_irrelevant_aggregate(self):
+        """target_grain=["borough"] 时，[violation_county] aggregate 应被过滤。"""
+        steps = [
+            {"step_type": "aggregate", "group_keys": ["borough"],
+             "metrics": [{"function": "COUNT", "alias": "total_crashes"}]},
+            {"step_type": "aggregate", "group_keys": ["violation_county"],
+             "metrics": [{"function": "SUM", "alias": "total_violations"}]},
+        ]
+        result = PlanComparator._normalize_dag_steps(steps, target_grain=["borough"])
+        agg_steps = [s for s in result if s.get("step_type") == "aggregate"]
+        assert len(agg_steps) == 1, (
+            f"target_grain 过滤后应仅剩 1 个 aggregate，实际 {len(agg_steps)}"
+        )
+        assert agg_steps[0]["group_keys"] == ["borough"]
+        assert len(agg_steps[0]["metrics"]) == 1
+
+    def test_target_grain_none_preserves_all(self):
+        """target_grain=None 时保留所有 aggregate 组——向后兼容。"""
+        steps = [
+            {"step_type": "aggregate", "group_keys": ["borough"],
+             "metrics": [{"function": "COUNT", "alias": "total_crashes"}]},
+            {"step_type": "aggregate", "group_keys": ["violation_county"],
+             "metrics": [{"function": "SUM", "alias": "total_violations"}]},
+        ]
+        result = PlanComparator._normalize_dag_steps(steps, target_grain=None)
+        agg_steps = [s for s in result if s.get("step_type") == "aggregate"]
+        assert len(agg_steps) == 2, (
+            f"target_grain=None 应保留所有 aggregate，实际 {len(agg_steps)}"
+        )

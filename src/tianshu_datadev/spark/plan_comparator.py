@@ -280,6 +280,7 @@ class PlanComparator:
         annotations: list | None = None,     # noqa: ARG002 保留接口，Phase 8 消费
         warnings: list[AnnotationWarning] | None = None,
         enabled_step_types: set[str] | None = None,
+        target_grain: list[str] | None = None,  # 新增：目标粒度——用于过滤 DAG 中间粒度 aggregate
     ) -> PlanComparisonReport:
         """多语句 SqlProgram ↔ SparkPlan 逻辑对比入口。
 
@@ -308,7 +309,7 @@ class PlanComparator:
         # Step 1.3：DAG 归一化——合并多个 aggregate/project step
         # 使 SQL DAG 的多语句结构与 Mapper 从平铺 Contract 生成的
         # 单 aggregate/单 project 结构对齐——消除拓扑不对称
-        sql_steps_data = self._normalize_dag_steps(sql_steps_data)
+        sql_steps_data = self._normalize_dag_steps(sql_steps_data, target_grain=target_grain)
 
         # Step 1.5：规范化 BETWEEN 右值——SQL 侧和 Spark 侧序列化格式不同
         self._normalize_between_rights(sql_steps_data)
