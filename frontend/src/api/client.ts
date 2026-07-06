@@ -177,6 +177,7 @@ export interface ExecuteRichResponse {
   execution_trace: ExecutionTraceSummary;
   result_summary: ResultSummarySummary;
   open_questions: OpenQuestionSummary[];
+  llm_traces?: Record<string, LlmTraceNode> | null;  // LLM 调用追踪（可选）
 }
 
 /** 文件树节点 */
@@ -237,6 +238,7 @@ export interface RunAllResponse {
   open_questions: OpenQuestionSummary[];
   pipeline_error?: { stage: string; error_type: string; error_message: string } | null;
   pipeline_stages?: { stage: string; status: string; error_type?: string; error_message?: string }[];
+  llm_traces?: Record<string, LlmTraceNode> | null;  // LLM 调用追踪（可选）
 }
 
 /** 通用错误：提取 API 错误信息 */
@@ -371,4 +373,45 @@ export interface SparkVerifyResponse {
 /** 触发 Spark 管线验证——传入 Pipeline Run-All 产出的 request_id */
 export function sparkVerify(requestId: string): Promise<SparkVerifyResponse> {
   return apiPost<SparkVerifyResponse>('/spark/verify', { request_id: requestId });
+}
+
+// ── LLM 调用追踪 ──
+
+/** LLM 节点调用追踪 */
+export interface LlmTraceNode {
+  node_name: string;
+  model: string;
+  token_usage: Record<string, number>;
+  latency_ms: number;
+  status: string;
+  error_type: string | null;
+}
+
+// ── Spark 阶段独立触发 ──
+
+/** Spark 单阶段请求 */
+export interface SparkStageRequest {
+  request_id: string;
+}
+
+/** Spark 单阶段响应 */
+export interface SparkStageResponse {
+  request_id: string;
+  stage: string;
+  status: 'ok' | 'failed' | 'skipped';
+  missing_dependencies: string[];
+  errors: string[];
+  spark_stages: SparkStageItem[];
+  llm_traces: Record<string, LlmTraceNode> | null;
+}
+
+/** Spark 6 阶段 slug 列表 */
+const SPARK_STAGES = ['map', 'develop', 'compile', 'validate', 'compare', 'physical-verify'] as const;
+
+/** 触发单个 Spark 管线阶段 */
+export function runSparkStage(
+  requestId: string,
+  stage: string,
+): Promise<SparkStageResponse> {
+  return apiPost<SparkStageResponse>(`/spark/${stage}`, { request_id: requestId });
 }
