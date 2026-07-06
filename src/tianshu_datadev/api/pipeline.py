@@ -53,10 +53,11 @@ if TYPE_CHECKING:
     from tianshu_datadev.planning.sql_program import SqlProgram
     from tianshu_datadev.spark.compiler import SparkCompileResult
     from tianshu_datadev.spark.models import SparkPlan
-    from tianshu_datadev.spark.orchestrator import SparkPipelineStage
     from tianshu_datadev.spark.plan_comparator import PlanComparisonReport
     from tianshu_datadev.spark.snapshot import SnapshotBuilder, SnapshotManifest, SnapshotSourceProvider
     from tianshu_datadev.sql.models import CompiledSql, ExecutionTrace, ResultSummary
+
+from tianshu_datadev.spark.orchestrator import SparkPipelineStage
 
 logger = logging.getLogger(__name__)
 
@@ -2228,8 +2229,6 @@ class Pipeline:
         Raises:
             SparkDependencyMissingError: 前置产物缺失
         """
-        from tianshu_datadev.spark.orchestrator import SparkPipelineStage
-
         missing: list[str] = []
 
         if stage == SparkPipelineStage.MAPPER:
@@ -2284,10 +2283,10 @@ class Pipeline:
         Raises:
             SparkDependencyMissingError: 前置产物缺失
         """
-        from tianshu_datadev.spark.orchestrator import SparkPipelineStage
+        # TODO: 当前返回 dict，待 Task 4 定义 SparkStageResponse 模型后应返回该类型
 
         # 获取阶段的字符串值，后续多处使用
-        stage_val = stage.value if hasattr(stage, "value") else str(stage)
+        stage_val = stage.value
 
         # Step 1: 导出 artifacts
         artifacts = self.export_artifacts(request_id)
@@ -2314,7 +2313,7 @@ class Pipeline:
             elif stage == SparkPipelineStage.VALIDATOR:
                 self._do_spark_validate(context, errors)
             elif stage == SparkPipelineStage.COMPARATOR:
-                self._do_spark_compare(artifacts, context, errors)
+                self._do_spark_compare(artifacts, context)
             elif stage == SparkPipelineStage.PHYSICAL_VERIFIER:
                 self._do_spark_physical_verify(artifacts, context)
         except Exception as e:
@@ -2413,7 +2412,6 @@ class Pipeline:
         self,
         artifacts: PipelineArtifactBundle,
         context: SparkStageContext,
-        errors: list[str],
     ) -> None:
         """执行 COMPARATOR 阶段——SQL ↔ Spark 逻辑对比。"""
         from tianshu_datadev.spark.plan_comparator import PlanComparator
