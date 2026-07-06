@@ -518,19 +518,38 @@ class PlanComparator:
                 if set(gk) == target_set
             }
 
-        # 将分组后的 aggregate 插入 result（放在 scan/filter/join/read 之后）
-        for gk_tuple, agg_data in agg_groups.items():
-            merged_agg = {
-                "step_type": "aggregate",
-                "group_keys": agg_data["group_keys"],
-                "metrics": agg_data["metrics"],
-            }
-            # 找到合适的插入位置
+        # 将分组后的 aggregate 按原始出现顺序插入 result
+        # 修复：多个 grain 组计算同一 insert_pos 时顺序反转的 bug
+        if agg_groups:
+            # 记录每个 grain 在原始 sql_steps 中的首次出现位置
+            grain_first_pos: dict[tuple, int] = {}
+            for idx, step in enumerate(sql_steps):
+                if step.get("step_type") == "aggregate":
+                    gk = tuple(sorted(step.get("group_keys", [])))
+                    if gk not in grain_first_pos:
+                        grain_first_pos[gk] = idx
+
+            # 按首次出现位置排序
+            sorted_groups = sorted(
+                agg_groups.items(),
+                key=lambda item: grain_first_pos.get(item[0], 9999),
+            )
+
+            # 找到插入位置（最后一个 scan/filter/join/read 之后）
             insert_pos = 0
             for i, s in enumerate(result):
                 if s.get("step_type") in ("scan", "filter", "join", "read"):
                     insert_pos = i + 1
-            result.insert(insert_pos, merged_agg)
+
+            # 按顺序一次性插入所有 aggregate，每个后续 aggregate 插入位置递增
+            for gk_tuple, agg_data in sorted_groups:
+                merged_agg = {
+                    "step_type": "aggregate",
+                    "group_keys": agg_data["group_keys"],
+                    "metrics": agg_data["metrics"],
+                }
+                result.insert(insert_pos, merged_agg)
+                insert_pos += 1
 
         # 将合并后的 project 追加到末尾
         if has_project:
