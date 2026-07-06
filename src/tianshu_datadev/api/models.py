@@ -443,3 +443,30 @@ class SparkVerifyResponse(StrictModel):
     review_ready: bool = False  # REVIEW_READY 判定——所有关键阶段通过的标志
     package_id: str = ""  # SparkReviewPackage ID
     errors: list[str] = []  # 错误信息列表（成功时为空）
+
+
+# ════════════════════════════════════════════
+# Spark 阶段独立触发——POST /api/spark/{stage}
+# ════════════════════════════════════════════
+
+
+class SparkStageRequest(StrictModel):
+    """Spark 单阶段触发请求——传入 Pipeline 产出的 request_id。"""
+
+    request_id: str  # Pipeline execute_rich 返回的 request_id
+
+
+class SparkStageResponse(StrictModel):
+    """Spark 单阶段触发响应——含该阶段结果 + 全量阶段状态 + LLM 追踪。
+
+    每次单阶段执行后返回当前全部阶段的状态（供前端更新指示灯），
+    以及该阶段新增的 LLM 调用追踪信息。
+    """
+
+    request_id: str  # 回显请求的 request_id
+    stage: str  # 当前执行的阶段名（MAPPER / DEVELOPER / ...）
+    status: str  # "ok" | "failed" | "skipped"
+    missing_dependencies: list[str] = []  # 依赖缺失时的缺失项列表
+    errors: list[str] = []  # 错误信息
+    spark_stages: list[SparkStageItem] = []  # 当前全部阶段状态
+    llm_traces: dict | None = None  # 本阶段新增的 LLM 追踪（LlmTraceNode dict）

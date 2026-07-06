@@ -19,8 +19,13 @@ Phase 4.5B 新增前端 SPA 专用端点：
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+
+if TYPE_CHECKING:
+    from tianshu_datadev.spark.orchestrator import SparkPipelineStage
 
 from .models import (
     ExecuteRequest,
@@ -28,6 +33,7 @@ from .models import (
     PlanRequest,
     RunAllRequest,
     SparkStageItem,
+    SparkStageRequest,  # 新增
     SparkVerifyRequest,
     SparkVerifyResponse,
 )
@@ -330,3 +336,86 @@ async def spark_verify(request: Request, body: SparkVerifyRequest):
                 "field_ref": None,
             },
         )
+
+
+# ════════════════════════════════════════════
+# Spark 阶段独立触发端点（Phase: spark-stage-independent）
+# ════════════════════════════════════════════
+
+
+def _handle_spark_stage(
+    request: Request,
+    request_id: str,
+    stage: "SparkPipelineStage",
+):
+    """Spark 阶段统一处理——参数校验、异常转换、调用 dispatcher。
+
+    捕获 SparkDependencyMissingError → 422，
+    其他异常 → 500。
+    """
+    from tianshu_datadev.api.pipeline import SparkDependencyMissingError
+
+    pipeline = request.app.state.pipeline
+    try:
+        return pipeline.run_spark_stage(request_id, stage)
+    except SparkDependencyMissingError as e:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error_code": "SPARK_DEPENDENCY_MISSING",
+                "message": str(e),
+                "field_ref": e.stage.value if e.stage else None,
+                "missing_dependencies": e.missing,
+            },
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error_code": "SPARK_STAGE_FAILED",
+                "message": f"Spark 阶段 {stage.value} 执行异常：{e}",
+                "field_ref": stage.value,
+            },
+        )
+
+
+@api_router.post("/spark/map")
+async def spark_map(request: Request, body: SparkStageRequest):
+    """Spark MAPPER 阶段——Contract → SparkPlan 映射。"""
+    from tianshu_datadev.spark.orchestrator import SparkPipelineStage
+    return _handle_spark_stage(request, body.request_id, SparkPipelineStage.MAPPER)
+
+
+@api_router.post("/spark/develop")
+async def spark_develop(request: Request, body: SparkStageRequest):
+    """Spark DEVELOPER 阶段——LLM 语义标注（可选）。"""
+    from tianshu_datadev.spark.orchestrator import SparkPipelineStage
+    return _handle_spark_stage(request, body.request_id, SparkPipelineStage.DEVELOPER)
+
+
+@api_router.post("/spark/compile")
+async def spark_compile(request: Request, body: SparkStageRequest):
+    """Spark COMPILER 阶段——SparkPlan → PySpark DSL 编译。"""
+    from tianshu_datadev.spark.orchestrator import SparkPipelineStage
+    return _handle_spark_stage(request, body.request_id, SparkPipelineStage.COMPILER)
+
+
+@api_router.post("/spark/validate")
+async def spark_validate(request: Request, body: SparkStageRequest):
+    """Spark VALIDATOR 阶段——PySpark DSL 静态安全校验。"""
+    from tianshu_datadev.spark.orchestrator import SparkPipelineStage
+    return _handle_spark_stage(request, body.request_id, SparkPipelineStage.VALIDATOR)
+
+
+@api_router.post("/spark/compare")
+async def spark_compare(request: Request, body: SparkStageRequest):
+    """Spark COMPARATOR 阶段——SQL ↔ Spark 逻辑链路对比。"""
+    from tianshu_datadev.spark.orchestrator import SparkPipelineStage
+    return _handle_spark_stage(request, body.request_id, SparkPipelineStage.COMPARATOR)
+
+
+@api_router.post("/spark/physical-verify")
+async def spark_physical_verify(request: Request, body: SparkStageRequest):
+    """Spark PHYSICAL_VERIFIER 阶段——双引擎物理结果对比。"""
+    from tianshu_datadev.spark.orchestrator import SparkPipelineStage
+    return _handle_spark_stage(request, body.request_id, SparkPipelineStage.PHYSICAL_VERIFIER)
