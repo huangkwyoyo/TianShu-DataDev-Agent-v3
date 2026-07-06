@@ -408,6 +408,9 @@ class DataTransformContractExtractor:
             # 遍历 plan 的所有 step
             for step in plan.steps:
                 if isinstance(step, ScanStep):
+                    # _temp_* 表是 DAG 内部管道——不进入 Contract
+                    if step.table_ref.startswith("_temp_"):
+                        continue
                     self._extract_scan(
                         step, input_tables, input_columns, seen_tables, seen_columns,
                     )
@@ -527,10 +530,21 @@ class DataTransformContractExtractor:
 
     @staticmethod
     def _extract_column_ref(col) -> tuple[str, str]:
-        """从 ColumnRef 提取 (table_ref, normalized_name)。"""
-        table = col.table_ref if hasattr(col, "table_ref") else ""
-        name = col.normalized_name if hasattr(col, "normalized_name") else str(col)
-        return table, name
+        """从 ColumnRef 提取 (table_ref, normalized_name)。
+
+        仅接受有 table_ref 和 normalized_name 属性的对象（ColumnRef）。
+        非列引用类型（如嵌套 Predicate）说明上游构造了非法 CASE WHEN 条件，
+        必须拒绝而非静默字符串化——与 _extract_literal_value 的类型守卫对称。
+
+        Raises:
+            ValueError: col 不是 ColumnRef（缺少 table_ref 或 normalized_name 属性）
+        """
+        if hasattr(col, "table_ref") and hasattr(col, "normalized_name"):
+            return col.table_ref, col.normalized_name
+        raise ValueError(
+            f"CASE WHEN 左侧仅支持 ColumnRef（列引用），"
+            f"收到 {type(col).__name__}。嵌套表达式/子查询不支持"
+        )
 
     @staticmethod
     def _extract_literal_value(lit) -> str | int | float | bool | None:

@@ -687,6 +687,103 @@ class TestContractExtractorV1:
         with pytest.raises(ValueError, match="右侧仅支持 SqlLiteral"):
             DataTransformContractExtractor._extract_literal_value(col)
 
+    def test_predicate_to_case_when_rejects_predicate_left(self):
+        """二元比较左侧是嵌套 Predicate → ValueError，不把 repr 字符串写入列名。"""
+        import pytest
+
+        # 攻击路径：二元比较（EQ）的 left 不是 ColumnRef，而是嵌套 Predicate
+        # _extract_column_ref 必须拒绝并抛出 ValueError
+        pred = Predicate(
+            left=Predicate(
+                left=ColumnRef(
+                    table_ref="t1", column_name="amount",
+                    normalized_name="amount",
+                ),
+                operator=PredicateOperator.GT,
+                right=SqlLiteral(value=50),
+            ),
+            operator=PredicateOperator.EQ,
+            right=SqlLiteral(value=100),
+        )
+
+        with pytest.raises(ValueError, match="左侧仅支持 ColumnRef"):
+            DataTransformContractExtractor._predicate_to_case_when_condition(pred)
+
+    def test_extract_column_ref_rejects_non_column_ref(self):
+        """_extract_column_ref 对非 ColumnRef 抛 ValueError，不返回 str()。"""
+        import pytest
+
+        pred = Predicate(
+            left=ColumnRef(table_ref="t1", column_name="x", normalized_name="x"),
+            operator=PredicateOperator.EQ,
+            right=SqlLiteral(value=1),
+        )
+
+        with pytest.raises(ValueError, match="左侧仅支持 ColumnRef"):
+            DataTransformContractExtractor._extract_column_ref(pred)
+
+    def test_contract_input_tables_excludes_temp(self):
+        """Contract V1 的 input_tables 不应包含 _temp_* 中间表——DAG 内部管道。"""
+        from tianshu_datadev.planning.sql_build_plan import (
+            ScanStep,
+            SqlBuildPlan,
+            ProjectStep,
+        )
+        from tianshu_datadev.planning.models import ColumnRef, AliasExpr
+        from tianshu_datadev.planning.sql_program import (
+            SqlProgram,
+            SqlStatement,
+            StatementKind,
+        )
+        from tianshu_datadev.artifacts.contract_extractor import DataTransformContractExtractor
+
+        # 构造含 _temp_* scan 的 2 语句 SqlProgram
+        stmt_0_plan = SqlBuildPlan(
+            plan_id="plan_0", spec_hash="test_hash",
+            steps=[
+                ScanStep(step_type="scan", step_id="scan_fc",
+                         table_ref="fc", required_columns=[
+                             ColumnRef(table_ref="fc", column_name="borough", normalized_name="borough"),
+                         ]),
+                ProjectStep(step_type="project", step_id="proj_0", columns=[
+                    AliasExpr(expression=ColumnRef(table_ref="", column_name="borough", normalized_name="borough"),
+                              alias="borough"),
+                ]),
+            ],
+        )
+        stmt_1_plan = SqlBuildPlan(
+            plan_id="plan_1", spec_hash="test_hash",
+            steps=[
+                ScanStep(step_type="scan", step_id="scan_temp",
+                         table_ref="_temp_abc123_crash_boro_agg", required_columns=[
+                             ColumnRef(table_ref="_temp_abc123_crash_boro_agg",
+                                       column_name="borough", normalized_name="borough"),
+                         ]),
+                ProjectStep(step_type="project", step_id="proj_1", columns=[
+                    AliasExpr(expression=ColumnRef(table_ref="", column_name="borough", normalized_name="borough"),
+                              alias="borough"),
+                ]),
+            ],
+        )
+        sql_program = SqlProgram(
+            program_id="test_prog", spec_id="test_spec",
+            statements=[
+                SqlStatement(statement_id="stmt_0", plan=stmt_0_plan, kind=StatementKind.PRODUCER),
+                SqlStatement(statement_id="stmt_1", plan=stmt_1_plan,
+                            kind=StatementKind.CONSUMER, depends_on=["stmt_0"]),
+            ],
+            topological_order=["stmt_0", "stmt_1"],
+        )
+
+        extractor = DataTransformContractExtractor()
+        contract = extractor.extract_v1(sql_program)
+
+        input_refs = {t.table_ref for t in contract.input_tables}
+        assert "fc" in input_refs, "源表 fc 应出现在 input_tables"
+        assert not any(ref.startswith("_temp_") for ref in input_refs), (
+            f"_temp_* 表不应进入 Contract input_tables，实际={input_refs}"
+        )
+
 
 # ════════════════════════════════════════════
 # Phase 3C Step 2——Pipeline 集成测试
