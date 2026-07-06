@@ -34,3 +34,17 @@ Task 3: complete (commits c356f31..e60ae5d, review approved; note: _extract_colu
 Task 4: complete (commits e60ae5d..85f2ab4, review clean + insert-order fix applied)
 Task 5: complete (commits 85f2ab4..e13587b, review clean)
 Task 6: complete (commits e13587b..1423e58, review approved; note: 3 extra A-class bug fixes beyond brief—raw_condition/target_grain subset/project FINAL-only)
+
+## Spark Stage Independent + LLM Traces
+Started: 2026-07-06
+Base commit: 8f6b91a
+Task 1: complete (commits f7eb357..072c06c, review approved)
+Task 2: complete (commits b6ef9d5..2997b0e, review approved)
+Task 3: complete (commits 2997b0e..8f1dc26, review approved — fix: 移除 errors 死参数 + 消除重复 import)
+Task 4: complete (commits 8f1dc26..be3cdc0, review approved — 6 endpoints + models, 0 issues)
+Task 5: complete (commits 8f6b91a..f7eb357, review approved)
+Task 6: complete (commits 072c06c..0abf98e, review approved)
+Task 7: complete (commits 0abf98e..b6ef9d5, review approved)
+Task 8: complete (commits be3cdc0..285aab5, review approved — App.tsx 集成 +57/-7, 0 issues)
+Task 9: complete (commits 285aab5..883df23, review approved — 14 tests, 0 issues)
+Final Review: approved (commits ca838b3..8c12a24, 1 Important + 6 Minor fixed)
