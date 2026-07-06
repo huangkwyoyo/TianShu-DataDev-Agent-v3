@@ -1853,7 +1853,7 @@ class TestNormalizeDagSteps:
     """
 
     def test_merges_multiple_aggregates(self):
-        """3 个 aggregate step → 归一化为 1 个，metrics 和 group_keys 合并去重。"""
+        """同粒度 aggregate 合并，不同粒度 aggregate 保持独立。"""
         steps = [
             {"step_type": "scan", "table_ref": "fc"},
             {"step_type": "aggregate", "group_keys": ["borough"],
@@ -1865,9 +1865,55 @@ class TestNormalizeDagSteps:
         ]
         result = PlanComparator._normalize_dag_steps(steps)
         agg_steps = [s for s in result if s.get("step_type") == "aggregate"]
-        assert len(agg_steps) == 1, f"预期 1 个 aggregate，实际 {len(agg_steps)}"
-        assert len(agg_steps[0]["metrics"]) == 3
-        assert set(agg_steps[0]["group_keys"]) == {"borough", "violation_county"}
+        # B1：同粒度 [borough] 合并为 1 个（2 metrics），[violation_county] 独立 1 个
+        assert len(agg_steps) == 2, f"预期 2 个 aggregate（不同粒度独立），实际 {len(agg_steps)}"
+
+        # 收集所有 group_keys 集合
+        all_groups = [tuple(sorted(s["group_keys"])) for s in agg_steps]
+        assert ("borough",) in all_groups, "应保留 [borough] 粒度的 aggregate"
+        assert ("violation_county",) in all_groups, "应保留 [violation_county] 粒度的 aggregate"
+
+        # [borough] aggregate 应有 2 个 metrics（合并自两个同粒度 aggregate）
+        borough_agg = [s for s in agg_steps if s["group_keys"] == ["borough"]][0]
+        assert len(borough_agg["metrics"]) == 2, (
+            f"[borough] aggregate 应有 2 个 metrics，实际 {len(borough_agg['metrics'])}"
+        )
+
+        # [violation_county] aggregate 应有 1 个 metric
+        vc_agg = [s for s in agg_steps if s["group_keys"] == ["violation_county"]][0]
+        assert len(vc_agg["metrics"]) == 1
+
+    def test_aggregate_same_grain_merged(self):
+        """多个同 [borough] aggregate → 合并为 1 个，metrics 去重合并。"""
+        steps = [
+            {"step_type": "aggregate", "group_keys": ["borough"],
+             "metrics": [{"function": "COUNT", "input_column": "crash_id", "alias": "total_crashes"}]},
+            {"step_type": "aggregate", "group_keys": ["borough"],
+             "metrics": [{"function": "SUM", "input_column": "persons_injured", "alias": "total_injured"}]},
+        ]
+        result = PlanComparator._normalize_dag_steps(steps)
+        agg_steps = [s for s in result if s.get("step_type") == "aggregate"]
+        assert len(agg_steps) == 1
+        assert agg_steps[0]["group_keys"] == ["borough"]
+        assert len(agg_steps[0]["metrics"]) == 2
+        aliases = {m["alias"] for m in agg_steps[0]["metrics"]}
+        assert aliases == {"total_crashes", "total_injured"}
+
+    def test_aggregate_different_grain_kept_separate(self):
+        """[borough] 和 [violation_county] 不同粒度 → 各自独立，不合并。"""
+        steps = [
+            {"step_type": "aggregate", "group_keys": ["borough"],
+             "metrics": [{"function": "COUNT", "alias": "total_crashes"}]},
+            {"step_type": "aggregate", "group_keys": ["violation_county"],
+             "metrics": [{"function": "SUM", "alias": "total_violations"}]},
+        ]
+        result = PlanComparator._normalize_dag_steps(steps)
+        agg_steps = [s for s in result if s.get("step_type") == "aggregate"]
+        assert len(agg_steps) == 2, (
+            f"不同粒度应保持独立，实际合并为 {len(agg_steps)} 个"
+        )
+        gk_sets = {tuple(sorted(s["group_keys"])) for s in agg_steps}
+        assert gk_sets == {("borough",), ("violation_county",)}
 
     def test_merges_multiple_projects(self):
         """7 个 project step → 归一化为 1 个，columns 合并去重。"""

@@ -457,46 +457,49 @@ class PlanComparator:
     @staticmethod
     def _normalize_dag_steps(
         sql_steps: list[dict[str, Any]],
+        target_grain: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """将 DAG 扁平化产生的多个同类型 step 合并为单一步骤。
 
         合并规则：
-        1. aggregate：合并所有 group_keys（去重）+ 合并所有 metrics（去重按 alias）
+        1. aggregate：按 group_keys 签名分组合并——同粒度合并，不同粒度独立
         2. project：合并所有 columns（去重按 alias）
         3. 其他类型（scan/filter/join/case_when/sort/limit）：保持原样
+        4. 若提供 target_grain，只保留 group_keys 签名匹配的 aggregate 组
 
         此归一化使 SQL DAG 的多语句结构与 Mapper 从平铺 Contract
         生成的单 aggregate/单 project 结构对齐。
 
         Args:
             sql_steps: _flatten_sql_program_steps() 产出的扁平化步骤
+            target_grain: 可选——目标粒度（如 ["borough"]），
+                          非空时只保留匹配的 aggregate 组
 
         Returns:
-            归一化后的步骤列表——aggregate 和 project 各最多一个
+            归一化后的步骤列表
         """
         result: list[dict[str, Any]] = []
-        agg_group_keys: list[str] = []
-        agg_metrics: list[dict[str, Any]] = []
         proj_columns: list[dict[str, Any]] = []
-        seen_agg_aliases: set[str] = set()
         seen_proj_aliases: set[str] = set()
-        has_aggregate = False
         has_project = False
 
+        # aggregate 按 group_keys 签名分组合并——禁止跨粒度硬合并
+        agg_groups: dict[tuple, dict] = {}
         for step in sql_steps:
             stype = step.get("step_type", "")
             if stype == "aggregate":
-                has_aggregate = True
-                # 合并 group_keys（去重）
-                for gk in step.get("group_keys", []):
-                    if gk not in agg_group_keys:
-                        agg_group_keys.append(gk)
-                # 合并 metrics（去重按 alias）
+                gk_tuple = tuple(sorted(step.get("group_keys", [])))
+                if gk_tuple not in agg_groups:
+                    agg_groups[gk_tuple] = {
+                        "group_keys": list(gk_tuple),
+                        "metrics": [],
+                        "seen_aliases": set(),
+                    }
                 for m in step.get("metrics", []):
                     alias = m.get("alias", "")
-                    if alias not in seen_agg_aliases:
-                        seen_agg_aliases.add(alias)
-                        agg_metrics.append(m)
+                    if alias not in agg_groups[gk_tuple]["seen_aliases"]:
+                        agg_groups[gk_tuple]["seen_aliases"].add(alias)
+                        agg_groups[gk_tuple]["metrics"].append(m)
             elif stype == "project":
                 has_project = True
                 for col in step.get("columns", []):
@@ -507,14 +510,22 @@ class PlanComparator:
             else:
                 result.append(step)
 
-        # 将合并后的 aggregate 插入 result（放在 scan/filter/join/read 之后）
-        if has_aggregate:
+        # B2：target_grain 过滤——只保留最终业务粒度 aggregate
+        if target_grain is not None:
+            target_set = set(target_grain)
+            agg_groups = {
+                gk: data for gk, data in agg_groups.items()
+                if set(gk) == target_set
+            }
+
+        # 将分组后的 aggregate 插入 result（放在 scan/filter/join/read 之后）
+        for gk_tuple, agg_data in agg_groups.items():
             merged_agg = {
                 "step_type": "aggregate",
-                "group_keys": agg_group_keys,
-                "metrics": agg_metrics,
+                "group_keys": agg_data["group_keys"],
+                "metrics": agg_data["metrics"],
             }
-            # 找到最后一个 scan/filter/join/read 的位置，aggregate 插入其后
+            # 找到合适的插入位置
             insert_pos = 0
             for i, s in enumerate(result):
                 if s.get("step_type") in ("scan", "filter", "join", "read"):
