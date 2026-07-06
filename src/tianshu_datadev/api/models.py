@@ -469,4 +469,4 @@ class SparkStageResponse(StrictModel):
     missing_dependencies: list[str] = []  # 依赖缺失时的缺失项列表
     errors: list[str] = []  # 错误信息
     spark_stages: list[SparkStageItem] = []  # 当前全部阶段状态
-    llm_traces: dict | None = None  # 本阶段新增的 LLM 追踪（LlmTraceNode dict）
+    llm_traces: dict | None = None  # 当前 request_id 的全部 LLM 追踪（LlmTraceNode dict）

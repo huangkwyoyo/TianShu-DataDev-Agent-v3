@@ -236,6 +236,8 @@ class Pipeline:
             self._results.pop(rid, None)
             self._packages.pop(rid, None)
             self._timestamps.pop(rid, None)
+            self._llm_traces.pop(rid, None)
+            self._spark_contexts.pop(rid, None)
         if expired_ids:
             logger.debug("TTL 过期清理完成，移除 %d 条缓存", len(expired_ids))
         return len(expired_ids)
@@ -2302,7 +2304,6 @@ class Pipeline:
         self._check_stage_dependencies(stage, context, artifacts)
 
         # Step 4: 执行阶段
-        errors: list[str] = []
         try:
             if stage == SparkPipelineStage.MAPPER:
                 self._do_spark_map(artifacts, context)
@@ -2311,7 +2312,7 @@ class Pipeline:
             elif stage == SparkPipelineStage.COMPILER:
                 self._do_spark_compile(context)
             elif stage == SparkPipelineStage.VALIDATOR:
-                self._do_spark_validate(context, errors)
+                self._do_spark_validate(context)
             elif stage == SparkPipelineStage.COMPARATOR:
                 self._do_spark_compare(artifacts, context)
             elif stage == SparkPipelineStage.PHYSICAL_VERIFIER:
@@ -2392,9 +2393,7 @@ class Pipeline:
         context.compile_result = result
         context.stage_results["COMPILER"] = "SUCCESS"
 
-    def _do_spark_validate(
-        self, context: SparkStageContext, errors: list[str],
-    ) -> None:
+    def _do_spark_validate(self, context: SparkStageContext) -> None:
         """执行 VALIDATOR 阶段——PySpark DSL 安全校验。"""
         from tianshu_datadev.spark.validator import SparkStaticValidator
 
@@ -2405,8 +2404,7 @@ class Pipeline:
         else:
             context.stage_results["VALIDATOR"] = "FAILURE"
             for e in validation.errors:
-                errors.append(f"[VALIDATOR] {e.error_code}: {e.detail}")
-            context.errors.extend(errors)
+                context.errors.append(f"[VALIDATOR] {e.error_code}: {e.detail}")
 
     def _do_spark_compare(
         self,
