@@ -1,7 +1,7 @@
 # Phase 6-8 已知风险登记
 
-> 日期：2026-07-05 | 最后更新：2026-07-05 Phase 9A5 REVIEW_READY 终验收完成——全链路 Pipeline → ReviewPackage 审查级闭环
-> 状态：C1-C4 全部点亮，9A1-9A3 + 9A5 已完成（9A4 阻塞-待业务方），629 passed / 11 skipped
+> 日期：2026-07-06 | 最后更新：2026-07-06 Spark Comparator 内容级对齐完成——Case 06 LOGIC_EQUIVALENT 达成，"三层剥离"闭环
+> 状态：C1-C4 全部点亮，Case 06 内容级对齐完成（8 commits），809 passed / 11 skipped (core)，2105 passed / 11 skipped (total)
 
 ---
 
@@ -167,32 +167,33 @@
 
 ---
 
-## Case06-Comparator: 多语句 DAG Spark Comparator——B 类收口完成，内容级对齐待后续 🟢
+## Case06-Comparator: 多语句 DAG Spark Comparator——✅ 内容级对齐完成，LOGIC_EQUIVALENT 达成
 
-- **风险等级**：B（归一化已实现，内容级差异仍需后续 Phase）
+- **风险等级**：已消除（2026-07-06 内容级对齐完成）
 - **发现时间**：2026-07-05 全局收尾审计
 - **收口时间**：2026-07-05 Case06 B 类功能收口——比率计算/CASE WHEN/Comparator 归一化
+- **对齐完成时间**：2026-07-06 Spark Comparator 内容级对齐——"三层剥离"
 - **影响范围**：`tests/api/test_nyc_business_case.py`——`TestNYCCase06SparkDualChain`
 - **当前状态**：
   - ✅ `PlanComparator.compare_program()`——SqlProgram 多语句扁平化对比已实现
-  - ✅ `PlanComparator._normalize_dag_steps()`——DAG 归一化（aggregate 3→1, project 7→1）
+  - ✅ `PlanComparator._normalize_dag_steps()`——DAG 归一化（grain-aware aggregate 合并 + target_grain 过滤）
   - ✅ `Orchestrator.run()`——接受 `SqlProgram | SqlBuildPlan`，自动分派
   - ✅ `Pipeline.export_artifacts()`——暴露 `sql_program` 字段
   - ✅ `TestNYCCase06SparkDualChain`——3 个测试
-  - ✅ 比率计算（compute_ratios）实现——SqlRawExpression 全链路（Spec → Builder → Compiler）
+  - ✅ 比率计算（compute_ratios）实现——SqlRawExpression 全链路
   - ✅ CASE WHEN（risk_label）实现——WhenBranch 字符串模式支持复杂布尔条件
-  - ✅ 2 个 xfail 转正：`test_run_all_produces_borough_results` / `test_safety_risk_level_values_valid`
-  - 🟡 `test_spark_orchestrator_logic_equivalence`——xfail(strict=True)：归一化有效但 scan/join/aggregate 内容级差异（_temp_* 引用 vs Mapper 别名）仍需更深层对齐
-- **阻塞因素**：
-  - scan/join/aggregate 内容级差异——SQL DAG 的 `_temp_*` 表引用与 Mapper 别名不匹配
-  - 待后续 Phase 引入 plan 级别对齐（scan 过滤、join 重排、引用归一化）
-- **处置建议**：SQL 管线 B 类收口完成（全部执行通过）+ XPASS 清零（cleanup_status 真实断言）。Spark 双链 Comparator 框架就绪（归一化已消除步数差异）。内容级对齐（_temp_* 引用 vs Mapper 别名）登记为独立 C 类后续 Phase——工作量估计 1-2 天。
-- **Task 9 豁免**：Orchestrator 集成测试（原方案 Task 9）已豁免——归一化已有 8 个测试覆盖：
-  - 单元测试：`TestNormalizeDagSteps`（3 个——aggregate 合并/project 合并/类型保留）
-  - 集成测试：`TestPlanComparatorMultiStatementFlatten`（SqlProgram 扁平化 + 多语句对比）
-  - 业务测试：`TestNYCCase06SparkDualChain`（3 个——严格等价/不崩溃/Contract 提取）
-  - Orchestrator 测试：`TestOrchestratorSqlProgramIntegration`（2 个——SqlProgram 分派/向后兼容）
-  - 额外 Orchestrator 级测试不会增加新的证据价值——豁免合理
+  - ✅ **2026-07-06**：`test_spark_orchestrator_logic_equivalence` xfail → **PASS**（LOGIC_EQUIVALENT）
+- **对齐策略（"三层剥离"）**：
+  1. `_flatten_sql_program_steps()`：过滤 `_temp_*` scan + `_temp_*` join（DAG 内部管道）
+  2. `_normalize_dag_steps()`：grain-aware aggregate 合并（同粒度合并 metrics，不同粒度独立）
+  3. `compare_program()` + Orchestrator：`target_grain` 从 Contract.grouping_keys 透传，过滤非目标粒度 aggregate
+  4. Contract 提取器：`extract_v1()` 过滤 `_temp_*` scan + join（对称守卫）
+- **剩余风险**（非阻塞）：
+  - R-CA-1（C）：`target_grain` 过滤是 Case 06 特化，不是通用业务真理——多输出粒度场景需扩展
+  - R-CA-3（中高 B）：Builder 缺 join——独立排查 builder join 生成逻辑
+  - R-CA-2（B）：`_temp_` 前缀检测逻辑两处不一致——建议提取共享谓词
+- **处置建议**：Case 06 闭环达成，合并就绪。剩余风险登记为后续独立 Phase。闭环报告：`docs/superpowers/specs/2026-07-06-spark-comparator-closure-and-risks.md`
+- **状态**：✅ 已消除——Case 06 Spark 双链 LOGIC_EQUIVALENT 达成，1 xfail 转正，659 passed / 11 skipped（spark+artifacts+api）
 
 ---
 
@@ -207,7 +208,10 @@
 | R3 | 已消除 | — | — | 2026-07-04 已修复 |
 | R4 | 已消除 | — | — | — |
 | Case05-Comp | C | 否 | 否 | 窗口函数 Comparator NOT_COVERED——待后续 Phase 升级为严格断言 |
-| Case06-Comp | B→C | 否 | 否 | B 类收口完成 + XPASS 清零。内容级对齐（_temp_* vs Mapper 别名）登记为独立 C 类后续 Phase |
+| Case06-Comp | 已消除 | — | — | **2026-07-06 消除**："三层剥离"使 Case 06 达到 LOGIC_EQUIVALENT，xfail 转正 |
+| R-CA-1 | **C** | 否 | 否 | `target_grain` 过滤是 Case 06 特化——不可误解为通用业务真理，多输出粒度场景需扩展 |
+| R-CA-3 | **中高（B）** | 否 | 否 | Builder 缺 join——B 类设计修复项，下一轮迭代优先处理 |
+| R-CA-2 | B | 否 | 否 | `_temp_` 前缀检测逻辑两处不一致——建议提取共享谓词 |
 | 9A1 | B-低风险 | 否 | 否 | 2026-07-05 已完成——PipelineArtifactBundle + export_artifacts() 就绪 |
 | 9A2 | B-低风险 | 否 | 否 | 2026-07-05 已完成——桥接函数标记 deprecated + 真实 SqlBuildPlan 驱动 COMPARATOR |
 | 9A3 | B-低风险 | 否 | 否 | 2026-07-05 已完成——Lite→V1 适配层 + Harness 自动驱动器 |

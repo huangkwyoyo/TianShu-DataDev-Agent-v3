@@ -301,4 +301,4 @@ python -m ruff check src/ tests/
 |:--:|------|:--:|------|
 | R-CA-1 | B2 的 `target_grain` 过滤假设所有非目标粒度 aggregate 都是 DAG 内部实现——对 Case 06 成立，对更复杂的多输出粒度场景需重新评估 | C | 后续 Phase 扩展 target_grain 为 target_grains（支持多输出粒度） |
 | R-CA-2 | `_temp_` 前缀是 DAG 内部管道的充分非必要条件——若未来临时表命名规则变化，过滤规则需同步更新 | B | 测试覆盖 `_temp_` 前缀过滤，改名会触发测试失败 |
-| R-CA-3 | Step 4（all_three_join）的 join 在 builder 输出中缺失——这是 builder bug，非 Comparator 问题，不影响对齐但可能导致业务语义不完整 | B | 独立排查 builder 的 join 生成逻辑，不阻塞本 Phase |
+| R-CA-3 | Step 4（all_three_join）的 join 在 builder 输出中缺失——这是 builder bug，非 Comparator 问题。当前 Case 06 不影响对齐，但新 case 中可能暴露导致业务语义不完整 | **中高** | **B 类设计修复项**：独立排查 builder 的 join 生成逻辑，建立单独的修复任务——不阻塞本 Phase 合并，但应在下一轮迭代中优先处理 |
