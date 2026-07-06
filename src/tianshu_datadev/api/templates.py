@@ -27,8 +27,12 @@ TEMPLATES: list[dict] = [
             "spec:\n"
             "  type: aggregate_table  # aggregate_table（汇总表）| detail_table（明细表）| label_table（标签表）\n"
             "  target_table: ads.taxi_daily_report\n"
-            "  target_grain: [trip_date, borough]\n"
+            "  target_grain: [pickup_date_key, borough]\n"
             '  summary: "按日期和行政区统计出租车行程量和收入"\n'
+            "\n"
+            "  time_range:\n"
+            '    start: "2026-01-01"  # 数据起始日期\n'
+            '    end: "2026-03-31"    # 数据截止日期\n'
             "\n"
             "  source_tables:\n"
             "    - name: gold.fact_trips\n"
@@ -105,8 +109,8 @@ TEMPLATES: list[dict] = [
             "      alias: avg_distance\n"
             "\n"
             "  dimensions:\n"
-            "    - dimension_name: trip_date\n"
-            "      column_ref: trip_date\n"
+            "    - dimension_name: pickup_date_key\n"
+            "      column_ref: pickup_date_key\n"
             "    - dimension_name: borough\n"
             "      column_ref: borough\n"
             "\n"
@@ -118,8 +122,8 @@ TEMPLATES: list[dict] = [
             "      join_type: LEFT  # INNER（内连接）| LEFT（左连接）| RIGHT（右连接）| FULL（全连接）\n"
             "\n"
             "  output_columns:\n"
-            "    - name: trip_date\n"
-            "      type: date\n"
+            "    - name: pickup_date_key\n"
+            "      type: integer\n"
             "    - name: borough\n"
             "      type: varchar\n"
             "    - name: trip_count\n"
@@ -157,6 +161,10 @@ TEMPLATES: list[dict] = [
             "  target_table: ads.trip_distance_label\n"
             "  target_grain: [trip_id]\n"
             '  summary: "行程距离分类打标——短途/中途/长途/异常"\n'
+            "\n"
+            "  time_range:\n"
+            '    start: "2026-01-01"  # 数据起始日期\n'
+            '    end: "2026-03-31"    # 数据截止日期\n'
             "\n"
             "  source_tables:\n"
             "    - name: gold.fact_trips\n"
@@ -238,8 +246,12 @@ TEMPLATES: list[dict] = [
             "spec:\n"
             "  type: aggregate_table  # aggregate_table（汇总表）| detail_table（明细表）| label_table（标签表）\n"
             "  target_table: ads.zone_trip_analysis\n"
-            "  target_grain: [trip_date, borough, zone_name]\n"
+            "  target_grain: [pickup_date_key, borough, zone_name]\n"
             '  summary: "多步骤行程分析——关联出租区域维和日期维，按日期/行政区/区域统计行程量"\n'
+            "\n"
+            "  time_range:\n"
+            '    start: "2026-01-01"  # 数据起始日期\n'
+            '    end: "2026-03-31"    # 数据截止日期\n'
             "\n"
             "  source_tables:\n"
             "    - name: gold.fact_trips\n"
@@ -344,8 +356,8 @@ TEMPLATES: list[dict] = [
             "      alias: avg_distance\n"
             "\n"
             "  dimensions:\n"
-            "    - dimension_name: trip_date\n"
-            "      column_ref: trip_date\n"
+            "    - dimension_name: pickup_date_key\n"
+            "      column_ref: pickup_date_key\n"
             "    - dimension_name: borough\n"
             "      column_ref: borough\n"
             "    - dimension_name: zone_name\n"
@@ -364,8 +376,8 @@ TEMPLATES: list[dict] = [
             "      join_type: LEFT  # INNER（内连接）| LEFT（左连接）| RIGHT（右连接）| FULL（全连接）\n"
             "\n"
             "  output_columns:\n"
-            "    - name: trip_date\n"
-            "      type: date\n"
+            "    - name: pickup_date_key\n"
+            "      type: integer\n"
             "    - name: borough\n"
             "      type: varchar\n"
             "    - name: zone_name\n"
@@ -389,7 +401,7 @@ TEMPLATES: list[dict] = [
             "2. 过滤异常数据：is_distance_outlier = false\n"
             "3. LEFT JOIN silver.taxi_zone ON ft.pickup_location_id = tz.location_id（获取 borough + zone_name）\n"
             "4. LEFT JOIN gold.dim_date ON ft.pickup_date_key = dd.date_key（获取日期属性）\n"
-            "5. 按 trip_date + borough + zone_name 汇总，聚合 trip_count / total_fare / avg_distance\n"
+            "5. 按 pickup_date_key + borough + zone_name 汇总，聚合 trip_count / total_fare / avg_distance\n"
             "\n"
             "## 关联推理提示\n"
             "- ft.pickup_location_id → tz.location_id（事实表上客区域编码 → 维表区域编码）\n"
@@ -412,6 +424,10 @@ TEMPLATES: list[dict] = [
             "  target_table: ads.trip_detail_wide\n"
             "  target_grain: [trip_id]\n"
             '  summary: "行程明细宽表——关联出租区域维表，展开上客/下客区域名称和行政区"\n'
+            "\n"
+            "  time_range:\n"
+            '    start: "2026-01-01"  # 数据起始日期\n'
+            '    end: "2026-03-31"    # 数据截止日期\n'
             "\n"
             "  source_tables:\n"
             "    - name: gold.fact_trips\n"
@@ -558,6 +574,10 @@ TEMPLATES: list[dict] = [
             "  target_grain: [borough, location_id]\n"
             '  summary: "各行政区 Top10 热门出租区域——按行程量降序排名"\n'
             "\n"
+            "  time_range:\n"
+            '    start: "2026-01-01"  # 数据起始日期\n'
+            '    end: "2026-03-31"    # 数据截止日期\n'
+            "\n"
             "  source_tables:\n"
             "    - name: gold.fact_trips\n"
             "      alias: ft\n"
@@ -699,8 +719,8 @@ TEMPLATES: list[dict] = [
             "    #   alias: trip_count\n"
             "\n"
             "  dimensions:                    # 维度声明（可选）\n"
-            "    # - dimension_name: trip_date\n"
-            "    #   column_ref: trip_date\n"
+            "    # - dimension_name: pickup_date_key\n"
+            "    #   column_ref: pickup_date_key\n"
             "\n"
             "  joins:                         # Join 声明（可选，多表时填写）\n"
             "    # 可用维度表：silver.taxi_zone（265行/location_id）, gold.dim_date（1.1万行/date_key）,\n"

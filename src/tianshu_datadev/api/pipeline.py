@@ -164,6 +164,8 @@ class Pipeline:
         snapshot_provider: SnapshotSourceProvider | None = None,
         # ── Phase 9C-R16: 默认 table_paths 回退——E2E 环境无需前端传参 ──
         default_table_paths: dict[str, str] | None = None,
+        # ── NYC 数据仓库 DuckDB 文件路径——模板引用 gold/silver schema 表时使用 ──
+        duckdb_path: str | None = None,
     ):
         """初始化流水线。
 
@@ -173,6 +175,8 @@ class Pipeline:
                      注入后 RelationshipPlanner + SpecEnricher 均走 LLM 推断。
             default_table_paths: 默认表名→CSV 路径映射——当 API 调用未显式传入
                                  table_paths 时使用此回退值。E2E 测试环境用。
+            duckdb_path: 外部 DuckDB 数据库文件路径——ATTACH 后自动创建 schema VIEW
+                         桥接，使模板引用的 gold/silver 表可直接查询
         """
         self._base_output_dir = base_output_dir
         self._results: dict[str, dict] = {}  # request_id → 内部产物
@@ -187,6 +191,8 @@ class Pipeline:
         self._snapshot_provider = snapshot_provider
         # ── Phase 9C-R16: table_paths 回退值 ──
         self._default_table_paths = default_table_paths or {}
+        # ── 外部 DuckDB 数据库路径 ──
+        self._duckdb_path = duckdb_path
 
     # ── 缓存生命周期管理 ──────────────────────────────
 
@@ -779,7 +785,10 @@ class Pipeline:
                 program_artifact = compiler.compile_program(sql_program)
 
                 stage = "execute"
-                execute_executor = DuckDBExecutor(table_paths=self._resolve_table_paths(table_paths))
+                execute_executor = DuckDBExecutor(
+                    table_paths=self._resolve_table_paths(table_paths),
+                    duckdb_path=self._duckdb_path,
+                )
                 program_result = execute_executor.execute_program(
                     program_artifact.compiled
                 )
@@ -824,7 +833,10 @@ class Pipeline:
                 program_artifact = compiler.compile_program(sql_program)
 
                 stage = "execute"
-                execute_executor = DuckDBExecutor(table_paths=self._resolve_table_paths(table_paths))
+                execute_executor = DuckDBExecutor(
+                    table_paths=self._resolve_table_paths(table_paths),
+                    duckdb_path=self._duckdb_path,
+                )
                 program_result = execute_executor.execute_program(
                     program_artifact.compiled
                 )
@@ -862,7 +874,10 @@ class Pipeline:
                 compiled = compiler.compile(plan)
 
                 stage = "execute"
-                execute_executor = DuckDBExecutor(table_paths=self._resolve_table_paths(table_paths))
+                execute_executor = DuckDBExecutor(
+                    table_paths=self._resolve_table_paths(table_paths),
+                    duckdb_path=self._duckdb_path,
+                )
                 trace, summary = execute_executor.execute(compiled)
 
             # ── 执行状态检查——RUNTIME_FAIL 阻断，不进入成功路径 ──
@@ -1077,7 +1092,10 @@ class Pipeline:
                 compiled_sql = program_artifact.compiled.statements[-1]
 
                 stage = "execute"
-                executor = DuckDBExecutor(table_paths=self._resolve_table_paths(table_paths))
+                executor = DuckDBExecutor(
+                    table_paths=self._resolve_table_paths(table_paths),
+                    duckdb_path=self._duckdb_path,
+                )
                 program_result = executor.execute_program(
                     program_artifact.compiled
                 )
@@ -1307,7 +1325,10 @@ class Pipeline:
                 compiled_sql = program_artifact.compiled.statements[-1]
 
                 stage = "execute"
-                execute_executor = DuckDBExecutor(table_paths=self._resolve_table_paths(table_paths))
+                execute_executor = DuckDBExecutor(
+                    table_paths=self._resolve_table_paths(table_paths),
+                    duckdb_path=self._duckdb_path,
+                )
                 program_result = execute_executor.execute_program(
                     program_artifact.compiled
                 )
@@ -1347,7 +1368,10 @@ class Pipeline:
                 compiled_sql = artifact.compiled_sql
 
                 stage = "execute"
-                execute_executor = DuckDBExecutor(table_paths=self._resolve_table_paths(table_paths))
+                execute_executor = DuckDBExecutor(
+                    table_paths=self._resolve_table_paths(table_paths),
+                    duckdb_path=self._duckdb_path,
+                )
                 trace, summary = execute_executor.execute(compiled_sql)
 
                 sql_program = build_sql_program(plan, spec.spec_hash)
@@ -1990,7 +2014,10 @@ class Pipeline:
             compiled = compiler.compile(plan)
 
             stage = "execute"
-            executor = DuckDBExecutor(table_paths=self._resolve_table_paths(table_paths))
+            executor = DuckDBExecutor(
+                table_paths=self._resolve_table_paths(table_paths),
+                duckdb_path=self._duckdb_path,
+            )
             trace, summary = executor.execute(compiled)
 
             # ── 执行状态检查——RUNTIME_FAIL 阻断，不进入成功路径 ──

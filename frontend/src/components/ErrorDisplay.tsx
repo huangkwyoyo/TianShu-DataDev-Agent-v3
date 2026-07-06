@@ -13,6 +13,7 @@ export function ErrorDisplay({ error, onDismiss }: Props) {
   // 根据错误码确定展示样式
   const isReject = error.error_code.includes('REJECT') ||
     error.error_code === 'VALIDATION_ERROR' ||
+    error.error_code.startsWith('PIPELINE_') ||
     error.message.includes('阻断');
 
   const isNotFound = error.error_code === 'NOT_FOUND' ||
@@ -20,6 +21,8 @@ export function ErrorDisplay({ error, onDismiss }: Props) {
 
   const isApiUnavailable = error.error_code === 'NETWORK_ERROR' ||
     error.error_code === 'PARSE_ERROR';
+
+  const isPipelineError = error.error_code.startsWith('PIPELINE_');
 
   const borderColor = isReject ? 'var(--red)' :
     isNotFound ? 'var(--yellow)' :
@@ -31,6 +34,7 @@ export function ErrorDisplay({ error, onDismiss }: Props) {
         <div className="error-code">
           [{error.error_code}]
           {isReject && ' — 管线阻断'}
+          {isPipelineError && error.field_ref && ` — ${error.field_ref} 阶段失败`}
           {isNotFound && ' — 资源不存在'}
           {isApiUnavailable && ' — API 不可用'}
         </div>

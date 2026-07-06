@@ -115,6 +115,14 @@ export default function App() {
       const partial = await onSuccess(result);
       update({
         isLoading: false,
+        // 管线错误同时写入 error，使 ErrorDisplay 在主面板区也能展示错误原因
+        error: plError
+          ? {
+              error_code: `PIPELINE_${plError.stage.toUpperCase()}_FAILED`,
+              message: plError.error_message,
+              field_ref: plError.stage,
+            }
+          : null,
         pipelineError: plError,
         pipelineStages: plStages,
         ...partial,

@@ -1563,9 +1563,11 @@ class SqlBuildPlanBuilder:
 
         # 5. AggregateStep——如果有指标
         # 多表 JOIN 后用空 table_ref 让 DuckDB 从 JOIN 结果中自动解析列引用，
-        # 避免左表别名引用右表列（如 ft.borough）的问题
+        # 避免左表别名引用右表列（如 ft.borough）的问题。
+        # 自引用例外：必须使用左别名消除同名列歧义（左右表列名完全相同）
         if spec.metrics:
-            agg = self._build_aggregate_step(spec, "")
+            agg_table_ref = left_alias if is_self_join else ""
+            agg = self._build_aggregate_step(spec, agg_table_ref)
             steps.append(agg)
 
         # 5b. WindowStep——如果有窗口指标（聚合后、投影前）
@@ -1574,7 +1576,9 @@ class SqlBuildPlanBuilder:
             steps.append(window)
 
         # 6. ProjectStep（排除窗口函数已产出的别名）
-        project = self._build_project_step(spec)
+        # 自引用时用左别名消除列歧义——左右表列名完全相同，DuckDB 无法自动解析
+        proj_table_ref = left_alias if is_self_join else ""
+        project = self._build_project_step(spec, default_table_ref=proj_table_ref)
         if window:
             win_aliases = {str(w.alias) for w in window.window_exprs if w.alias}
             filtered_cols = [
@@ -1851,6 +1855,8 @@ class SqlBuildPlanBuilder:
 
         relative_range 与 start/end 互斥——relative_range 优先。
 
+        column_ref 解析优先级：tr.column_ref > 对应 InputTableDecl.time_field。
+
         Args:
             spec: 已解析的 DeveloperSpec
             table_alias: 表别名（用于 ColumnRef.table_ref）
@@ -1862,7 +1868,20 @@ class SqlBuildPlanBuilder:
         if tr is None:
             return None
 
-        normalized = self._normalizer.normalize(tr.column_ref)
+        # 解析时间列名：优先用 time_range.column_ref，为空时回退到表声明的 time_field
+        column_ref = tr.column_ref
+        if not column_ref:
+            # 从 input_tables 中查找匹配的表，取其 time_field
+            for t in spec.input_tables:
+                if t.table_alias == table_alias:
+                    column_ref = t.time_field or ""
+                    break
+
+        if not column_ref:
+            # 无法确定时间列——无法构建过滤条件
+            return None
+
+        normalized = self._normalizer.normalize(column_ref)
 
         # ── 模式 1：相对日期范围（relative_range 优先）──
         if tr.relative_range:
@@ -1878,14 +1897,14 @@ class SqlBuildPlanBuilder:
                 return FilterStep(
                     step_id=SqlBuildPlan.generate_step_id("filter", {
                         "table": table_alias,
-                        "col": tr.column_ref,
+                        "col": column_ref,
                         "op": "GTE",
                         "relative_range": tr.relative_range,
                     }),
                     predicate=Predicate(
                         left=ColumnRef(
                             table_ref=table_alias,
-                            column_name=tr.column_ref,
+                            column_name=column_ref,
                             normalized_name=normalized,
                         ),
                         operator=PredicateOperator.GTE,
@@ -1900,14 +1919,14 @@ class SqlBuildPlanBuilder:
                 return FilterStep(
                     step_id=SqlBuildPlan.generate_step_id("filter", {
                         "table": table_alias,
-                        "col": tr.column_ref,
+                        "col": column_ref,
                         "op": "GTE",
                         "relative_range": "mtd",
                     }),
                     predicate=Predicate(
                         left=ColumnRef(
                             table_ref=table_alias,
-                            column_name=tr.column_ref,
+                            column_name=column_ref,
                             normalized_name=normalized,
                         ),
                         operator=PredicateOperator.GTE,
@@ -1922,14 +1941,14 @@ class SqlBuildPlanBuilder:
                 return FilterStep(
                     step_id=SqlBuildPlan.generate_step_id("filter", {
                         "table": table_alias,
-                        "col": tr.column_ref,
+                        "col": column_ref,
                         "op": "GTE",
                         "relative_range": "ytd",
                     }),
                     predicate=Predicate(
                         left=ColumnRef(
                             table_ref=table_alias,
-                            column_name=tr.column_ref,
+                            column_name=column_ref,
                             normalized_name=normalized,
                         ),
                         operator=PredicateOperator.GTE,
@@ -1952,7 +1971,7 @@ class SqlBuildPlanBuilder:
             return FilterStep(
                 step_id=SqlBuildPlan.generate_step_id("filter", {
                     "table": table_alias,
-                    "col": tr.column_ref,
+                    "col": column_ref,
                     "op": "BETWEEN",
                     "calendar_type": tr.calendar_type,
                     "fiscal_year": tr.fiscal_year,
@@ -1960,7 +1979,7 @@ class SqlBuildPlanBuilder:
                 predicate=Predicate(
                     left=ColumnRef(
                         table_ref=table_alias,
-                        column_name=tr.column_ref,
+                        column_name=column_ref,
                         normalized_name=normalized,
                     ),
                     operator=PredicateOperator.BETWEEN,
@@ -1976,13 +1995,13 @@ class SqlBuildPlanBuilder:
             return FilterStep(
                 step_id=SqlBuildPlan.generate_step_id("filter", {
                     "table": table_alias,
-                    "col": tr.column_ref,
+                    "col": column_ref,
                     "op": "BETWEEN",
                 }),
                 predicate=Predicate(
                     left=ColumnRef(
                         table_ref=table_alias,
-                        column_name=tr.column_ref,
+                        column_name=column_ref,
                         normalized_name=normalized,
                     ),
                     operator=PredicateOperator.BETWEEN,

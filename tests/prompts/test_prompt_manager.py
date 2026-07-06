@@ -73,11 +73,12 @@ class TestVersionListing:
     """版本列表测试。"""
 
     def test_list_all_tasks(self, manager: PromptManager) -> None:
-        """list_tasks() 返回 4 个已注册的 task。"""
+        """list_tasks() 返回 5 个已注册的 task。"""
         tasks = manager.list_tasks()
-        assert len(tasks) == 4
+        assert len(tasks) == 5
         assert "developer_spec_parser" in tasks
         assert "relationship_planner" in tasks
+        assert "spark_annotator" in tasks
         assert "sql_build_planner" in tasks
         assert "sql_program_planner" in tasks
 

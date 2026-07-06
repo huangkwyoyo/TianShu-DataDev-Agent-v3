@@ -53,6 +53,27 @@ def _discover_csv_fixtures() -> dict[str, str]:
     return mapping
 
 
+def _discover_nyc_duckdb() -> str | None:
+    """自动发现 NYC 出租车数据仓库 DuckDB 文件。
+
+    按优先级依次尝试以下路径，返回第一个存在的文件绝对路径。
+    若都不存在，返回 None——Pipeline 将以纯 in-memory 模式运行。
+
+    Returns:
+        数据库文件绝对路径或 None
+    """
+    candidate_paths = [
+        os.path.join(
+            "D:\\", "ProgramData", "Datawarehouse",
+            "纽约市城市交通", "nyc_transport.duckdb",
+        ),
+    ]
+    for p in candidate_paths:
+        if os.path.isfile(p):
+            return os.path.abspath(p)
+    return None
+
+
 def create_app(pipeline: Pipeline | None = None) -> FastAPI:
     """创建 FastAPI 应用实例。
 
@@ -82,10 +103,15 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
     # 注入流水线——未显式传入时仅在 E2E 测试模式下自动发现 CSV fixture 文件
     # 生产路径不扫描 tests/fixtures/，避免测试数据泄漏到生产环境
     if pipeline is None:
+        # 自动发现 NYC 数据仓库 DuckDB 文件
+        db_path = _discover_nyc_duckdb()
         if os.environ.get("TIANSHU_E2E_MODE") == "true":
-            pipeline = Pipeline(default_table_paths=_discover_csv_fixtures())
+            pipeline = Pipeline(
+                default_table_paths=_discover_csv_fixtures(),
+                duckdb_path=db_path,
+            )
         else:
-            pipeline = Pipeline()
+            pipeline = Pipeline(duckdb_path=db_path)
     app.state.pipeline = pipeline
 
     # 注册异常处理器

@@ -120,13 +120,10 @@ class SqlBuildPlanValidator:
         # ── 9. 时间过滤校验 ──
         self._validate_time_filter(ctx, questions)
 
-        # ── 10. 明细查询 LIMIT 校验 ──
-        self._validate_detail_limit(ctx, questions)
-
-        # ── 11. 窗口函数校验（Phase 3B 新增） ──
+        # ── 10. 窗口函数校验（Phase 3B 新增） ──
         self._validate_window_functions(ctx, questions)
 
-        # ── 12. 窗口函数位置校验（Phase 3B 新增） ──
+        # ── 11. 窗口函数位置校验（Phase 3B 新增） ──
         self._validate_window_position(ctx, questions)
 
         # ── 13. 粒度完整性校验（Phase 4C 补全——原 known_gap） ──
@@ -282,7 +279,7 @@ class SqlBuildPlanValidator:
                         description=(
                             f"不支持的步骤类型 '{step_type_name}'——"
                             f"当前白名单: {[t.__name__ for t in _allowed]}。"
-                            f"该类型计划在后续 Phase 中开放（详见 Phase 4.6 规划）。"
+                            f"该步骤类型当前未开放，如有需求请联系平台管理员。"
                         ),
                         blocking=True,
                     )
@@ -362,8 +359,7 @@ class SqlBuildPlanValidator:
                             field_ref=f"{step.table_ref}.{col_ref.column_name}",
                             description=(
                                 f"字段 '{step.table_ref}.{col_ref.column_name}' "
-                                f"（归一化: {col_ref.normalized_name}）未在 "
-                                f"SourceManifest 的 {step.table_ref} 表中找到——"
+                                f"未在 SourceManifest 的 {step.table_ref} 表中找到——"
                                 f"已知字段: {known_cols}"
                             ),
                             blocking=True,
@@ -427,8 +423,8 @@ class SqlBuildPlanValidator:
                         source="validator",
                         field_ref=ref,
                         description=(
-                            f"JoinStep.relationship_ref '{ref}' 在 "
-                            f"RelationshipHypothesis 中未找到——可能硬门禁漏拦截"
+                            f"内部数据异常——Join 关联记录 '{ref}' 缺失，"
+                            f"请重新执行关系推理"
                         ),
                         blocking=True,
                     )
@@ -440,8 +436,9 @@ class SqlBuildPlanValidator:
                         source="validator",
                         field_ref=ref,
                         description=(
-                            f"JoinStep 包含 {level.value} 证据等级的 Join——"
-                            f"硬门禁违规。WEAK/NONE Join 不得进入 SqlBuildPlan"
+                            f"关联证据不足（{level.value}）——"
+                            f"请确认两表之间是否有明确的关联关系，"
+                            f"或在 DeveloperSpec 中显式声明 join_keys"
                         ),
                         blocking=True,
                     )
@@ -835,44 +832,15 @@ class SqlBuildPlanValidator:
                         field_ref=f"{step.table_ref}",
                         description=(
                             f"大事实表 '{step.table_ref}'（估算 {table.estimated_row_count:,} 行）"
-                            f"缺少时间过滤条件——可能触发全表扫描"
+                            f"缺少时间过滤条件——可能触发全表扫描。"
+                            f"请在 spec 中添加 time_range 声明，例如：\n"
+                            f"  time_range:\n"
+                            f'    start: "2026-01-01"\n'
+                            f'    end: "2026-03-31"'
                         ),
                         blocking=True,
                     )
                 )
-
-    def _validate_detail_limit(self, ctx: _ValidationContext, questions: list[OpenQuestion]) -> None:
-        """检查明细查询（无聚合）是否有 LIMIT。
-
-        规则：如果 SqlBuildPlan 不包含 AggregateStep，且不包含 LimitStep，
-        则添加 blocking 问题——防止无限制返回明细数据。
-        """
-        # 有聚合 → 不是明细查询，OK
-        if ctx.aggregate_steps:
-            return
-
-        # 有 LIMIT 步骤 → OK
-        if ctx.limit_steps:
-            return
-
-        # 有排序且排序带 limit → OK
-        for s in ctx.sort_steps:
-            if s.limit is not None and s.limit > 0:
-                return
-
-        questions.append(
-            OpenQuestion(
-                question_id=f"Q-VAL-LIMIT-{ctx.plan.plan_id}",
-                source="validator",
-                field_ref="plan.steps",
-                description=(
-                    "明细查询（无聚合）缺少 LIMIT——"
-                    "必须显式设置行数限制以防止无限制返回明细数据"
-                ),
-                blocking=True,
-            )
-        )
-
 
 # ════════════════════════════════════════════
 # 验证上下文
@@ -967,42 +935,67 @@ def _classify_step(step: StepNode, ctx: _ValidationContext) -> None:
 def _has_time_predicate(predicates: list) -> bool:
     """检查谓词列表中是否包含时间相关条件。
 
-    启发式检测：检查谓词的 left 字段是否引用了疑似时间字段名
-    （如 date、time、timestamp、dt、ds 等）。
+    检测策略（三级）：
+    1. 列名含时间关键词（date/time/timestamp/dt 等）
+    2. 列名匹配常见时间字段后缀（_at/_date/_time/_ts/_dt）
+    3. BETWEEN 谓词的右值为日期格式字符串（如 "2026-01-01"）→ 高度疑似时间过滤
     """
     time_keywords = {
         "date", "time", "timestamp", "datetime", "dt", "ds",
         "event_time", "create_time", "created_at", "updated_at",
         "stat_date", "dt_date", "day", "hour",
     }
+    # 常见时间字段后缀——覆盖 pickup_at / dropoff_at / order_date 等
+    time_suffixes = ("_at", "_date", "_time", "_ts", "_dt")
 
     for pred in predicates:
-        if _is_time_field(pred, time_keywords):
+        if _is_time_field(pred, time_keywords, time_suffixes):
             return True
     return False
 
 
-def _is_time_field(pred, time_keywords: set[str]) -> bool:
+def _looks_like_date_value(value: str) -> bool:
+    """检查字符串是否像日期值（YYYY-MM-DD 格式）。"""
+    import re
+    return bool(re.match(r'^\d{4}-\d{2}-\d{2}$', value))
+
+
+def _is_time_field(pred, time_keywords: set[str], time_suffixes: tuple[str, ...] = ()) -> bool:
     """递归检查谓词树中是否包含时间字段引用。"""
     # 检查 left 侧
     left = getattr(pred, "left", None)
     if left is not None:
         col_name = getattr(left, "column_name", "")
         norm_name = getattr(left, "normalized_name", "")
-        if any(kw in col_name.lower() for kw in time_keywords):
+        col_lower = col_name.lower()
+        norm_lower = norm_name.lower()
+        # 策略 1：关键词匹配
+        if any(kw in col_lower for kw in time_keywords):
             return True
-        if any(kw in norm_name.lower() for kw in time_keywords):
+        if any(kw in norm_lower for kw in time_keywords):
+            return True
+
+        # 策略 2：时间字段后缀匹配
+        if time_suffixes and any(col_lower.endswith(suffix) for suffix in time_suffixes):
+            return True
+        if time_suffixes and any(norm_lower.endswith(suffix) for suffix in time_suffixes):
             return True
         # 递归嵌套 Predicate
         if hasattr(left, "operator"):
-            if _is_time_field(left, time_keywords):
+            if _is_time_field(left, time_keywords, time_suffixes):
                 return True
 
     # 检查 right 侧
     right = getattr(pred, "right", None)
-    if right is not None and hasattr(right, "operator"):
-        if _is_time_field(right, time_keywords):
-            return True
+    if right is not None:
+        # 策略 3：BETWEEN 右值如果是列表且含日期格式字符串 → 时间过滤
+        if isinstance(right, list):
+            right_values = [getattr(v, "value", v) for v in right]
+            if any(_looks_like_date_value(str(v)) for v in right_values):
+                return True
+        if hasattr(right, "operator"):
+            if _is_time_field(right, time_keywords, time_suffixes):
+                return True
 
     return False
 

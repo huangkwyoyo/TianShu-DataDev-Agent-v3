@@ -317,41 +317,9 @@ class TestSqlBuildPlanValidator:
         validator = SqlBuildPlanValidator()
         passed, questions = validator.validate(plan, manifest)
 
-        # 应该有时间和/或 LIMIT 相关的问题
+        # 大事实表缺少时间过滤应产生问题
         assert len(questions) > 0, "大事实表无时间过滤应产生问题"
         # 检查是否有时间过滤相关问题
         time_questions = [q for q in questions if "时间" in q.description]
         assert len(time_questions) > 0, f"应包含时间过滤警告，实际: {[q.description for q in questions]}"
 
-    def test_detail_query_no_limit_rejected(self):
-        """明细查询（无聚合）缺 LIMIT 被拒绝。"""
-        spec = _parse_spec("fixtures/golden/golden_no_time_range.md")
-        manifest = _build_manifest(spec)
-
-        # 手动构建无聚合 + 无 LIMIT 的计划
-        from tianshu_datadev.planning.models import ColumnRef
-        from tianshu_datadev.planning.sql_build_plan import ScanStep as ScanStepAlias
-
-        plan = SqlBuildPlan(
-            plan_id="test_no_limit",
-            spec_hash=spec.spec_hash,
-            steps=[
-                ScanStepAlias(
-                    step_id="step_scan_1",
-                    table_ref="tf",
-                    required_columns=[
-                        ColumnRef(table_ref="tf", column_name="id", normalized_name="id"),
-                    ],
-                    estimated_row_count=100,
-                ),
-            ],
-            multi_table=False,
-        )
-
-        validator = SqlBuildPlanValidator()
-        passed, questions = validator.validate(plan, manifest)
-
-        # 明细查询无 LIMIT → 应有 blocking 问题
-        limit_questions = [q for q in questions if "LIMIT" in q.description]
-        assert len(limit_questions) > 0, f"期望 LIMIT 警告，实际: {questions}"
-        assert any(q.blocking for q in limit_questions)

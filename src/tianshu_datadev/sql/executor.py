@@ -37,12 +37,19 @@ class DuckDBExecutor:
     6. 输出 ExecutionTrace + ResultSummary
     """
 
-    def __init__(self, table_paths: dict[str, str] | None = None, timeout_sec: float = _DEFAULT_TIMEOUT_SEC):
+    def __init__(
+        self,
+        table_paths: dict[str, str] | None = None,
+        timeout_sec: float = _DEFAULT_TIMEOUT_SEC,
+        duckdb_path: str | None = None,
+    ):
         """初始化执行器。
 
         Args:
             table_paths: 物理表名 → CSV 文件路径的映射
             timeout_sec: 执行超时秒数
+            duckdb_path: 外部 DuckDB 数据库文件路径——ATTACH 后自动创建同名 schema
+                         和 VIEW，使编译产生的两段表名（如 gold.fact_trips）可直接查询
 
         Raises:
             ValueError: table_paths 的 key（物理表名）或 value（CSV 路径）包含非法 SQL 字符
@@ -51,6 +58,7 @@ class DuckDBExecutor:
             self._validate_table_paths(table_paths)
         self._table_paths = table_paths or {}
         self._timeout_sec = timeout_sec
+        self._duckdb_path = duckdb_path
 
     def execute(self, compiled: CompiledSql) -> tuple[ExecutionTrace, ResultSummary]:
         """执行编译后的 SQL。
@@ -107,6 +115,9 @@ class DuckDBExecutor:
 
             # 加载 CSV fixture 表
             self._load_tables(con)
+
+            # ATTACH 外部 DuckDB 数据库（如 NYC 数据仓库）
+            self._attach_database(con)
 
             # 执行 SQL
             result = con.execute(compiled.sql)
@@ -262,6 +273,9 @@ class DuckDBExecutor:
 
             # 2. 加载 CSV 表——只加载一次
             self._load_tables(con)
+
+            # 2b. ATTACH 外部 DuckDB 数据库
+            self._attach_database(con)
 
             # 3. 按顺序执行每条语句
             for i, stmt_id in enumerate(compiled.statement_order):
@@ -445,6 +459,63 @@ class DuckDBExecutor:
             except Exception:
                 # CSV 加载失败——跳过此表，让 SQL 执行时报错暴露
                 pass
+
+    def _attach_database(self, con) -> None:
+        """ATTACH 外部 DuckDB 数据库并创建 schema + VIEW 桥接。
+
+        编译产生的 SQL 使用两段表名（如 gold.fact_trips），但 ATTACH 的数据库
+        表名需要三段（catalog.schema.table）。此方法在默认 catalog 中创建同名
+        schema 和 VIEW，使两段表名可直接解析到外部数据库表。
+
+        注意：information_schema 在 system catalog 下，不能用 {alias}.information_schema
+        查询——需用全局 information_schema + table_catalog 过滤。
+        """
+        if not self._duckdb_path:
+            return
+
+        try:
+            # 使用固定别名 ATTACH 外部数据库
+            alias = "_ext_db"
+            con.execute(f"ATTACH '{self._duckdb_path}' AS {alias} (READ_ONLY)")
+
+            # 发现所有用户 schema（排除系统 schema——通过 table_catalog 过滤）
+            schemas = con.execute(f"""
+                SELECT DISTINCT table_schema
+                FROM information_schema.tables
+                WHERE table_catalog = '{alias}'
+                  AND table_schema NOT IN ('information_schema', 'pg_catalog')
+            """).fetchall()
+
+            for (schema_name,) in schemas:
+                # 在默认 catalog 创建同名 schema
+                try:
+                    con.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
+                except Exception:
+                    continue
+
+                # 为该 schema 下的每张表创建 VIEW
+                tables = con.execute(f"""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_catalog = '{alias}'
+                      AND table_schema = '{schema_name}'
+                      AND table_type = 'BASE TABLE'
+                """).fetchall()
+
+                for (table_name,) in tables:
+                    try:
+                        con.execute(
+                            f"CREATE OR REPLACE VIEW {schema_name}.{table_name} AS "
+                            f"SELECT * FROM {alias}.{schema_name}.{table_name}"
+                        )
+                    except Exception:
+                        # VIEW 创建失败——可能已存在或权限问题，跳过
+                        pass
+
+        except Exception:
+            # ATTACH 失败——数据库文件不存在或损坏，静默跳过
+            # SQL 执行时会因表缺失而报明确错误
+            pass
 
     @staticmethod
     def _extract_column_types(description) -> list[str]:
