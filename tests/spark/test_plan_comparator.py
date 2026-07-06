@@ -1727,6 +1727,125 @@ class TestPlanComparatorMultiStatementFlatten:
 # ── _normalize_dag_steps 单元测试 ──
 
 
+    def test_temp_join_filtered_from_compare_program(self):
+        """_temp_* 表之间的 join 应从扁平化结果中过滤——DAG 内部管道 join。"""
+        from tianshu_datadev.planning.sql_build_plan import (
+            JoinStep,
+            ScanStep,
+            JoinType,
+        )
+        from tianshu_datadev.planning.sql_program import (
+            SqlProgram,
+            SqlStatement,
+            StatementKind,
+        )
+
+        # 构造含 _temp_* join 的 SqlProgram
+        stmt_plan = _make_sql_plan([
+            ScanStep(
+                step_type="scan", step_id="scan_t1",
+                table_ref="_temp_c0_trip_agg",
+                required_columns=[
+                    ColumnRef(table_ref="_temp_c0_trip_agg", column_name="borough", normalized_name="borough"),
+                ],
+            ),
+            ScanStep(
+                step_type="scan", step_id="scan_t2",
+                table_ref="_temp_c0_crash_agg",
+                required_columns=[
+                    ColumnRef(table_ref="_temp_c0_crash_agg", column_name="borough", normalized_name="borough"),
+                ],
+            ),
+            JoinStep(
+                step_type="join", step_id="join_temp",
+                right_table_ref="_temp_c0_crash_agg",
+                join_type=JoinType.LEFT,
+                join_keys=[(
+                    ColumnRef(table_ref="_temp_c0_trip_agg", column_name="borough", normalized_name="borough"),
+                    ColumnRef(table_ref="_temp_c0_crash_agg", column_name="borough", normalized_name="borough"),
+                )],
+                relationship_ref="rel_temp",
+            ),
+        ])
+
+        sql_program = self._make_minimal_sql_program([
+            self._make_statement("stmt_0", stmt_plan, kind=StatementKind.PRODUCER),
+        ])
+
+        comparator = PlanComparator()
+        flattened = comparator._flatten_sql_program_steps(sql_program)
+
+        # _temp_ scan 被过滤 + _temp_ join 被过滤 → 结果为空
+        join_steps = [s for s in flattened if s.get("step_type") == "join"]
+        scan_steps = [s for s in flattened if s.get("step_type") == "scan"]
+        assert len(join_steps) == 0, (
+            f"_temp_* join 应被过滤，实际保留 {len(join_steps)} 个"
+        )
+        assert len(scan_steps) == 0, (
+            f"_temp_* scan 应被过滤，实际保留 {len(scan_steps)} 个"
+        )
+
+    def test_source_join_preserved_in_compare_program(self):
+        """源表之间的 join（非 _temp_*）应保留并参与对比。"""
+        from tianshu_datadev.planning.sql_build_plan import (
+            JoinStep,
+            ScanStep,
+            JoinType,
+        )
+        from tianshu_datadev.planning.sql_program import (
+            SqlProgram,
+            SqlStatement,
+            StatementKind,
+        )
+
+        # 构造含源表 join（tz ↔ zts）的 SqlProgram
+        stmt_plan = _make_sql_plan([
+            ScanStep(
+                step_type="scan", step_id="scan_tz",
+                table_ref="tz",
+                required_columns=[
+                    ColumnRef(table_ref="tz", column_name="location_id", normalized_name="location_id"),
+                ],
+            ),
+            ScanStep(
+                step_type="scan", step_id="scan_zts",
+                table_ref="zts",
+                required_columns=[
+                    ColumnRef(table_ref="zts", column_name="pickup_location_id", normalized_name="pickup_location_id"),
+                ],
+            ),
+            JoinStep(
+                step_type="join", step_id="join_tz_zts",
+                right_table_ref="zts",
+                join_type=JoinType.LEFT,
+                join_keys=[(
+                    ColumnRef(table_ref="tz", column_name="location_id", normalized_name="location_id"),
+                    ColumnRef(table_ref="zts", column_name="pickup_location_id", normalized_name="pickup_location_id"),
+                )],
+                relationship_ref="rel_tz_zts",
+            ),
+        ])
+
+        sql_program = self._make_minimal_sql_program([
+            self._make_statement("stmt_0", stmt_plan, kind=StatementKind.PRODUCER),
+        ])
+
+        comparator = PlanComparator()
+        flattened = comparator._flatten_sql_program_steps(sql_program)
+
+        join_steps = [s for s in flattened if s.get("step_type") == "join"]
+        assert len(join_steps) == 1, (
+            f"源表 join 应保留，实际 {len(join_steps)} 个"
+        )
+        # 验证保留的 join 是源表 join，不是 _temp_ join
+        assert "tz" in join_steps[0].get("left_table_ref", ""), (
+            f"保留的 join 应引用源表 tz，实际={join_steps[0]}"
+        )
+
+
+# ── _normalize_dag_steps 单元测试 ──
+
+
 class TestNormalizeDagSteps:
     """Comparator DAG 归一化——_normalize_dag_steps() 的单元测试。
 

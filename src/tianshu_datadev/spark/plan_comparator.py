@@ -440,6 +440,16 @@ class PlanComparator:
                     if isinstance(table_ref, str) and table_ref.startswith("_temp_"):
                         continue  # 跳过 _temp_ 中间表 scan
 
+                # 过滤 _temp_* join：DAG 内部管道 join——_temp_ 表之间的
+                # 关联是 DAG 实现细节，Spark 侧 Mapper 从 Contract 生成的
+                # SparkPlan 不包含这些中间表 join
+                if step_type == "join":
+                    lt = step_dict.get("left_table_ref", "")
+                    rt = step_dict.get("right_table_ref", "")
+                    if (isinstance(lt, str) and lt.startswith("_temp_")) or \
+                       (isinstance(rt, str) and rt.startswith("_temp_")):
+                        continue  # 跳过 _temp_ 中间表 join
+
                 all_steps.append(step_dict)
 
         return all_steps
