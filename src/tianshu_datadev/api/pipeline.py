@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from tianshu_datadev.api.templates import TEMPLATES
@@ -50,6 +51,10 @@ if TYPE_CHECKING:
     from tianshu_datadev.planning.relationship_hypothesis import RelationshipHypothesis
     from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan
     from tianshu_datadev.planning.sql_program import SqlProgram
+    from tianshu_datadev.spark.compiler import SparkCompileResult
+    from tianshu_datadev.spark.models import SparkPlan
+    from tianshu_datadev.spark.orchestrator import SparkPipelineStage
+    from tianshu_datadev.spark.plan_comparator import PlanComparisonReport
     from tianshu_datadev.spark.snapshot import SnapshotBuilder, SnapshotManifest, SnapshotSourceProvider
     from tianshu_datadev.sql.models import CompiledSql, ExecutionTrace, ResultSummary
 
@@ -194,6 +199,8 @@ class Pipeline:
         self._default_table_paths = default_table_paths or {}
         # ── 外部 DuckDB 数据库路径 ──
         self._duckdb_path = duckdb_path
+        # ── Spark 阶段独立触发——上下文缓存 ──
+        self._spark_contexts: dict[str, SparkStageContext] = {}
         # ── LLM 调用追踪（request-scoped cache）──
         self._llm_traces: dict[str, dict[str, LlmTraceNode]] = {}
         # request_id → {node_name: LlmTraceNode}
@@ -2200,12 +2207,296 @@ class Pipeline:
         }
 
 
+    # ════════════════════════════════════════════
+    # Spark 阶段独立触发——辅助方法与阶段入口
+    # ════════════════════════════════════════════
+
+    def _get_or_create_spark_context(self, request_id: str) -> SparkStageContext:
+        """获取或创建 request_id 的 Spark 阶段上下文。"""
+        if request_id not in self._spark_contexts:
+            self._spark_contexts[request_id] = SparkStageContext()
+        return self._spark_contexts[request_id]
+
+    def _check_stage_dependencies(
+        self,
+        stage: "SparkPipelineStage",
+        context: SparkStageContext,
+        artifacts: PipelineArtifactBundle,
+    ) -> None:
+        """Spark 阶段依赖门禁——检查前置产物是否就绪。
+
+        Raises:
+            SparkDependencyMissingError: 前置产物缺失
+        """
+        from tianshu_datadev.spark.orchestrator import SparkPipelineStage
+
+        missing: list[str] = []
+
+        if stage == SparkPipelineStage.MAPPER:
+            if artifacts.data_transform_contract is None:
+                missing.append("data_transform_contract（请先执行 编译执行 生成 Contract）")
+
+        elif stage == SparkPipelineStage.DEVELOPER:
+            if context.spark_plan is None:
+                missing.append("spark_plan（请先执行 MAPPER 阶段）")
+
+        elif stage == SparkPipelineStage.COMPILER:
+            if context.spark_plan is None:
+                missing.append("spark_plan（请先执行 MAPPER 阶段）")
+
+        elif stage == SparkPipelineStage.VALIDATOR:
+            if context.compile_result is None:
+                missing.append("compile_result（请先执行 COMPILER 阶段）")
+
+        elif stage == SparkPipelineStage.COMPARATOR:
+            if artifacts.sql_build_plan is None:
+                missing.append("sql_build_plan")
+            if context.spark_plan is None:
+                missing.append("spark_plan（请先执行 MAPPER 阶段）")
+            if artifacts.data_transform_contract is None:
+                missing.append("data_transform_contract")
+
+        elif stage == SparkPipelineStage.PHYSICAL_VERIFIER:
+            if artifacts.compiled_sql is None:
+                missing.append("compiled_sql")
+            if context.compile_result is None:
+                missing.append("spark compile_result（请先执行 COMPILER 阶段）")
+
+        if missing:
+            raise SparkDependencyMissingError(stage, missing)
+
+    def run_spark_stage(
+        self,
+        request_id: str,
+        stage: "SparkPipelineStage",
+    ) -> dict:
+        """执行单个 Spark 管线阶段。
+
+        流程：
+        1. export_artifacts(request_id) → 获取 contract + sql_plan
+        2. _get_or_create_spark_context(request_id) → 获取或创建阶段上下文
+        3. _check_stage_dependencies(stage, context, artifacts) → 依赖门禁
+        4. 执行该阶段（复用现有组件，不通过 SparkOrchestrator.run()）
+        5. 缓存中间产物到 SparkStageContext
+        6. 收集 llm_traces
+        7. 返回 SparkStageResponse 风格 dict
+
+        Raises:
+            SparkDependencyMissingError: 前置产物缺失
+        """
+        from tianshu_datadev.spark.orchestrator import SparkPipelineStage
+
+        # 获取阶段的字符串值，后续多处使用
+        stage_val = stage.value if hasattr(stage, "value") else str(stage)
+
+        # Step 1: 导出 artifacts
+        artifacts = self.export_artifacts(request_id)
+        if artifacts is None:
+            raise SparkDependencyMissingError(
+                stage, [f"request_id '{request_id}' 对应的 artifacts 不存在或已过期"]
+            )
+
+        # Step 2: 获取 Spark 上下文
+        context = self._get_or_create_spark_context(request_id)
+
+        # Step 3: 依赖门禁
+        self._check_stage_dependencies(stage, context, artifacts)
+
+        # Step 4: 执行阶段
+        errors: list[str] = []
+        try:
+            if stage == SparkPipelineStage.MAPPER:
+                self._do_spark_map(artifacts, context)
+            elif stage == SparkPipelineStage.DEVELOPER:
+                self._do_spark_develop(context)
+            elif stage == SparkPipelineStage.COMPILER:
+                self._do_spark_compile(context)
+            elif stage == SparkPipelineStage.VALIDATOR:
+                self._do_spark_validate(context, errors)
+            elif stage == SparkPipelineStage.COMPARATOR:
+                self._do_spark_compare(artifacts, context, errors)
+            elif stage == SparkPipelineStage.PHYSICAL_VERIFIER:
+                self._do_spark_physical_verify(artifacts, context)
+        except Exception as e:
+            context.stage_results[stage_val] = "FAILURE"
+            context.errors.append(f"[{stage_val}] 异常：{e}")
+
+        # Step 5: 构建响应
+        status_map = {
+            "SUCCESS": "ok",
+            "FAILURE": "failed",
+            "SKIPPED": "skipped",
+            "NOT_EXECUTED": "skipped",
+        }
+        spark_stages: list[dict] = []
+        for s_name, s_result in context.stage_results.items():
+            spark_stages.append({
+                "stage": s_name,
+                "status": status_map.get(s_result, "skipped"),
+            })
+
+        current_status = status_map.get(
+            context.stage_results.get(stage_val, "NOT_EXECUTED"), "skipped"
+        )
+
+        return {
+            "request_id": request_id,
+            "stage": stage_val,
+            "status": current_status,
+            "missing_dependencies": [],
+            "errors": list(context.errors),
+            "spark_stages": spark_stages,
+            "llm_traces": self._get_llm_traces(request_id),
+        }
+
+    # ════════════════════════════════════════════
+    # 各阶段私有实现方法
+    # ════════════════════════════════════════════
+
+    def _do_spark_map(
+        self, artifacts: PipelineArtifactBundle, context: SparkStageContext,
+    ) -> None:
+        """执行 MAPPER 阶段——Contract → SparkPlan。"""
+        from tianshu_datadev.artifacts.models import DataTransformContractV1
+        from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+        from tianshu_datadev.spark.mapper import map_contract_to_spark_plan
+
+        raw_contract = artifacts.data_transform_contract
+        if isinstance(raw_contract, DataTransformContractV1):
+            v1_contract = raw_contract
+        else:
+            v1_contract = adapt_lite_to_v1(raw_contract)
+
+        result = map_contract_to_spark_plan(v1_contract)
+        if result.success and result.spark_plan is not None:
+            context.spark_plan = result.spark_plan
+            context.stage_results["MAPPER"] = "SUCCESS"
+        else:
+            context.stage_results["MAPPER"] = "FAILURE"
+            gap_msgs = [g.message for g in result.gaps] if result.gaps else ["未知错误"]
+            context.errors.append(f"[MAPPER] 映射失败：{'; '.join(gap_msgs)}")
+
+    def _do_spark_develop(self, context: SparkStageContext) -> None:
+        """执行 DEVELOPER 阶段——LLM 语义标注（可选）。
+
+        当前无 SparkDeveloperService 注入时标记 SKIPPED，不阻断后续阶段。
+        """
+        context.stage_results["DEVELOPER"] = "SKIPPED"
+        context.errors.append("[DEVELOPER] SKIPPED: 未注入 SparkDeveloperService")
+
+    def _do_spark_compile(self, context: SparkStageContext) -> None:
+        """执行 COMPILER 阶段——SparkPlan → PySpark DSL。"""
+        from tianshu_datadev.spark.compiler import SparkCompiler
+
+        compiler = SparkCompiler()
+        result = compiler.compile(context.spark_plan)
+        context.compile_result = result
+        context.stage_results["COMPILER"] = "SUCCESS"
+
+    def _do_spark_validate(
+        self, context: SparkStageContext, errors: list[str],
+    ) -> None:
+        """执行 VALIDATOR 阶段——PySpark DSL 安全校验。"""
+        from tianshu_datadev.spark.validator import SparkStaticValidator
+
+        validator = SparkStaticValidator()
+        validation = validator.validate(context.compile_result.raw_pyspark)
+        if validation.is_valid:
+            context.stage_results["VALIDATOR"] = "SUCCESS"
+        else:
+            context.stage_results["VALIDATOR"] = "FAILURE"
+            for e in validation.errors:
+                errors.append(f"[VALIDATOR] {e.error_code}: {e.detail}")
+            context.errors.extend(errors)
+
+    def _do_spark_compare(
+        self,
+        artifacts: PipelineArtifactBundle,
+        context: SparkStageContext,
+        errors: list[str],
+    ) -> None:
+        """执行 COMPARATOR 阶段——SQL ↔ Spark 逻辑对比。"""
+        from tianshu_datadev.spark.plan_comparator import PlanComparator
+
+        comparator = PlanComparator()
+        sql_plan = artifacts.sql_build_plan
+        sql_program = artifacts.sql_program
+
+        if sql_program is not None:
+            target_grain = None
+            raw_contract = artifacts.data_transform_contract
+            if raw_contract is not None and hasattr(raw_contract, "grouping_keys"):
+                target_grain = (
+                    raw_contract.grouping_keys
+                    if raw_contract.grouping_keys
+                    else None
+                )
+            report = comparator.compare_program(
+                sql_program, context.spark_plan,
+                target_grain=target_grain,
+            )
+        elif sql_plan is not None:
+            report = comparator.compare(sql_plan, context.spark_plan)
+        else:
+            context.stage_results["COMPARATOR"] = "SKIPPED"
+            context.errors.append("[COMPARATOR] SKIPPED: 无 SqlBuildPlan/SqlProgram，无法执行逻辑对比")
+            return
+
+        context.comparator_report = report
+        context.stage_results["COMPARATOR"] = "SUCCESS"
+
+    def _do_spark_physical_verify(
+        self, artifacts: PipelineArtifactBundle, context: SparkStageContext,
+    ) -> None:
+        """执行 PHYSICAL_VERIFIER 阶段——双引擎物理结果对比。
+
+        当前需要 Spark 运行时环境，标记 SKIPPED。
+        """
+        context.stage_results["PHYSICAL_VERIFIER"] = "SKIPPED"
+        context.errors.append(
+            "[PHYSICAL_VERIFIER] SKIPPED: 需要 Spark 运行时环境，当前未配置"
+        )
+
+
 def _safe_enum_value(obj, attr: str) -> str:
     """安全获取枚举属性的字符串值——兼容 Enum 和普通属性。"""
     val = getattr(obj, attr, "")
     if hasattr(val, "value"):
         return val.value
     return str(val)
+
+
+# ════════════════════════════════════════════
+# Spark 阶段独立触发——上下文缓存与异常
+# ════════════════════════════════════════════
+
+
+@dataclass
+class SparkStageContext:
+    """request_id 级别的 Spark 阶段中间产物缓存。
+
+    由 Pipeline._get_or_create_spark_context() 创建和管理，
+    独立于 SparkOrchestrator 的内部缓存。
+    """
+    spark_plan: "SparkPlan | None" = None
+    compile_result: "SparkCompileResult | None" = None
+    comparator_report: "PlanComparisonReport | None" = None
+    stage_results: dict[str, str] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+
+
+class SparkDependencyMissingError(Exception):
+    """Spark 阶段依赖缺失异常——由 _check_stage_dependencies 抛出。
+
+    当用户跳过前置阶段直接触发后续阶段时抛出。
+    routes.py 的 _handle_spark_stage() 捕获此异常返回 422。
+    """
+    def __init__(self, stage: "SparkPipelineStage", missing: list[str]):
+        self.stage = stage
+        self.missing = missing
+        super().__init__(
+            f"阶段 {stage.value} 缺少前置产物：{', '.join(missing)}"
+        )
 
 
 # ── Phase 9A1: 延迟重建 PipelineArtifactBundle——确保 Contract 类型已导入 ──
