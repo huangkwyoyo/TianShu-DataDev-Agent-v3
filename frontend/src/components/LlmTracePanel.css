@@ -1,0 +1,85 @@
+/* LLM 调用追踪面板 */
+.llm-trace-panel {
+  margin: 12px 0;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.llm-trace-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: #f8fafc;
+  cursor: pointer;
+  user-select: none;
+  font-size: 13px;
+  font-weight: 600;
+  color: #475569;
+}
+
+.llm-trace-header:hover {
+  background: #f1f5f9;
+}
+
+.llm-trace-chevron {
+  transition: transform 0.2s;
+  font-size: 10px;
+}
+
+.llm-trace-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+.llm-trace-badge {
+  margin-left: auto;
+  background: #3b82f6;
+  color: #fff;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 10px;
+}
+
+.llm-trace-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.llm-trace-table th {
+  text-align: left;
+  padding: 6px 10px;
+  background: #f1f5f9;
+  color: #64748b;
+  font-weight: 600;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.llm-trace-table td {
+  padding: 5px 10px;
+  border-bottom: 1px solid #f1f5f9;
+  color: #334155;
+}
+
+.llm-trace-table tr.status-valid td:first-child {
+  border-left: 3px solid #22c55e;
+}
+
+.llm-trace-table tr.status-error td:first-child {
+  border-left: 3px solid #ef4444;
+}
+
+.llm-trace-table tr.status-skipped td:first-child {
+  border-left: 3px solid #94a3b8;
+}
+
+.llm-trace-summary {
+  background: #f8fafc;
+  font-weight: 600;
+  color: #1e293b;
+}
+
+.llm-trace-summary td {
+  border-top: 2px solid #e2e8f0;
+}
