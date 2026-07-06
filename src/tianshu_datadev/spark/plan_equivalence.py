@@ -261,7 +261,11 @@ def compare_join_steps(
             verdict=EquivalenceVerdict.NOT_EQUIVALENT,
             sql_count=sql_count,
             spark_count=spark_count,
-            detail="Join 规格不一致",
+            detail=(
+                f"Join 规格不一致——"
+                f"SQL 侧: {sql_normalized}，"
+                f"Spark 侧: {spark_normalized}"
+            ),
         )
 
     return StepEquivalenceResult(
@@ -362,7 +366,11 @@ def compare_aggregate_steps(
             verdict=EquivalenceVerdict.NOT_EQUIVALENT,
             sql_count=sql_count,
             spark_count=spark_count,
-            detail="聚合指标规格不一致",
+            detail=(
+                f"聚合指标规格不一致——"
+                f"SQL 侧: {sql_metric_specs}，"
+                f"Spark 侧: {spark_metric_specs}"
+            ),
         )
 
     return StepEquivalenceResult(
