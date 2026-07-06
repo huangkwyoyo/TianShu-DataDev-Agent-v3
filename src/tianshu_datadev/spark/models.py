@@ -19,6 +19,7 @@ from typing import Literal
 
 from pydantic import Field
 
+from tianshu_datadev.artifacts.models import CaseWhenCondition
 from tianshu_datadev.developer_spec.models import StrictModel
 
 # ════════════════════════════════════════════
@@ -188,11 +189,16 @@ class SparkCaseWhenBranch(StrictModel):
 
     Phase 5 仅保留标签值——完整谓词还原在 Phase 7 PlanEquivalence 时做。
     Phase 6B 新增 condition_column / condition_value 支持编译期代码生成。
+    Phase 10 新增 condition: CaseWhenCondition——结构化 Predicate AST，
+             从 Contract 提取器的 _predicate_to_case_when_condition() 生成。
+             condition_column / condition_value 保留向后兼容（展示/审查用途），
+             编译器优先使用 condition，为 None 时抛出 RenderError 阻断。
     """
 
     label: str  # 标签值
-    condition_column: str = ""  # Phase 6B：条件列名（如 "status"）
-    condition_value: str = ""   # Phase 6B：条件值（如 "paid"）
+    condition_column: str = ""  # Phase 6B：条件列名（保留兼容，不进 compiler 可执行路径）
+    condition_value: str = ""   # Phase 6B：条件值（保留兼容，不进 compiler 可执行路径）
+    condition: CaseWhenCondition | None = None  # Phase 10：结构化条件 AST
 
 
 class SparkWindowStep(StrictModel):

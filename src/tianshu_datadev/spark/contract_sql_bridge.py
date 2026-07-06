@@ -8,14 +8,14 @@
 - filters → FilterStep
 - join_relationships → JoinStep
 - aggregations + grouping_keys → AggregateStep
-- case_when_labels → CaseWhenStep（标签级，不含完整谓词）
+- case_when_labels → CaseWhenStep（仅 branches spec 路径，labels-only 跳过）
 - output_columns → ProjectStep
 - sort_spec → SortStep
 - limit_spec → LimitStep
 
 已知限制：
 - window_specs 不映射——Phase 7B Comparator 不启用 window 对比
-- case_when 仅映射标签级结构，完整谓词表达式在后续 Phase 覆盖
+- case_when 要求 Contract 携带 branches spec（结构化条件），labels-only Contract 不生成 CaseWhenStep
 - 该桥接是确定性轻量映射，不涉及 SQL pipeline 的 SpecEnricher 推测逻辑
 
 后续若 SQL pipeline 提供正式的 Contract → SqlBuildPlan 路径，可直接替换本模块的映射逻辑。
@@ -25,8 +25,64 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from tianshu_datadev.planning.models import (
+    ColumnRef,
+    Predicate,
+    PredicateOperator,
+    SqlLiteral,
+)
+
 if TYPE_CHECKING:
     from tianshu_datadev.artifacts.models import DataTransformContractV1
+
+
+def _condition_to_predicate(condition) -> Predicate:
+    """将 CaseWhenCondition 反向转换为 Predicate AST——供 contract_to_sql_steps 使用。
+
+    支持：EQ/NEQ/GT/GTE/LT/LTE/IS_NULL/IS_NOT_NULL/AND/OR。
+    不支持的操作符抛出 ValueError。
+
+    Args:
+        condition: CaseWhenCondition 实例
+
+    Returns:
+        Predicate 实例
+    """
+    op = condition.operator
+
+    # 一元操作符
+    if op in ("IS_NULL", "IS_NOT_NULL"):
+        return Predicate(
+            left=ColumnRef(
+                table_ref=condition.table_ref,
+                column_name=condition.normalized_name,
+                normalized_name=condition.normalized_name,
+            ),
+            operator=PredicateOperator(op),
+            right=None,
+        )
+
+    # 二元比较
+    if op in ("EQ", "NEQ", "GT", "GTE", "LT", "LTE"):
+        return Predicate(
+            left=ColumnRef(
+                table_ref=condition.table_ref,
+                column_name=condition.normalized_name,
+                normalized_name=condition.normalized_name,
+            ),
+            operator=PredicateOperator(op),
+            right=SqlLiteral(value=condition.value),
+        )
+
+    # 逻辑组合
+    if op in ("AND", "OR"):
+        return Predicate(
+            left=_condition_to_predicate(condition.left),
+            operator=PredicateOperator(op),
+            right=_condition_to_predicate(condition.right),
+        )
+
+    raise ValueError(f"_condition_to_predicate 不支持操作符: {op}")
 
 
 def contract_to_sql_steps(
@@ -158,18 +214,20 @@ def contract_to_sql_steps(
             metrics=agg_metrics,
         ))
 
-    # 5. case_when_labels → CaseWhenStep（标签级——完整谓词在后续 Phase 做）
+    # 5. case_when_labels → CaseWhenStep
+    # 仅当 Contract 携带 branches spec 时才生成 CaseWhenStep。
+    # labels-only Contract 不生成——"无法表达条件，不伪造可执行语义"。
     if contract.case_when_labels:
         for cw in contract.case_when_labels:
+            if not cw.branches:
+                # labels-only：仅用于展示/审查，不反向生成 CaseWhenStep
+                continue
             cases = []
-            for label in cw.labels:
+            for bs in cw.branches:
+                pred = _condition_to_predicate(bs.condition)
                 cases.append(WhenBranch(
-                    condition=Predicate(
-                        left=ColumnRef(table_ref="", column_name="", normalized_name=""),
-                        operator=PredicateOperator.EQ,
-                        right=SqlLiteral(value=""),
-                    ),
-                    result=SqlLiteral(value=label),
+                    condition=pred,
+                    result=SqlLiteral(value=bs.label),
                 ))
             steps.append(CaseWhenStep(
                 step_type="case_when",

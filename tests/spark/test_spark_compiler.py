@@ -6,6 +6,7 @@ import re
 
 import pytest
 
+from tianshu_datadev.artifacts.models import CaseWhenCondition
 from tianshu_datadev.spark.compiler import SparkCompiler
 from tianshu_datadev.spark.models import (
     SparkAggFunction,
@@ -681,10 +682,10 @@ class TestCompileJoin:
 
 
 class TestCompileCaseWhen:
-    """CaseWhenStep 编译测试。"""
+    """CaseWhenStep 编译测试——使用结构化 condition（Phase 10）。"""
 
     def test_simple_case_when(self):
-        """单分支 CASE WHEN 编译。"""
+        """单分支 CASE WHEN 编译——EQ 条件渲染。"""
         plan = _make_plan(
             SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
             SparkCaseWhenStep(
@@ -693,8 +694,11 @@ class TestCompileCaseWhen:
                 branches=[
                     SparkCaseWhenBranch(
                         label="normal",
-                        condition_column="status",
-                        condition_value="paid",
+                        condition=CaseWhenCondition(
+                            operator="EQ",
+                            normalized_name="status",
+                            value="paid",
+                        ),
                     ),
                 ],
                 else_value="other",
@@ -707,9 +711,7 @@ class TestCompileCaseWhen:
         assert "F.when(" in result.raw_pyspark
         assert ".otherwise(" in result.raw_pyspark
         assert 'F.col("status")' in result.raw_pyspark
-        # condition_value 直接渲染为等值比较的右值（'paid'）
-        # label 和 else_value 通过 F.lit() 渲染
-        assert "== 'paid'" in result.raw_pyspark
+        assert "== F.lit('paid')" in result.raw_pyspark
         assert "F.lit('normal')" in result.raw_pyspark
 
     def test_case_when_multiple_branches(self):
@@ -722,18 +724,27 @@ class TestCompileCaseWhen:
                 branches=[
                     SparkCaseWhenBranch(
                         label="high",
-                        condition_column="priority",
-                        condition_value="1",
+                        condition=CaseWhenCondition(
+                            operator="EQ",
+                            normalized_name="priority",
+                            value="1",
+                        ),
                     ),
                     SparkCaseWhenBranch(
                         label="medium",
-                        condition_column="priority",
-                        condition_value="2",
+                        condition=CaseWhenCondition(
+                            operator="EQ",
+                            normalized_name="priority",
+                            value="2",
+                        ),
                     ),
                     SparkCaseWhenBranch(
                         label="low",
-                        condition_column="priority",
-                        condition_value="3",
+                        condition=CaseWhenCondition(
+                            operator="EQ",
+                            normalized_name="priority",
+                            value="3",
+                        ),
                     ),
                 ],
                 else_value="unknown",
@@ -758,8 +769,11 @@ class TestCompileCaseWhen:
                 branches=[
                     SparkCaseWhenBranch(
                         label="valid",
-                        condition_column="status",
-                        condition_value="active",
+                        condition=CaseWhenCondition(
+                            operator="EQ",
+                            normalized_name="status",
+                            value="active",
+                        ),
                     ),
                 ],
                 else_value=None,
@@ -769,6 +783,331 @@ class TestCompileCaseWhen:
         result = compiler.compile(plan)
 
         assert "F.lit(None)" in result.raw_pyspark
+
+
+# ════════════════════════════════════════════
+# Phase 10 结构化条件测试——CASE WHEN Predicate AST 渲染
+# ════════════════════════════════════════════
+
+
+class TestCompileCaseWhenStructuredConditions:
+    """Phase 10 结构化条件编译测试——验证 CaseWhenCondition → PySpark Column API。"""
+
+    def test_is_null_condition(self):
+        """IS_NULL → F.col("distance_miles").isNull()。"""
+        plan = _make_plan(
+            SparkReadStep(alias="ft", source_name="fact_trips", input_key="ft"),
+            SparkCaseWhenStep(
+                input_alias="ft",
+                output_alias="distance_category",
+                branches=[
+                    SparkCaseWhenBranch(
+                        label="unknown",
+                        condition=CaseWhenCondition(
+                            operator="IS_NULL",
+                            normalized_name="distance_miles",
+                        ),
+                    ),
+                ],
+                else_value="valid",
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        assert 'F.col("distance_miles").isNull()' in result.raw_pyspark
+        assert "F.when(" in result.raw_pyspark
+
+    def test_eq_true_condition(self):
+        """EQ True → F.col(...) == F.lit(True)，非 F.lit('true')。"""
+        plan = _make_plan(
+            SparkReadStep(alias="ft", source_name="fact_trips", input_key="ft"),
+            SparkCaseWhenStep(
+                input_alias="ft",
+                output_alias="distance_category",
+                branches=[
+                    SparkCaseWhenBranch(
+                        label="outlier",
+                        condition=CaseWhenCondition(
+                            operator="EQ",
+                            normalized_name="is_distance_outlier",
+                            value=True,
+                        ),
+                    ),
+                ],
+                else_value="normal",
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        assert "F.lit(True)" in result.raw_pyspark
+        assert "F.lit('true')" not in result.raw_pyspark
+        assert "F.lit('True')" not in result.raw_pyspark
+
+    def test_lte_numeric_condition(self):
+        """LTE 2 → F.col(...) <= F.lit(2)，非 F.lit('2')。"""
+        plan = _make_plan(
+            SparkReadStep(alias="ft", source_name="fact_trips", input_key="ft"),
+            SparkCaseWhenStep(
+                input_alias="ft",
+                output_alias="distance_category",
+                branches=[
+                    SparkCaseWhenBranch(
+                        label="short",
+                        condition=CaseWhenCondition(
+                            operator="LTE",
+                            normalized_name="distance_miles",
+                            value=2,
+                        ),
+                    ),
+                ],
+                else_value="long",
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        assert "F.lit(2)" in result.raw_pyspark
+        assert "F.lit('2')" not in result.raw_pyspark
+
+    def test_gt_numeric_condition(self):
+        """GT 10 → F.col(...) > F.lit(10)。"""
+        plan = _make_plan(
+            SparkReadStep(alias="ft", source_name="fact_trips", input_key="ft"),
+            SparkCaseWhenStep(
+                input_alias="ft",
+                output_alias="distance_category",
+                branches=[
+                    SparkCaseWhenBranch(
+                        label="long",
+                        condition=CaseWhenCondition(
+                            operator="GT",
+                            normalized_name="distance_miles",
+                            value=10,
+                        ),
+                    ),
+                ],
+                else_value="short",
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        assert "F.lit(10)" in result.raw_pyspark
+        assert "F.col(\"distance_miles\") > F.lit(10)" in result.raw_pyspark
+
+    def test_and_condition(self):
+        """AND(LTE 2, GT 0) → (F.col(...) <= F.lit(2)) & (F.col(...) > F.lit(0))。"""
+        plan = _make_plan(
+            SparkReadStep(alias="ft", source_name="fact_trips", input_key="ft"),
+            SparkCaseWhenStep(
+                input_alias="ft",
+                output_alias="distance_category",
+                branches=[
+                    SparkCaseWhenBranch(
+                        label="short",
+                        condition=CaseWhenCondition(
+                            operator="AND",
+                            left=CaseWhenCondition(
+                                operator="LTE",
+                                normalized_name="distance_miles",
+                                value=2,
+                            ),
+                            right=CaseWhenCondition(
+                                operator="GT",
+                                normalized_name="distance_miles",
+                                value=0,
+                            ),
+                        ),
+                    ),
+                ],
+                else_value="other",
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        assert "&" in result.raw_pyspark
+        assert "F.lit(2)" in result.raw_pyspark
+        assert "F.lit(0)" in result.raw_pyspark
+
+    def test_or_with_is_null(self):
+        """OR(IS_NULL x, EQ y True) → (F.col("x").isNull()) | (F.col("y") == F.lit(True))。"""
+        plan = _make_plan(
+            SparkReadStep(alias="ft", source_name="fact_trips", input_key="ft"),
+            SparkCaseWhenStep(
+                input_alias="ft",
+                output_alias="distance_category",
+                branches=[
+                    SparkCaseWhenBranch(
+                        label="unknown",
+                        condition=CaseWhenCondition(
+                            operator="OR",
+                            left=CaseWhenCondition(
+                                operator="IS_NULL",
+                                normalized_name="distance_miles",
+                            ),
+                            right=CaseWhenCondition(
+                                operator="EQ",
+                                normalized_name="is_distance_outlier",
+                                value=True,
+                            ),
+                        ),
+                    ),
+                ],
+                else_value="valid",
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        assert ".isNull()" in result.raw_pyspark
+        assert "|" in result.raw_pyspark
+        assert "F.lit(True)" in result.raw_pyspark
+
+    def test_case_02_full_chain(self):
+        """Case 02 完整 4 分支：IS_NULL OR =true → unknown; LTE 2 → short;
+        AND(GT 2, LTE 10) → medium; GT 10 → long。"""
+        plan = _make_plan(
+            SparkReadStep(alias="ft", source_name="fact_trips", input_key="ft"),
+            SparkCaseWhenStep(
+                input_alias="ft",
+                output_alias="distance_category",
+                branches=[
+                    # 分支 1：distance_miles IS NULL OR is_distance_outlier = true → unknown
+                    SparkCaseWhenBranch(
+                        label="unknown",
+                        condition=CaseWhenCondition(
+                            operator="OR",
+                            left=CaseWhenCondition(
+                                operator="IS_NULL",
+                                normalized_name="distance_miles",
+                            ),
+                            right=CaseWhenCondition(
+                                operator="EQ",
+                                normalized_name="is_distance_outlier",
+                                value=True,
+                            ),
+                        ),
+                    ),
+                    # 分支 2：distance_miles <= 2 → short
+                    SparkCaseWhenBranch(
+                        label="short",
+                        condition=CaseWhenCondition(
+                            operator="LTE",
+                            normalized_name="distance_miles",
+                            value=2,
+                        ),
+                    ),
+                    # 分支 3：distance_miles > 2 AND distance_miles <= 10 → medium
+                    SparkCaseWhenBranch(
+                        label="medium",
+                        condition=CaseWhenCondition(
+                            operator="AND",
+                            left=CaseWhenCondition(
+                                operator="GT",
+                                normalized_name="distance_miles",
+                                value=2,
+                            ),
+                            right=CaseWhenCondition(
+                                operator="LTE",
+                                normalized_name="distance_miles",
+                                value=10,
+                            ),
+                        ),
+                    ),
+                    # 分支 4：distance_miles > 10 → long
+                    SparkCaseWhenBranch(
+                        label="long",
+                        condition=CaseWhenCondition(
+                            operator="GT",
+                            normalized_name="distance_miles",
+                            value=10,
+                        ),
+                    ),
+                ],
+                else_value="unknown",
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        # 验证 4 个 F.when 调用
+        assert result.raw_pyspark.count("F.when(") == 4
+        # 验证所有标签出现
+        assert "F.lit('unknown')" in result.raw_pyspark
+        assert "F.lit('short')" in result.raw_pyspark
+        assert "F.lit('medium')" in result.raw_pyspark
+        assert "F.lit('long')" in result.raw_pyspark
+        # 验证类型保真：数字和布尔
+        assert "F.lit(2)" in result.raw_pyspark
+        assert "F.lit(10)" in result.raw_pyspark
+        assert "F.lit(True)" in result.raw_pyspark
+        # 验证 IS_NULL 渲染
+        assert ".isNull()" in result.raw_pyspark
+        # 验证逻辑操作符
+        assert " & " in result.raw_pyspark or "&" in result.raw_pyspark
+        assert " | " in result.raw_pyspark or "|" in result.raw_pyspark
+
+    def test_labels_only_branch_raises(self):
+        """condition=None 的分支 → RenderError，不生成空条件。"""
+        plan = _make_plan(
+            SparkReadStep(alias="ft", source_name="fact_trips", input_key="ft"),
+            SparkCaseWhenStep(
+                input_alias="ft",
+                output_alias="label",
+                branches=[
+                    SparkCaseWhenBranch(label="bad"),  # 无 condition
+                ],
+                else_value="other",
+            ),
+        )
+        compiler = SparkCompiler()
+        with pytest.raises(RenderError, match="缺少结构化 condition"):
+            compiler.compile(plan)
+
+    def test_unsupported_operator_raises(self):
+        """不支持的操作符（如 IN）→ RenderError。"""
+        with pytest.raises(RenderError, match="不支持条件操作符"):
+            compiler = SparkCompiler()
+            compiler._render_case_when_condition(
+                CaseWhenCondition(operator="IN", normalized_name="x", value="1")
+            )
+
+    def test_and_missing_left_raises(self):
+        """AND 缺少 left 子树 → RenderError，不抛 AttributeError。"""
+        compiler = SparkCompiler()
+        with pytest.raises(RenderError, match="缺少 left 或 right 子树"):
+            compiler._render_case_when_condition(
+                CaseWhenCondition(
+                    operator="AND",
+                    right=CaseWhenCondition(
+                        operator="EQ", normalized_name="x", value=1,
+                    ),
+                ),
+            )
+
+    def test_and_missing_right_raises(self):
+        """AND 缺少 right 子树 → RenderError，不抛 AttributeError。"""
+        compiler = SparkCompiler()
+        with pytest.raises(RenderError, match="缺少 left 或 right 子树"):
+            compiler._render_case_when_condition(
+                CaseWhenCondition(
+                    operator="AND",
+                    left=CaseWhenCondition(
+                        operator="EQ", normalized_name="x", value=1,
+                    ),
+                ),
+            )
+
+    def test_or_missing_both_raises(self):
+        """OR 缺少左右子树 → RenderError，不抛 AttributeError。"""
+        compiler = SparkCompiler()
+        with pytest.raises(RenderError, match="缺少 left 或 right 子树"):
+            compiler._render_case_when_condition(
+                CaseWhenCondition(operator="OR"),
+            )
 
 
 # ════════════════════════════════════════════
