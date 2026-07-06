@@ -1015,6 +1015,15 @@ class Pipeline:
                 "pipeline_stages": self._build_pipeline_stages(stage, error_info),
             }
 
+        # ── 确定性抽取 Contract（供 Spark 管线使用）──
+        # 前提：plan 已通过 Validator 校验，compiled/trace/summary 已在当前作用域
+        contract = None
+        try:
+            extractor = DataTransformContractExtractor()
+            contract = extractor.extract(plan)
+        except Exception as contract_err:
+            logger.warning("Contract 抽取失败（非阻断）：%s", contract_err)
+
         # ── 成功路径——现有逻辑不变 ──
         request_id = self._gen_request_id(spec)
         self._store_result(request_id, {
@@ -1025,6 +1034,7 @@ class Pipeline:
             "trace": trace,
             "summary": summary,
             "table_mapping": table_mapping or {},
+            "contract": contract,  # 新增——供 Spark 管线使用
         })
 
         return {
@@ -1343,6 +1353,7 @@ class Pipeline:
                     "package_manifest": package_manifest.model_dump(
                         exclude_none=True
                     ) if hasattr(package_manifest, "model_dump") else {},
+                    "llm_traces": self._get_llm_traces(request_id),  # 新增——LLM 调用追踪
                 }
 
             elif hypothesis and len(hypothesis.candidates) > 1:
@@ -1606,6 +1617,7 @@ class Pipeline:
             "trace": trace,
             "summary": summary,
             "contract": contract,
+            "llm_traces": self._get_llm_traces(request_id),  # 新增——LLM 调用追踪
             "table_mapping": table_mapping or {},
             # ── Phase 9B-P0 ──
             "snapshot_manifest": snapshot_manifest,
@@ -1641,6 +1653,7 @@ class Pipeline:
                 list(plan_questions) + list(val_questions) + list(extra_questions)
             ),
             "artifact_count": len(package_manifest.artifacts),
+            "llm_traces": self._get_llm_traces(request_id),  # 新增——LLM 调用追踪
         }
         if rich:
             # 提取 SQL 文本——兼容 CompiledSql 对象和纯字符串
@@ -2141,10 +2154,22 @@ class Pipeline:
             }
 
         request_id = self._gen_request_id(spec)
+
+        # ── 确定性抽取 Contract（供 Spark 管线使用）──
+        # 前提：plan 已通过 Validator 校验，compiled/trace/summary 已在当前作用域
+        contract = None
+        try:
+            extractor = DataTransformContractExtractor()
+            contract = extractor.extract(plan)
+        except Exception as contract_err:
+            logger.warning("Contract 抽取失败（非阻断）：%s", contract_err)
+
         self._store_result(request_id, {
             "parsed_spec": spec, "manifest": manifest, "plan": plan,
             "compiled": compiled, "trace": trace, "summary": summary,
             "table_mapping": table_mapping or {},
+            "contract": contract,  # 新增——供 Spark 管线使用
+            "llm_traces": self._get_llm_traces(request_id),  # 新增——LLM 调用追踪
         })
 
         return {
@@ -2171,6 +2196,7 @@ class Pipeline:
                 "numeric_sums": summary.numeric_sums,
             },
             "open_questions": _summarize_open_questions(all_questions),
+            "llm_traces": self._get_llm_traces(request_id),  # 新增
         }
 
 
