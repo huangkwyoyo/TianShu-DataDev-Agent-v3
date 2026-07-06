@@ -292,6 +292,34 @@ class Pipeline:
             return None
         return dict(traces)
 
+    def _record_trace(
+        self,
+        request_id: str,
+        node_name: str,
+        model: str = "deterministic",
+        token_usage: dict[str, int] | None = None,
+        latency_ms: int = 0,
+        status: str = "skipped",
+        error_type: str | None = None,
+    ) -> None:
+        """记录单次管线阶段执行的诊断元数据——轻量版（不依赖 LlmResponse）。
+
+        Fake 模式下记录确定性执行的阶段信息（model="deterministic", status="skipped"），
+        真实 LLM 模式下可记录实际 token 消耗和延迟。
+        """
+        if request_id not in self._llm_traces:
+            self._llm_traces[request_id] = {}
+
+        trace = LlmTraceNode(
+            node_name=node_name,
+            model=model,
+            token_usage=token_usage or {},
+            latency_ms=latency_ms,
+            status=status,
+            error_type=error_type,
+        )
+        self._llm_traces[request_id][node_name] = trace
+
     # ── 核心管线方法 ──────────────────────────────
 
     @staticmethod
@@ -2058,6 +2086,18 @@ class Pipeline:
         extra_questions = parsed["extra_questions"]
         table_mapping = parsed["table_mapping"]
 
+        # ── 记录 Parse + Relationship 阶段的 LLM 追踪（Fake 模式下为 skipped）──
+        _t0 = time.time()
+        request_id = self._gen_request_id(spec)
+        self._record_trace(
+            request_id, "parse_developer_spec",
+            status="skipped", latency_ms=int((time.time() - _t0) * 1000),
+        )
+        self._record_trace(
+            request_id, "relationship_planner",
+            status="skipped", latency_ms=1,
+        )
+
         # ── Stage 3-5: Build → Compile → Execute ──
         plan = None
         compiled = None
@@ -2065,8 +2105,13 @@ class Pipeline:
         stage = "build"
 
         try:
+            _build_start = time.time()
             builder = SqlBuildPlanBuilder()
             plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
+            self._record_trace(
+                request_id, "sql_build_planner",
+                status="skipped", latency_ms=int((time.time() - _build_start) * 1000),
+            )
 
             validator = SqlBuildPlanValidator()
             _passed, val_questions = validator.validate(plan, manifest)
@@ -2083,12 +2128,18 @@ class Pipeline:
                     "compiler_version": "",
                     "execution_trace": None,
                     "result_summary": None,
+                    "llm_traces": self._get_llm_traces(request_id),
                 })
                 return blocked
 
             stage = "compile"
+            _compile_start = time.time()
             compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
             compiled = compiler.compile(plan)
+            self._record_trace(
+                request_id, "sql_program_planner",
+                status="skipped", latency_ms=int((time.time() - _compile_start) * 1000),
+            )
 
             stage = "execute"
             executor = DuckDBExecutor(
@@ -2130,6 +2181,7 @@ class Pipeline:
                     "open_questions": _summarize_open_questions(all_questions),
                     "pipeline_error": error_info,
                     "pipeline_stages": self._build_pipeline_stages("execute", error_info),
+                    "llm_traces": self._get_llm_traces(request_id),
                 }
 
         except Exception as e:
@@ -2161,6 +2213,7 @@ class Pipeline:
                 "open_questions": [],
                 "pipeline_error": error_info,
                 "pipeline_stages": self._build_pipeline_stages(stage, error_info),
+                "llm_traces": self._get_llm_traces(request_id),
             }
 
         request_id = self._gen_request_id(spec)

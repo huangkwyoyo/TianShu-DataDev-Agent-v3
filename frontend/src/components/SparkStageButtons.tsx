@@ -121,8 +121,6 @@ export function SparkStageButtons({ requestId, stages, onStageComplete, onError,
     }
   };
 
-  if (!requestId) return null;
-
   return (
     <div className="spark-stage-buttons">
       <span className="section-label">Spark 管线</span>
@@ -132,17 +130,22 @@ export function SparkStageButtons({ requestId, stages, onStageComplete, onError,
         const isLoading = loadingStage === stageEnum;
         const cn = STAGE_CN[stageEnum] || stageEnum;
 
+        // 无 requestId 时全部按钮不可用
+        const hasRequest = !!requestId;
+        const isDisabled = !hasRequest || !isAvailable || disabled || !!loadingStage;
+        const tooltip = !hasRequest
+          ? '请先执行"编译执行"获取 request_id'
+          : isAvailable
+            ? `执行 ${cn} 阶段`
+            : `${cn}：缺少前置产物`;
+
         return (
           <button
             key={stageEnum}
             className={`spark-stage-btn status-${status === 'ok' ? 'ok' : status === 'failed' ? 'failed' : status === 'skipped' ? 'skipped' : 'none'}`}
-            disabled={!isAvailable || disabled || !!loadingStage}
+            disabled={isDisabled}
             onClick={() => handleClick(stageEnum)}
-            title={
-              isAvailable
-                ? `执行 ${cn} 阶段`
-                : `${cn}：缺少前置产物`
-            }
+            title={tooltip}
           >
             <span className="stage-icon">
               {isLoading ? '⏳' : stageIcon(status)}

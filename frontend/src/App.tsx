@@ -442,7 +442,7 @@ export default function App() {
               traces={state.llmTraces}
               visible={
                 (state.activePanel === 'sql' || state.activePanel === 'package') &&
-                state.llmTraces !== null
+                state.executeResult !== null
               }
             />
 

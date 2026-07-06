@@ -24,8 +24,26 @@ export function LlmTracePanel({ traces, visible }: Props) {
     return Object.entries(traces);
   }, [traces]);
 
-  // 无数据或不显示时返回 null
-  if (!visible || entries.length === 0) return null;
+  // 不显示时返回 null
+  if (!visible) return null;
+
+  // 无数据时显示精简提示面板
+  if (entries.length === 0) {
+    return (
+      <div className="llm-trace-panel">
+        <div className="llm-trace-header" onClick={() => setExpanded(!expanded)}>
+          <span className={`llm-trace-chevron ${expanded ? 'expanded' : ''}`}>▶</span>
+          LLM 调用追踪
+          <span className="llm-trace-badge">无数据</span>
+        </div>
+        {expanded && (
+          <div className="llm-trace-empty">
+            暂无 LLM 调用数据——当前为确定性运行模式（Fake Adapter），未产生真实 LLM 调用。
+          </div>
+        )}
+      </div>
+    );
+  }
 
   // 计算汇总
   const totalPrompt = entries.reduce((sum, [, t]) => sum + (t.token_usage?.prompt_tokens || 0), 0);
