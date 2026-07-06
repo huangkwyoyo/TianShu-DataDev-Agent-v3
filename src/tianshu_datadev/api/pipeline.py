@@ -21,6 +21,7 @@ from tianshu_datadev.developer_spec.models import (
 )
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
 from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
+from tianshu_datadev.llm.models import LlmResponse, LlmTraceNode
 from tianshu_datadev.planning.cross_validator import cross_validate
 from tianshu_datadev.planning.program_factory import (
     build_sql_program,
@@ -193,6 +194,9 @@ class Pipeline:
         self._default_table_paths = default_table_paths or {}
         # ── 外部 DuckDB 数据库路径 ──
         self._duckdb_path = duckdb_path
+        # ── LLM 调用追踪（request-scoped cache）──
+        self._llm_traces: dict[str, dict[str, LlmTraceNode]] = {}
+        # request_id → {node_name: LlmTraceNode}
 
     # ── 缓存生命周期管理 ──────────────────────────────
 
@@ -227,6 +231,56 @@ class Pipeline:
         if expired_ids:
             logger.debug("TTL 过期清理完成，移除 %d 条缓存", len(expired_ids))
         return len(expired_ids)
+
+    # ── LLM 调用追踪 ───────────────────────────────
+
+    def _record_llm_trace(self, request_id: str, response: LlmResponse) -> None:
+        """从 LlmResponse 记录单次 LLM 调用的诊断元数据。
+
+        同一 node_name 多次调用 → 保留最后一次（不聚合）。
+        仅在 request-scoped cache 中存储。
+
+        Args:
+            request_id: Pipeline 请求 ID
+            response: LLM Gateway 返回的 LlmResponse
+        """
+        if request_id not in self._llm_traces:
+            self._llm_traces[request_id] = {}
+
+        # 从 LlmResponse.task 映射到 node_name
+        node_name = response.task  # 直接使用 task 字段——值与 node_name 合法值一致
+
+        # 从 validation_status 映射到 trace status
+        if response.validation_status == "valid":
+            status = "valid"
+        elif response.validation_status == "invalid":
+            status = "invalid"
+        else:
+            status = "skipped"
+
+        trace = LlmTraceNode(
+            node_name=node_name,
+            model=getattr(response, "model", "") or "fake",
+            token_usage=response.token_usage or {},
+            latency_ms=response.latency_ms,
+            status=status,
+            error_type=None,  # 当前 LlmResponse 没有 error_type 字段——预留
+        )
+        self._llm_traces[request_id][node_name] = trace
+
+    def _get_llm_traces(self, request_id: str) -> dict[str, LlmTraceNode] | None:
+        """获取指定 request_id 的 LLM 调用追踪数据。
+
+        Args:
+            request_id: Pipeline 请求 ID
+
+        Returns:
+            {node_name: LlmTraceNode} 字典，无数据时返回 None
+        """
+        traces = self._llm_traces.get(request_id)
+        if not traces:
+            return None
+        return dict(traces)
 
     # ── 核心管线方法 ──────────────────────────────
 

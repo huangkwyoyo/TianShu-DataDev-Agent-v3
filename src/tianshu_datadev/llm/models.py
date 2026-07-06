@@ -124,6 +124,26 @@ class LlmResponse(StrictModel):
         return f"llm_responses/parsed/{request_id}_{hash_hex}.json"
 
 
+class LlmTraceNode(StrictModel):
+    """单个 LLM 节点调用诊断元数据。
+
+    仅含诊断信息——不含 prompt 原文、raw response、业务数据。
+    不可进入 IR、不可影响路由、不可参与 REVIEW_READY 判定。
+    """
+    node_name: str
+    # 合法值：
+    #   "parse_developer_spec" | "relationship_planner" |
+    #   "sql_build_planner" | "sql_program_planner" | "spark_developer"
+    model: str              # 实际模型标识（Fake 时为 "fake"）
+    token_usage: dict[str, int] = {}
+    # {"prompt_tokens": N, "completion_tokens": N, "total_tokens": N}
+    latency_ms: int = 0     # 总延迟（毫秒）
+    status: str = "skipped"
+    # "valid" | "invalid" | "skipped" | "error"
+    error_type: str | None = None
+    # 失败时的 AdapterError 类型字符串
+
+
 class SchemaBinding(StrictModel):
     """任务到 Pydantic Schema 的绑定——Gateway 用此校验 LLM 输出的 JSON。
 
