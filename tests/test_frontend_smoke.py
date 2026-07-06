@@ -335,17 +335,20 @@ class TestSparkPipelineFrontend:
 
     # ── App.tsx 测试 ──
 
-    def test_app_has_spark_verify_button(self):
-        """App.tsx 包含 'Spark 验证' 按钮且 disabled 依赖 requestId。"""
+    def test_app_has_spark_stage_buttons(self):
+        """App.tsx 包含 SparkStageButtons 组件 + handleSparkStageComplete 回调。"""
         src = self._read_file("frontend", "src", "App.tsx")
-        assert "Spark 验证" in src, (
-            "App.tsx 中缺少 'Spark 验证' 按钮"
+        assert "SparkStageButtons" in src, (
+            "App.tsx 中缺少 SparkStageButtons 组件"
+        )
+        assert "handleSparkStageComplete" in src, (
+            "App.tsx 中缺少 handleSparkStageComplete 回调"
         )
         assert "handleSparkVerify" in src, (
-            "App.tsx 中缺少 handleSparkVerify 函数"
+            "App.tsx 中缺少 handleSparkVerify 函数（向后兼容保留）"
         )
-        assert "!state.requestId" in src, (
-            "Spark 按钮 disabled 逻辑未依赖 requestId"
+        assert "requestId={state.requestId}" in src, (
+            "SparkStageButtons 未接收 requestId prop"
         )
 
     def test_app_has_second_pipeline_indicator_with_spark_title(self):
