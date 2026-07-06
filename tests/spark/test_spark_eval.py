@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 
+from tianshu_datadev.artifacts.models import CaseWhenCondition
 from tianshu_datadev.harness.spark_eval import (
     SparkEvalCase,
     SparkEvalDimension,
@@ -736,9 +737,11 @@ class TestC4D5PhysicalPrecondition:
                     output_alias="level",
                     branches=[
                         SparkCaseWhenBranch(
-                            label="high", condition_column="amount",
-                            condition_value="100",
+                        label="high",
+                        condition=CaseWhenCondition(
+                            operator="GT", normalized_name="amount", value=100,
                         ),
+                    ),
                     ],
                     else_value="low",
                 ),
@@ -852,6 +855,8 @@ class TestC4D4LogicEquivalence:
         验证 PlanComparator 判定 LOGIC_EQUIVALENT，零未覆盖类型。
         """
         from tianshu_datadev.artifacts.models import (
+            CaseWhenBranchSpec,
+            CaseWhenCondition,
             CaseWhenLabelSpec,
             ContractAggregation,
             ContractInputTable,
@@ -921,6 +926,20 @@ class TestC4D4LogicEquivalence:
                     branch_count=2,
                     labels=["high", "low"],
                     else_label="mid",
+                    branches=[
+                        CaseWhenBranchSpec(
+                            label="high",
+                            condition=CaseWhenCondition(
+                                operator="GT", normalized_name="amount", value=100,
+                            ),
+                        ),
+                        CaseWhenBranchSpec(
+                            label="low",
+                            condition=CaseWhenCondition(
+                                operator="LTE", normalized_name="amount", value=100,
+                            ),
+                        ),
+                    ],
                 ),
             ],
             output_grain=["region_code"],

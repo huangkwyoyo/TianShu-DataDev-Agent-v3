@@ -12,6 +12,8 @@ from __future__ import annotations
 import pytest
 
 from tianshu_datadev.artifacts.models import (
+    CaseWhenBranchSpec,
+    CaseWhenCondition,
     CaseWhenLabelSpec,
     ContractAggregation,
     ContractInputTable,
@@ -138,6 +140,32 @@ def _make_minimal_contract() -> DataTransformContractV1:
                 branch_count=3,
                 labels=["high", "mid", "low"],
                 else_label="unknown",
+                branches=[
+                    CaseWhenBranchSpec(
+                        label="high",
+                        condition=CaseWhenCondition(
+                            operator="GT", normalized_name="amount", value=100,
+                        ),
+                    ),
+                    CaseWhenBranchSpec(
+                        label="mid",
+                        condition=CaseWhenCondition(
+                            operator="AND",
+                            left=CaseWhenCondition(
+                                operator="GT", normalized_name="amount", value=50,
+                            ),
+                            right=CaseWhenCondition(
+                                operator="LTE", normalized_name="amount", value=100,
+                            ),
+                        ),
+                    ),
+                    CaseWhenBranchSpec(
+                        label="low",
+                        condition=CaseWhenCondition(
+                            operator="LTE", normalized_name="amount", value=50,
+                        ),
+                    ),
+                ],
             ),
         ],
         window_specs=[

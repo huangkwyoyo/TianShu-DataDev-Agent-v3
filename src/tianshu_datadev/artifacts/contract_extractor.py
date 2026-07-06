@@ -23,6 +23,8 @@ from tianshu_datadev.planning.sql_program import SqlProgram
 from tianshu_datadev.sql.write_plan import FinalWritePlan
 
 from .models import (
+    CaseWhenBranchSpec,
+    CaseWhenCondition,
     CaseWhenLabelSpec,
     ContractAggregation,
     ContractColumn,
@@ -477,7 +479,8 @@ class DataTransformContractExtractor:
     ) -> list[CaseWhenLabelSpec]:
         """从 CaseWhenStep 提取 CASE WHEN 标签规格。
 
-        一个 CaseWhenStep 产生一个标签列，提取所有分支的 label 值。
+        一个 CaseWhenStep 产生一个标签列，同时提取 labels（展示兼容）和
+        branches（结构化条件）两个平行列表。
 
         Args:
             step: CaseWhenStep 实例
@@ -485,6 +488,9 @@ class DataTransformContractExtractor:
 
         Returns:
             CaseWhenLabelSpec 列表（当前每个 step 对应一个 spec）
+
+        Raises:
+            ValueError: 遇到不支持的 PredicateOperator（IN/BETWEEN/LIKE 等）
         """
         labels: list[str] = []
         else_label: str | None = None
@@ -497,15 +503,106 @@ class DataTransformContractExtractor:
         if step.else_value is not None and hasattr(step.else_value, "value"):
             else_label = str(step.else_value.value)
 
+        # 提取结构化条件分支——与 labels 平行
+        branches_spec: list[CaseWhenBranchSpec] = []
+        for branch in step.cases:
+            cond = DataTransformContractExtractor._predicate_to_case_when_condition(
+                branch.condition,
+            )
+            label = str(branch.result.value) if hasattr(branch.result, "value") else ""
+            branches_spec.append(CaseWhenBranchSpec(label=label, condition=cond))
+
         return [
             CaseWhenLabelSpec(
                 statement_id=statement_id,
-                output_alias=step.step_id,
+                output_alias=step.alias,  # 业务列名，非 step_id
                 branch_count=len(step.cases),
                 labels=labels,
                 else_label=else_label,
+                branches=branches_spec,
             )
         ]
+
+    # ── Predicate → CaseWhenCondition 转换辅助 ──
+
+    @staticmethod
+    def _extract_column_ref(col) -> tuple[str, str]:
+        """从 ColumnRef 提取 (table_ref, normalized_name)。"""
+        table = col.table_ref if hasattr(col, "table_ref") else ""
+        name = col.normalized_name if hasattr(col, "normalized_name") else str(col)
+        return table, name
+
+    @staticmethod
+    def _extract_literal_value(lit) -> str | int | float | bool | None:
+        """从 SqlLiteral 提取原始类型的值——保留 int/float/bool，不转字符串。
+
+        仅接受有 value 属性的对象（SqlLiteral）。非字面量类型（如 ColumnRef）
+        说明上游 Predicate 的右侧不是常量，CASE WHEN 当前不支持列-列比较，
+        必须拒绝而非静默字符串化。
+
+        Raises:
+            ValueError: lit 不是 SqlLiteral（无 value 属性）
+        """
+        if hasattr(lit, "value"):
+            return lit.value  # 保留原始类型：int、float、bool、str、None
+        raise ValueError(
+            f"CASE WHEN 右侧仅支持 SqlLiteral（字面量），"
+            f"收到 {type(lit).__name__}。列-列比较等复杂表达式不支持"
+        )
+
+    @staticmethod
+    def _predicate_to_case_when_condition(pred) -> CaseWhenCondition:
+        """将 Predicate AST 递归转换为 CaseWhenCondition 扁平表示。
+
+        支持：EQ/NEQ/GT/GTE/LT/LTE/IS_NULL/IS_NOT_NULL/AND/OR。
+        不支持 IN/BETWEEN/LIKE/NOT——遇到即抛 ValueError 阻断。
+
+        Args:
+            pred: planning.models.Predicate 实例
+
+        Returns:
+            CaseWhenCondition——扁平序列化表示
+
+        Raises:
+            ValueError: 遇到不支持的 PredicateOperator
+        """
+        op = pred.operator.value if hasattr(pred.operator, "value") else str(pred.operator)
+
+        # 一元操作符
+        if op in ("IS_NULL", "IS_NOT_NULL"):
+            table, name = DataTransformContractExtractor._extract_column_ref(pred.left)
+            return CaseWhenCondition(
+                operator=op, table_ref=table, normalized_name=name,
+            )
+
+        # 二元比较——右侧必须是 SqlLiteral（字面量），不支持列-列比较
+        if op in ("EQ", "NEQ", "GT", "GTE", "LT", "LTE"):
+            table, name = DataTransformContractExtractor._extract_column_ref(pred.left)
+            if not hasattr(pred.right, "value"):
+                raise ValueError(
+                    f"CASE WHEN 条件 operator='{op}' 右侧必须是 SqlLiteral（字面量），"
+                    f"收到 {type(pred.right).__name__}。列-列比较不支持"
+                )
+            val = DataTransformContractExtractor._extract_literal_value(pred.right)
+            return CaseWhenCondition(
+                operator=op, table_ref=table, normalized_name=name, value=val,
+            )
+
+        # 逻辑组合
+        if op in ("AND", "OR"):
+            left_c = DataTransformContractExtractor._predicate_to_case_when_condition(
+                pred.left,
+            )
+            right_c = DataTransformContractExtractor._predicate_to_case_when_condition(
+                pred.right,
+            )
+            return CaseWhenCondition(operator=op, left=left_c, right=right_c)
+
+        # 不支持的操作符——阻断，不平替
+        raise ValueError(
+            f"Contract CASE WHEN 不支持 PredicateOperator.{op}，"
+            f"需扩展 _predicate_to_case_when_condition 或由上游拒绝该条件"
+        )
 
     @staticmethod
     def _extract_window_v1(

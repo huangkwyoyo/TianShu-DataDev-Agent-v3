@@ -477,6 +477,8 @@ def _map_case_when(
     """将 Contract 的 case_when_labels 映射为 CaseWhenStep 列表。
 
     每个 CaseWhenLabelSpec 映射为一个 SparkCaseWhenStep。
+    优先使用 branches spec（含结构化 condition），回退到 labels-only 路径
+    （condition=None，仅兼容展示/审查，进入 compiler 时 RenderError 阻断）。
 
     Args:
         case_when_labels: CaseWhenLabelSpec 列表
@@ -486,7 +488,17 @@ def _map_case_when(
     """
     steps: list[SparkCaseWhenStep] = []
     for cwl in case_when_labels:
-        branches = [SparkCaseWhenBranch(label=label) for label in cwl.labels]
+        if cwl.branches:
+            # 新路径：使用完整条件分支
+            branches = [
+                SparkCaseWhenBranch(label=bs.label, condition=bs.condition)
+                for bs in cwl.branches
+            ]
+        else:
+            # labels-only 路径：仅兼容展示/审查，condition=None
+            # 编译器遇到时会抛出 RenderError
+            branches = [SparkCaseWhenBranch(label=label) for label in cwl.labels]
+
         steps.append(
             SparkCaseWhenStep(
                 input_alias="",  # 由 statement_id 推断，Phase 5 暂空

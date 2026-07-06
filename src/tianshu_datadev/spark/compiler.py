@@ -22,7 +22,7 @@ from tianshu_datadev.spark.models import (
     SparkSortStep,
     SparkWindowStep,
 )
-from tianshu_datadev.spark.renderer import SparkCodeRenderer
+from tianshu_datadev.spark.renderer import RenderError, SparkCodeRenderer
 
 # ════════════════════════════════════════════
 # 编译结果
@@ -445,8 +445,8 @@ class SparkCompiler:
     ) -> tuple[str, str]:
         """编译 CaseWhenStep → {out} = {input}.withColumn(col, F.when(...).otherwise(...))。
 
-        Phase 6B 每个分支使用 condition_column == condition_value 的简单等值条件。
-        完整谓词还原（多条件）推迟到 Phase 7。
+        每个分支必须携带结构化 condition（CaseWhenCondition AST），
+        condition=None 时抛出 RenderError 阻断——labels-only 路径不进可执行 compiler。
         """
         input_alias = self.renderer.validate_identifier(
             step.input_alias, "CaseWhenStep.input_alias"
@@ -465,15 +465,26 @@ class SparkCompiler:
 
         # 倒序遍历分支——构建 F.when(cond, val).otherwise(inner)
         for branch in reversed(step.branches):
-            cond_col = self.renderer.render_column(branch.condition_column)
-            cond_val = self.renderer.render_literal(branch.condition_value)
+            # 缺条件→阻断，不平替为空条件
+            if branch.condition is None:
+                raise RenderError(
+                    f"CaseWhenStep 分支 label='{branch.label}' 缺少结构化 condition，"
+                    f"labels-only 路径不能进入可执行 compiler。"
+                    f"请确保 Contract 提取时已填充 CaseWhenBranchSpec.branches"
+                )
             label_lit = self.renderer.render_literal(branch.label)
-            chain = f"F.when({cond_col} == {cond_val}, F.lit({label_lit})).otherwise({chain})"
+            cond = self._render_case_when_condition(branch.condition)
+            chain = f"F.when({cond}, F.lit({label_lit})).otherwise({chain})"
 
         raw = f'{out_alias} = {input_alias}.withColumn("{output_col}", {chain})'
 
         branches_desc = ", ".join(
-            f"WHEN {b.condition_column} = {b.condition_value} THEN {b.label}"
+            f"WHEN {b.condition.operator}"
+            + (f" {b.condition.normalized_name}" if b.condition.normalized_name else "")
+            + (f" {b.condition.value}" if b.condition.value is not None else "")
+            + f" THEN {b.label}"
+            if b.condition is not None
+            else f"WHEN ? THEN {b.label}"
             for b in step.branches
         )
         comment = self._build_comment_block(
@@ -487,6 +498,57 @@ class SparkCompiler:
             output=out_alias,
         )
         return raw, comment
+
+    def _render_case_when_condition(self, condition) -> str:
+        """将 CaseWhenCondition AST 渲染为 PySpark Column API 表达式。
+
+        使用 renderer.render_column / render_literal / render_operator 做安全渲染。
+        render_literal 已正确处理 int/float/bool/str 类型保真。
+
+        Args:
+            condition: CaseWhenCondition 实例
+
+        Returns:
+            PySpark Column API 表达式字符串（如 '(F.col("a").isNull()) | (F.col("b") == F.lit(True))'）
+
+        Raises:
+            RenderError: 遇到不支持的操作符
+        """
+        op = condition.operator
+
+        # 一元：IS_NULL / IS_NOT_NULL
+        if op == "IS_NULL":
+            col = self.renderer.render_column(
+                condition.normalized_name or condition.table_ref
+            )
+            return f"{col}.isNull()"
+        if op == "IS_NOT_NULL":
+            col = self.renderer.render_column(
+                condition.normalized_name or condition.table_ref
+            )
+            return f"{col}.isNotNull()"
+
+        # 二元比较
+        if op in ("EQ", "NEQ", "GT", "GTE", "LT", "LTE"):
+            col = self.renderer.render_column(
+                condition.normalized_name or condition.table_ref
+            )
+            py_op = self.renderer.render_operator(op)
+            val = self.renderer.render_literal(condition.value)
+            return f"{col} {py_op} F.lit({val})"
+
+        # 逻辑组合——left/right 必须非空，否则是畸形 AST
+        if op in ("AND", "OR"):
+            if condition.left is None or condition.right is None:
+                raise RenderError(
+                    f"CaseWhenCondition operator='{op}' 缺少 left 或 right 子树，"
+                    f"AND/OR 要求左右子树均非空"
+                )
+            left = self._render_case_when_condition(condition.left)
+            right = self._render_case_when_condition(condition.right)
+            return f"({left}) & ({right})" if op == "AND" else f"({left}) | ({right})"
+
+        raise RenderError(f"Spark CASE WHEN 不支持条件操作符: {op}")
 
     def _compile_window(
         self, step: SparkWindowStep, step_id: str, index: int, total: int,

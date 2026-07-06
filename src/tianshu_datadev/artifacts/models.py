@@ -155,14 +155,43 @@ class DataTransformContractLite(StrictModel):
 # ════════════════════════════════════════════
 
 
+class CaseWhenCondition(StrictModel):
+    """CASE WHEN 分支条件——Predicate AST 的扁平序列化表示。
+
+    此模型仅在 Spark 合约层使用，不负责还原 SQL Predicate。
+    叶子节点：operator + table_ref/normalized_name + value（原始类型）
+      例：GT, "ft", "amount", 100 → amount > 100
+      例：IS_NULL, "ft", "distance_miles", None → distance_miles IS NULL
+    逻辑节点：operator + left + right
+      例：AND, left_cond, right_cond → (left) AND (right)
+
+    不支持的操作符在提取时由 _predicate_to_case_when_condition() 抛出 ValueError 阻断。
+    """
+
+    operator: str  # PredicateOperator 枚举值（EQ/NEQ/GT/GTE/LT/LTE/IS_NULL/IS_NOT_NULL/AND/OR）
+    table_ref: str = ""          # 列所属表别名（来自 ColumnRef.table_ref）
+    normalized_name: str = ""    # 归一化列名（来自 ColumnRef.normalized_name）
+    value: str | int | float | bool | None = None  # 叶子节点：字面量值，保留原始类型
+    left: "CaseWhenCondition | None" = None   # 逻辑节点左子树
+    right: "CaseWhenCondition | None" = None  # 逻辑节点右子树
+
+
+class CaseWhenBranchSpec(StrictModel):
+    """单个 CASE WHEN 分支的完整规格——label + 结构化 condition。"""
+
+    label: str  # 标签值（如 "short"、"medium"）
+    condition: CaseWhenCondition  # 结构化条件 AST
+
+
 class CaseWhenLabelSpec(StrictModel):
     """v1 Contract 中的 CASE WHEN 标签规格——从 CaseWhenStep 确定性抽取。"""
 
     statement_id: str  # 所属语句（对应 SqlStatement.statement_id）
-    output_alias: str  # 输出列别名（CaseWhenStep 产生带别名的输出列）
+    output_alias: str  # 输出列别名（业务列名，来自 CaseWhenStep.alias）
     branch_count: int  # WHEN 分支数量
-    labels: list[str] = []  # 所有分支的标签值（从 WhenBranch.result 提取）
+    labels: list[str] = []  # 所有分支的标签值（从 WhenBranch.result 提取，兼容展示/审查用途）
     else_label: str | None = None  # ELSE 默认值（无 ELSE 时为 None）
+    branches: list[CaseWhenBranchSpec] = []  # 完整条件分支（含结构化 condition）
 
 
 class WindowSpecSummary(StrictModel):

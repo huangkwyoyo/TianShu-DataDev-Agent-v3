@@ -660,6 +660,33 @@ class TestContractExtractorV1:
         with pytest.raises(ValueError, match="不含任何 statement"):
             extractor.extract_v1(sql_program)
 
+    def test_predicate_to_case_when_rejects_column_ref_right(self):
+        """二元比较右侧是 ColumnRef（列-列比较）→ ValueError，不静默字符串化。"""
+        import pytest
+
+        # 构造一个右侧为 ColumnRef 的 Predicate（列-列比较：amount > other_amount）
+        pred = Predicate(
+            left=ColumnRef(
+                table_ref="t1", column_name="amount", normalized_name="amount",
+            ),
+            operator=PredicateOperator.GT,
+            right=ColumnRef(
+                table_ref="t1", column_name="other_amount", normalized_name="other_amount",
+            ),
+        )
+
+        with pytest.raises(ValueError, match="列-列比较"):
+            DataTransformContractExtractor._predicate_to_case_when_condition(pred)
+
+    def test_extract_literal_value_rejects_non_sql_literal(self):
+        """_extract_literal_value 对非 SqlLiteral 抛 ValueError，不返回 str()。"""
+        import pytest
+
+        col = ColumnRef(table_ref="t1", column_name="x", normalized_name="x")
+
+        with pytest.raises(ValueError, match="右侧仅支持 SqlLiteral"):
+            DataTransformContractExtractor._extract_literal_value(col)
+
 
 # ════════════════════════════════════════════
 # Phase 3C Step 2——Pipeline 集成测试

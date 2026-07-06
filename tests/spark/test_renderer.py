@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from tianshu_datadev.artifacts.models import CaseWhenCondition
 from tianshu_datadev.spark.models import (
     SparkAggFunction,
     SparkJoinType,
@@ -583,7 +584,7 @@ class TestMaliciousInputPhase6B:
             compiler.compile(plan)
 
     def test_case_when_malicious_condition_column_rejected(self):
-        """case_when condition_column 含恶意字符——编译时抛出 RenderError。"""
+        """case_when condition.normalized_name 含恶意字符——编译时抛出 RenderError。"""
         from tianshu_datadev.spark.compiler import SparkCompiler
         from tianshu_datadev.spark.models import (
             SparkCaseWhenBranch,
@@ -605,8 +606,11 @@ class TestMaliciousInputPhase6B:
                     branches=[
                         SparkCaseWhenBranch(
                             label="bad",
-                            condition_column='status; DROP TABLE',  # 恶意列名
-                            condition_value="active",
+                            condition=CaseWhenCondition(
+                                operator="EQ",
+                                normalized_name="status; DROP TABLE",  # 恶意列名
+                                value="active",
+                            ),
                         ),
                     ],
                     else_value="other",
@@ -640,8 +644,11 @@ class TestMaliciousInputPhase6B:
                     branches=[
                         SparkCaseWhenBranch(
                             label="ok",
-                            condition_column="status",
-                            condition_value="active",
+                            condition=CaseWhenCondition(
+                                operator="EQ",
+                                normalized_name="status",
+                                value="active",
+                            ),
                         ),
                     ],
                     else_value="other",
