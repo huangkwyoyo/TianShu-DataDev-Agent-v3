@@ -1200,17 +1200,13 @@ class TestNYCCase06SparkDualChain:
     导致严格断言 xfail。一旦 B 类功能收口，xfail 应自然转正。
     """
 
-    @pytest.mark.xfail(
-        reason="已知限制：B 类收口已完成（比率计算/CASE WHEN/Comparator 归一化），"
-               "DAG 归一化（_normalize_dag_steps）有效——aggregate 3→1、project 7→1，"
-               "步数差异已消除。但 scan/join/aggregate 的内容级差异"
-               "（_temp_* 表引用 vs Mapper 别名）导致仍为 LOGIC_MISMATCH。"
-               "需独立 Phase 引入 plan 级别内容对齐（scan 别名重映射、join 引用归一化）。"
-               "一旦内容级对齐完成，此 xfail 应自然转正。",
-        strict=True,
-    )
     def test_spark_orchestrator_logic_equivalence(self, nyc06_spec_md, nyc06_csv_paths):
-        """多语句 DAG Spark Orchestrator 逻辑等价判定——显式断言 comparator_report.status。"""
+        """多语句 DAG Spark Orchestrator 逻辑等价判定——显式断言 comparator_report.status。
+
+        内容级对齐（三层剥离：_temp_ scan/join 过滤 + grain-aware aggregate 合并 +
+        target_grain 传递 + 最终 project 列归拢）使 SQL DAG 扁平化结果
+        与 Mapper SparkPlan 在业务语义级对齐，Comparator 应判 LOGIC_EQUIVALENT。
+        """
         pytest.importorskip("pyspark", reason="PySpark 环境不可用")
 
         from tianshu_datadev.spark.orchestrator import SparkOrchestrator

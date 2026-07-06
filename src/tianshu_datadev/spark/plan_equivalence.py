@@ -317,9 +317,9 @@ def compare_aggregate_steps(
     sql_agg = sql_aggs[0]
     spark_agg = spark_aggs[0]
 
-    # 对比分组键
-    sql_groups = sorted([normalize_field_name(g) for g in sql_agg.get("group_keys", [])])
-    spark_groups = sorted([normalize_field_name(g) for g in spark_agg.get("group_keys", [])])
+    # 对比分组键——去重后比较（SQL 侧 _normalize_dag_steps 已去重，Spark 侧 Mapper 可能含重复）
+    sql_groups = sorted(set(normalize_field_name(g) for g in sql_agg.get("group_keys", [])))
+    spark_groups = sorted(set(normalize_field_name(g) for g in spark_agg.get("group_keys", [])))
 
     if sql_groups != spark_groups:
         return StepEquivalenceResult(

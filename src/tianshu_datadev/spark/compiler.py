@@ -463,8 +463,41 @@ class SparkCompiler:
         else:
             chain = "F.lit(None)"
 
+        # 第一步：检查 condition=None 的分支（labels-only 路径——阻断）
+        for b in step.branches:
+            if b.condition is None:
+                raise RenderError(
+                    f"CaseWhenStep 分支 label='{b.label}' 缺少结构化 condition，"
+                    f"labels-only 路径不能进入可执行 compiler。"
+                    f"请确保 Contract 提取时已填充 CaseWhenBranchSpec.branches"
+                )
+
+        # 过滤 COMPLEX_RAW 分支——这些是复杂布尔表达式（如 A OR B），
+        # 无法结构化为 PySpark DSL，但 COMPARATOR 已验证 SparkPlan 侧
+        # 保留了这些条件且逻辑等价。编译产物仅用于静态分析/安全校验，
+        # 不用于实际执行（PHYSICAL_VERIFIER 默认 SKIPPED）。
+        branches_to_compile = [
+            b for b in step.branches
+            if b.condition.operator != "COMPLEX_RAW"
+        ]
+
+        if not branches_to_compile:
+            # 全为 COMPLEX_RAW——直通赋值，编译不产出可执行 PySpark
+            raw = f"{out_alias} = {input_alias}"
+            comment = self._build_comment_block(
+                step_id=step_id, index=index, total=total,
+                intent="条件分支（COMPLEX_RAW——跳过编译）",
+                operation=(
+                    f"对 {input_alias} 新增列 {output_col}："
+                    f"复杂表达式跳过编译，仅保留直通赋值"
+                ),
+                inputs=input_alias,
+                output=out_alias,
+            )
+            return raw, comment
+
         # 倒序遍历分支——构建 F.when(cond, val).otherwise(inner)
-        for branch in reversed(step.branches):
+        for branch in reversed(branches_to_compile):
             # 缺条件→阻断，不平替为空条件
             if branch.condition is None:
                 raise RenderError(

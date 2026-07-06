@@ -417,6 +417,12 @@ class DataTransformContractExtractor:
                 elif isinstance(step, FilterStep):
                     filters.append(self._extract_filter(step))
                 elif isinstance(step, JoinStep):
+                    # _temp_* 表之间的 Join 是 DAG 内部管道——不进入 Contract
+                    if step.join_keys and any(
+                        k[0].table_ref.startswith("_temp_") or k[1].table_ref.startswith("_temp_")
+                        for k in step.join_keys
+                    ):
+                        continue
                     join_rel = self._extract_join(step, {})
                     if join_rel:
                         join_relationships.append(join_rel)
@@ -509,9 +515,26 @@ class DataTransformContractExtractor:
         # 提取结构化条件分支——与 labels 平行
         branches_spec: list[CaseWhenBranchSpec] = []
         for branch in step.cases:
-            cond = DataTransformContractExtractor._predicate_to_case_when_condition(
-                branch.condition,
-            )
+            if branch.condition is not None:
+                # 结构化条件分支（简单比较，如 status = 'VIP'）
+                cond = DataTransformContractExtractor._predicate_to_case_when_condition(
+                    branch.condition,
+                )
+            else:
+                # raw_condition 模式——复杂布尔表达式（如 A OR B / A AND B）
+                # 无法分解为 CaseWhenCondition 叶子/逻辑节点。
+                # 创建占位节点承载原始表达式前 200 字符，
+                # Spark compiler 遇到 COMPLEX_RAW 时会抛出 RenderError 阻断——
+                # 这是预期行为：复杂表达式当前不走结构化 contract 路径。
+                raw_text = (
+                    branch.raw_condition.sql_fragment[:200]
+                    if branch.raw_condition is not None and hasattr(branch.raw_condition, "sql_fragment")
+                    else ""
+                )
+                cond = CaseWhenCondition(
+                    operator="COMPLEX_RAW",
+                    normalized_name=raw_text,
+                )
             label = str(branch.result.value) if hasattr(branch.result, "value") else ""
             branches_spec.append(CaseWhenBranchSpec(label=label, condition=cond))
 

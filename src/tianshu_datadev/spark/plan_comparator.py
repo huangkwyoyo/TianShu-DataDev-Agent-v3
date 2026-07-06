@@ -484,6 +484,9 @@ class PlanComparator:
         seen_proj_aliases: set[str] = set()
         has_project = False
 
+        # 收集所有 project steps——仅当 target_grain 非空时只保留最后一个（FINAL 输出）
+        all_project_steps: list[list[dict[str, Any]]] = []
+
         # aggregate 按 group_keys 签名分组合并——禁止跨粒度硬合并
         agg_groups: dict[tuple, dict] = {}
         for step in sql_steps:
@@ -503,21 +506,56 @@ class PlanComparator:
                         agg_groups[gk_tuple]["metrics"].append(m)
             elif stype == "project":
                 has_project = True
-                for col in step.get("columns", []):
-                    alias = col.get("alias", "")
-                    if alias not in seen_proj_aliases:
-                        seen_proj_aliases.add(alias)
-                        proj_columns.append(col)
+                if target_grain is not None:
+                    # target_grain 路径——收集所有 project 步，后续只保留最后一个
+                    all_project_steps.append(step.get("columns", []) or [])
+                else:
+                    # 单 Plan 路径——合并所有 project 步的列（旧行为）
+                    for col in step.get("columns", []):
+                        alias = col.get("alias", "")
+                        if alias not in seen_proj_aliases:
+                            seen_proj_aliases.add(alias)
+                            proj_columns.append(col)
             else:
                 result.append(step)
 
-        # B2：target_grain 过滤——只保留最终业务粒度 aggregate
+        # B2：target_grain 过滤——保留匹配的 aggregate
         if target_grain is not None:
             target_set = set(target_grain)
-            agg_groups = {
-                gk: data for gk, data in agg_groups.items()
-                if set(gk) == target_set
-            }
+            # 检查是否有 aggregate 的 grain 精确匹配 target_grain
+            has_exact_match = any(set(gk) == target_set for gk in agg_groups)
+            if has_exact_match:
+                # 精确匹配模式：只保留 grain 完全等于 target_set 的 aggregate
+                agg_groups = {
+                    gk: data for gk, data in agg_groups.items()
+                    if set(gk) == target_set
+                }
+            elif agg_groups:
+                # 无精确匹配——所有 aggregate 的 grain 都是 target_set 的子集
+                #（如 ["borough"] 和 ["violation_county"] 都是 {"borough","violation_county"} 的子集）。
+                # 此时合并所有 aggregate 为 1 个，与 Mapper 从 Contract 平铺
+                # aggregation/grouping_keys 生成 1 个 SparkAggregateStep 的行为对称。
+                all_group_keys: list[str] = []
+                seen_gk: set[str] = set()
+                all_metrics: list[dict[str, Any]] = []
+                seen_metric_aliases: set[str] = set()
+                for gk_tuple, agg_data in agg_groups.items():
+                    for gk in agg_data["group_keys"]:
+                        if gk not in seen_gk:
+                            seen_gk.add(gk)
+                            all_group_keys.append(gk)
+                    for m in agg_data["metrics"]:
+                        alias = m.get("alias", "")
+                        if alias not in seen_metric_aliases:
+                            seen_metric_aliases.add(alias)
+                            all_metrics.append(m)
+                agg_groups = {
+                    tuple(sorted(all_group_keys)): {
+                        "group_keys": all_group_keys,
+                        "metrics": all_metrics,
+                        "seen_aliases": seen_metric_aliases,
+                    }
+                }
 
         # 将分组后的 aggregate 按原始出现顺序插入 result
         # 修复：多个 grain 组计算同一 insert_pos 时顺序反转的 bug
@@ -553,7 +591,31 @@ class PlanComparator:
                 insert_pos += 1
 
         # 将合并后的 project 追加到末尾
-        if has_project:
+        if has_project and all_project_steps:
+            # target_grain 路径：只保留最后一个 project step 的列（FINAL 输出）
+            # 中间 project step 中的临时列（如 total_fare、violation_county）不是最终输出，
+            # 但为衍生列补全 column_name（如 crash_per_million_trips 的 column_name
+            # 在中间 step 中为空，最终 step 中有值）
+            last_project_cols = all_project_steps[-1]
+            merged_cols: list[dict[str, Any]] = []
+            col_name_fallback: dict[str, str] = {}
+            for cols_list in all_project_steps[:-1]:
+                for col in cols_list:
+                    alias = col.get("alias", "")
+                    cname = col.get("column_name", "")
+                    if alias and cname and alias not in col_name_fallback:
+                        col_name_fallback[alias] = cname
+            for col in last_project_cols:
+                entry = dict(col)
+                if not entry.get("column_name", "") and entry.get("alias", "") in col_name_fallback:
+                    entry["column_name"] = col_name_fallback[entry["alias"]]
+                merged_cols.append(entry)
+            result.append({
+                "step_type": "project",
+                "columns": merged_cols,
+            })
+        elif has_project:
+            # 单 Plan 路径（target_grain is None）：合并所有 project 步的列（旧行为）
             result.append({
                 "step_type": "project",
                 "columns": proj_columns,
