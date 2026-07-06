@@ -9,6 +9,8 @@ import { SqlDisplay } from './components/SqlDisplay';
 import { PackageTree } from './components/PackageTree';
 import { ErrorDisplay } from './components/ErrorDisplay';
 import { StatusBar } from './components/StatusBar';
+import { SparkStageButtons } from './components/SparkStageButtons';
+import { LlmTracePanel } from './components/LlmTracePanel';
 import {
   PipelineStageIndicator,
   type StageInfo,
@@ -27,6 +29,9 @@ import {
   ExecuteRichResponse,
   PackageRichResponse,
   SparkVerifyResponse,
+  SparkStageResponse,
+  LlmTraceNode,
+  RunAllResponse,
   TemplateFull,
 } from './api/client';
 import './App.css';
@@ -55,6 +60,9 @@ interface AppState {
   // Spark 管线验证结果
   sparkStages: StageInfo[];
   sparkVerifyResult: SparkVerifyResponse | null;
+
+  // LLM 调用追踪（各阶段累积）
+  llmTraces: Record<string, LlmTraceNode> | null;
 }
 
 export default function App() {
@@ -72,6 +80,7 @@ export default function App() {
     packageResult: null,
     sparkStages: [],
     sparkVerifyResult: null,
+    llmTraces: null,
   });
 
   /** 更新部分状态 */
@@ -186,6 +195,10 @@ export default function App() {
         packageResult: null,
         requestId: result.request_id,
         activePanel: 'sql',
+        llmTraces: (result as ExecuteRichResponse).llm_traces || null,
+        // 重置 Spark 状态——新的 execute 需要重新执行 Spark 阶段
+        sparkStages: [],
+        sparkVerifyResult: null,
       }),
     );
   };
@@ -205,6 +218,7 @@ export default function App() {
           return {
             requestId: result.request_id,
             activePanel: 'sql' as Panel,
+            llmTraces: (result as RunAllResponse).llm_traces || null,
           };
         }
         // 管线成功——尝试获取 package
@@ -225,6 +239,7 @@ export default function App() {
             packageResult: pkg,
             requestId: result.request_id,
             activePanel: 'package' as Panel,
+            llmTraces: (result as RunAllResponse).llm_traces || null,
             // SQL 管线成功——设置全部 8 阶段为 ok，使指示灯在成功后仍然可见
             pipelineStages: [
               { stage: 'parser', status: 'ok' },
@@ -241,6 +256,7 @@ export default function App() {
           return {
             requestId: result.request_id,
             activePanel: 'sql' as Panel,
+            llmTraces: (result as RunAllResponse).llm_traces || null,
             error: {
               error_code: 'PACKAGE_FETCH_FAILED',
               message: 'RunAll 成功但获取 Package 失败',
@@ -274,6 +290,31 @@ export default function App() {
             : { error_code: 'NETWORK_ERROR', message: String(err), field_ref: null };
         update({ isLoading: false, error: apiErr, sparkStages: [], sparkVerifyResult: null });
       });
+  };
+
+  /** Spark 单阶段完成回调 */
+  const handleSparkStageComplete = (response: SparkStageResponse) => {
+    // 将后端返回的 spark_stages 映射为前端 StageInfo 格式
+    const stages: StageInfo[] = response.spark_stages.map((s) => ({
+      stage: s.stage,
+      status: s.status,
+    }));
+    update({
+      sparkStages: stages,
+      sparkVerifyResult: {
+        request_id: response.request_id,
+        spark_stages: response.spark_stages,
+        overall_status: '',
+        comparator_status: '',
+        review_ready: false,
+        package_id: '',
+        errors: response.errors,
+      },
+      // 合并 llm_traces——后续阶段的追踪追加到已有数据
+      llmTraces: response.llm_traces
+        ? { ...(state.llmTraces || {}), ...response.llm_traces }
+        : state.llmTraces,
+    });
   };
 
   const hasContent = state.markdownText.trim().length > 0;
@@ -340,13 +381,13 @@ export default function App() {
             >
               全流程 Run-All
             </button>
-            <button
-              className="btn btn-accent"
-              disabled={!state.requestId || state.isLoading}
-              onClick={handleSparkVerify}
-            >
-              Spark 验证
-            </button>
+            <SparkStageButtons
+              requestId={state.requestId}
+              stages={state.sparkStages}
+              onStageComplete={handleSparkStageComplete}
+              onError={(err) => update({ error: err })}
+              disabled={state.isLoading}
+            />
             {state.isLoading && <span className="loading-indicator">处理中...</span>}
           </div>
 
@@ -395,6 +436,15 @@ export default function App() {
                 visible={state.activePanel === 'sql'}
               />
             )}
+
+            {/* LLM 调用追踪——编译执行后或 Spark 阶段后 */}
+            <LlmTracePanel
+              traces={state.llmTraces}
+              visible={
+                (state.activePanel === 'sql' || state.activePanel === 'package') &&
+                state.llmTraces !== null
+              }
+            />
 
             {state.packageResult && (
               <PackageTree
