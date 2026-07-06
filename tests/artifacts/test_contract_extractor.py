@@ -287,50 +287,52 @@ def _make_minimal_plan(
     ]
     if extra_steps:
         steps.extend(extra_steps)
-    steps.extend([
-        ProjectStep(
-            step_id="proj_1",
-            columns=[
-                AliasExpr(
-                    expression=ColumnRef(
-                        table_ref="t1",
-                        column_name="category",
-                        normalized_name="category",
+    steps.extend(
+        [
+            ProjectStep(
+                step_id="proj_1",
+                columns=[
+                    AliasExpr(
+                        expression=ColumnRef(
+                            table_ref="t1",
+                            column_name="category",
+                            normalized_name="category",
+                        ),
+                        alias="category",
                     ),
-                    alias="category",
-                ),
-                AliasExpr(
-                    expression=ColumnRef(
-                        table_ref="t1",
-                        column_name="cnt",
-                        normalized_name="cnt",
+                    AliasExpr(
+                        expression=ColumnRef(
+                            table_ref="t1",
+                            column_name="cnt",
+                            normalized_name="cnt",
+                        ),
+                        alias="cnt",
                     ),
-                    alias="cnt",
-                ),
-                AliasExpr(
-                    expression=ColumnRef(
-                        table_ref="t1",
-                        column_name="total",
-                        normalized_name="total",
+                    AliasExpr(
+                        expression=ColumnRef(
+                            table_ref="t1",
+                            column_name="total",
+                            normalized_name="total",
+                        ),
+                        alias="total",
                     ),
-                    alias="total",
-                ),
-            ],
-        ),
-        SortStep(
-            step_id="sort_1",
-            order_by=[
-                SortSpec(
-                    column="total",
-                    direction="DESC",
-                ),
-            ],
-        ),
-        LimitStep(
-            step_id="limit_1",
-            limit=100,
-        ),
-    ])
+                ],
+            ),
+            SortStep(
+                step_id="sort_1",
+                order_by=[
+                    SortSpec(
+                        column="total",
+                        direction="DESC",
+                    ),
+                ],
+            ),
+            LimitStep(
+                step_id="limit_1",
+                limit=100,
+            ),
+        ]
+    )
     return SqlBuildPlan(
         plan_id=plan_id,
         spec_hash=f"hash_{plan_id}",
@@ -667,11 +669,15 @@ class TestContractExtractorV1:
         # 构造一个右侧为 ColumnRef 的 Predicate（列-列比较：amount > other_amount）
         pred = Predicate(
             left=ColumnRef(
-                table_ref="t1", column_name="amount", normalized_name="amount",
+                table_ref="t1",
+                column_name="amount",
+                normalized_name="amount",
             ),
             operator=PredicateOperator.GT,
             right=ColumnRef(
-                table_ref="t1", column_name="other_amount", normalized_name="other_amount",
+                table_ref="t1",
+                column_name="other_amount",
+                normalized_name="other_amount",
             ),
         )
 
@@ -696,7 +702,8 @@ class TestContractExtractorV1:
         pred = Predicate(
             left=Predicate(
                 left=ColumnRef(
-                    table_ref="t1", column_name="amount",
+                    table_ref="t1",
+                    column_name="amount",
                     normalized_name="amount",
                 ),
                 operator=PredicateOperator.GT,
@@ -724,53 +731,87 @@ class TestContractExtractorV1:
 
     def test_contract_input_tables_excludes_temp(self):
         """Contract V1 的 input_tables 不应包含 _temp_* 中间表——DAG 内部管道。"""
+        from tianshu_datadev.artifacts.contract_extractor import DataTransformContractExtractor
+        from tianshu_datadev.planning.models import AliasExpr, ColumnRef
         from tianshu_datadev.planning.sql_build_plan import (
+            ProjectStep,
             ScanStep,
             SqlBuildPlan,
-            ProjectStep,
         )
-        from tianshu_datadev.planning.models import ColumnRef, AliasExpr
         from tianshu_datadev.planning.sql_program import (
             SqlProgram,
             SqlStatement,
             StatementKind,
         )
-        from tianshu_datadev.artifacts.contract_extractor import DataTransformContractExtractor
 
         # 构造含 _temp_* scan 的 2 语句 SqlProgram
         stmt_0_plan = SqlBuildPlan(
-            plan_id="plan_0", spec_hash="test_hash",
+            plan_id="plan_0",
+            spec_hash="test_hash",
             steps=[
-                ScanStep(step_type="scan", step_id="scan_fc",
-                         table_ref="fc", required_columns=[
-                             ColumnRef(table_ref="fc", column_name="borough", normalized_name="borough"),
-                         ]),
-                ProjectStep(step_type="project", step_id="proj_0", columns=[
-                    AliasExpr(expression=ColumnRef(table_ref="", column_name="borough", normalized_name="borough"),
-                              alias="borough"),
-                ]),
+                ScanStep(
+                    step_type="scan",
+                    step_id="scan_fc",
+                    table_ref="fc",
+                    required_columns=[
+                        ColumnRef(table_ref="fc", column_name="borough", normalized_name="borough"),
+                    ],
+                ),
+                ProjectStep(
+                    step_type="project",
+                    step_id="proj_0",
+                    columns=[
+                        AliasExpr(
+                            expression=ColumnRef(
+                                table_ref="", column_name="borough", normalized_name="borough"
+                            ),
+                            alias="borough",
+                        ),
+                    ],
+                ),
             ],
         )
         stmt_1_plan = SqlBuildPlan(
-            plan_id="plan_1", spec_hash="test_hash",
+            plan_id="plan_1",
+            spec_hash="test_hash",
             steps=[
-                ScanStep(step_type="scan", step_id="scan_temp",
-                         table_ref="_temp_abc123_crash_boro_agg", required_columns=[
-                             ColumnRef(table_ref="_temp_abc123_crash_boro_agg",
-                                       column_name="borough", normalized_name="borough"),
-                         ]),
-                ProjectStep(step_type="project", step_id="proj_1", columns=[
-                    AliasExpr(expression=ColumnRef(table_ref="", column_name="borough", normalized_name="borough"),
-                              alias="borough"),
-                ]),
+                ScanStep(
+                    step_type="scan",
+                    step_id="scan_temp",
+                    table_ref="_temp_abc123_crash_boro_agg",
+                    required_columns=[
+                        ColumnRef(
+                            table_ref="_temp_abc123_crash_boro_agg",
+                            column_name="borough",
+                            normalized_name="borough",
+                        ),
+                    ],
+                ),
+                ProjectStep(
+                    step_type="project",
+                    step_id="proj_1",
+                    columns=[
+                        AliasExpr(
+                            expression=ColumnRef(
+                                table_ref="", column_name="borough", normalized_name="borough"
+                            ),
+                            alias="borough",
+                        ),
+                    ],
+                ),
             ],
         )
         sql_program = SqlProgram(
-            program_id="test_prog", spec_id="test_spec",
+            program_id="test_prog",
+            spec_id="test_spec",
             statements=[
                 SqlStatement(statement_id="stmt_0", plan=stmt_0_plan, kind=StatementKind.PRODUCER),
-                SqlStatement(statement_id="stmt_1", plan=stmt_1_plan,
-                            kind=StatementKind.CONSUMER, depends_on=["stmt_0"]),
+                SqlStatement(
+                    statement_id="stmt_1",
+                    plan=stmt_1_plan,
+                    kind=StatementKind.CONSUMER,
+                    depends_on=["stmt_0"],
+                ),
             ],
             topological_order=["stmt_0", "stmt_1"],
         )

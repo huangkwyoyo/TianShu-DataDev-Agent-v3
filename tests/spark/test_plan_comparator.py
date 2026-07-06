@@ -249,16 +249,17 @@ class TestPlanComparatorScanEquivalence:
 
         assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
         assert any(
-            r.step_type == "scan" and r.verdict == EquivalenceVerdict.EQUIVALENT
-            for r in report.step_results
+            r.step_type == "scan" and r.verdict == EquivalenceVerdict.EQUIVALENT for r in report.step_results
         )
 
     def test_scan_read_not_equivalent_different_alias(self):
         """不同表别名 → LOGIC_MISMATCH。"""
         sql_plan = _make_sql_plan([_make_sql_scan_step()])
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(alias="different_alias"),
-        ])
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(alias="different_alias"),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -271,14 +272,18 @@ class TestPlanComparatorFilterEquivalence:
 
     def test_filter_equivalent(self):
         """相同过滤条件 → LOGIC_EQUIVALENT。"""
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            _make_sql_filter_step(),
-        ])
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            _make_spark_filter_step(),
-        ])
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                _make_sql_filter_step(),
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                _make_spark_filter_step(),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -287,21 +292,25 @@ class TestPlanComparatorFilterEquivalence:
 
     def test_filter_not_equivalent(self):
         """不同过滤操作符 → LOGIC_MISMATCH。"""
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            _make_sql_filter_step(),
-        ])
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                _make_sql_filter_step(),
+            ]
+        )
         # Spark 侧用 EQ 而非 GT
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            SparkFilterStep(
-                step_type=SparkStepType.FILTER,
-                input_alias="od",
-                operator="EQ",
-                left="amount",
-                right="threshold",
-            ),
-        ])
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                SparkFilterStep(
+                    step_type=SparkStepType.FILTER,
+                    input_alias="od",
+                    operator="EQ",
+                    left="amount",
+                    right="threshold",
+                ),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -343,33 +352,37 @@ class TestPlanComparatorFilterEquivalence:
             operator="BETWEEN",
             left="ft.pickup_date_key",
             right="[SqlLiteral(value='20260101', is_sql_expr=False),"
-                  " SqlLiteral(value='20260331', is_sql_expr=False)]",
+            " SqlLiteral(value='20260331', is_sql_expr=False)]",
         )
 
-        sql_plan = _make_sql_plan([
-            ScanStep(
-                step_type="scan",
-                step_id="scan_ft",
-                table_ref="ft",
-                required_columns=[
-                    ColumnRef(
-                        table_ref="ft",
-                        column_name="pickup_date_key",
-                        normalized_name="pickup_date_key",
-                    ),
-                ],
-            ),
-            sql_filter,
-        ])
-        spark_plan = _make_spark_plan([
-            SparkReadStep(
-                step_type=SparkStepType.READ,
-                alias="ft",
-                source_name="fact_trips",
-                input_key="fact_trips_key",
-            ),
-            spark_filter,
-        ])
+        sql_plan = _make_sql_plan(
+            [
+                ScanStep(
+                    step_type="scan",
+                    step_id="scan_ft",
+                    table_ref="ft",
+                    required_columns=[
+                        ColumnRef(
+                            table_ref="ft",
+                            column_name="pickup_date_key",
+                            normalized_name="pickup_date_key",
+                        ),
+                    ],
+                ),
+                sql_filter,
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                SparkReadStep(
+                    step_type=SparkStepType.READ,
+                    alias="ft",
+                    source_name="fact_trips",
+                    input_key="fact_trips_key",
+                ),
+                spark_filter,
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -388,14 +401,18 @@ class TestPlanComparatorProjectEquivalence:
 
     def test_project_equivalent(self):
         """相同投影列 → LOGIC_EQUIVALENT。"""
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            _make_sql_project_step(),
-        ])
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            _make_spark_project_step(),
-        ])
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                _make_sql_project_step(),
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                _make_spark_project_step(),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -404,23 +421,27 @@ class TestPlanComparatorProjectEquivalence:
 
     def test_project_not_equivalent(self):
         """投影列不一致 → LOGIC_MISMATCH。"""
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            _make_sql_project_step(),
-        ])
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            SparkProjectStep(
-                step_type=SparkStepType.PROJECT,
-                input_alias="od",
-                columns=[
-                    SparkProjectColumn(
-                        column_name="different_col",
-                        alias="different_col",
-                    ),
-                ],
-            ),
-        ])
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                _make_sql_project_step(),
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                SparkProjectStep(
+                    step_type=SparkStepType.PROJECT,
+                    input_alias="od",
+                    columns=[
+                        SparkProjectColumn(
+                            column_name="different_col",
+                            alias="different_col",
+                        ),
+                    ],
+                ),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -433,14 +454,18 @@ class TestPlanComparatorSortEquivalence:
 
     def test_sort_equivalent(self):
         """相同排序规格 → LOGIC_EQUIVALENT。"""
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            _make_sql_sort_step(),
-        ])
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            _make_spark_sort_step(),
-        ])
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                _make_sql_sort_step(),
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                _make_spark_sort_step(),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -449,23 +474,27 @@ class TestPlanComparatorSortEquivalence:
 
     def test_sort_not_equivalent(self):
         """排序方向不一致 → LOGIC_MISMATCH。"""
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            _make_sql_sort_step(),  # DESC
-        ])
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            SparkSortStep(
-                step_type=SparkStepType.SORT,
-                input_alias="od",
-                order_by=[
-                    SparkSortSpec(
-                        column="amount",
-                        direction=SparkSortDirection.ASC,
-                    ),
-                ],
-            ),
-        ])
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                _make_sql_sort_step(),  # DESC
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                SparkSortStep(
+                    step_type=SparkStepType.SORT,
+                    input_alias="od",
+                    order_by=[
+                        SparkSortSpec(
+                            column="amount",
+                            direction=SparkSortDirection.ASC,
+                        ),
+                    ],
+                ),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -478,14 +507,18 @@ class TestPlanComparatorLimitEquivalence:
 
     def test_limit_equivalent(self):
         """相同 limit 值 → LOGIC_EQUIVALENT。"""
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            _make_sql_limit_step(),
-        ])
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            _make_spark_limit_step(),
-        ])
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                _make_sql_limit_step(),
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                _make_spark_limit_step(),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -494,18 +527,22 @@ class TestPlanComparatorLimitEquivalence:
 
     def test_limit_not_equivalent(self):
         """不同 limit 值 → LOGIC_MISMATCH。"""
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            _make_sql_limit_step(),  # LIMIT 100
-        ])
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            SparkLimitStep(
-                step_type=SparkStepType.LIMIT,
-                input_alias="od",
-                limit=50,
-            ),
-        ])
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                _make_sql_limit_step(),  # LIMIT 100
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                SparkLimitStep(
+                    step_type=SparkStepType.LIMIT,
+                    input_alias="od",
+                    limit=50,
+                ),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -526,41 +563,45 @@ class TestPlanComparatorJoinEquivalence:
         from tianshu_datadev.planning.sql_build_plan import JoinStep
         from tianshu_datadev.spark.models import SparkJoinStep, SparkJoinType
 
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            JoinStep(
-                step_type="join",
-                step_id="step_join_001",
-                right_table_ref="user_profile",
-                join_type="INNER",
-                join_keys=[
-                    (
-                        ColumnRef(
-                            table_ref="order_info",
-                            column_name="user_id",
-                            normalized_name="user_id",
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                JoinStep(
+                    step_type="join",
+                    step_id="step_join_001",
+                    right_table_ref="user_profile",
+                    join_type="INNER",
+                    join_keys=[
+                        (
+                            ColumnRef(
+                                table_ref="order_info",
+                                column_name="user_id",
+                                normalized_name="user_id",
+                            ),
+                            ColumnRef(
+                                table_ref="user_profile",
+                                column_name="user_id",
+                                normalized_name="user_id",
+                            ),
                         ),
-                        ColumnRef(
-                            table_ref="user_profile",
-                            column_name="user_id",
-                            normalized_name="user_id",
-                        ),
-                    ),
-                ],
-                relationship_ref="rel_001",
-            ),
-        ])
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            SparkJoinStep(
-                step_type=SparkStepType.JOIN,
-                left_alias="od",
-                right_alias="up",
-                left_key="user_id",
-                right_key="user_id",
-                join_type=SparkJoinType.INNER,
-            ),
-        ])
+                    ],
+                    relationship_ref="rel_001",
+                ),
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                SparkJoinStep(
+                    step_type=SparkStepType.JOIN,
+                    left_alias="od",
+                    right_alias="up",
+                    left_key="user_id",
+                    right_key="user_id",
+                    join_type=SparkJoinType.INNER,
+                ),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -574,41 +615,45 @@ class TestPlanComparatorJoinEquivalence:
         from tianshu_datadev.planning.sql_build_plan import JoinStep
         from tianshu_datadev.spark.models import SparkJoinStep, SparkJoinType
 
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            JoinStep(
-                step_type="join",
-                step_id="step_join_001",
-                right_table_ref="od",
-                join_type="INNER",
-                join_keys=[
-                    (
-                        ColumnRef(
-                            table_ref="od",
-                            column_name="user_id",
-                            normalized_name="user_id",
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                JoinStep(
+                    step_type="join",
+                    step_id="step_join_001",
+                    right_table_ref="od",
+                    join_type="INNER",
+                    join_keys=[
+                        (
+                            ColumnRef(
+                                table_ref="od",
+                                column_name="user_id",
+                                normalized_name="user_id",
+                            ),
+                            ColumnRef(
+                                table_ref="od",
+                                column_name="user_id",
+                                normalized_name="user_id",
+                            ),
                         ),
-                        ColumnRef(
-                            table_ref="od",
-                            column_name="user_id",
-                            normalized_name="user_id",
-                        ),
-                    ),
-                ],
-                relationship_ref="rel_001",
-            ),
-        ])
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            SparkJoinStep(
-                step_type=SparkStepType.JOIN,
-                left_alias="od",
-                right_alias="od",
-                left_key="user_id",
-                right_key="user_id",
-                join_type=SparkJoinType.INNER,
-            ),
-        ])
+                    ],
+                    relationship_ref="rel_001",
+                ),
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                SparkJoinStep(
+                    step_type=SparkStepType.JOIN,
+                    left_alias="od",
+                    right_alias="od",
+                    left_key="user_id",
+                    right_key="user_id",
+                    join_type=SparkJoinType.INNER,
+                ),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -633,36 +678,40 @@ class TestPlanComparatorAggregateEquivalence:
             SparkAggregateStep,
         )
 
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            AggregateStep(
-                step_type="aggregate",
-                step_id="step_agg_001",
-                group_keys=[
-                    ColumnRef(
-                        table_ref="order_info",
-                        column_name="region",
-                        normalized_name="region",
-                    ),
-                ],
-                metrics=[],
-            ),
-        ])
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            SparkAggregateStep(
-                step_type=SparkStepType.AGGREGATE,
-                input_alias="od",
-                group_keys=["region"],
-                metrics=[
-                    SparkAggregateSpec(
-                        function=SparkAggFunction.COUNT,
-                        input_column=None,
-                        alias="cnt",
-                    ),
-                ],
-            ),
-        ])
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                AggregateStep(
+                    step_type="aggregate",
+                    step_id="step_agg_001",
+                    group_keys=[
+                        ColumnRef(
+                            table_ref="order_info",
+                            column_name="region",
+                            normalized_name="region",
+                        ),
+                    ],
+                    metrics=[],
+                ),
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                SparkAggregateStep(
+                    step_type=SparkStepType.AGGREGATE,
+                    input_alias="od",
+                    group_keys=["region"],
+                    metrics=[
+                        SparkAggregateSpec(
+                            function=SparkAggFunction.COUNT,
+                            input_column=None,
+                            alias="cnt",
+                        ),
+                    ],
+                ),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -678,42 +727,46 @@ class TestPlanComparatorAggregateEquivalence:
             SparkAggregateStep,
         )
 
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            AggregateStep(
-                step_type="aggregate",
-                step_id="step_agg_001",
-                group_keys=[
-                    ColumnRef(
-                        table_ref="order_info",
-                        column_name="region",
-                        normalized_name="region",
-                    ),
-                ],
-                metrics=[
-                    AggregateSpec(
-                        aggregation=AggregationType.COUNT,
-                        input_column=None,
-                        alias="cnt",
-                    ),
-                ],
-            ),
-        ])
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            SparkAggregateStep(
-                step_type=SparkStepType.AGGREGATE,
-                input_alias="od",
-                group_keys=["region"],
-                metrics=[
-                    SparkAggregateSpec(
-                        function=SparkAggFunction.COUNT,
-                        input_column=None,
-                        alias="cnt",
-                    ),
-                ],
-            ),
-        ])
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                AggregateStep(
+                    step_type="aggregate",
+                    step_id="step_agg_001",
+                    group_keys=[
+                        ColumnRef(
+                            table_ref="order_info",
+                            column_name="region",
+                            normalized_name="region",
+                        ),
+                    ],
+                    metrics=[
+                        AggregateSpec(
+                            aggregation=AggregationType.COUNT,
+                            input_column=None,
+                            alias="cnt",
+                        ),
+                    ],
+                ),
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                SparkAggregateStep(
+                    step_type=SparkStepType.AGGREGATE,
+                    input_alias="od",
+                    group_keys=["region"],
+                    metrics=[
+                        SparkAggregateSpec(
+                            function=SparkAggFunction.COUNT,
+                            input_column=None,
+                            alias="cnt",
+                        ),
+                    ],
+                ),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -737,26 +790,30 @@ class TestPlanComparatorCaseWhenEquivalence:
             SparkCaseWhenStep,
         )
 
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            CaseWhenStep(
-                step_type="case_when",
-                step_id="step_cw_001",
-                cases=[],
-                else_value=None,
-                alias="label",
-            ),
-        ])
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            SparkCaseWhenStep(
-                step_type=SparkStepType.CASE_WHEN,
-                input_alias="od",
-                output_alias="label",
-                branches=[SparkCaseWhenBranch(label="normal")],
-                else_value="other",
-            ),
-        ])
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                CaseWhenStep(
+                    step_type="case_when",
+                    step_id="step_cw_001",
+                    cases=[],
+                    else_value=None,
+                    alias="label",
+                ),
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                SparkCaseWhenStep(
+                    step_type=SparkStepType.CASE_WHEN,
+                    input_alias="od",
+                    output_alias="label",
+                    branches=[SparkCaseWhenBranch(label="normal")],
+                    else_value="other",
+                ),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -771,39 +828,43 @@ class TestPlanComparatorCaseWhenEquivalence:
             SparkCaseWhenStep,
         )
 
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            CaseWhenStep(
-                step_type="case_when",
-                step_id="step_cw_001",
-                cases=[
-                    WhenBranch(
-                        condition=Predicate(
-                            left=ColumnRef(
-                                table_ref="order_info",
-                                column_name="status",
-                                normalized_name="status",
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                CaseWhenStep(
+                    step_type="case_when",
+                    step_id="step_cw_001",
+                    cases=[
+                        WhenBranch(
+                            condition=Predicate(
+                                left=ColumnRef(
+                                    table_ref="order_info",
+                                    column_name="status",
+                                    normalized_name="status",
+                                ),
+                                operator=PredicateOperator.EQ,
+                                right=SqlLiteral(value="paid"),
                             ),
-                            operator=PredicateOperator.EQ,
-                            right=SqlLiteral(value="paid"),
+                            result=SqlLiteral(value="normal"),
                         ),
-                        result=SqlLiteral(value="normal"),
-                    ),
-                ],
-                else_value=SqlLiteral(value="other"),
-                alias="label",
-            ),
-        ])
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            SparkCaseWhenStep(
-                step_type=SparkStepType.CASE_WHEN,
-                input_alias="od",
-                output_alias="label",
-                branches=[SparkCaseWhenBranch(label="normal")],
-                else_value="other",
-            ),
-        ])
+                    ],
+                    else_value=SqlLiteral(value="other"),
+                    alias="label",
+                ),
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                SparkCaseWhenStep(
+                    step_type=SparkStepType.CASE_WHEN,
+                    input_alias="od",
+                    output_alias="label",
+                    branches=[SparkCaseWhenBranch(label="normal")],
+                    else_value="other",
+                ),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -828,29 +889,33 @@ class TestPlanComparatorNotCovered:
             SparkWindowStep,
         )
 
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            WindowStep(
-                step_type="window",
-                step_id="step_window_001",
-                window_exprs=[],
-            ),
-        ])
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            SparkWindowStep(
-                step_type=SparkStepType.WINDOW,
-                input_alias="od",
-                expressions=[
-                    SparkWindowExpr(
-                        function=SparkWindowFunction.ROW_NUMBER,
-                        alias="rn",
-                        partition_by=["region"],
-                        order_by=["amount"],
-                    ),
-                ],
-            ),
-        ])
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                WindowStep(
+                    step_type="window",
+                    step_id="step_window_001",
+                    window_exprs=[],
+                ),
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                SparkWindowStep(
+                    step_type=SparkStepType.WINDOW,
+                    input_alias="od",
+                    expressions=[
+                        SparkWindowExpr(
+                            function=SparkWindowFunction.ROW_NUMBER,
+                            alias="rn",
+                            partition_by=["region"],
+                            order_by=["amount"],
+                        ),
+                    ],
+                ),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -879,32 +944,36 @@ class TestPlanComparatorMixedScenarios:
         )
 
         # SQL 侧：scan + filter（已覆盖）+ window（未覆盖）
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            _make_sql_filter_step(),
-            WindowStep(
-                step_type="window",
-                step_id="step_window_001",
-                window_exprs=[],
-            ),
-        ])
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                _make_sql_filter_step(),
+                WindowStep(
+                    step_type="window",
+                    step_id="step_window_001",
+                    window_exprs=[],
+                ),
+            ]
+        )
         # Spark 侧：read + filter（已覆盖）+ window（未覆盖）
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            _make_spark_filter_step(),
-            SparkWindowStep(
-                step_type=SparkStepType.WINDOW,
-                input_alias="od",
-                expressions=[
-                    SparkWindowExpr(
-                        function=SparkWindowFunction.ROW_NUMBER,
-                        alias="rn",
-                        partition_by=["region"],
-                        order_by=["amount"],
-                    ),
-                ],
-            ),
-        ])
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                _make_spark_filter_step(),
+                SparkWindowStep(
+                    step_type=SparkStepType.WINDOW,
+                    input_alias="od",
+                    expressions=[
+                        SparkWindowExpr(
+                            function=SparkWindowFunction.ROW_NUMBER,
+                            alias="rn",
+                            partition_by=["region"],
+                            order_by=["amount"],
+                        ),
+                    ],
+                ),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -913,53 +982,51 @@ class TestPlanComparatorMixedScenarios:
         assert report.status == ComparisonStatus.NOT_COVERED
         assert "window" in report.uncovered_step_types
         # 已覆盖部分应等价
-        covered_results = [
-            r for r in report.step_results
-            if r.step_type in ("scan", "filter")
-        ]
-        assert all(
-            r.verdict == EquivalenceVerdict.EQUIVALENT
-            for r in covered_results
-        )
+        covered_results = [r for r in report.step_results if r.step_type in ("scan", "filter")]
+        assert all(r.verdict == EquivalenceVerdict.EQUIVALENT for r in covered_results)
 
     def test_all_covered_but_mismatched_join(self):
         """全部已覆盖（含 join），但 join 别名不匹配 → LOGIC_MISMATCH。"""
         from tianshu_datadev.planning.sql_build_plan import JoinStep
         from tianshu_datadev.spark.models import SparkJoinStep, SparkJoinType
 
-        sql_plan = _make_sql_plan([
-            JoinStep(
-                step_type="join",
-                step_id="step_join_001",
-                right_table_ref="user_profile",
-                join_type="INNER",
-                join_keys=[
-                    (
-                        ColumnRef(
-                            table_ref="order_info",
-                            column_name="user_id",
-                            normalized_name="user_id",
+        sql_plan = _make_sql_plan(
+            [
+                JoinStep(
+                    step_type="join",
+                    step_id="step_join_001",
+                    right_table_ref="user_profile",
+                    join_type="INNER",
+                    join_keys=[
+                        (
+                            ColumnRef(
+                                table_ref="order_info",
+                                column_name="user_id",
+                                normalized_name="user_id",
+                            ),
+                            ColumnRef(
+                                table_ref="user_profile",
+                                column_name="user_id",
+                                normalized_name="user_id",
+                            ),
                         ),
-                        ColumnRef(
-                            table_ref="user_profile",
-                            column_name="user_id",
-                            normalized_name="user_id",
-                        ),
-                    ),
-                ],
-                relationship_ref="rel_001",
-            ),
-        ])
-        spark_plan = _make_spark_plan([
-            SparkJoinStep(
-                step_type=SparkStepType.JOIN,
-                left_alias="od",
-                right_alias="up",
-                left_key="user_id",
-                right_key="user_id",
-                join_type=SparkJoinType.INNER,
-            ),
-        ])
+                    ],
+                    relationship_ref="rel_001",
+                ),
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                SparkJoinStep(
+                    step_type=SparkStepType.JOIN,
+                    left_alias="od",
+                    right_alias="up",
+                    left_key="user_id",
+                    right_key="user_id",
+                    join_type=SparkJoinType.INNER,
+                ),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -1038,29 +1105,33 @@ class TestPlanComparisonReportStructure:
             SparkWindowStep,
         )
 
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            WindowStep(
-                step_type="window",
-                step_id="step_window_001",
-                window_exprs=[],
-            ),
-        ])
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            SparkWindowStep(
-                step_type=SparkStepType.WINDOW,
-                input_alias="od",
-                expressions=[
-                    SparkWindowExpr(
-                        function=SparkWindowFunction.ROW_NUMBER,
-                        alias="rn",
-                        partition_by=["region"],
-                        order_by=["amount"],
-                    ),
-                ],
-            ),
-        ])
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                WindowStep(
+                    step_type="window",
+                    step_id="step_window_001",
+                    window_exprs=[],
+                ),
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                SparkWindowStep(
+                    step_type=SparkStepType.WINDOW,
+                    input_alias="od",
+                    expressions=[
+                        SparkWindowExpr(
+                            function=SparkWindowFunction.ROW_NUMBER,
+                            alias="rn",
+                            partition_by=["region"],
+                            order_by=["amount"],
+                        ),
+                    ],
+                ),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -1143,7 +1214,9 @@ class TestPlanComparatorCustomEnabledTypes:
                         "left_field": {"raw": "region_code", "normalized": "region_code"},
                         "right_field": {"raw": "region_code", "normalized": "region_code"},
                         "evidence_checks": {
-                            "exact_name_match": True, "type_match": True, "unique_match": True,
+                            "exact_name_match": True,
+                            "type_match": True,
+                            "unique_match": True,
                         },
                     },
                     level="STRONG",
@@ -1177,13 +1250,17 @@ class TestPlanComparatorCustomEnabledTypes:
                         CaseWhenBranchSpec(
                             label="high",
                             condition=CaseWhenCondition(
-                                operator="GT", normalized_name="amount", value=100,
+                                operator="GT",
+                                normalized_name="amount",
+                                value=100,
                             ),
                         ),
                         CaseWhenBranchSpec(
                             label="low",
                             condition=CaseWhenCondition(
-                                operator="LTE", normalized_name="amount", value=100,
+                                operator="LTE",
+                                normalized_name="amount",
+                                value=100,
                             ),
                         ),
                     ],
@@ -1205,6 +1282,7 @@ class TestPlanComparatorCustomEnabledTypes:
         from tianshu_datadev.spark.contract_sql_bridge import (
             contract_to_sql_steps,
         )
+
         sql_steps = contract_to_sql_steps(contract)
 
         sql_plan = _make_sql_plan(sql_steps)
@@ -1380,27 +1458,33 @@ class TestPlanComparatorMultiStatementFlatten:
         )
 
         # 构造 2 语句 SqlProgram：stmt_0 产生 _temp_c0_trip_agg，stmt_1 读取它
-        stmt_0_plan = _make_sql_plan([
-            ScanStep(
-                step_type="scan", step_id="scan_ft",
-                table_ref="fact_trips",
-                required_columns=[
-                    ColumnRef(table_ref="fact_trips", column_name="boro", normalized_name="boro"),
-                ],
-            ),
-            _make_sql_filter_step("filter_001"),
-            _make_sql_project_step("proj_001"),
-        ])
-        stmt_1_plan = _make_sql_plan([
-            ScanStep(
-                step_type="scan", step_id="scan_temp",
-                table_ref="_temp_c0_trip_agg",  # ← 应被过滤
-                required_columns=[
-                    ColumnRef(table_ref="_temp_c0_trip_agg", column_name="boro", normalized_name="boro"),
-                ],
-            ),
-            _make_sql_filter_step("filter_002"),
-        ])
+        stmt_0_plan = _make_sql_plan(
+            [
+                ScanStep(
+                    step_type="scan",
+                    step_id="scan_ft",
+                    table_ref="fact_trips",
+                    required_columns=[
+                        ColumnRef(table_ref="fact_trips", column_name="boro", normalized_name="boro"),
+                    ],
+                ),
+                _make_sql_filter_step("filter_001"),
+                _make_sql_project_step("proj_001"),
+            ]
+        )
+        stmt_1_plan = _make_sql_plan(
+            [
+                ScanStep(
+                    step_type="scan",
+                    step_id="scan_temp",
+                    table_ref="_temp_c0_trip_agg",  # ← 应被过滤
+                    required_columns=[
+                        ColumnRef(table_ref="_temp_c0_trip_agg", column_name="boro", normalized_name="boro"),
+                    ],
+                ),
+                _make_sql_filter_step("filter_002"),
+            ]
+        )
 
         sql_program = SqlProgram(
             program_id=SqlProgram.generate_program_id("test_flatten_temp"),
@@ -1426,17 +1510,15 @@ class TestPlanComparatorMultiStatementFlatten:
 
         # _temp_* scan 应被排除
         temp_scans = [
-            s for s in flat
+            s
+            for s in flat
             if s.get("step_type") == "scan" and str(s.get("table_ref", "")).startswith("_temp_")
         ]
-        assert len(temp_scans) == 0, (
-            f"_temp_* scan 应被排除，实际仍有 {len(temp_scans)} 个：{temp_scans}"
-        )
+        assert len(temp_scans) == 0, f"_temp_* scan 应被排除，实际仍有 {len(temp_scans)} 个：{temp_scans}"
 
         # 源表 scan（fact_trips）应保留
         source_scans = [
-            s for s in flat
-            if s.get("step_type") == "scan" and s.get("table_ref") == "fact_trips"
+            s for s in flat if s.get("step_type") == "scan" and s.get("table_ref") == "fact_trips"
         ]
         assert len(source_scans) == 1, f"源表 scan 应保留 1 个，实际 {len(source_scans)}"
 
@@ -1460,58 +1542,75 @@ class TestPlanComparatorMultiStatementFlatten:
         )
 
         # 构造含多种语义 step 的 3 语句 SqlProgram
-        stmt_0_plan = _make_sql_plan([
-            ScanStep(
-                step_type="scan", step_id="scan_od",
-                table_ref="order_detail",
-                required_columns=[
-                    ColumnRef(table_ref="order_detail", column_name="order_id", normalized_name="order_id"),
-                ],
-            ),
-            _make_sql_filter_step("filter_agg"),
-            AggregateStep(
-                step_type="aggregate", step_id="agg_001",
-                group_keys=[
-                    ColumnRef(table_ref="order_detail", column_name="region", normalized_name="region"),
-                ],
-                metrics=[
-                    AggregateSpec(aggregation=AggregationType.COUNT, input_column=None, alias="cnt"),
-                ],
-            ),
-            _make_sql_project_step("proj_agg"),
-        ])
+        stmt_0_plan = _make_sql_plan(
+            [
+                ScanStep(
+                    step_type="scan",
+                    step_id="scan_od",
+                    table_ref="order_detail",
+                    required_columns=[
+                        ColumnRef(
+                            table_ref="order_detail", column_name="order_id", normalized_name="order_id"
+                        ),
+                    ],
+                ),
+                _make_sql_filter_step("filter_agg"),
+                AggregateStep(
+                    step_type="aggregate",
+                    step_id="agg_001",
+                    group_keys=[
+                        ColumnRef(table_ref="order_detail", column_name="region", normalized_name="region"),
+                    ],
+                    metrics=[
+                        AggregateSpec(aggregation=AggregationType.COUNT, input_column=None, alias="cnt"),
+                    ],
+                ),
+                _make_sql_project_step("proj_agg"),
+            ]
+        )
 
-        stmt_1_plan = _make_sql_plan([
-            ScanStep(
-                step_type="scan", step_id="scan_od2",
-                table_ref="order_detail",
-                required_columns=[
-                    ColumnRef(table_ref="order_detail", column_name="order_id", normalized_name="order_id"),
-                ],
-            ),
-            JoinStep(
-                step_type="join", step_id="join_001",
-                right_table_ref="od",
-                join_type="INNER",
-                join_keys=[(
-                    ColumnRef(table_ref="od", column_name="user_id", normalized_name="user_id"),
-                    ColumnRef(table_ref="od", column_name="user_id", normalized_name="user_id"),
-                )],
-                relationship_ref="rel_001",
-            ),
-            _make_sql_project_step("proj_join"),
-        ])
+        stmt_1_plan = _make_sql_plan(
+            [
+                ScanStep(
+                    step_type="scan",
+                    step_id="scan_od2",
+                    table_ref="order_detail",
+                    required_columns=[
+                        ColumnRef(
+                            table_ref="order_detail", column_name="order_id", normalized_name="order_id"
+                        ),
+                    ],
+                ),
+                JoinStep(
+                    step_type="join",
+                    step_id="join_001",
+                    right_table_ref="od",
+                    join_type="INNER",
+                    join_keys=[
+                        (
+                            ColumnRef(table_ref="od", column_name="user_id", normalized_name="user_id"),
+                            ColumnRef(table_ref="od", column_name="user_id", normalized_name="user_id"),
+                        )
+                    ],
+                    relationship_ref="rel_001",
+                ),
+                _make_sql_project_step("proj_join"),
+            ]
+        )
 
         sql_program = SqlProgram(
             program_id=SqlProgram.generate_program_id("test_preserve_semantic"),
             spec_id="test_preserve_semantic",
             statements=[
                 SqlStatement(
-                    statement_id="stmt_0", plan=stmt_0_plan,
-                    kind=StatementKind.PRODUCER, produces="_temp_c0_agg",
+                    statement_id="stmt_0",
+                    plan=stmt_0_plan,
+                    kind=StatementKind.PRODUCER,
+                    produces="_temp_c0_agg",
                 ),
                 SqlStatement(
-                    statement_id="stmt_1", plan=stmt_1_plan,
+                    statement_id="stmt_1",
+                    plan=stmt_1_plan,
                     kind=StatementKind.CONSUMER,
                 ),
             ],
@@ -1555,109 +1654,136 @@ class TestPlanComparatorMultiStatementFlatten:
         )
 
         # SQL 侧：2 语句 SqlProgram
-        stmt_0_plan = _make_sql_plan([
-            ScanStep(
-                step_type="scan", step_id="scan_od",
-                table_ref="od",
-                required_columns=[
-                    ColumnRef(table_ref="od", column_name="amount", normalized_name="amount"),
-                    ColumnRef(table_ref="od", column_name="region", normalized_name="region"),
-                ],
-            ),
-            _make_sql_filter_step("filter_001"),
-            AggregateStep(
-                step_type="aggregate", step_id="agg_001",
-                group_keys=[
-                    ColumnRef(table_ref="od", column_name="region", normalized_name="region"),
-                ],
-                metrics=[
-                    AggregateSpec(aggregation=AggregationType.SUM, input_column="amount", alias="total_amt"),
-                ],
-            ),
-            _make_sql_project_step("proj_001"),
-        ])
+        stmt_0_plan = _make_sql_plan(
+            [
+                ScanStep(
+                    step_type="scan",
+                    step_id="scan_od",
+                    table_ref="od",
+                    required_columns=[
+                        ColumnRef(table_ref="od", column_name="amount", normalized_name="amount"),
+                        ColumnRef(table_ref="od", column_name="region", normalized_name="region"),
+                    ],
+                ),
+                _make_sql_filter_step("filter_001"),
+                AggregateStep(
+                    step_type="aggregate",
+                    step_id="agg_001",
+                    group_keys=[
+                        ColumnRef(table_ref="od", column_name="region", normalized_name="region"),
+                    ],
+                    metrics=[
+                        AggregateSpec(
+                            aggregation=AggregationType.SUM, input_column="amount", alias="total_amt"
+                        ),
+                    ],
+                ),
+                _make_sql_project_step("proj_001"),
+            ]
+        )
         # stmt_1 读取 _temp 表再做一次 project（模拟 FINAL 包装）
-        stmt_1_plan = _make_sql_plan([
-            ScanStep(
-                step_type="scan", step_id="scan_temp",
-                table_ref="_temp_c0_agg",  # ← 应被过滤
-                required_columns=[
-                    ColumnRef(table_ref="_temp_c0_agg", column_name="region", normalized_name="region"),
-                ],
-            ),
-            ProjectStep(
-                step_type="project", step_id="proj_final",
-                columns=[
-                    AliasExpr(
-                        expression=ColumnRef(
-                            table_ref="_temp_c0_agg",
-                            column_name="region", normalized_name="region",
+        stmt_1_plan = _make_sql_plan(
+            [
+                ScanStep(
+                    step_type="scan",
+                    step_id="scan_temp",
+                    table_ref="_temp_c0_agg",  # ← 应被过滤
+                    required_columns=[
+                        ColumnRef(table_ref="_temp_c0_agg", column_name="region", normalized_name="region"),
+                    ],
+                ),
+                ProjectStep(
+                    step_type="project",
+                    step_id="proj_final",
+                    columns=[
+                        AliasExpr(
+                            expression=ColumnRef(
+                                table_ref="_temp_c0_agg",
+                                column_name="region",
+                                normalized_name="region",
+                            ),
+                            alias="region",
                         ),
-                        alias="region",
-                    ),
-                    AliasExpr(
-                        expression=ColumnRef(
-                            table_ref="_temp_c0_agg",
-                            column_name="total_amt", normalized_name="total_amt",
+                        AliasExpr(
+                            expression=ColumnRef(
+                                table_ref="_temp_c0_agg",
+                                column_name="total_amt",
+                                normalized_name="total_amt",
+                            ),
+                            alias="total_amt",
                         ),
-                        alias="total_amt",
-                    ),
-                ],
-            ),
-        ])
+                    ],
+                ),
+            ]
+        )
 
         sql_program = SqlProgram(
             program_id=SqlProgram.generate_program_id("test_eq"),
             spec_id="test_eq",
             statements=[
                 SqlStatement(
-                    statement_id="stmt_0", plan=stmt_0_plan,
-                    kind=StatementKind.PRODUCER, produces="_temp_c0_agg",
+                    statement_id="stmt_0",
+                    plan=stmt_0_plan,
+                    kind=StatementKind.PRODUCER,
+                    produces="_temp_c0_agg",
                 ),
                 SqlStatement(
-                    statement_id="stmt_1", plan=stmt_1_plan,
-                    kind=StatementKind.FINAL, depends_on=["stmt_0"],
+                    statement_id="stmt_1",
+                    plan=stmt_1_plan,
+                    kind=StatementKind.FINAL,
+                    depends_on=["stmt_0"],
                 ),
             ],
             topological_order=["stmt_0", "stmt_1"],
         )
 
         # Spark 侧：等价 SparkPlan（read+filter+aggregate+project+project）
-        spark_plan = _make_spark_plan([
-            SparkReadStep(
-                step_type=SparkStepType.READ, alias="od",
-                source_name="order_detail", input_key="order_detail_key",
-                required_columns=["amount", "region"],
-            ),
-            SparkFilterStep(
-                step_type=SparkStepType.FILTER, input_alias="od",
-                operator="GT", left="amount", right="threshold",
-            ),
-            SparkAggregateStep(
-                step_type=SparkStepType.AGGREGATE, input_alias="od",
-                group_keys=["region"],
-                metrics=[
-                    SparkAggregateSpec(
-                        function=SparkAggFunction.SUM,
-                        input_column="amount", alias="total_amt",
-                    ),
-                ],
-            ),
-            SparkProjectStep(
-                step_type=SparkStepType.PROJECT, input_alias="od",
-                columns=[
-                    SparkProjectColumn(column_name="order_id", alias="order_id"),
-                    SparkProjectColumn(column_name="amount", alias="amount"),
-                ],
-            ),
-            SparkProjectStep(
-                step_type=SparkStepType.PROJECT, input_alias="od",
-                columns=[
-                    SparkProjectColumn(column_name="region", alias="region"),
-                    SparkProjectColumn(column_name="total_amt", alias="total_amt"),
-                ],
-            ),
-        ])
+        spark_plan = _make_spark_plan(
+            [
+                SparkReadStep(
+                    step_type=SparkStepType.READ,
+                    alias="od",
+                    source_name="order_detail",
+                    input_key="order_detail_key",
+                    required_columns=["amount", "region"],
+                ),
+                SparkFilterStep(
+                    step_type=SparkStepType.FILTER,
+                    input_alias="od",
+                    operator="GT",
+                    left="amount",
+                    right="threshold",
+                ),
+                SparkAggregateStep(
+                    step_type=SparkStepType.AGGREGATE,
+                    input_alias="od",
+                    group_keys=["region"],
+                    metrics=[
+                        SparkAggregateSpec(
+                            function=SparkAggFunction.SUM,
+                            input_column="amount",
+                            alias="total_amt",
+                        ),
+                    ],
+                ),
+                SparkProjectStep(
+                    step_type=SparkStepType.PROJECT,
+                    input_alias="od",
+                    columns=[
+                        SparkProjectColumn(column_name="order_id", alias="order_id"),
+                        SparkProjectColumn(column_name="amount", alias="amount"),
+                    ],
+                ),
+                SparkProjectStep(
+                    step_type=SparkStepType.PROJECT,
+                    input_alias="od",
+                    columns=[
+                        SparkProjectColumn(column_name="region", alias="region"),
+                        SparkProjectColumn(column_name="total_amt", alias="total_amt"),
+                    ],
+                ),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare_program(sql_program, spark_plan)
@@ -1680,17 +1806,20 @@ class TestPlanComparatorMultiStatementFlatten:
         )
 
         # SQL 侧：scan + filter + project
-        stmt_plan = _make_sql_plan([
-            ScanStep(
-                step_type="scan", step_id="scan_od",
-                table_ref="od",
-                required_columns=[
-                    ColumnRef(table_ref="od", column_name="amount", normalized_name="amount"),
-                ],
-            ),
-            _make_sql_filter_step("filter_001"),
-            _make_sql_project_step("proj_001"),
-        ])
+        stmt_plan = _make_sql_plan(
+            [
+                ScanStep(
+                    step_type="scan",
+                    step_id="scan_od",
+                    table_ref="od",
+                    required_columns=[
+                        ColumnRef(table_ref="od", column_name="amount", normalized_name="amount"),
+                    ],
+                ),
+                _make_sql_filter_step("filter_001"),
+                _make_sql_project_step("proj_001"),
+            ]
+        )
 
         sql_program = SqlProgram(
             program_id=SqlProgram.generate_program_id("test_mismatch"),
@@ -1702,19 +1831,24 @@ class TestPlanComparatorMultiStatementFlatten:
         )
 
         # Spark 侧：仅有 read + project（缺少 filter）——不等价
-        spark_plan = _make_spark_plan([
-            SparkReadStep(
-                step_type=SparkStepType.READ, alias="od",
-                source_name="order_detail", input_key="order_detail_key",
-            ),
-            SparkProjectStep(
-                step_type=SparkStepType.PROJECT, input_alias="od",
-                columns=[
-                    SparkProjectColumn(column_name="order_id", alias="order_id"),
-                    SparkProjectColumn(column_name="amount", alias="amount"),
-                ],
-            ),
-        ])
+        spark_plan = _make_spark_plan(
+            [
+                SparkReadStep(
+                    step_type=SparkStepType.READ,
+                    alias="od",
+                    source_name="order_detail",
+                    input_key="order_detail_key",
+                ),
+                SparkProjectStep(
+                    step_type=SparkStepType.PROJECT,
+                    input_alias="od",
+                    columns=[
+                        SparkProjectColumn(column_name="order_id", alias="order_id"),
+                        SparkProjectColumn(column_name="amount", alias="amount"),
+                    ],
+                ),
+            ]
+        )
 
         comparator = PlanComparator()
         report = comparator.compare_program(sql_program, spark_plan)
@@ -1723,54 +1857,71 @@ class TestPlanComparatorMultiStatementFlatten:
             f"预期 LOGIC_MISMATCH（Spark 侧缺 filter），实际 {report.status}"
         )
 
-
-# ── _normalize_dag_steps 单元测试 ──
-
+    # ── _normalize_dag_steps 单元测试 ──
 
     def test_temp_join_filtered_from_compare_program(self):
         """_temp_* 表之间的 join 应从扁平化结果中过滤——DAG 内部管道 join。"""
         from tianshu_datadev.planning.sql_build_plan import (
             JoinStep,
-            ScanStep,
             JoinType,
+            ScanStep,
         )
         from tianshu_datadev.planning.sql_program import (
-            SqlProgram,
-            SqlStatement,
             StatementKind,
         )
 
         # 构造含 _temp_* join 的 SqlProgram
-        stmt_plan = _make_sql_plan([
-            ScanStep(
-                step_type="scan", step_id="scan_t1",
-                table_ref="_temp_c0_trip_agg",
-                required_columns=[
-                    ColumnRef(table_ref="_temp_c0_trip_agg", column_name="borough", normalized_name="borough"),
-                ],
-            ),
-            ScanStep(
-                step_type="scan", step_id="scan_t2",
-                table_ref="_temp_c0_crash_agg",
-                required_columns=[
-                    ColumnRef(table_ref="_temp_c0_crash_agg", column_name="borough", normalized_name="borough"),
-                ],
-            ),
-            JoinStep(
-                step_type="join", step_id="join_temp",
-                right_table_ref="_temp_c0_crash_agg",
-                join_type=JoinType.LEFT,
-                join_keys=[(
-                    ColumnRef(table_ref="_temp_c0_trip_agg", column_name="borough", normalized_name="borough"),
-                    ColumnRef(table_ref="_temp_c0_crash_agg", column_name="borough", normalized_name="borough"),
-                )],
-                relationship_ref="rel_temp",
-            ),
-        ])
+        stmt_plan = _make_sql_plan(
+            [
+                ScanStep(
+                    step_type="scan",
+                    step_id="scan_t1",
+                    table_ref="_temp_c0_trip_agg",
+                    required_columns=[
+                        ColumnRef(
+                            table_ref="_temp_c0_trip_agg", column_name="borough", normalized_name="borough"
+                        ),
+                    ],
+                ),
+                ScanStep(
+                    step_type="scan",
+                    step_id="scan_t2",
+                    table_ref="_temp_c0_crash_agg",
+                    required_columns=[
+                        ColumnRef(
+                            table_ref="_temp_c0_crash_agg", column_name="borough", normalized_name="borough"
+                        ),
+                    ],
+                ),
+                JoinStep(
+                    step_type="join",
+                    step_id="join_temp",
+                    right_table_ref="_temp_c0_crash_agg",
+                    join_type=JoinType.LEFT,
+                    join_keys=[
+                        (
+                            ColumnRef(
+                                table_ref="_temp_c0_trip_agg",
+                                column_name="borough",
+                                normalized_name="borough",
+                            ),
+                            ColumnRef(
+                                table_ref="_temp_c0_crash_agg",
+                                column_name="borough",
+                                normalized_name="borough",
+                            ),
+                        )
+                    ],
+                    relationship_ref="rel_temp",
+                ),
+            ]
+        )
 
-        sql_program = self._make_minimal_sql_program([
-            self._make_statement("stmt_0", stmt_plan, kind=StatementKind.PRODUCER),
-        ])
+        sql_program = self._make_minimal_sql_program(
+            [
+                self._make_statement("stmt_0", stmt_plan, kind=StatementKind.PRODUCER),
+            ]
+        )
 
         comparator = PlanComparator()
         flattened = comparator._flatten_sql_program_steps(sql_program)
@@ -1778,65 +1929,76 @@ class TestPlanComparatorMultiStatementFlatten:
         # _temp_ scan 被过滤 + _temp_ join 被过滤 → 结果为空
         join_steps = [s for s in flattened if s.get("step_type") == "join"]
         scan_steps = [s for s in flattened if s.get("step_type") == "scan"]
-        assert len(join_steps) == 0, (
-            f"_temp_* join 应被过滤，实际保留 {len(join_steps)} 个"
-        )
-        assert len(scan_steps) == 0, (
-            f"_temp_* scan 应被过滤，实际保留 {len(scan_steps)} 个"
-        )
+        assert len(join_steps) == 0, f"_temp_* join 应被过滤，实际保留 {len(join_steps)} 个"
+        assert len(scan_steps) == 0, f"_temp_* scan 应被过滤，实际保留 {len(scan_steps)} 个"
 
     def test_source_join_preserved_in_compare_program(self):
         """源表之间的 join（非 _temp_*）应保留并参与对比。"""
         from tianshu_datadev.planning.sql_build_plan import (
             JoinStep,
-            ScanStep,
             JoinType,
+            ScanStep,
         )
         from tianshu_datadev.planning.sql_program import (
-            SqlProgram,
-            SqlStatement,
             StatementKind,
         )
 
         # 构造含源表 join（tz ↔ zts）的 SqlProgram
-        stmt_plan = _make_sql_plan([
-            ScanStep(
-                step_type="scan", step_id="scan_tz",
-                table_ref="tz",
-                required_columns=[
-                    ColumnRef(table_ref="tz", column_name="location_id", normalized_name="location_id"),
-                ],
-            ),
-            ScanStep(
-                step_type="scan", step_id="scan_zts",
-                table_ref="zts",
-                required_columns=[
-                    ColumnRef(table_ref="zts", column_name="pickup_location_id", normalized_name="pickup_location_id"),
-                ],
-            ),
-            JoinStep(
-                step_type="join", step_id="join_tz_zts",
-                right_table_ref="zts",
-                join_type=JoinType.LEFT,
-                join_keys=[(
-                    ColumnRef(table_ref="tz", column_name="location_id", normalized_name="location_id"),
-                    ColumnRef(table_ref="zts", column_name="pickup_location_id", normalized_name="pickup_location_id"),
-                )],
-                relationship_ref="rel_tz_zts",
-            ),
-        ])
+        stmt_plan = _make_sql_plan(
+            [
+                ScanStep(
+                    step_type="scan",
+                    step_id="scan_tz",
+                    table_ref="tz",
+                    required_columns=[
+                        ColumnRef(table_ref="tz", column_name="location_id", normalized_name="location_id"),
+                    ],
+                ),
+                ScanStep(
+                    step_type="scan",
+                    step_id="scan_zts",
+                    table_ref="zts",
+                    required_columns=[
+                        ColumnRef(
+                            table_ref="zts",
+                            column_name="pickup_location_id",
+                            normalized_name="pickup_location_id",
+                        ),
+                    ],
+                ),
+                JoinStep(
+                    step_type="join",
+                    step_id="join_tz_zts",
+                    right_table_ref="zts",
+                    join_type=JoinType.LEFT,
+                    join_keys=[
+                        (
+                            ColumnRef(
+                                table_ref="tz", column_name="location_id", normalized_name="location_id"
+                            ),
+                            ColumnRef(
+                                table_ref="zts",
+                                column_name="pickup_location_id",
+                                normalized_name="pickup_location_id",
+                            ),
+                        )
+                    ],
+                    relationship_ref="rel_tz_zts",
+                ),
+            ]
+        )
 
-        sql_program = self._make_minimal_sql_program([
-            self._make_statement("stmt_0", stmt_plan, kind=StatementKind.PRODUCER),
-        ])
+        sql_program = self._make_minimal_sql_program(
+            [
+                self._make_statement("stmt_0", stmt_plan, kind=StatementKind.PRODUCER),
+            ]
+        )
 
         comparator = PlanComparator()
         flattened = comparator._flatten_sql_program_steps(sql_program)
 
         join_steps = [s for s in flattened if s.get("step_type") == "join"]
-        assert len(join_steps) == 1, (
-            f"源表 join 应保留，实际 {len(join_steps)} 个"
-        )
+        assert len(join_steps) == 1, f"源表 join 应保留，实际 {len(join_steps)} 个"
         # 验证保留的 join 是源表 join，不是 _temp_ join
         assert "tz" in join_steps[0].get("left_table_ref", ""), (
             f"保留的 join 应引用源表 tz，实际={join_steps[0]}"
@@ -1856,12 +2018,21 @@ class TestNormalizeDagSteps:
         """同粒度 aggregate 合并，不同粒度 aggregate 保持独立。"""
         steps = [
             {"step_type": "scan", "table_ref": "fc"},
-            {"step_type": "aggregate", "group_keys": ["borough"],
-             "metrics": [{"function": "COUNT", "alias": "total_crashes"}]},
-            {"step_type": "aggregate", "group_keys": ["borough"],
-             "metrics": [{"function": "SUM", "alias": "total_injured"}]},
-            {"step_type": "aggregate", "group_keys": ["violation_county"],
-             "metrics": [{"function": "SUM", "alias": "total_violations"}]},
+            {
+                "step_type": "aggregate",
+                "group_keys": ["borough"],
+                "metrics": [{"function": "COUNT", "alias": "total_crashes"}],
+            },
+            {
+                "step_type": "aggregate",
+                "group_keys": ["borough"],
+                "metrics": [{"function": "SUM", "alias": "total_injured"}],
+            },
+            {
+                "step_type": "aggregate",
+                "group_keys": ["violation_county"],
+                "metrics": [{"function": "SUM", "alias": "total_violations"}],
+            },
         ]
         result = PlanComparator._normalize_dag_steps(steps)
         agg_steps = [s for s in result if s.get("step_type") == "aggregate"]
@@ -1886,10 +2057,16 @@ class TestNormalizeDagSteps:
     def test_aggregate_same_grain_merged(self):
         """多个同 [borough] aggregate → 合并为 1 个，metrics 去重合并。"""
         steps = [
-            {"step_type": "aggregate", "group_keys": ["borough"],
-             "metrics": [{"function": "COUNT", "input_column": "crash_id", "alias": "total_crashes"}]},
-            {"step_type": "aggregate", "group_keys": ["borough"],
-             "metrics": [{"function": "SUM", "input_column": "persons_injured", "alias": "total_injured"}]},
+            {
+                "step_type": "aggregate",
+                "group_keys": ["borough"],
+                "metrics": [{"function": "COUNT", "input_column": "crash_id", "alias": "total_crashes"}],
+            },
+            {
+                "step_type": "aggregate",
+                "group_keys": ["borough"],
+                "metrics": [{"function": "SUM", "input_column": "persons_injured", "alias": "total_injured"}],
+            },
         ]
         result = PlanComparator._normalize_dag_steps(steps)
         agg_steps = [s for s in result if s.get("step_type") == "aggregate"]
@@ -1902,33 +2079,46 @@ class TestNormalizeDagSteps:
     def test_aggregate_different_grain_kept_separate(self):
         """[borough] 和 [violation_county] 不同粒度 → 各自独立，不合并。"""
         steps = [
-            {"step_type": "aggregate", "group_keys": ["borough"],
-             "metrics": [{"function": "COUNT", "alias": "total_crashes"}]},
-            {"step_type": "aggregate", "group_keys": ["violation_county"],
-             "metrics": [{"function": "SUM", "alias": "total_violations"}]},
+            {
+                "step_type": "aggregate",
+                "group_keys": ["borough"],
+                "metrics": [{"function": "COUNT", "alias": "total_crashes"}],
+            },
+            {
+                "step_type": "aggregate",
+                "group_keys": ["violation_county"],
+                "metrics": [{"function": "SUM", "alias": "total_violations"}],
+            },
         ]
         result = PlanComparator._normalize_dag_steps(steps)
         agg_steps = [s for s in result if s.get("step_type") == "aggregate"]
-        assert len(agg_steps) == 2, (
-            f"不同粒度应保持独立，实际合并为 {len(agg_steps)} 个"
-        )
+        assert len(agg_steps) == 2, f"不同粒度应保持独立，实际合并为 {len(agg_steps)} 个"
         gk_sets = {tuple(sorted(s["group_keys"])) for s in agg_steps}
         assert gk_sets == {("borough",), ("violation_county",)}
 
     def test_merges_multiple_projects(self):
         """7 个 project step → 归一化为 1 个，columns 合并去重。"""
         steps = [
-            {"step_type": "project", "columns": [
-                {"column_name": "borough", "alias": "borough"},
-                {"column_name": "total_crashes", "alias": "total_crashes"},
-            ]},
-            {"step_type": "project", "columns": [
-                {"column_name": "total_injured", "alias": "total_injured"},
-            ]},
-            {"step_type": "project", "columns": [
-                {"column_name": "borough", "alias": "borough"},  # 重复——应去重
-                {"column_name": "total_killed", "alias": "total_killed"},
-            ]},
+            {
+                "step_type": "project",
+                "columns": [
+                    {"column_name": "borough", "alias": "borough"},
+                    {"column_name": "total_crashes", "alias": "total_crashes"},
+                ],
+            },
+            {
+                "step_type": "project",
+                "columns": [
+                    {"column_name": "total_injured", "alias": "total_injured"},
+                ],
+            },
+            {
+                "step_type": "project",
+                "columns": [
+                    {"column_name": "borough", "alias": "borough"},  # 重复——应去重
+                    {"column_name": "total_killed", "alias": "total_killed"},
+                ],
+            },
         ]
         result = PlanComparator._normalize_dag_steps(steps)
         proj_steps = [s for s in result if s.get("step_type") == "project"]
@@ -1959,29 +2149,37 @@ class TestNormalizeDagSteps:
     def test_target_grain_filters_irrelevant_aggregate(self):
         """target_grain=["borough"] 时，[violation_county] aggregate 应被过滤。"""
         steps = [
-            {"step_type": "aggregate", "group_keys": ["borough"],
-             "metrics": [{"function": "COUNT", "alias": "total_crashes"}]},
-            {"step_type": "aggregate", "group_keys": ["violation_county"],
-             "metrics": [{"function": "SUM", "alias": "total_violations"}]},
+            {
+                "step_type": "aggregate",
+                "group_keys": ["borough"],
+                "metrics": [{"function": "COUNT", "alias": "total_crashes"}],
+            },
+            {
+                "step_type": "aggregate",
+                "group_keys": ["violation_county"],
+                "metrics": [{"function": "SUM", "alias": "total_violations"}],
+            },
         ]
         result = PlanComparator._normalize_dag_steps(steps, target_grain=["borough"])
         agg_steps = [s for s in result if s.get("step_type") == "aggregate"]
-        assert len(agg_steps) == 1, (
-            f"target_grain 过滤后应仅剩 1 个 aggregate，实际 {len(agg_steps)}"
-        )
+        assert len(agg_steps) == 1, f"target_grain 过滤后应仅剩 1 个 aggregate，实际 {len(agg_steps)}"
         assert agg_steps[0]["group_keys"] == ["borough"]
         assert len(agg_steps[0]["metrics"]) == 1
 
     def test_target_grain_none_preserves_all(self):
         """target_grain=None 时保留所有 aggregate 组——向后兼容。"""
         steps = [
-            {"step_type": "aggregate", "group_keys": ["borough"],
-             "metrics": [{"function": "COUNT", "alias": "total_crashes"}]},
-            {"step_type": "aggregate", "group_keys": ["violation_county"],
-             "metrics": [{"function": "SUM", "alias": "total_violations"}]},
+            {
+                "step_type": "aggregate",
+                "group_keys": ["borough"],
+                "metrics": [{"function": "COUNT", "alias": "total_crashes"}],
+            },
+            {
+                "step_type": "aggregate",
+                "group_keys": ["violation_county"],
+                "metrics": [{"function": "SUM", "alias": "total_violations"}],
+            },
         ]
         result = PlanComparator._normalize_dag_steps(steps, target_grain=None)
         agg_steps = [s for s in result if s.get("step_type") == "aggregate"]
-        assert len(agg_steps) == 2, (
-            f"target_grain=None 应保留所有 aggregate，实际 {len(agg_steps)}"
-        )
+        assert len(agg_steps) == 2, f"target_grain=None 应保留所有 aggregate，实际 {len(agg_steps)}"
