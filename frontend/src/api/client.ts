@@ -403,6 +403,40 @@ export interface SparkStageResponse {
   errors: string[];
   spark_stages: SparkStageItem[];
   llm_traces: Record<string, LlmTraceNode> | null;
+  result?: SparkStageResult | null;
+}
+
+/** Spark 阶段特有结果 */
+export interface SparkStageResult {
+  type: 'mapper' | 'developer' | 'compiler' | 'validator' | 'comparator' | 'physical_verify';
+  steps?: { step_type: string; description: string }[];
+  step_count?: number;
+  plan_id?: string;
+  message?: string;
+  pyspark_code?: string;          // 编译器产的带注释 PySpark DSL 代码（transform 函数）
+  standalone_pyspark?: string;    // 独立可执行脚本（含 SparkSession 引导、spark.read.csv）
+  raw_hash?: string;
+  is_valid?: boolean;
+  status?: string;
+  step_results?: { step_type: string; verdict: string }[];
+  unsupported_types?: string[];
+  uncovered_step_types?: string[];
+  errors?: string[];
+  skipped?: boolean;  // true 表示该阶段因环境/配置原因被跳过
+
+  // ── Phase 8: DEVELOPER 阶段标注输出 ──
+  annotations?: {
+    step_id: string;
+    intent: string;
+    intent_detail: string;
+    operation_summary: string;
+  }[];
+  annotation_count?: number;
+  warnings?: {
+    warning_id: string;
+    severity: string;
+    description: string;
+  }[];
 }
 
 /** Spark 6 阶段 slug 列表 */
