@@ -15,9 +15,9 @@
 | 改动点 | 文件 | 说明 |
 |--------|------|------|
 | ① 传参 | `pipeline.py` → `_do_spark_compile()` | 将 `context.annotation_result` 传入 `compiler.compile()` |
-| ② 增强注释 | `compiler.py` → `_build_comment_block()` | 有 LLM annotation 时用 `intent_detail` + `operation_summary` 替换结构性描述 |
+| ② 增强注释 | `compiler.py` → `_build_comment_block()` | 有 LLM annotation 时追加 Business 行 |
 | ③ 换输出 | `pipeline.py` → `_do_spark_compile()` | standalone 改为使用 `result.annotated_pyspark` |
-| ④ 输出解读 | `pipeline.py` → standalone wrapper | `__main__` 中 print/show 前追加字段含义说明 |
+| ④ 输出注释 | `pipeline.py` → standalone wrapper | `__main__` 中 `# 输出字段说明:` 静态注释（不进可执行代码） |
 
 ## 3. 数据流
 
@@ -32,8 +32,9 @@ COMPILER 阶段入口 (_do_spark_compile)
   │
   ├─ for i, step in enumerate(plan.steps):
   │     step_id = state.next_step_id(step_type)           ← "SparkReadStep_0"
-  │     annotation = lookup_annotation(step_id, annotations)  ← 按 step_id 匹配
-  │     _compile_xxx(step, step_id, annotation)           ← LLM 描述传入编译方法
+  │     annotation = ann_map.get(step_id)                 ← 按 step_id 匹配
+  │     raw, comment = _compile_xxx(step, step_id, ...)   ← 原签名不变
+  │     if annotation: comment = _build_comment_block(...) ← 后处理增强
   │
   ▼
   result.raw_pyspark         ← 不变（hash 一致性保障）
@@ -42,7 +43,7 @@ COMPILER 阶段入口 (_do_spark_compile)
   ▼
   standalone wrapper
   ├── 注解部分用 annotated_pyspark
-  └── 追加 print("字段说明: ...") 解读块
+  └── 追加 # 输出字段说明: ... 静态注释（不进可执行代码）
 ```
 
 ## 4. 改动详情
@@ -71,19 +72,22 @@ for line in annotated.split('\n'):
     wrapper_lines.append(line)
 ```
 
-改动三：wrapper 末尾追加字段解读块
+改动三：wrapper 末尾追加静态字段解读注释
+
+⚠ **安全约束：LLM 文本不得进入可执行 Python 语句（`print(...)` / `exec()` / `eval()`）。
+LLM 内容仅可出现在 `#` 注释中，依赖 `_verify_no_comment_injection()` 防线。**
 
 ```python
-# 在 print("=== 结果概要 ===") 前插入字段说明
+# 在 print("=== 结果概要 ===") 前插入静态字段注释
+# LLM 文本只进注释块，不进可执行代码
 if context.annotation_result:
     last_ann = context.annotation_result.annotations[-1]
-    if last_ann.intent_detail:
-        wrapper_lines.append(f'    print("字段说明: {last_ann.intent_detail}")')
+    wrapper_lines.append(f'    # 输出字段说明: {last_ann.intent_detail}')
 ```
 
-### 4.2 `compiler.py` — `_build_comment_block()`
+### 4.2 `compiler.py` — 注释增强（`_build_comment_block`）
 
-代码位置：约第 740 行
+**原则：保留 5 行固定结构，有 LLM annotation 时替换 Intent 和 Operation 行，追加 Business 行。**
 
 ```python
 def _build_comment_block(
@@ -99,43 +103,32 @@ def _build_comment_block(
     # ── Phase 8B: LLM 语义标注注入（可选）──
     annotation: StepAnnotation | None = None,
 ) -> str:
-    """构建步骤注释块。
+    """构建步骤注释块——5 行固定格式。
 
-    有 LLM annotation 时，用 intent_detail 作为 operation 的业务描述，
-    operation_summary 作为额外行内说明。
+    有 LLM annotation 时：
+    - Intent 行用 annotation.intent
+    - Operation 行用 annotation.operation_summary
+    - 追加 Business 行（intent_detail）
+    - Step / Inputs / Output 行保持不变
     """
     if annotation is not None:
         lines = [
-            "# ════════════════════════════════════════",
-            f"# Step {index + 1}/{total} — {annotation.intent_detail or annotation.intent or intent}",
-            f"# 操作: {annotation.operation_summary or operation}",
-            "# ════════════════════════════════════════",
+            f"# Step: {step_id}（索引 {index + 1}/{total}）",
+            f"# Intent: {annotation.intent if hasattr(annotation.intent, 'value') else annotation.intent}",
+            f"# Operation: {annotation.operation_summary or operation}",
+            f"# Inputs: {inputs}",
+            f"# Output: {output}",
+            f"# Business: {annotation.intent_detail}",
         ]
         return "\n".join(lines)
 
-    # 原结构性注释逻辑
+    # 原结构性注释逻辑（5 行）
     ...
-```
-
-每个 `_compile_xxx()` 方法需要将 annotation 透传给 `_build_comment_block()`：
-
-```python
-def _compile_read(self, step, step_id, index, total, annotation=None):
-    raw = f"{alias} = inputs[{key_str}]"
-    comment = self._build_comment_block(
-        step_id=step_id, index=index, total=total,
-        intent="数据读取",
-        operation=f"从 inputs[{step.source_name}] 读取数据",
-        inputs=step.source_name,
-        output=alias,
-        annotation=annotation,
-    )
-    return raw, comment
 ```
 
 ### 4.3 compiler `compile()` 主循环
 
-`compile()` 方法中，遍历 steps 时按 step_id 查找 annotation：
+**策略：不改 `_compile_xxx()` 签名。compile() 拿到 `raw, comment` 后，在循环内统一增强 comment。**
 
 ```python
 def compile(self, plan: SparkPlan, annotations: list | None = None) -> SparkCompileResult:
@@ -153,26 +146,41 @@ def compile(self, plan: SparkPlan, annotations: list | None = None) -> SparkComp
         step_id = state.next_step_id(step_type)    # "SparkReadStep_0"
         annotation = ann_map.get(step_id)           # 按 step_id 匹配 LLM 标注
 
+        # 调用原编译方法（签名不变，不传 annotation）
         if isinstance(step, SparkReadStep):
-            raw, comment = self._compile_read(step, step_id, i, len(plan.steps), annotation)
+            raw, comment = self._compile_read(step, step_id, i, len(plan.steps))
         elif ...:
             ...
+
+        # 后处理：有 LLM annotation 时增强 comment（Phase 8B）
+        if annotation is not None:
+            comment = self._build_comment_block(
+                step_id=step_id, index=i, total=len(plan.steps),
+                intent=step_type,
+                operation="",  # 将由 annotation 填充
+                inputs="",
+                output="",
+                annotation=annotation,
+            )
+        ...
 ```
 
 ## 5. 边界 & 约束
 
 **改动范围：**
-- `pipeline.py`: +~30 行（传参 + wrapper 增强）
-- `compiler.py`: +~40 行（`_build_comment_block` 增强 + 逐方法透传 + compile 主循环匹配）
+- `pipeline.py`: +~35 行（传参 + standalone 改 annotated_pyspark + 输出注释）
+- `compiler.py`: +~30 行（`_build_comment_block` 增强 + compile 主循环后处理）
 
 **不修改：**
 - `developer.py` / `annotations.py` / `SparkOrchestrator` / `routes.py`
 - Prompt 模板
 - 前端面板
+- 所有 `_compile_xxx()` 方法签名
 
 **关键约束：**
 - `raw_pyspark` 不变（`raw_hash` 不受影响）
-- `_verify_no_comment_injection()` 需通过——注释格式不含裸代码
+- `_verify_no_comment_injection()` 通过——注释格式不含裸代码，**不得削弱该函数**
+- LLM 文本只能出现在 `# ` 注释行中，**不可进入任何可执行 Python 语句**
 - `annotation_result=None`（DEVELOPER 未执行）时走原逻辑，不报错
 
 ## 6. 数据流图（代码级）
@@ -193,10 +201,10 @@ SparkStageContext
 
 | # | 验收项 | 验证方式 |
 |---|--------|---------|
-| 1 | `transform()` 每步上方有 `# LLM 业务注释` | API 返回 standalone 脚本检查 |
-| 2 | 注释含 `intent_detail` 业务语义 | 检查注释含真实业务描述 |
-| 3 | `__main__` 中 print/show 前有字段解读 | 脚本含 `print("字段说明:...")` |
-| 4 | 覆盖率 > 90% 步骤有注释 | 实际步骤数检查 |
+| 1 | `transform()` 每步注释块包含 `intent_detail` 业务语义 | API 返回 standalone 脚本检查 |
+| 2 | 注释含 `intent_detail` 业务语义（非纯结构性描述） | 检查注释含真实业务文字 |
+| 3 | `__main__` 中 print/show 前有静态 `# 输出字段说明:` 注释 | 脚本含注释行，不含可执行 print |
+| 4 | `annotation_count == len(spark_plan.steps)`；annotation_result=None 时不要求 | 全量步骤命中 |
 | 5 | `annotation_result=None` 时不报错 | pytest 验证 |
 | 6 | `raw_hash` 不变 | 单元测试验证 |
 | 7 | `_verify_no_comment_injection()` 通过 | 编译过程不抛出 |
@@ -205,6 +213,8 @@ SparkStageContext
 ## 8. 风险 & 回退
 
 - **风险：** `_build_comment_block` 输出格式变更可能导致 `_verify_no_comment_injection` 误报
-  → 兜底：若误报，在 `_verify_no_comment_injection` 中更新去注释逻辑
+  → 处理原则：**不得削弱 `_verify_no_comment_injection()`**。优先修正注释渲染方式：
+    1. 所有 LLM 文本必须经过 `renderer.render_comment_text()` 单行清洗（去换行、转义引号）
+    2. 只有在证明 `_verify_no_comment_injection()` 自身存在明确 bug，并有恶意注入回归测试验证时，才能调整该函数
 - **风险：** step_id 匹配失败（compiler 内部 step_id 生成逻辑与 annotation 的 step_id 不一致）
   → 兜底：匹配失败时静默降级为结构性注释，不阻断编译
