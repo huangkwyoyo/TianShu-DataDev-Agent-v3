@@ -85,6 +85,40 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
     Returns:
         配置完成的 FastAPI 应用
     """
+    import logging
+
+    from tianshu_datadev.config import load_dotenv
+    from tianshu_datadev.spark.developer import SparkDeveloperService
+    from tianshu_datadev.prompts.manager import PromptManager
+    from tianshu_datadev.llm.adapters.anthropic_adapter import AnthropicAdapter
+
+    logger = logging.getLogger(__name__)
+
+    # ── Phase 8: 加载 .env 环境变量 ──
+    load_dotenv()
+
+    # ── Phase 8: 创建 SparkDeveloperService（API Key preflight）──
+    spark_developer_service = None
+    api_key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    if api_key:
+        try:
+            adapter = AnthropicAdapter()
+            prompt_manager = PromptManager()
+            spark_developer_service = SparkDeveloperService.from_provider_adapter(
+                adapter, prompt_manager, max_llm_retries=1
+            )
+            logger.info("SparkDeveloperService 初始化成功——DEVELOPER 阶段将调用 DeepSeek API")
+        except Exception as exc:
+            logger.warning(
+                "SparkDeveloperService 创建失败（key 存在但初始化异常），"
+                "DEVELOPER 阶段将标记 SKIPPED: %s", exc
+            )
+    else:
+        logger.info(
+            "未检测到 DEEPSEEK_API_KEY 或 ANTHROPIC_API_KEY——"
+            "SparkDeveloperService 跳过，DEVELOPER 阶段将标记 SKIPPED"
+        )
+
     app = FastAPI(
         title="TianShu DataDev Agent API",
         version="0.1.0",
@@ -109,10 +143,15 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
             pipeline = Pipeline(
                 default_table_paths=_discover_csv_fixtures(),
                 duckdb_path=db_path,
+                developer_service=spark_developer_service,
             )
         else:
-            pipeline = Pipeline(duckdb_path=db_path)
+            pipeline = Pipeline(
+                duckdb_path=db_path,
+                developer_service=spark_developer_service,
+            )
     app.state.pipeline = pipeline
+    app.state.spark_developer_service = spark_developer_service
 
     # 注册异常处理器
     register_error_handlers(app)
