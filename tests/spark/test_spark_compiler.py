@@ -563,6 +563,111 @@ class TestAnnotationInjection:
         # 至少 Business 行不包含换行产生的多行
         assert "\n\n" not in result, "Business 行注入不应产生空行"
 
+    # ── 集成测试：E2E compile() 通过 annotation 参数 ──
+
+    def _make_full_plan(self):
+        """构建一个 3-step 计划（read + filter + project）用于集成测试。"""
+        return _make_plan(
+            SparkReadStep(alias="ft", source_name="fact_trips", input_key="ft"),
+            SparkFilterStep(input_alias="ft", operator="GT",
+                           left="ft.distance", right="10"),
+            SparkProjectStep(input_alias="ft", columns=[
+                SparkProjectColumn(column_name="trip_id", alias="trip_id"),
+                SparkProjectColumn(column_name="distance", alias="distance"),
+            ]),
+        )
+
+    def _make_annotations(self):
+        """构建 3 个与 full_plan 步骤匹配的 StepAnnotation。"""
+        return [
+            StepAnnotation(
+                step_id="SparkReadStep_0", step_index=0,
+                step_type="SparkReadStep", intent=StepIntent.SOURCE,
+                intent_detail="读取出租车行程事实数据表 ft",
+                operation_summary="从 fact_trips 读取原始数据",
+            ),
+            StepAnnotation(
+                step_id="SparkFilterStep_1", step_index=1,
+                step_type="SparkFilterStep", intent=StepIntent.CLEAN,
+                intent_detail="过滤距离大于 10 的行程记录",
+                operation_summary="按 distance > 10 过滤",
+            ),
+            StepAnnotation(
+                step_id="SparkProjectStep_2", step_index=2,
+                step_type="SparkProjectStep", intent=StepIntent.SHAPE,
+                intent_detail="选取 trip_id 和 distance 两个输出字段",
+                operation_summary="投影保留 trip_id 和 distance",
+            ),
+        ]
+
+    def test_compile_with_annotations_all_steps(self):
+        """传入 annotations 时所有 step 的注释块都包含 Business 行。"""
+        compiler = SparkCompiler()
+        plan = self._make_full_plan()
+        anns = self._make_annotations()
+        result = compiler.compile(plan, annotations=anns)
+        # 每个 step 的注释块应包含 Business: 行
+        for ann in anns:
+            step_comment = self._extract_step_comment(result.annotated_pyspark, ann.step_id)
+            assert step_comment is not None, f"未找到 {ann.step_id} 的注释块"
+            assert f"# Business: {ann.intent_detail}" in step_comment, (
+                f"{ann.step_id} 缺少 Business 行"
+            )
+            assert "# Inputs:" in step_comment, f"{ann.step_id} 的 Inputs 行被清空"
+            assert "# Output:" in step_comment, f"{ann.step_id} 的 Output 行被清空"
+
+    def _extract_step_comment(self, code: str, step_id: str) -> str | None:
+        """从编译代码中提取指定 step_id 的注释块。"""
+        lines = code.split("\n")
+        in_target = False
+        comment_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith(f"# Step: {step_id}"):
+                in_target = True
+                comment_lines.append(stripped)
+            elif in_target:
+                if stripped.startswith("#"):
+                    comment_lines.append(stripped)
+                else:
+                    break
+        return "\n".join(comment_lines) if comment_lines else None
+
+    def test_compile_without_annotations_fallback(self):
+        """annotations=None 时走原逻辑，不报错。"""
+        compiler = SparkCompiler()
+        plan = self._make_full_plan()
+        result = compiler.compile(plan, annotations=None)
+        # 不应包含 Business 行
+        assert "# Business:" not in result.annotated_pyspark, "无 annotation 时不应有 Business 行"
+        # 原有 5 行结构仍存在
+        assert "# Intent:" in result.annotated_pyspark
+        assert "# Operation:" in result.annotated_pyspark
+
+    def test_annotated_pyspark_injection_verified(self):
+        """annotations 注入后 _verify_no_comment_injection 仍通过。"""
+        compiler = SparkCompiler()
+        plan = self._make_full_plan()
+        anns = self._make_annotations()
+        result = compiler.compile(plan, annotations=anns)
+        # _verify_no_comment_injection 在 compile() 内部已调用
+        # 这里验证 raw_hash 正确（raw 不受影响）
+        raw_only = compiler.compile(plan, annotations=None)
+        assert result.raw_hash == raw_only.raw_hash, "annotation 不应改变 raw_hash"
+
+    def test_annotated_pyspark_contains_all_annotation_intents(self):
+        """每个 annotation 的 intent/intent_detail/operation_summary 出现在 annotated_pyspark 中。"""
+        compiler = SparkCompiler()
+        plan = self._make_full_plan()
+        anns = self._make_annotations()
+        result = compiler.compile(plan, annotations=anns)
+        code = result.annotated_pyspark
+        for ann in anns:
+            assert ann.intent.value in code, f"intent {ann.intent.value} 未出现"
+            if ann.operation_summary:
+                assert ann.operation_summary in code, f"operation_summary {ann.operation_summary} 未出现"
+            assert ann.intent_detail in code, f"intent_detail {ann.intent_detail} 未出现"
+
 
 # ════════════════════════════════════════════
 # Phase 6B 测试——aggregate / join / case_when
