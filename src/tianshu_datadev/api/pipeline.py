@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan
     from tianshu_datadev.planning.sql_program import SqlProgram
     from tianshu_datadev.spark.compiler import SparkCompileResult
+    from tianshu_datadev.spark.annotations import AnnotatedSparkPlan
     from tianshu_datadev.spark.models import SparkPlan
     from tianshu_datadev.spark.plan_comparator import PlanComparisonReport
     from tianshu_datadev.spark.snapshot import SnapshotBuilder, SnapshotManifest, SnapshotSourceProvider
@@ -173,6 +174,8 @@ class Pipeline:
         default_table_paths: dict[str, str] | None = None,
         # ── NYC 数据仓库 DuckDB 文件路径——模板引用 gold/silver schema 表时使用 ──
         duckdb_path: str | None = None,
+        # ── Phase 8: SparkDeveloperService 注入（可选）──
+        developer_service=None,  # SparkDeveloperService | None，None → SKIPPED
     ):
         """初始化流水线。
 
@@ -200,6 +203,8 @@ class Pipeline:
         self._default_table_paths = default_table_paths or {}
         # ── 外部 DuckDB 数据库路径 ──
         self._duckdb_path = duckdb_path
+        # ── Phase 8: SparkDeveloperService 注入 ──
+        self._spark_developer_service = developer_service
         # ── Spark 阶段独立触发——上下文缓存 ──
         self._spark_contexts: dict[str, SparkStageContext] = {}
         # ── LLM 调用追踪（request-scoped cache）──
@@ -2392,6 +2397,44 @@ class Pipeline:
             context.stage_results.get(stage_val, "NOT_EXECUTED"), "skipped"
         )
 
+        # ── Phase 8: DEVELOPER 结果构建（含标注数据）──
+        result: dict | None = None
+        if stage == SparkPipelineStage.DEVELOPER:
+            if current_status == "ok" and context.annotation_result is not None:
+                ann = context.annotation_result
+                result = {
+                    "type": "developer",
+                    "message": f"LLM 语义标注完成——{len(ann.annotations)} 个步骤",
+                    "annotation_count": len(ann.annotations),
+                    "annotations": [
+                        {
+                            "step_id": a.step_id,
+                            "intent": a.intent.value if hasattr(a.intent, "value") else str(a.intent),
+                            "intent_detail": a.intent_detail,
+                            "operation_summary": a.operation_summary,
+                        }
+                        for a in ann.annotations
+                    ],
+                    "warnings": [
+                        {
+                            "warning_id": w.warning_id,
+                            "severity": w.severity,
+                            "description": w.description,
+                        }
+                        for w in ann.warnings
+                    ],
+                }
+            else:
+                result = {
+                    "type": "developer",
+                    "message": (
+                        "LLM 语义标注失败"
+                        if current_status == "failed"
+                        else "LLM 语义标注阶段——未注入 SparkDeveloperService，已标记 SKIPPED"
+                    ),
+                    "skipped": current_status == "skipped",
+                }
+
         return {
             "request_id": request_id,
             "stage": stage_val,
@@ -2400,6 +2443,7 @@ class Pipeline:
             "errors": list(context.errors),
             "spark_stages": spark_stages,
             "llm_traces": self._get_llm_traces(request_id),
+            "result": result,
         }
 
     # ════════════════════════════════════════════
@@ -2430,12 +2474,28 @@ class Pipeline:
             context.errors.append(f"[MAPPER] 映射失败：{'; '.join(gap_msgs)}")
 
     def _do_spark_develop(self, context: SparkStageContext) -> None:
-        """执行 DEVELOPER 阶段——LLM 语义标注（可选）。
+        """执行 DEVELOPER 阶段——LLM 语义标注。
 
-        当前无 SparkDeveloperService 注入时标记 SKIPPED，不阻断后续阶段。
+        Phase 8: 注入 SparkDeveloperService 后调用真实 LLM 标注，
+        异常时标记 FAILURE，不阻断后续阶段。
         """
-        context.stage_results["DEVELOPER"] = "SKIPPED"
-        context.errors.append("[DEVELOPER] SKIPPED: 未注入 SparkDeveloperService")
+        if self._spark_developer_service is None:
+            context.stage_results["DEVELOPER"] = "SKIPPED"
+            context.errors.append("[DEVELOPER] SKIPPED: 未注入 SparkDeveloperService")
+            return
+
+        if context.spark_plan is None:
+            context.stage_results["DEVELOPER"] = "SKIPPED"
+            context.errors.append("[DEVELOPER] SKIPPED: 无 SparkPlan（MAPPER 未执行或失败）")
+            return
+
+        try:
+            annotated = self._spark_developer_service.annotate(context.spark_plan)
+            context.annotation_result = annotated
+            context.stage_results["DEVELOPER"] = "SUCCESS"
+        except Exception as e:
+            context.stage_results["DEVELOPER"] = "FAILURE"
+            context.errors.append(f"[DEVELOPER] 标注异常：{e}")
 
     def _do_spark_compile(self, context: SparkStageContext) -> None:
         """执行 COMPILER 阶段——SparkPlan → PySpark DSL。"""
@@ -2530,6 +2590,8 @@ class SparkStageContext:
     spark_plan: "SparkPlan | None" = None
     compile_result: "SparkCompileResult | None" = None
     comparator_report: "PlanComparisonReport | None" = None
+    # ── Phase 8: DEVELOPER 阶段产物缓存 ──
+    annotation_result: "AnnotatedSparkPlan | None" = None
     stage_results: dict[str, str] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
 

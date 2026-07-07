@@ -981,3 +981,76 @@ class TestOrchestratorSqlProgramIntegration:
         assert state.comparator_report is not None
         from tianshu_datadev.spark.plan_comparator import ComparisonStatus
         assert state.comparator_report.status == ComparisonStatus.LOGIC_EQUIVALENT
+
+
+# ════════════════════════════════════════════
+# Phase 8: Pipeline._do_spark_develop 单元测试
+# ════════════════════════════════════════════
+
+
+class TestPipelineSparkDevelop:
+    """Pipeline._do_spark_develop 三态覆盖——SUCCESS / FAILURE / SKIPPED。"""
+
+    def test_do_spark_develop_with_service_success(self):
+        """注入 mock service 时 DEVELOPER 阶段返回 SUCCESS 且 annotation_result 非空。"""
+        from unittest.mock import MagicMock
+
+        from tianshu_datadev.api.pipeline import Pipeline, SparkStageContext
+        from tianshu_datadev.spark.annotations import AnnotatedSparkPlan, StepAnnotation, StepIntent
+        from tianshu_datadev.spark.developer import SparkDeveloperService
+
+        # 准备
+        mock_ann = AnnotatedSparkPlan(
+            plan_id="test",
+            baseline_plan_hash="abc",
+            annotations=[
+                StepAnnotation(step_id="SparkReadStep_0", step_index=0, step_type="read",
+                               intent=StepIntent.SOURCE, intent_detail="读取数据"),
+            ],
+        )
+        mock_service = MagicMock(spec=SparkDeveloperService)
+        mock_service.annotate.return_value = mock_ann
+
+        pipeline = Pipeline(developer_service=mock_service)
+        ctx = SparkStageContext()
+        ctx.spark_plan = MagicMock()
+
+        # 执行
+        pipeline._do_spark_develop(ctx)
+
+        # 验证
+        assert ctx.stage_results["DEVELOPER"] == "SUCCESS"
+        assert ctx.annotation_result is not None
+        assert ctx.annotation_result.annotations[0].step_id == "SparkReadStep_0"
+        mock_service.annotate.assert_called_once_with(ctx.spark_plan)
+
+    def test_do_spark_develop_service_failure(self):
+        """service 抛异常时 DEVELOPER 标记 FAILURE。"""
+        from unittest.mock import MagicMock
+
+        from tianshu_datadev.api.pipeline import Pipeline, SparkStageContext
+        from tianshu_datadev.spark.developer import SparkDeveloperService
+
+        mock_service = MagicMock(spec=SparkDeveloperService)
+        mock_service.annotate.side_effect = ValueError("API 调用失败")
+
+        pipeline = Pipeline(developer_service=mock_service)
+        ctx = SparkStageContext()
+        ctx.spark_plan = MagicMock()
+
+        pipeline._do_spark_develop(ctx)
+
+        assert ctx.stage_results["DEVELOPER"] == "FAILURE"
+        assert any("[DEVELOPER] 标注异常" in e for e in ctx.errors)
+
+    def test_do_spark_develop_no_service_skips(self):
+        """service=None 时 DEVELOPER 标记 SKIPPED。"""
+        from tianshu_datadev.api.pipeline import Pipeline, SparkStageContext
+
+        pipeline = Pipeline()  # developer_service=None
+        ctx = SparkStageContext()
+
+        pipeline._do_spark_develop(ctx)
+
+        assert ctx.stage_results["DEVELOPER"] == "SKIPPED"
+        assert any("未注入" in e for e in ctx.errors)
