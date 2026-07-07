@@ -2480,6 +2480,28 @@ class Pipeline:
                 "skipped": current_status == "skipped",
             }
 
+        # PHYSICAL_VERIFIER——无论 ok/skipped/failed 都返回结果消息
+        if stage == SparkPipelineStage.PHYSICAL_VERIFIER:
+            if current_status == "ok":
+                result = {
+                    "type": "physical_verify",
+                    "message": "物理验证通过——双引擎输出结果一致",
+                    "skipped": False,
+                }
+            else:
+                # 收集跳过原因（来自 context.errors 中 PHYSICAL_VERIFIER 前缀的错误）
+                verify_errors = [
+                    e.split("] ", 1)[1] if "] " in e else e
+                    for e in context.errors
+                    if e.startswith("[PHYSICAL_VERIFIER]")
+                ]
+                reason = verify_errors[0] if verify_errors else "物理验证阶段未执行"
+                result = {
+                    "type": "physical_verify",
+                    "message": reason,
+                    "skipped": current_status == "skipped",
+                }
+
         return {
             "request_id": request_id,
             "stage": stage_val,

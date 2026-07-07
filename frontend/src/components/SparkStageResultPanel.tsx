@@ -264,9 +264,10 @@ export function SparkStageResultPanel({ stage, result, status, visible }: Props)
         </>
       )}
 
-      {/* PHYSICAL_VERIFIER——物理验证结果 */}
-      {result.type === 'physical_verify' && !result.skipped && (
-        <div className="spark-result-message">
+      {/* PHYSICAL_VERIFIER——物理验证结果（含 skipped 原因展示） */}
+      {result.type === 'physical_verify' && (
+        <div className={`spark-result-message${result.skipped ? ' stage-skipped' : ''}`}>
+          {result.skipped ? '⏭️ ' : '✅ '}
           {result.message || '物理验证结果'}
         </div>
       )}
