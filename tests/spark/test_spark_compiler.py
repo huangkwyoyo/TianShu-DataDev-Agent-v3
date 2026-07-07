@@ -464,104 +464,63 @@ class TestMaliciousInput:
 class TestAnnotationInjection:
     """LLM 语义标注注入 `_enhance_comment_with_annotation` 的验证测试。
 
+    Phase 8C：注释简化为 Step 行 + 一句自然语言业务描述（intent_detail）。
+    不再产生 Intent/Operation/Inputs/Output 结构化行。
+
     核心检查点：
-    - Intent/Operation 行被 LLM 文本替换
-    - Business 行追加在 Output 行之后
-    - Inputs/Output 行被保留（不清空）
+    - intent_detail 作为自然语言注释追加在 Step 行后
     - 所有 LLM 文本经 render_comment_text 清洗（换行被移除）
     - annotation=None 时不报错
-    - annotation 中含恶意换行时 Business 行仍为单行
+    - annotation 中含恶意换行时注释仍为单行
     """
 
     def _make_comment(self) -> str:
-        """生成一个标准 5 行结构性注释作为测试输入。"""
-        return (
-            "# Step: SparkReadStep_0（索引 1/6）\n"
-            "# Intent: source\n"
-            "# Operation: 读取数据\n"
-            "# Inputs: ft\n"
-            "# Output: od"
-        )
+        """生成一个 Step 行注释作为测试输入。"""
+        return "# Step: SparkReadStep_0（索引 1/6）"
 
-    def _make_annotation(self, intent_detail="读取行程事实表", operation_summary="从 ft 读取数据") -> StepAnnotation:
+    def _make_annotation(self, intent_detail="读取行程事实表") -> StepAnnotation:
         return StepAnnotation(
             step_id="SparkReadStep_0",
             step_index=0,
             step_type="SparkReadStep",
             intent=StepIntent.SOURCE,
             intent_detail=intent_detail,
-            operation_summary=operation_summary,
+            operation_summary="从 ft 读取数据",
         )
 
-    def test_intent_replaced(self):
-        """Intent 行被 annotation.intent 替换。"""
-        compiler = SparkCompiler()
-        ann = self._make_annotation()
-        comment = self._make_comment()
-        result = compiler._enhance_comment_with_annotation(comment, ann)
-        expected_intent = f"# Intent: {ann.intent.value}"
-        assert expected_intent in result, f"Intent 行应被替换为 {expected_intent!r}"
-
-    def test_operation_replaced(self):
-        """Operation 行被 annotation.operation_summary 替换。"""
-        compiler = SparkCompiler()
-        ann = self._make_annotation(operation_summary="从 ft 事实表读取行程数据")
-        comment = self._make_comment()
-        result = compiler._enhance_comment_with_annotation(comment, ann)
-        assert "# Operation: 从 ft 事实表读取行程数据" in result
-
-    def test_business_appended_after_output(self):
-        """Business 行追加在 Output 行之后。"""
+    def test_intent_detail_appended(self):
+        """intent_detail 作为自然语言注释追加在 Step 行之后。"""
         compiler = SparkCompiler()
         ann = self._make_annotation(intent_detail="读取出租车行程事实数据表")
         comment = self._make_comment()
         result = compiler._enhance_comment_with_annotation(comment, ann)
         lines = result.split("\n")
-        # 找 Output 行和 Business 行的索引
-        output_idx = next(i for i, l in enumerate(lines) if l.startswith("# Output:"))
-        business_idx = next(i for i, l in enumerate(lines) if l.startswith("# Business:"))
-        assert business_idx == output_idx + 1, (
-            f"Business 行应在 Output 行之后：Output={output_idx}, Business={business_idx}"
-        )
-        assert "# Business: 读取出租车行程事实数据表" in result
+        assert lines[0] == "# Step: SparkReadStep_0（索引 1/6）"
+        assert lines[1] == "# 读取出租车行程事实数据表"
 
-    def test_inputs_output_preserved(self):
-        """Inputs/Output 行内容不被清空。"""
+    def test_no_structured_lines(self):
+        """增强后不含 Intent/Operation/Inputs/Output 结构化行。"""
         compiler = SparkCompiler()
         ann = self._make_annotation()
         comment = self._make_comment()
         result = compiler._enhance_comment_with_annotation(comment, ann)
-        assert "# Inputs: ft" in result, "Inputs 行应被保留"
-        assert "# Output: od" in result, "Output 行应被保留"
-
-    def test_operation_summary_empty_falls_back(self):
-        """operation_summary 为空时不替换 Operation 行（保留结构性描述）。"""
-        compiler = SparkCompiler()
-        # operation_summary="" 的 annotation
-        ann = StepAnnotation(
-            step_id="SparkReadStep_0", step_index=0,
-            step_type="SparkReadStep", intent=StepIntent.SOURCE,
-            intent_detail="读取数据", operation_summary="",
-        )
-        comment = self._make_comment()
-        result = compiler._enhance_comment_with_annotation(comment, ann)
-        # Operation 行应保留原值（不做替换）
-        assert "# Operation: 读取数据" in result
+        assert "# Intent:" not in result
+        assert "# Operation:" not in result
+        assert "# Inputs:" not in result
+        assert "# Output:" not in result
 
     def test_malicious_newline_in_intent_detail_sanitized(self):
-        """intent_detail 中含恶意换行——Business 注释为单行（不产生裸代码）。"""
+        """intent_detail 中含恶意换行——注释为单行（不产生裸代码）。"""
         compiler = SparkCompiler()
         ann = self._make_annotation(
             intent_detail="正常描述\neval('bad')\n# 注入",
         )
         comment = self._make_comment()
         result = compiler._enhance_comment_with_annotation(comment, ann)
-        # 所有 Business 行应该在 # 注释中，不在可执行代码中
-        business_lines = [l for l in result.split("\n") if l.lstrip().startswith("# Business:")]
-        assert len(business_lines) == 1, "Business 应为单行注释"
-        # 验证没有裸代码行：去注释后应与原 raw 一致（在 compile() 的 _verify_no_comment_injection 验证）
-        # 至少 Business 行不包含换行产生的多行
-        assert "\n\n" not in result, "Business 行注入不应产生空行"
+        # 注释部分应被 render_comment_text 清洗掉换行，只保留 2 行（Step + 描述）
+        lines = result.split("\n")
+        assert len(lines) == 2, f"应为 2 行（Step + 清洗后的单行注释），实际 {len(lines)} 行"
+        assert "正常描述" in result
 
     # ── 集成测试：E2E compile() 通过 annotation 参数 ──
 
@@ -601,20 +560,21 @@ class TestAnnotationInjection:
         ]
 
     def test_compile_with_annotations_all_steps(self):
-        """传入 annotations 时所有 step 的注释块都包含 Business 行。"""
+        """传入 annotations 时所有 step 的注释块包含 intent_detail。"""
         compiler = SparkCompiler()
         plan = self._make_full_plan()
         anns = self._make_annotations()
         result = compiler.compile(plan, annotations=anns)
-        # 每个 step 的注释块应包含 Business: 行
+        # 每个 step 的注释块应为 2 行：Step + intent_detail
         for ann in anns:
             step_comment = self._extract_step_comment(result.annotated_pyspark, ann.step_id)
             assert step_comment is not None, f"未找到 {ann.step_id} 的注释块"
-            assert f"# Business: {ann.intent_detail}" in step_comment, (
-                f"{ann.step_id} 缺少 Business 行"
+            assert f"# {ann.intent_detail}" in step_comment, (
+                f"{ann.step_id} 缺少 intent_detail 注释"
             )
-            assert "# Inputs:" in step_comment, f"{ann.step_id} 的 Inputs 行被清空"
-            assert "# Output:" in step_comment, f"{ann.step_id} 的 Output 行被清空"
+            # 不应包含旧的结构化行
+            assert "# Intent:" not in step_comment, f"{ann.step_id} 不应有 Intent 行"
+            assert "# Operation:" not in step_comment, f"{ann.step_id} 不应有 Operation 行"
 
     def _extract_step_comment(self, code: str, step_id: str) -> str | None:
         """从编译代码中提取指定 step_id 的注释块。"""
@@ -634,15 +594,15 @@ class TestAnnotationInjection:
         return "\n".join(comment_lines) if comment_lines else None
 
     def test_compile_without_annotations_fallback(self):
-        """annotations=None 时走原逻辑，不报错。"""
+        """annotations=None 时仅生成 Step 行，不报错。"""
         compiler = SparkCompiler()
         plan = self._make_full_plan()
         result = compiler.compile(plan, annotations=None)
-        # 不应包含 Business 行
-        assert "# Business:" not in result.annotated_pyspark, "无 annotation 时不应有 Business 行"
-        # 原有 5 行结构仍存在
-        assert "# Intent:" in result.annotated_pyspark
-        assert "# Operation:" in result.annotated_pyspark
+        # 只含 Step 行，不补业务注释（无 annotation 就没有 intent_detail）
+        assert "# Step:" in result.annotated_pyspark
+        assert "# Business:" not in result.annotated_pyspark
+        # 也不应含有旧的结构化行
+        assert "# Intent:" not in result.annotated_pyspark
 
     def test_annotated_pyspark_injection_verified(self):
         """annotations 注入后 _verify_no_comment_injection 仍通过。"""
@@ -656,16 +616,13 @@ class TestAnnotationInjection:
         assert result.raw_hash == raw_only.raw_hash, "annotation 不应改变 raw_hash"
 
     def test_annotated_pyspark_contains_all_annotation_intents(self):
-        """每个 annotation 的 intent/intent_detail/operation_summary 出现在 annotated_pyspark 中。"""
+        """每个 annotation 的 intent_detail 出现在 annotated_pyspark 中。"""
         compiler = SparkCompiler()
         plan = self._make_full_plan()
         anns = self._make_annotations()
         result = compiler.compile(plan, annotations=anns)
         code = result.annotated_pyspark
         for ann in anns:
-            assert ann.intent.value in code, f"intent {ann.intent.value} 未出现"
-            if ann.operation_summary:
-                assert ann.operation_summary in code, f"operation_summary {ann.operation_summary} 未出现"
             assert ann.intent_detail in code, f"intent_detail {ann.intent_detail} 未出现"
 
 
@@ -1711,10 +1668,11 @@ class TestCompileWindow:
 
         annotated = result.annotated_pyspark
         assert "# Step:" in annotated
-        assert "# Intent: 窗口函数" in annotated
-        assert "# Operation:" in annotated
-        assert "# Inputs:" in annotated
-        assert "# Output:" in annotated
+        # Phase 8C：不再产生 Intent/Operation/Inputs/Output 结构化行
+        assert "# Intent:" not in annotated
+        assert "# Operation:" not in annotated
+        assert "# Inputs:" not in annotated
+        assert "# Output:" not in annotated
 
 
 # ════════════════════════════════════════════
@@ -1723,26 +1681,24 @@ class TestCompileWindow:
 
 
 class TestCommentFormat:
-    """5 行注释格式测试。"""
+    """注释格式测试——Phase 8C 简化为 Step 行 + 可选业务注释。"""
 
-    def test_comment_has_five_lines(self):
-        """每个步骤生成恰好 5 行注释。"""
+    def test_comment_has_one_line(self):
+        """每个步骤无 annotation 时只生成 Step 行。"""
         plan = _make_plan(
             SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
         )
         compiler = SparkCompiler()
         result = compiler.compile(plan)
 
-        comments = [
+        step_lines = [
             line for line in result.annotated_pyspark.split("\n")
-            if line.strip().startswith("# Step:") or line.strip().startswith("# Intent:")
-            or line.strip().startswith("# Operation:") or line.strip().startswith("# Inputs:")
-            or line.strip().startswith("# Output:")
+            if line.strip().startswith("# Step:")
         ]
-        assert len(comments) == 5
+        assert len(step_lines) == 1
 
-    def test_comment_keys_present(self):
-        """5 个固定 key 全部出现在注释中。"""
+    def test_comment_step_present(self):
+        """Step 行始终出现在注释中。"""
         plan = _make_plan(
             SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
         )
@@ -1750,10 +1706,11 @@ class TestCommentFormat:
         result = compiler.compile(plan)
 
         assert "# Step:" in result.annotated_pyspark
-        assert "# Intent:" in result.annotated_pyspark
-        assert "# Operation:" in result.annotated_pyspark
-        assert "# Inputs:" in result.annotated_pyspark
-        assert "# Output:" in result.annotated_pyspark
+        # Phase 8C：不再产生 Intent/Operation/Inputs/Output
+        assert "# Intent:" not in result.annotated_pyspark
+        assert "# Operation:" not in result.annotated_pyspark
+        assert "# Inputs:" not in result.annotated_pyspark
+        assert "# Output:" not in result.annotated_pyspark
 
     def test_comment_missing_from_raw(self):
         """raw_pyspark 不含注释。"""
@@ -1764,7 +1721,6 @@ class TestCommentFormat:
         result = compiler.compile(plan)
 
         assert "# Step:" not in result.raw_pyspark
-        assert "# Intent:" not in result.raw_pyspark
 
     def test_comment_index_format(self):
         """注释包含索引信息（索引 N/总数）。"""

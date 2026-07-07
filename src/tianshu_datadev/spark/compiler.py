@@ -56,6 +56,7 @@ class _CompileState:
 
     raw_lines: list[str] = field(default_factory=list)
     annotated_lines: list[str] = field(default_factory=list)
+    comment_lines: list[str] = field(default_factory=list)  # Phase 8C: 注释统一收集在代码前
     step_ids: list[str] = field(default_factory=list)
     # 追踪每个 step 的输出变量名
     output_var_map: dict[int, str] = field(default_factory=dict)
@@ -68,9 +69,13 @@ class _CompileState:
         return sid
 
     def add_step(self, step_id: str, raw_code: str, comment_block: str) -> None:
-        """添加一个编译好的步骤。"""
+        """添加一个编译好的步骤。
+
+        Phase 8C：注释块收集到 comment_lines，代码行追加到 raw_lines + annotated_lines。
+        最终输出时所有注释块排在一起，代码另起段落。
+        """
         if comment_block:
-            self.annotated_lines.append(comment_block)
+            self.comment_lines.append(comment_block)
         self.raw_lines.append(raw_code)
         self.annotated_lines.append(raw_code)
         self.step_ids.append(step_id)
@@ -172,7 +177,17 @@ class SparkCompiler:
 
         # 组装函数体
         body_raw = "\n".join(f"    {line}" for line in state.raw_lines[3:])  # 跳过导入
-        body_annotated = "\n".join(f"    {line}" for line in state.annotated_lines[3:])
+        # Phase 8C: 所有注释块排在函数体顶部，代码统一跟在后面
+        if state.comment_lines:
+            # 多行注释块每行都要缩进 4 空格
+            indented_comments = "\n".join(
+                "\n".join(f"    {l}" for l in block.split("\n"))
+                for block in state.comment_lines
+            )
+            code = "\n".join(f"    {line}" for line in state.annotated_lines[3:])
+            body_annotated = f"{indented_comments}\n{code}"
+        else:
+            body_annotated = "\n".join(f"    {line}" for line in state.annotated_lines[3:])
 
         raw_pyspark = (
             f"{imports}\n\n\n"
@@ -768,13 +783,7 @@ class SparkCompiler:
         """编译不支持/未实现的 step 类型——生成占位符注释。"""
         step_type = type(step).__name__
         raw = f"# UNSUPPORTED: {step_type} — {reason}"
-        comment = (
-            f"# Step: {step_id}\n"
-            f"# Intent: 未实现\n"
-            f"# Operation: {step_type} 编译尚未实现（{reason}）\n"
-            f"# Inputs: N/A\n"
-            f"# Output: N/A"
-        )
+        comment = f"# Step: {step_id}\n# {step_type} 编译尚未实现（{reason}）"
         return raw, comment
 
     # ── 注释块生成 ──
@@ -784,84 +793,32 @@ class SparkCompiler:
         step_id: str,
         index: int,
         total: int,
-        intent: str,
-        operation: str,
-        inputs: str,
-        output: str,
+        intent: str = "",
+        operation: str = "",
+        inputs: str = "",
+        output: str = "",
     ) -> str:
-        """构建 5 行固定格式注释块。
+        """构建 Step 头部注释行。
 
-        格式：Step / Intent / Operation / Inputs / Output
-        所有文本字段均通过 render_comment_text 清洗——不含 SQL 文本、不含换行。
+        Phase 8C：简化为仅含 Step 行，结构化的 Intent/Operation/Inputs/Output
+        不再产生。具体的业务过程注释由 LLM annotation（intent_detail）注入。
         """
-        r = self.renderer
-        lines = [
-            f"# Step: {step_id}（索引 {index + 1}/{total}）",
-            f"# Intent: {r.render_comment_text(intent)}",
-            f"# Operation: {r.render_comment_text(operation)}",
-            f"# Inputs: {r.render_comment_text(inputs)}",
-            f"# Output: {r.render_comment_text(output)}",
-        ]
-        # 每行独立清洗，末尾不加换行（由 add_step 统一管理）
-        return "\n".join(lines)
+        return f"# Step: {step_id}（索引 {index + 1}/{total}）"
 
     def _enhance_comment_with_annotation(
         self,
         comment: str,
         annotation: StepAnnotation,
     ) -> str:
-        """在已有结构性注释基础上增强——替换 Intent/Operation 文本，追加 Business 行。
+        """在 Step 头部注释后附加一句自然语言业务注释（intent_detail）。
 
-        不清空 Inputs/Output——它们由 _compile_xxx 生成，包含真实的输入输出列信息。
-        所有 LLM 来源文本必须经过 self.renderer.render_comment_text() 清洗。
-        职责分工：
-        - _build_comment_block():  结构性 5 行注释（Step / Intent / Operation / Inputs / Output）
-        - _enhance_comment_with_annotation(): LLM 语义增强（替换 Intent/Operation，追加 Business）
-
-        Args:
-            comment: _compile_xxx 返回的原结构性注释
-            annotation: StepAnnotation（LLM 语义标注）
-
-        Returns:
-            增强后的注释字符串
+        原结构化注释（Intent/Operation/Inputs/Output）不再产生，
+        Phase 8C 统一使用 intent_detail 作为每步的唯一业务过程描述。
+        所有 LLM 来源文本通过 self.renderer.render_comment_text() 清洗。
         """
         r = self.renderer
-
-        # 替换 Intent 行内容（保留 # Intent: 行前缀）
-        intent_text = (
-            annotation.intent.value
-            if hasattr(annotation.intent, "value")
-            else str(annotation.intent)
-        )
-        comment = re.sub(
-            r'^# Intent: .*$',
-            f'# Intent: {r.render_comment_text(intent_text)}',
-            comment,
-            count=1,
-            flags=re.MULTILINE,
-        )
-
-        # 替换 Operation 行内容（仅当 operation_summary 非空时）
-        if annotation.operation_summary:
-            comment = re.sub(
-                r'^# Operation: .*$',
-                f'# Operation: {r.render_comment_text(annotation.operation_summary)}',
-                comment,
-                count=1,
-                flags=re.MULTILINE,
-            )
-
-        # 在 Output 行后追加 Business 行
-        business_text = annotation.intent_detail
-        comment = re.sub(
-            r'^(# Output: .*)$',
-            rf'\1\n# Business: {r.render_comment_text(business_text)}',
-            comment,
-            count=1,
-            flags=re.MULTILINE,
-        )
-
-        return comment
+        detail = r.render_comment_text(annotation.intent_detail)
+        return f"{comment}\n# {detail}"
 
     @staticmethod
     def _verify_no_comment_injection(raw: str, annotated: str) -> None:
