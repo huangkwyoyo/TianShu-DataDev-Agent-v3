@@ -461,6 +461,8 @@ class SparkStageResponse(StrictModel):
 
     每次单阶段执行后返回当前全部阶段的状态（供前端更新指示灯），
     以及该阶段新增的 LLM 调用追踪信息。
+    result 字段包含阶段特有的结构化内容（SparkPlan 步骤/PySpark 代码/验证结果等），
+    供前端 SparkStageResultPanel 渲染。
     """
 
     request_id: str  # 回显请求的 request_id
@@ -470,3 +472,4 @@ class SparkStageResponse(StrictModel):
     errors: list[str] = []  # 错误信息
     spark_stages: list[SparkStageItem] = []  # 当前全部阶段状态
     llm_traces: dict | None = None  # 当前 request_id 的全部 LLM 追踪（LlmTraceNode dict）
+    result: dict | None = None  # 阶段特有结构化内容（SparkPlan 步骤/代码/验证报告等）

@@ -10,6 +10,7 @@ import { PackageTree } from './components/PackageTree';
 import { ErrorDisplay } from './components/ErrorDisplay';
 import { StatusBar } from './components/StatusBar';
 import { SparkStageButtons } from './components/SparkStageButtons';
+import { SparkStageResultPanel } from './components/SparkStageResultPanel';
 import { LlmTracePanel } from './components/LlmTracePanel';
 import {
   PipelineStageIndicator,
@@ -32,6 +33,7 @@ import {
   SparkStageResponse,
   LlmTraceNode,
   RunAllResponse,
+  SparkStageResult,
   TemplateFull,
 } from './api/client';
 import './App.css';
@@ -61,6 +63,9 @@ interface AppState {
   sparkStages: StageInfo[];
   sparkVerifyResult: SparkVerifyResponse | null;
 
+  // Spark 单阶段触发的产物内容（供面板展示）
+  sparkStageResult: { stage: string; result: SparkStageResult; status: string } | null;
+
   // LLM 调用追踪（各阶段累积）
   llmTraces: Record<string, LlmTraceNode> | null;
 }
@@ -80,6 +85,7 @@ export default function App() {
     packageResult: null,
     sparkStages: [],
     sparkVerifyResult: null,
+    sparkStageResult: null,
     llmTraces: null,
   });
 
@@ -100,6 +106,7 @@ export default function App() {
         planResult: null,
         executeResult: null,
         packageResult: null,
+        sparkStageResult: null,
         activePanel: null,
       });
     }
@@ -160,6 +167,7 @@ export default function App() {
         packageResult: null,
         requestId: result.request_id,
         activePanel: 'parse',
+        sparkStageResult: null,
       }),
     );
   };
@@ -178,6 +186,7 @@ export default function App() {
         packageResult: null,
         requestId: result.request_id,
         activePanel: 'plan',
+        sparkStageResult: null,
       }),
     );
   };
@@ -199,6 +208,7 @@ export default function App() {
         // 重置 Spark 状态——新的 execute 需要重新执行 Spark 阶段
         sparkStages: [],
         sparkVerifyResult: null,
+        sparkStageResult: null,
       }),
     );
   };
@@ -219,6 +229,7 @@ export default function App() {
             requestId: result.request_id,
             activePanel: 'sql' as Panel,
             llmTraces: (result as RunAllResponse).llm_traces || null,
+            sparkStageResult: null,
           };
         }
         // 管线成功——尝试获取 package
@@ -239,6 +250,7 @@ export default function App() {
             packageResult: pkg,
             requestId: result.request_id,
             activePanel: 'package' as Panel,
+            sparkStageResult: null,
             llmTraces: (result as RunAllResponse).llm_traces || null,
             // SQL 管线成功——设置全部 8 阶段为 ok，使指示灯在成功后仍然可见
             pipelineStages: [
@@ -257,6 +269,7 @@ export default function App() {
             requestId: result.request_id,
             activePanel: 'sql' as Panel,
             llmTraces: (result as RunAllResponse).llm_traces || null,
+            sparkStageResult: null,
             error: {
               error_code: 'PACKAGE_FETCH_FAILED',
               message: 'RunAll 成功但获取 Package 失败',
@@ -310,6 +323,10 @@ export default function App() {
         package_id: '',
         errors: response.errors,
       },
+      // 存储阶段产物内容（供 SparkStageResultPanel 渲染）
+      sparkStageResult: response.result
+        ? { stage: response.stage, result: response.result, status: response.status }
+        : null,
       // 合并 llm_traces——后续阶段的追踪追加到已有数据
       llmTraces: response.llm_traces
         ? { ...(state.llmTraces || {}), ...response.llm_traces }
@@ -423,6 +440,16 @@ export default function App() {
                 steps={state.planResult.steps}
                 validationPassed={state.planResult.validation_passed}
                 visible={state.activePanel === 'plan'}
+              />
+            )}
+
+            {/* Spark 单阶段结果面板——位于 SQL 面板上方，方便对比审查 */}
+            {state.sparkStageResult && (
+              <SparkStageResultPanel
+                stage={state.sparkStageResult.stage}
+                result={state.sparkStageResult.result}
+                status={state.sparkStageResult.status}
+                visible={true}
               />
             )}
 

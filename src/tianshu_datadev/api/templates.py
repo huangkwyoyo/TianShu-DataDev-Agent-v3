@@ -691,12 +691,16 @@ TEMPLATES: list[dict] = [
             "  target_grain: [维度列1, 维度列2]\n"
             '  summary: "一句话描述业务目标"\n'
             "\n"
+            "  time_range:\n"
+            '    start: "2026-01-01"  # 数据起始日期\n'
+            '    end: "2026-03-31"    # 数据截止日期（大事实表必须设定，否则触发 Q-VAL-TIME 阻塞）\n'
+            "\n"
             "  source_tables:\n"
             "    - name: gold.fact_trips      # 可用：gold.fact_trips（8032万）/ gold.fact_crashes（166万）/ gold.fact_parking_violations（958万）\n"
             "      alias: ft                  # 别名（2-4个字母）\n"
             "      row_count: ~8032万         # 实际行数：fact_trips=8032万, fact_crashes=166万, parking=958万\n"
             "      role: fact                 # fact（事实表）| dim（维度表）\n"
-            "      time_field: pickup_at      # 大事实表务必填写 time_field，否则触发 PerfValidator 全表扫描警告\n"
+            "      time_field: pickup_at      # 大事实表务必填写 time_field，配合 time_range 使用\n"
             "      key_columns:\n"
             "        - name: trip_id\n"
             "          type: varchar\n"
