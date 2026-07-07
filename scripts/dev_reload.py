@@ -303,6 +303,7 @@ def start_frontend(project_root: Path, log_dir: Path) -> subprocess.Popen:
         cwd=str(frontend_dir),
         stdout=log_fh,
         stderr=subprocess.STDOUT,
+        shell=True,  # Windows 上 npx 是 npx.cmd 批处理文件，必须 shell=True
     )
     log_fh.close()  # 子进程已通过 dup2 获得自己的 fd，可安全关闭父进程句柄
     return proc
