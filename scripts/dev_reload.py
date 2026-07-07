@@ -76,7 +76,10 @@ def parse_netstat_listeners(port: int) -> list[int]:
 
 
 def get_process_command_line(pid: int) -> str:
-    """通过 wmic 获取 Windows 进程的完整命令行。
+    """通过 wmic 或 PowerShell 获取 Windows 进程的完整命令行。
+
+    优先使用 wmic（Windows 10），不可用时回退到 PowerShell Get-CimInstance
+    （Windows 11 已弃用 wmic）。
 
     Args:
         pid: 进程 ID
@@ -84,6 +87,7 @@ def get_process_command_line(pid: int) -> str:
     Returns:
         命令行字符串；失败返回空字符串
     """
+    # 首选 wmic（Windows 10）
     try:
         out = subprocess.check_output(
             f"wmic process where ProcessId={pid} get CommandLine /format:list",
@@ -95,6 +99,23 @@ def get_process_command_line(pid: int) -> str:
                 return line.split("=", 1)[1].strip()
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError):
         pass
+
+    # 回退：PowerShell Get-CimInstance（Windows 11，wmic 已弃用）
+    try:
+        ps_cmd = (
+            "powershell -NoProfile -Command "
+            f"\"Get-CimInstance Win32_Process -Filter 'ProcessId={pid}' "
+            "| Select-Object -ExpandProperty CommandLine\""
+        )
+        out = subprocess.check_output(
+            ps_cmd, shell=True, text=True, timeout=10,
+        )
+        result = out.strip()
+        if result:
+            return result
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError):
+        pass
+
     return ""
 
 
@@ -317,6 +338,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     """入口——按 CLI 参数执行清理 + 重启 + 健康检查。"""
+    # 强制 UTF-8 输出——Windows Git Bash 默认 GBK 可能导致编码崩溃
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
     parser = build_parser()
     args = parser.parse_args()
 
@@ -351,7 +375,7 @@ def main() -> None:
         if all_errors:
             print("\n[安全闸门] 以下进程不在白名单内，拒绝终止：\n")
             for e in all_errors:
-                print(f"  ❌ {e}")
+                print(f"  [FAIL] {e}")
             print(
                 "\n请手动检查端口占用情况后重试。\n"
                 "提示：如果确认这些进程可终止，可先手动 taskkill 后再运行本脚本。"
@@ -391,9 +415,9 @@ def main() -> None:
             timeout=15.0, interval=1.0,
         )
         if backend_ok:
-            print("[验证] 后端 ✓  http://127.0.0.1:8000/api/health")
+            print("[验证] 后端 [OK]  http://127.0.0.1:8000/api/health")
         else:
-            print("[验证] 后端 ✗  健康检查超时，请检查 logs/dev/backend.log")
+            print("[验证] 后端 [FAIL]  健康检查超时，请检查 logs/dev/backend.log")
 
     if args.frontend:
         print("[验证] 等待前端就绪（超时 10s）...")
@@ -403,14 +427,14 @@ def main() -> None:
             timeout=10.0, interval=0.5,
         )
         if frontend_ok:
-            print("[验证] 前端 ✓  http://127.0.0.1:5173/")
+            print("[验证] 前端 [OK]  http://127.0.0.1:5173/")
         else:
-            print("[验证] 前端 ✗  健康检查超时，请检查 logs/dev/frontend.log")
+            print("[验证] 前端 [FAIL]  健康检查超时，请检查 logs/dev/frontend.log")
 
     # ════════ 6. 摘要 ════════
-    print("\n━━━ dev-reload 完成 ━━━")
-    print(f"  后端: {'✅' if backend_ok else '❌'} http://127.0.0.1:8000")
-    print(f"  前端: {'✅' if frontend_ok else '❌'} http://127.0.0.1:5173")
+    print("\n=== dev-reload 完成 ===")
+    print(f"  后端: {'[OK]' if backend_ok else '[FAIL]'} http://127.0.0.1:8000")
+    print(f"  前端: {'[OK]' if frontend_ok else '[FAIL]'} http://127.0.0.1:5173")
     print(f"  日志: {log_dir}")
 
     if not backend_ok or not frontend_ok:

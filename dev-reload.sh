@@ -13,5 +13,8 @@
 
 set -euo pipefail
 
+# 确保 Python 子进程使用 UTF-8 输出（Windows Git Bash 默认 GBK 会导致 emoji 编码崩溃）
+export PYTHONIOENCODING=utf-8
+
 cd "$(dirname "$0")"
 python scripts/dev_reload.py "$@"
