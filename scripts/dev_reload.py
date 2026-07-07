@@ -223,7 +223,7 @@ def wait_for_health(
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=5) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
-                headers = dict(resp.headers)
+                headers = {k.lower(): v for k, v in resp.headers.items()}
                 if check_fn(resp.status, body, headers):
                     return True
         except Exception as exc:
@@ -265,6 +265,7 @@ def start_backend(project_root: Path, log_dir: Path) -> subprocess.Popen:
         stdout=log_fh,
         stderr=subprocess.STDOUT,
     )
+    log_fh.close()  # 子进程已通过 dup2 获得自己的 fd，可安全关闭父进程句柄
     return proc
 
 
@@ -282,6 +283,7 @@ def start_frontend(project_root: Path, log_dir: Path) -> subprocess.Popen:
         stdout=log_fh,
         stderr=subprocess.STDOUT,
     )
+    log_fh.close()  # 子进程已通过 dup2 获得自己的 fd，可安全关闭父进程句柄
     return proc
 
 
@@ -290,9 +292,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     供 main() 使用，同时导出供单元测试验证参数组合。
 
-    注意：--backend 和 --frontend 使用 store_false + 反向 dest，
-    使得默认无参数时两项均为 True（全量处理），
-    传参时排除另一项。
+    注意：--backend/--frontend 使用 action="store_false" + 反向 dest 实现
+    "无参数=全量"的默认行为——默认值 store_false 使得无参数时两者均为 True。
     """
     parser = argparse.ArgumentParser(
         description="dev-reload——git pull 后重启前后端开发服务器",

@@ -6,17 +6,14 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
-
-import pytest
+from unittest.mock import patch
 
 # 将 scripts/ 加入路径以导入被测模块
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"))
-import dev_reload
+import dev_reload  # noqa: I001 — 需在 sys.path.insert 之后导入
 
 
 # ════════════════════════════════════════════
@@ -81,7 +78,10 @@ class TestCheckWhitelistBackend:
         """uvicorn + tianshu_datadev → allowed。"""
         with patch.object(
             dev_reload, "get_process_command_line",
-            return_value="python -m uvicorn tianshu_datadev.api.app:create_app --factory --host 127.0.0.1 --port 8000 --reload",
+            return_value=(
+                "python -m uvicorn tianshu_datadev.api.app:create_app "
+                "--factory --host 127.0.0.1 --port 8000 --reload"
+            ),
         ):
             allowed, reason = dev_reload.check_whitelist(12345, 8000, self.PROJECT_ROOT)
         assert allowed is True
