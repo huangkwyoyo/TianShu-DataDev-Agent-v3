@@ -2479,17 +2479,6 @@ class Pipeline:
                 ),
                 "skipped": current_status == "skipped",
             }
-                }
-            result = {
-                "type": "developer",
-                "message": (
-                    "LLM 语义标注失败"
-                    if current_status == "failed"
-                    else "LLM 语义标注阶段——未注入 SparkDeveloperService，已标记 SKIPPED"
-                ),
-                "skipped": current_status == "skipped",
-            }
-                }
 
         return {
             "request_id": request_id,
@@ -2559,12 +2548,19 @@ class Pipeline:
         from tianshu_datadev.spark.models import SparkReadStep
 
         compiler = SparkCompiler()
-        result = compiler.compile(context.spark_plan)
+
+        # ── Phase 8B: 传入 DEVELOPER 阶段的 LLM 语义标注 ──
+        step_annotations = None
+        if context.annotation_result is not None:
+            step_annotations = context.annotation_result.annotations
+
+        result = compiler.compile(context.spark_plan, annotations=step_annotations)
         context.compile_result = result
         context.stage_results["COMPILER"] = "SUCCESS"
 
         # ── 生成独立可执行脚本（wrapper 格式，含 SparkSession 引导）──
-        raw_pyspark = result.raw_pyspark
+        # ── Phase 8B: 使用 annotated_pyspark（含 LLM 业务注释）──
+        annotated_pyspark = result.annotated_pyspark
         # 提取所有 ReadStep 的 source_name
         input_names: list[str] = []
         for step in context.spark_plan.steps:
@@ -2580,8 +2576,8 @@ class Pipeline:
         wrapper_lines.append("# 以下 transform 函数由编译器自动生成")
         wrapper_lines.append("# 数据源需根据实际路径修改")
         wrapper_lines.append("")
-        # 嵌入原始 raw_pyspark（含 transform 函数）
-        for line in raw_pyspark.split("\n"):
+        # 嵌入 annotated_pyspark（含 LLM 业务注释的 transform 函数）
+        for line in annotated_pyspark.split("\n"):
             wrapper_lines.append(line)
         wrapper_lines.append("")
         wrapper_lines.append("")
@@ -2604,6 +2600,12 @@ class Pipeline:
         wrapper_lines.append("    # 2. 执行转换")
         wrapper_lines.append("    # ======================")
         wrapper_lines.append("    result = transform(inputs)")
+        wrapper_lines.append("")
+        # ── Phase 8B: 追加静态字段解读注释（仅注释块，不进可执行代码）──
+        if context.annotation_result and context.annotation_result.annotations:
+            last_ann = context.annotation_result.annotations[-1]
+            safe_detail = compiler.renderer.render_comment_text(last_ann.intent_detail)
+            wrapper_lines.append(f"    # 输出字段说明: {safe_detail}")
         wrapper_lines.append("")
         wrapper_lines.append("    # ======================")
         wrapper_lines.append("    # 3. 输出结果")
