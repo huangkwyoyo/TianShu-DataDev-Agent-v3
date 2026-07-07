@@ -98,9 +98,10 @@ class TestCheckWhitelistBackend:
         assert "12345" in reason
 
     def test_rejects_empty_command_line(self):
-        """命令行获取失败 → rejected + 说明原因。"""
+        """命令行获取失败但进程仍存活 → rejected + 说明原因。"""
         with patch.object(dev_reload, "get_process_command_line", return_value=""):
-            allowed, reason = dev_reload.check_whitelist(12345, 8000, self.PROJECT_ROOT)
+            with patch.object(dev_reload, "_process_exists", return_value=True):
+                allowed, reason = dev_reload.check_whitelist(12345, 8000, self.PROJECT_ROOT)
         assert allowed is False
         assert "无法获取" in reason
 

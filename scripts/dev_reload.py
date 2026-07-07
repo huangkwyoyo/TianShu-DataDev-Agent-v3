@@ -119,6 +119,32 @@ def get_process_command_line(pid: int) -> str:
     return ""
 
 
+def _process_exists(pid: int) -> bool:
+    """检查 PID 对应的进程是否仍然存活。
+
+    通过 PowerShell Get-Process 判断——比 wmic/CimInstance
+    更轻量，且能区分"进程不存在"和"权限不足"。
+
+    Args:
+        pid: 进程 ID
+
+    Returns:
+        True 如果进程存在
+    """
+    try:
+        subprocess.check_output(
+            f"powershell -NoProfile -Command \"Get-Process -Id {pid}\"",
+            shell=True, text=True, timeout=5,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
+    except (subprocess.TimeoutExpired, OSError):
+        # 超时或系统错误时保守返回 True（宁可拒绝也不误杀）
+        return True
+
+
 def check_whitelist(pid: int, port: int, project_root: Path) -> tuple[bool, str]:
     """检查端口上的 PID 是否在可终止白名单内。
 
@@ -137,8 +163,11 @@ def check_whitelist(pid: int, port: int, project_root: Path) -> tuple[bool, str]
     """
     cmdline = get_process_command_line(pid)
     if not cmdline:
+        # 可能是僵尸 PID（netstat 残留但进程已退出）
+        if not _process_exists(pid):
+            return True, ""  # 进程已死，视为可安全清理
         return False, (
-            f"PID {pid} 命令行无法获取（可能已退出或权限不足）"
+            f"PID {pid} 命令行无法获取（进程仍存活但权限不足）"
         )
 
     # 标准化路径分隔符（wmic 可能返回不同格式）
@@ -172,18 +201,28 @@ def check_whitelist(pid: int, port: int, project_root: Path) -> tuple[bool, str]
 def kill_process(pid: int) -> bool:
     """通过 taskkill /F 终止 Windows 进程。
 
+    进程不存在（taskkill 报"没有找到进程"）时也返回 True——
+    表示该 PID 已不存在，目标状态已达成。
+
     Args:
         pid: 进程 ID
 
     Returns:
-        是否成功终止（taskkill 返回码为 0）
+        是否成功终止（或进程本就不存在）
     """
     try:
         result = subprocess.run(
             f"taskkill /F /PID {pid}",
             shell=True, capture_output=True, text=True, timeout=10,
         )
-        return result.returncode == 0
+        # taskkill 成功（returncode 0）或进程不存在都视为成功
+        if result.returncode == 0:
+            return True
+        if result.stderr and "没有找到" in result.stderr:
+            return True  # 进程已不存在
+        if result.stdout and "没有找到" in result.stdout:
+            return True
+        return False
     except (subprocess.TimeoutExpired, OSError):
         return False
 
