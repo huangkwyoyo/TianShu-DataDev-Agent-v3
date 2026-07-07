@@ -113,7 +113,7 @@ class SparkCompiler:
 
         Args:
             plan: mapper.py 产出的 SparkPlan
-            annotations: StepAnnotation 列表（可选，Phase 6A 暂无 LLM 标注）
+            annotations: StepAnnotation 列表（可选，Phase 8B: 由 DEVELOPER 阶段产出）
 
         Returns:
             SparkCompileResult——含 raw + annotated 两个版本
@@ -129,6 +129,13 @@ class SparkCompiler:
         state.annotated_lines.append(imports)
         state.annotated_lines.append("")
         state.annotated_lines.append("")
+
+        # ── Phase 8B: 构建 step_id → StepAnnotation 映射 ──
+        ann_map: dict[str, "StepAnnotation"] = {}
+        if annotations is not None:
+            for a in annotations:
+                if hasattr(a, "step_id") and a.step_id:
+                    ann_map[a.step_id] = a
 
         for i, step in enumerate(plan.steps):
             step_type = type(step).__name__
@@ -155,6 +162,11 @@ class SparkCompiler:
                 raw, comment = self._compile_window(step, step_id, i, len(plan.steps))
             else:
                 raw, comment = self._compile_unsupported(step, step_id, "unknown")
+
+            # ── Phase 8B: 有 LLM annotation 时增强 comment ──
+            annotation = ann_map.get(step_id)
+            if annotation is not None:
+                comment = self._enhance_comment_with_annotation(comment, annotation)
 
             state.add_step(step_id, raw, comment)
 
