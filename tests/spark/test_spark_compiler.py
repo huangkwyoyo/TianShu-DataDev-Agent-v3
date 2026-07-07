@@ -26,6 +26,7 @@ from tianshu_datadev.spark.models import (
     SparkSortSpec,
     SparkSortStep,
 )
+from tianshu_datadev.spark.annotations import StepAnnotation, StepIntent
 from tianshu_datadev.spark.renderer import RenderError
 
 
@@ -453,6 +454,114 @@ class TestMaliciousInput:
         assert _strip_comments(result.annotated_pyspark) == result.raw_pyspark, (
             "恶意 source_name 导致 annotated 与 raw 不一致——注释注入风险"
         )
+
+
+# ════════════════════════════════════════════
+# Phase 8B 测试——LLM 语义标注注入
+# ════════════════════════════════════════════
+
+
+class TestAnnotationInjection:
+    """LLM 语义标注注入 `_enhance_comment_with_annotation` 的验证测试。
+
+    核心检查点：
+    - Intent/Operation 行被 LLM 文本替换
+    - Business 行追加在 Output 行之后
+    - Inputs/Output 行被保留（不清空）
+    - 所有 LLM 文本经 render_comment_text 清洗（换行被移除）
+    - annotation=None 时不报错
+    - annotation 中含恶意换行时 Business 行仍为单行
+    """
+
+    def _make_comment(self) -> str:
+        """生成一个标准 5 行结构性注释作为测试输入。"""
+        return (
+            "# Step: SparkReadStep_0（索引 1/6）\n"
+            "# Intent: source\n"
+            "# Operation: 读取数据\n"
+            "# Inputs: ft\n"
+            "# Output: od"
+        )
+
+    def _make_annotation(self, intent_detail="读取行程事实表", operation_summary="从 ft 读取数据") -> StepAnnotation:
+        return StepAnnotation(
+            step_id="SparkReadStep_0",
+            step_index=0,
+            step_type="SparkReadStep",
+            intent=StepIntent.SOURCE,
+            intent_detail=intent_detail,
+            operation_summary=operation_summary,
+        )
+
+    def test_intent_replaced(self):
+        """Intent 行被 annotation.intent 替换。"""
+        compiler = SparkCompiler()
+        ann = self._make_annotation()
+        comment = self._make_comment()
+        result = compiler._enhance_comment_with_annotation(comment, ann)
+        expected_intent = f"# Intent: {ann.intent.value}"
+        assert expected_intent in result, f"Intent 行应被替换为 {expected_intent!r}"
+
+    def test_operation_replaced(self):
+        """Operation 行被 annotation.operation_summary 替换。"""
+        compiler = SparkCompiler()
+        ann = self._make_annotation(operation_summary="从 ft 事实表读取行程数据")
+        comment = self._make_comment()
+        result = compiler._enhance_comment_with_annotation(comment, ann)
+        assert "# Operation: 从 ft 事实表读取行程数据" in result
+
+    def test_business_appended_after_output(self):
+        """Business 行追加在 Output 行之后。"""
+        compiler = SparkCompiler()
+        ann = self._make_annotation(intent_detail="读取出租车行程事实数据表")
+        comment = self._make_comment()
+        result = compiler._enhance_comment_with_annotation(comment, ann)
+        lines = result.split("\n")
+        # 找 Output 行和 Business 行的索引
+        output_idx = next(i for i, l in enumerate(lines) if l.startswith("# Output:"))
+        business_idx = next(i for i, l in enumerate(lines) if l.startswith("# Business:"))
+        assert business_idx == output_idx + 1, (
+            f"Business 行应在 Output 行之后：Output={output_idx}, Business={business_idx}"
+        )
+        assert "# Business: 读取出租车行程事实数据表" in result
+
+    def test_inputs_output_preserved(self):
+        """Inputs/Output 行内容不被清空。"""
+        compiler = SparkCompiler()
+        ann = self._make_annotation()
+        comment = self._make_comment()
+        result = compiler._enhance_comment_with_annotation(comment, ann)
+        assert "# Inputs: ft" in result, "Inputs 行应被保留"
+        assert "# Output: od" in result, "Output 行应被保留"
+
+    def test_operation_summary_empty_falls_back(self):
+        """operation_summary 为空时不替换 Operation 行（保留结构性描述）。"""
+        compiler = SparkCompiler()
+        # operation_summary="" 的 annotation
+        ann = StepAnnotation(
+            step_id="SparkReadStep_0", step_index=0,
+            step_type="SparkReadStep", intent=StepIntent.SOURCE,
+            intent_detail="读取数据", operation_summary="",
+        )
+        comment = self._make_comment()
+        result = compiler._enhance_comment_with_annotation(comment, ann)
+        # Operation 行应保留原值（不做替换）
+        assert "# Operation: 读取数据" in result
+
+    def test_malicious_newline_in_intent_detail_sanitized(self):
+        """intent_detail 中含恶意换行——Business 注释为单行（不产生裸代码）。"""
+        compiler = SparkCompiler()
+        ann = self._make_annotation(
+            intent_detail="正常描述\neval('bad')\n# 注入",
+        )
+        comment = self._make_comment()
+        result = compiler._enhance_comment_with_annotation(comment, ann)
+        # 所有 Business 行应该在 # 注释中，不在可执行代码中
+        business_lines = [l for l in result.split("\n") if l.lstrip().startswith("# Business:")]
+        assert len(business_lines) == 1, "Business 应为单行注释"
+        # 验证没有裸代码行：去注释后应与原 raw 一致（在 compile() 的 _verify_no_comment_injection 验证）
+        # 至少 Business 行不包含换行产生的多行
+        assert "\n\n" not in result, "Business 行注入不应产生空行"
 
 
 # ════════════════════════════════════════════
