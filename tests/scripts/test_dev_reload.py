@@ -113,7 +113,7 @@ class TestCheckWhitelistFrontend:
     def test_allows_vite_in_frontend_dir(self):
         """vite 且路径含 frontend → allowed。"""
         cmdline = (
-            f"node {PROJECT_ROOT / 'frontend' / 'node_modules' / '.bin' / 'vite'}"
+            f"node {self.PROJECT_ROOT / 'frontend' / 'node_modules' / '.bin' / 'vite'}"
             " --host 127.0.0.1 --port 5173"
         )
         with patch.object(dev_reload, "get_process_command_line", return_value=cmdline):
@@ -125,7 +125,7 @@ class TestCheckWhitelistFrontend:
         """node 且 cwd 在 frontend 目录 → allowed。"""
         cmdline = (
             r'C:\Program Files\nodejs\node.exe  '
-            fr'{PROJECT_ROOT}\frontend\node_modules\.bin\vite.js'
+            fr'{self.PROJECT_ROOT}\frontend\node_modules\.bin\vite.js'
         )
         with patch.object(dev_reload, "get_process_command_line", return_value=cmdline):
             allowed, reason = dev_reload.check_whitelist(22192, 5173, self.PROJECT_ROOT)
