@@ -297,10 +297,11 @@ class ResultCanonicalizer:
                 return self._KEY_SEPARATOR.join(parts)
 
             normalized_rows.sort(key=_sort_key)
-        elif not deduplicate:
-            # 无排序键且不去重——无法保证对比确定性
+        elif not deduplicate and len(normalized_rows) > 1:
+            # 无排序键且不去重且多行——无法保证对比确定性
+            # 单行结果天然确定，无需排序键
             raise CanonicalizationError(
-                "缺少排序键（order_keys）且 deduplicate=False——"
+                "缺少排序键（order_keys）且 deduplicate=False 且结果有多行——"
                 "无法保证双引擎结果对比的确定性。"
                 "请提供排序键或设置 deduplicate=True。"
             )
@@ -431,6 +432,7 @@ class PhysicalVerifier:
         snapshot_id: str,
         order_keys: list[str] | None = None,
         uncovered_step_types: list[str] | None = None,
+        duckdb_path: str | None = None,
     ) -> PhysicalVerificationReport:
         """执行双引擎物理验证。
 
@@ -443,6 +445,8 @@ class PhysicalVerifier:
             order_keys: 排序键——用于 ResultCanonicalizer 排序。
                         为 None 时尝试不排序对比（仅限单行结果）。
             uncovered_step_types: 物理验证未覆盖的 step 类型列表
+            duckdb_path: 外部 DuckDB 数据库路径——ATTACH 后自动创建
+                         gold/silver schema VIEW 桥接
 
         Returns:
             PhysicalVerificationReport——完整验证报告
@@ -471,10 +475,15 @@ class PhysicalVerifier:
             )
 
         # Step 2：DuckDB 执行 SQL
-        duckdb_result = self._execute_duckdb(sql_query, snapshot_dir)
+        duckdb_result = self._execute_duckdb(sql_query, snapshot_dir, duckdb_path=duckdb_path)
 
         # Step 3：Spark 执行 PySpark DSL
         spark_result = self._execute_spark(pyspark_code, snapshot_dir)
+
+        # 自动检测排序键：当无显式排序键时，从 DuckDB 结果列名自动提取
+        # 确保双引擎结果按相同键排序，实现确定性行级对比
+        if not order_keys and duckdb_result.output_rows:
+            order_keys = list(duckdb_result.output_rows[0].keys())
 
         # Step 4：规范化
         duckdb_rows: list[dict] = []
@@ -637,15 +646,21 @@ class PhysicalVerifier:
         self,
         sql_query: str,
         snapshot_dir: str,
+        duckdb_path: str | None = None,
     ) -> SparkExecutionResult:
         """通过 DuckDB 执行 SQL 查询——主进程内执行（轻量，无安全风险）。
 
         DuckDB 是内嵌式数据库——不需要子进程隔离。
         安全校验：_validate_select_sql 白名单——仅允许单条只读 SELECT。
 
+        数据加载顺序：
+        1. ATTACH 外部 DuckDB 数据库（如 NYC 数据仓库 gold.fact_trips）
+        2. 注册快照 Parquet 文件为视图——覆盖 ATTACH 的同名视图
+
         Args:
             sql_query: DuckDB SQL 查询
             snapshot_dir: 快照目录（用于自动发现 Parquet 文件）
+            duckdb_path: 外部 DuckDB 数据库路径——ATTACH 后自动创建 schema VIEW
 
         Returns:
             SparkExecutionResult——含输出行数据
@@ -666,7 +681,14 @@ class PhysicalVerifier:
             import duckdb
 
             con = duckdb.connect()
-            # 注册快照目录下的所有 Parquet 文件为视图
+
+            # Step 1：ATTACH 外部 DuckDB 数据库——使 gold/silver schema 表可用
+            # 先 ATTACH，后用快照 Parquet 覆盖——确保快照数据优先
+            if duckdb_path:
+                self._attach_external_database(con, duckdb_path)
+
+            # Step 2：注册快照目录下的所有 Parquet 文件为视图
+            # CREATE OR REPLACE VIEW 会覆盖 Step 1 中 ATTACH 的同名视图
             _register_parquet_views(con, snapshot_dir)
 
             result = con.execute(sql_query)
@@ -691,6 +713,61 @@ class PhysicalVerifier:
                 execution_time_ms=elapsed,
                 error_message=str(e),
             )
+
+    @staticmethod
+    def _attach_external_database(con, duckdb_path: str) -> None:
+        """ATTACH 外部 DuckDB 数据库并创建 schema + VIEW 桥接。
+
+        编译产生的 SQL 使用两段表名（如 gold.fact_trips），ATTACH 后自动
+        在默认 catalog 中创建同名 schema 和 VIEW，使两段表名可直接解析。
+
+        与 DuckDBExecutor._attach_database() 逻辑一致——确保 SQL 和
+        物理验证两个管线看到相同的表结构。
+        """
+        try:
+            alias = "_ext_db"
+            con.execute(f"ATTACH '{duckdb_path}' AS {alias} (READ_ONLY)")
+
+            # 发现所有用户 schema
+            schemas = con.execute(f"""
+                SELECT DISTINCT table_schema
+                FROM information_schema.tables
+                WHERE table_catalog = '{alias}'
+                  AND table_schema NOT IN ('information_schema', 'pg_catalog')
+            """).fetchall()
+
+            for (schema_name,) in schemas:
+                try:
+                    con.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
+                except Exception:
+                    continue
+
+                # 为该 schema 下的每张表创建 VIEW
+                tables = con.execute(f"""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_catalog = '{alias}'
+                      AND table_schema = '{schema_name}'
+                      AND table_type = 'BASE TABLE'
+                """).fetchall()
+
+                for (table_name,) in tables:
+                    try:
+                        con.execute(
+                            f"CREATE OR REPLACE VIEW {schema_name}.{table_name} AS "
+                            f"SELECT * FROM {alias}.{schema_name}.{table_name}"
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            # ATTACH 失败——记录详细信息以便排查
+            import sys
+            print(
+                f"[PhysicalVerifier] ATTACH 外部数据库失败：{e}",
+                file=sys.stderr,
+            )
+            import traceback
+            traceback.print_exc(file=sys.stderr)
 
     # ── Spark 执行 ──
 
@@ -806,10 +883,15 @@ def _register_parquet_views(duckdb_con: Any, snapshot_dir: str) -> None:
 
     对 snapshot_dir 下每个 *.parquet 文件创建视图——使用参数化查询避免 SQL 注入。
 
+    支持两种表名格式：
+    - flat name（如 fact_trips_sample）：直接创建同名视图
+    - schema 前缀（如 gold.fact_trips）：自动创建 schema，在对应 schema 下创建视图
+
     安全措施：
     1. 视图名严格校验（仅允许字母、数字、下划线，且不以数字开头）
+       支持 schema.table 格式——分别校验 schema 和 table 部分
     2. 路径穿越防护（realpath 必须位于 snapshot_dir 下）
-    3. 文件路径通过 ? 占位符绑定，不拼入 SQL 字符串
+    3. 文件路径通过字符串转义（单引号加倍），配合 realpath 校验确保安全
 
     仅在 snapshot_dir 存在且包含 .parquet 文件时才注册。
 
@@ -832,9 +914,21 @@ def _register_parquet_views(duckdb_con: Any, snapshot_dir: str) -> None:
         # 文件名去扩展名作为视图名
         view_name = filename.replace(".parquet", "")
 
-        # 严格标识符校验——SQL 标识符规范：字母/下划线开头 + 字母/数字/下划线
-        if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", view_name):
-            continue
+        # 解析 schema.table 格式——分别校验各段标识符
+        schema_name: str | None = None
+        table_name: str = view_name
+        if "." in view_name:
+            parts = view_name.split(".", 1)
+            schema_name, table_name = parts[0], parts[1]
+            # 分别校验 schema 和 table 部分——仅允许 SQL 标准标识符
+            if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", schema_name):
+                continue
+            if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", table_name):
+                continue
+        else:
+            # 严格标识符校验——SQL 标识符规范：字母/下划线开头 + 字母/数字/下划线
+            if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", view_name):
+                continue
 
         # 路径穿越防护——realpath 必须在 snapshot_dir 子树内
         try:
@@ -847,12 +941,27 @@ def _register_parquet_views(duckdb_con: Any, snapshot_dir: str) -> None:
         try:
             # 路径 SQL 转义——单引号加倍（SQL 标准），配合 realpath 校验确保安全
             escaped_path = filepath.replace("'", "''")
-            duckdb_con.execute(
-                'CREATE OR REPLACE VIEW "{name}" AS '
-                "SELECT * FROM read_parquet('{path}')".format(
-                    name=view_name, path=escaped_path,
-                ),
-            )
+            if schema_name is not None:
+                # schema.table 格式：自动创建 schema，在对应 schema 下创建视图
+                duckdb_con.execute(
+                    'CREATE SCHEMA IF NOT EXISTS "{schema}"'.format(
+                        schema=schema_name,
+                    ),
+                )
+                duckdb_con.execute(
+                    'CREATE OR REPLACE VIEW "{schema}"."{table}" AS '
+                    "SELECT * FROM read_parquet('{path}')".format(
+                        schema=schema_name, table=table_name, path=escaped_path,
+                    ),
+                )
+            else:
+                # flat name：直接创建视图（保持向后兼容）
+                duckdb_con.execute(
+                    'CREATE OR REPLACE VIEW "{name}" AS '
+                    "SELECT * FROM read_parquet('{path}')".format(
+                        name=view_name, path=escaped_path,
+                    ),
+                )
         except Exception:
             # 视图创建失败不阻断验证流程
             pass

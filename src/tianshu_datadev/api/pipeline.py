@@ -51,8 +51,8 @@ if TYPE_CHECKING:
     from tianshu_datadev.planning.relationship_hypothesis import RelationshipHypothesis
     from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan
     from tianshu_datadev.planning.sql_program import SqlProgram
-    from tianshu_datadev.spark.compiler import SparkCompileResult
     from tianshu_datadev.spark.annotations import AnnotatedSparkPlan
+    from tianshu_datadev.spark.compiler import SparkCompileResult
     from tianshu_datadev.spark.models import SparkPlan
     from tianshu_datadev.spark.plan_comparator import PlanComparisonReport
     from tianshu_datadev.spark.snapshot import SnapshotBuilder, SnapshotManifest, SnapshotSourceProvider
@@ -2232,12 +2232,99 @@ class Pipeline:
         except Exception as contract_err:
             logger.warning("Contract 抽取失败（非阻断）：%s", contract_err)
 
+        # ── 创建快照——供 PHYSICAL_VERIFIER 使用 ──
+        # 从 table_paths 的 CSV 文件生成 Parquet 快照，
+        # 使物理验证阶段能通过 _register_parquet_views 注册为 DuckDB 视图
+        snapshot_manifest = None
+        resolved_paths = self._resolve_table_paths(table_paths)
+        if resolved_paths:
+            try:
+                import os as _os
+                import tempfile as _tempfile
+
+                from tianshu_datadev.spark.snapshot import SnapshotFile
+                from tianshu_datadev.spark.snapshot import SnapshotManifest as _SnapManifest
+
+                # 计算 contract_hash——用于快照溯源
+                contract_hash = ""
+                if contract is not None:
+                    from tianshu_datadev.artifacts.models import (
+                        DataTransformContractLite as _Lite,
+                    )
+                    from tianshu_datadev.artifacts.models import (
+                        DataTransformContractV1 as _V1,  # noqa: N814
+                    )
+                    if isinstance(contract, _V1):
+                        contract_hash = _V1.compute_contract_hash(contract)
+                    elif isinstance(contract, _Lite):
+                        contract_hash = _Lite.compute_contract_hash(contract)
+
+                # 创建快照输出目录
+                snap_dir = _tempfile.mkdtemp(prefix="tianshu_snap_")
+
+                import pyarrow.csv as _pacsv
+                import pyarrow.parquet as _pq
+
+                files: list[SnapshotFile] = []
+                for table_name, csv_path in sorted(resolved_paths.items()):
+                    if not _os.path.isfile(csv_path):
+                        logger.warning("快照跳过——CSV 文件不存在：%s", csv_path)
+                        continue
+                    try:
+                        # 读取 CSV → PyArrow Table → 写入 Parquet
+                        table = _pacsv.read_csv(
+                            csv_path,
+                            read_options=_pacsv.ReadOptions(),
+                            parse_options=_pacsv.ParseOptions(),
+                        )
+                        # 文件名保留 schema 前缀（如 gold.fact_trips.parquet）
+                        parquet_path = _os.path.join(snap_dir, f"{table_name}.parquet")
+                        _pq.write_table(table, parquet_path)
+
+                        # 计算行数和文件 hash
+                        row_count = int(table.num_rows)
+                        file_sha256 = hashlib.sha256()
+                        with open(parquet_path, "rb") as _fh:
+                            for _chunk in iter(lambda: _fh.read(8192), b""):
+                                file_sha256.update(_chunk)
+
+                        files.append(SnapshotFile(
+                            source_name=table_name,
+                            file_path=parquet_path,
+                            format="parquet",
+                            row_count=row_count,
+                            file_sha256=file_sha256.hexdigest(),
+                        ))
+                    except Exception as _csv_err:
+                        logger.warning(
+                            "快照创建失败（表 %s）：%s", table_name, _csv_err,
+                        )
+                        continue
+
+                if files:
+                    # 生成确定性 snapshot_id
+                    snap_id = f"snap_{contract_hash[:16] if contract_hash else 'adhoc'}"
+                    snapshot_manifest = _SnapManifest(
+                        snapshot_id=snap_id,
+                        contract_hash=contract_hash,
+                        snapshot_dir=snap_dir,
+                        files=files,
+                        source_type="local_fixture",
+                    )
+                    logger.info(
+                        "快照创建成功——snapshot_id=%s，文件数=%d",
+                        snap_id, len(files),
+                    )
+            except Exception as snap_err:
+                logger.warning("快照创建失败（非阻断）：%s", snap_err)
+
         self._store_result(request_id, {
             "parsed_spec": spec, "manifest": manifest, "plan": plan,
             "compiled": compiled, "trace": trace, "summary": summary,
             "table_mapping": table_mapping or {},
             "contract": contract,  # 新增——供 Spark 管线使用
             "llm_traces": self._get_llm_traces(request_id),  # 新增——LLM 调用追踪
+            "snapshot_manifest": snapshot_manifest,  # 新增——供 PHYSICAL_VERIFIER 使用
         })
 
         return {
@@ -2695,12 +2782,122 @@ class Pipeline:
     ) -> None:
         """执行 PHYSICAL_VERIFIER 阶段——双引擎物理结果对比。
 
-        当前需要 Spark 运行时环境，标记 SKIPPED。
+        检测 PySpark 运行时环境：
+        - 可用时：调用 PhysicalVerifier 执行 DuckDB vs Spark 双引擎对比
+        - 不可用时：标记 SKIPPED 并记录跳过原因
         """
-        context.stage_results["PHYSICAL_VERIFIER"] = "SKIPPED"
-        context.errors.append(
-            "[PHYSICAL_VERIFIER] SKIPPED: 需要 Spark 运行时环境，当前未配置"
-        )
+        # Step 1：检查 PySpark 运行时环境
+        try:
+            import pyspark  # noqa: F401  # 检测是否已安装
+        except ImportError:
+            context.stage_results["PHYSICAL_VERIFIER"] = "SKIPPED"
+            context.errors.append(
+                "[PHYSICAL_VERIFIER] SKIPPED: PySpark 未安装——"
+                "请执行 pip install pyspark 后重试"
+            )
+            return
+
+        # Step 2：检查必要产物
+        if context.standalone_pyspark is None:
+            context.stage_results["PHYSICAL_VERIFIER"] = "SKIPPED"
+            context.errors.append(
+                "[PHYSICAL_VERIFIER] SKIPPED: 缺少 PySpark 编译产物（standalone_pyspark）——"
+                "请先执行 COMPILER 阶段"
+            )
+            return
+
+        if artifacts.compiled_sql is None:
+            context.stage_results["PHYSICAL_VERIFIER"] = "SKIPPED"
+            context.errors.append(
+                "[PHYSICAL_VERIFIER] SKIPPED: 缺少 SQL 编译产物（compiled_sql）——"
+                "请先执行 COMPILER 阶段"
+            )
+            return
+
+        # Step 3：确定快照目录
+        snapshot_dir: str | None = None
+        snapshot_id: str = ""
+        if artifacts.snapshot_manifest is not None:
+            snapshot_dir = artifacts.snapshot_manifest.snapshot_dir
+            snapshot_id = artifacts.snapshot_manifest.snapshot_id
+
+        # 无快照目录时使用临时目录——PhysicalVerifier 仍会尝试 DuckDB 端
+        if snapshot_dir is None:
+            import tempfile
+            snapshot_dir = tempfile.mkdtemp(prefix="tianshu_snap_")
+            snapshot_id = "adhoc"
+
+        # Step 4：提取排序键（从 SparkPlan 的 SortStep 中获取）
+        order_keys: list[str] = []
+        if context.spark_plan is not None:
+            for step in context.spark_plan.steps:
+                from tianshu_datadev.spark.models import SparkSortStep
+                if isinstance(step, SparkSortStep):
+                    order_keys = [col.ref_name for col in step.columns if hasattr(col, "ref_name")]
+                    break
+
+        # Step 5：获取 unsupported step types（从 Comparator 报告中继承）
+        uncovered_types: list[str] = []
+        if context.comparator_report is not None:
+            uncovered_types = list(context.comparator_report.uncovered_step_types)
+
+        # Step 6：执行双引擎物理验证
+        try:
+            from tianshu_datadev.spark.physical_verifier import PhysicalVerifier
+
+            contract_hash = ""
+            if artifacts.data_transform_contract is not None:
+                from tianshu_datadev.artifacts.models import DataTransformContractV1
+                if isinstance(artifacts.data_transform_contract, DataTransformContractV1):
+                    contract_hash = DataTransformContractV1.compute_contract_hash(
+                        artifacts.data_transform_contract
+                    )
+                else:
+                    contract_hash = hashlib.sha256(
+                        str(artifacts.data_transform_contract).encode()
+                    ).hexdigest()
+
+            sql_query = artifacts.compiled_sql.sql if hasattr(artifacts.compiled_sql, "sql") else str(artifacts.compiled_sql)
+            verifier = PhysicalVerifier()
+            report = verifier.verify(
+                sql_query=sql_query,
+                pyspark_code=context.standalone_pyspark,
+                snapshot_dir=snapshot_dir,
+                contract_hash=contract_hash,
+                snapshot_id=snapshot_id,
+                order_keys=order_keys if order_keys else None,
+                uncovered_step_types=uncovered_types if uncovered_types else None,
+                duckdb_path=self._duckdb_path,
+            )
+
+            # Step 7：判定结果
+            from tianshu_datadev.spark.physical_verifier import PhysicalVerificationStatus
+            if report.status == PhysicalVerificationStatus.RESULT_CONSISTENT:
+                context.stage_results["PHYSICAL_VERIFIER"] = "SUCCESS"
+                context.errors.append(
+                    "[PHYSICAL_VERIFIER] 物理验证通过——双引擎输出一致"
+                )
+            else:
+                context.stage_results["PHYSICAL_VERIFIER"] = "FAILURE"
+                diff_count = len(report.diffs)
+                diag_msg = (
+                    f"[PHYSICAL_VERIFIER] 物理验证未通过——"
+                    f"状态={report.status.value}，"
+                    f"差异条目数={diff_count}"
+                )
+                # 附加 report.error_message——包含 DuckDB/Spark 执行失败的详细原因
+                if report.error_message:
+                    diag_msg += f"，详情={report.error_message}"
+                # 附加 DuckDB 侧错误
+                if report.duckdb_result and report.duckdb_result.error_message:
+                    diag_msg += f"，DuckDB错误={report.duckdb_result.error_message}"
+                # 附加 Spark 侧错误
+                if report.spark_result and report.spark_result.error_message:
+                    diag_msg += f"，Spark错误={report.spark_result.error_message}"
+                context.errors.append(diag_msg)
+        except Exception as e:
+            context.stage_results["PHYSICAL_VERIFIER"] = "FAILURE"
+            context.errors.append(f"[PHYSICAL_VERIFIER] 执行异常：{e}")
 
 
 def _safe_enum_value(obj, attr: str) -> str:
@@ -2722,9 +2919,15 @@ def _summarize_step(step: "SparkStep") -> str:
     用于前端 SparkStageResultPanel 展示每个步骤的简要描述。
     """
     from tianshu_datadev.spark.models import (
-        SparkReadStep, SparkFilterStep, SparkJoinStep,
-        SparkAggregateStep, SparkProjectStep, SparkCaseWhenStep,
-        SparkWindowStep, SparkSortStep, SparkLimitStep,
+        SparkAggregateStep,
+        SparkCaseWhenStep,
+        SparkFilterStep,
+        SparkJoinStep,
+        SparkLimitStep,
+        SparkProjectStep,
+        SparkReadStep,
+        SparkSortStep,
+        SparkWindowStep,
     )
 
     if isinstance(step, SparkReadStep):

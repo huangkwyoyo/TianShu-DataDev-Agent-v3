@@ -1226,19 +1226,24 @@ class DuckDbSqlCompiler:
 
     @staticmethod
     def _render_comment_line(label: str, value: str) -> str:
-        """安全渲染单行注释——清洗控制字符、换行、注释破坏序列。
+        """安全渲染单行注释——清洗控制字符、换行、注释破坏序列、裸引号。
 
         规则：
         1. 替换 CR/LF 为空格
         2. 移除 C0 控制字符（0x00-0x1F，除 \\t 外）
         3. 连续 "--" 替换为 "- -"（防止注释提前终止）
-        4. 首尾空白 trim
-        5. 统一前缀 "-- {label}: "
+        4. 移除 ASCII 单引号 '（防止 PhysicalVerifier 的 _strip_string_literals
+           在 predicate 截断后遇到未配对引号而吞掉后续 SQL）
+        5. 首尾空白 trim
+        6. 统一前缀 "-- {label}: "
         """
         cleaned = str(value)
         cleaned = cleaned.replace("\r", " ").replace("\n", " ")
         cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", cleaned)
         cleaned = re.sub(r"--+", "- -", cleaned)
+        # 移除 ASCII 单引号——防止 predicate 截断导致未配对引号
+        # 破坏 PhysicalVerifier._strip_string_literals 状态机
+        cleaned = cleaned.replace("'", "")
         cleaned = cleaned.strip()
         return f"-- {label}: {cleaned}"
 

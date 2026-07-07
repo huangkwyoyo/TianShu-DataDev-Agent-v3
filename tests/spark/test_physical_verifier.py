@@ -152,6 +152,17 @@ class TestResultCanonicalizer:
         )
         assert len(result) == 2
 
+    def test_single_row_no_order_keys_passes(self):
+        """单行结果无排序键——天然确定，无需排序键。"""
+        canonicalizer = ResultCanonicalizer()
+        rows = [
+            {"id": "1", "val": "a"},
+        ]
+        # 单行无排序键不去重——不应抛异常
+        result = canonicalizer.canonicalize(rows, order_keys=None, deduplicate=False)
+        assert len(result) == 1
+        assert result[0]["id"] == "1"
+
 
 # ════════════════════════════════════════════
 # DuckDB 真实执行测试（需要 duckdb + pyarrow）
@@ -481,6 +492,62 @@ class TestDuckDBSecurity:
         assert result[0] == 3
         con.close()
 
+    def test_register_view_schema_table_format(self, temp_parquet_dir):
+        """schema.table 格式 Parquet → 自动创建 schema 并注册视图。"""
+        import duckdb
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        # 创建 schema.table 格式的 Parquet 文件——模拟 gold.fact_trips 场景
+        schema_table_file = "gold.fact_trips.parquet"
+        file_path = os.path.join(temp_parquet_dir, schema_table_file)
+        table = pa.table({"trip_id": ["t1", "t2"], "amount": [50, 75]})
+        pq.write_table(table, file_path)
+
+        con = duckdb.connect()
+        _register_parquet_views(con, temp_parquet_dir)
+
+        # 应能通过两段式名称查询——schema "gold" 已自动创建
+        result = con.execute(
+            'SELECT COUNT(*) FROM "gold"."fact_trips"'
+        ).fetchone()
+        assert result[0] == 2
+
+        # 验证 schema 确实存在
+        schemas = con.execute(
+            "SELECT schema_name FROM information_schema.schemata "
+            "WHERE schema_name = 'gold'"
+        ).fetchall()
+        assert len(schemas) == 1
+
+        con.close()
+        os.remove(file_path)
+
+    def test_register_view_multi_dot_skipped(self, temp_parquet_dir):
+        """多段名称（a.b.c）→ 静默跳过——仅支持 schema.table 两级。"""
+        import duckdb
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        # 创建三段式名称——非法，应被跳过
+        multi_dot_file = "a.b.c.parquet"
+        file_path = os.path.join(temp_parquet_dir, multi_dot_file)
+        table = pa.table({"id": ["1"], "val": [10]})
+        pq.write_table(table, file_path)
+
+        con = duckdb.connect()
+        _register_parquet_views(con, temp_parquet_dir)
+
+        # 三段式名称不应被注册
+        try:
+            con.execute('SELECT * FROM "a"."b"."c"')
+            pytest.fail("三段式名称不应被注册")
+        except Exception:
+            pass  # 预期：视图不存在
+
+        con.close()
+        os.remove(file_path)
+
 
 # ════════════════════════════════════════════
 # PhysicalVerifier mock 测试
@@ -622,13 +689,15 @@ class TestPhysicalVerifierWithMock:
             f"window 不应被 UNSUPPORTED_SEMANTICS 拦截，实际状态：{report.status.value}"
         )
 
-    def test_canonicalization_needed_no_order_keys(self, temp_parquet_dir):
-        """无排序键多行结果 → CANONICALIZATION_NEEDED。"""
-        rows = [
-            {"id": "1", "val": "a"},
-            {"id": "2", "val": "b"},
+    def test_auto_sort_keys_when_missing(self, temp_parquet_dir):
+        """无显式排序键 → 自动从 DuckDB 结果列名提取排序键，结果一致。"""
+        # Spark mock 返回与 DuckDB 一致的数据（无显式排序键）
+        expected_rows = [
+            {"order_id": "1", "amount": 100, "region": "east"},
+            {"order_id": "2", "amount": 200, "region": "west"},
+            {"order_id": "3", "amount": 150, "region": "east"},
         ]
-        mock_spark = _MockSparkExecutor(rows=rows)
+        mock_spark = _MockSparkExecutor(rows=expected_rows)
         verifier = PhysicalVerifier(spark_executor=mock_spark)
 
         sql = 'SELECT * FROM "order_info"'  # 无 ORDER BY
@@ -638,12 +707,40 @@ class TestPhysicalVerifierWithMock:
             sql_query=sql,
             pyspark_code=pyspark,
             snapshot_dir=temp_parquet_dir,
-            contract_hash="test_hash_abc",
-            snapshot_id="snap_test_001",
-            order_keys=None,  # 不指定排序键
+            contract_hash="test_hash_auto_sort",
+            snapshot_id="snap_test_auto_sort",
+            order_keys=None,  # 不指定排序键——应自动从 DuckDB 结果列名提取
         )
 
-        assert report.status == PhysicalVerificationStatus.CANONICALIZATION_NEEDED
+        # 自动排序后应得到一致结果
+        assert report.status == PhysicalVerificationStatus.RESULT_CONSISTENT, (
+            f"预期自动排序后 RESULT_CONSISTENT，实际 {report.status.value}。"
+            f" 错误：{report.error_message}"
+        )
+
+    def test_canonicalization_needed_no_order_keys_data_mismatch(self, temp_parquet_dir):
+        """自动排序后数据不一致 → RESULT_MISMATCH（非 CANONICALIZATION_NEEDED）。"""
+        # Spark mock 返回不同数据——自动排序后应检测到差异
+        mismatched_rows = [
+            {"order_id": "1", "amount": 999, "region": "east"},
+        ]
+        mock_spark = _MockSparkExecutor(rows=mismatched_rows)
+        verifier = PhysicalVerifier(spark_executor=mock_spark)
+
+        sql = 'SELECT * FROM "order_info"'  # 无 ORDER BY
+        pyspark = "result_df = input_df"
+
+        report = verifier.verify(
+            sql_query=sql,
+            pyspark_code=pyspark,
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_hash_mismatch",
+            snapshot_id="snap_test_mismatch",
+            order_keys=None,
+        )
+
+        # 自动排序后应检测到不一致（不再因缺少排序键而 CANONICALIZATION_NEEDED）
+        assert report.status == PhysicalVerificationStatus.RESULT_MISMATCH
 
     def test_spark_execution_error(self, temp_parquet_dir):
         """Spark 执行失败 → EXECUTION_ERROR。"""

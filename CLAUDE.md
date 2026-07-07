@@ -10,32 +10,27 @@
 - 注释应简洁明了，解释"为什么"而非"是什么"
 - 函数/类使用简短的中文 docstring 说明用途
 
-## .pyc 缓存清除
+## 服务重启规范——`./dev-reload.sh` 为唯一入口
 
-**每次修改 Python 源码并重启服务前，必须清除字节码缓存，否则旧代码可能继续生效。**
+**Windows Git Bash 环境下，Vite HMR 和 uvicorn --reload 文件监听不可靠。
+任何源码修改后如需验证效果，必须通过 `./dev-reload.sh` 重启服务。**
 
-- Python 首次导入 `.py` 时编译为 `.pyc` 存入 `__pycache__/`，后续直接加载缓存，跳过源码读取
-- 修改源码但进程仍存活、或 `.pyc` 未被覆盖时，Python 可能加载过期缓存，导致修改"看起来没生效"
-- **强制规则**：任何涉及后端（`src/`）或测试（`tests/`）的修改完成后，执行以下命令清除全项目缓存：
+### 触发条件（任一满足即执行）
 
-```bash
-find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null
-find . -name "*.pyc" -delete 2>/dev/null
-```
+- `git pull` / `git checkout` / `git merge` 后
+- 修改了 `src/` 下的 Python 源码
+- 修改了 `frontend/src/` 下的前端源码
+- 修改了 `scripts/` 下的工具脚本（如 `dev_reload.py` 本身）
+- 用户报告"前端页面没更新""修改没生效"等问题时——先执行 `./dev-reload.sh` 再排查
 
-- 服务器重启前必须先清缓存，再启动服务——顺序不可颠倒
+### 行为规则
 
-## git pull 后强制重启规范
-
-**Windows Git Bash 环境下，`git pull` 后 Vite HMR 和 uvicorn --reload
-文件监听不可靠，必须执行 `./dev-reload.sh` 确保最新代码生效。**
-
-**Agent 行为规范：**
-- `git pull` 或 `git checkout` 完成后，必须立即执行 `./dev-reload.sh`
+- **`./dev-reload.sh` 是重启的唯一入口**——禁止手动 `find ... -delete` 清 pyc、禁止手动 `taskkill`、禁止手动 `nohup uvicorn/vite`
+- 脚本自动完成：清 pyc → 识别端口 PID → 白名单校验 → 终止旧进程 → 启动新进程 → 健康检查
 - 脚本失败时不得跳过——输出包含端口、PID、命令行、日志路径，据此排查
 - 成功后直接报告结果，无需再问"需要重启吗"
 - 仅需重启一端时用 `--frontend` 或 `--backend`
-- **禁止在 `git pull` / `git checkout` 后使用 `--no-kill`**——该参数仅限手动诊断"补启动缺失服务"场景
+- **禁止使用 `--no-kill`**——该参数仅限手动诊断"补启动缺失服务"场景，正常重启必须走完整 kill→start 流程
 
 ## CodeGraph 使用策略
 

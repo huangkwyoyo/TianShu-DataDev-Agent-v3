@@ -42,14 +42,19 @@ def clean_pyc(project_root: Path) -> int:
     return count
 
 
-def parse_netstat_listeners(port: int) -> list[int]:
+def parse_netstat_listeners(port: int, validate_liveness: bool = False) -> list[int]:
     """解析 netstat -ano 输出，返回指定端口上所有 LISTENING 状态的 PID。
+
+    Windows 上 netstat 可能返回已退出进程的僵死 PID（TCP 表残留）。
+    当 validate_liveness=True 时，对每个 PID 调用 _process_exists() 过滤
+    僵死进程——这能防止脚本因 stale netstat 记录而误判"已在运行"跳过重启。
 
     Args:
         port: 目标端口号
+        validate_liveness: True 时过滤掉已不存在的进程
 
     Returns:
-        PID 列表（去重排序）
+        PID 列表（去重排序，且通过存活校验）
     """
     try:
         out = subprocess.check_output(
@@ -72,7 +77,18 @@ def parse_netstat_listeners(port: int) -> list[int]:
                 pids.append(pid)
         except ValueError:
             pass
-    return sorted(pids)
+
+    result = sorted(pids)
+
+    # 过滤僵死 PID——netstat 可能残留已退出进程的 TCP 表项
+    if validate_liveness and result:
+        alive = [p for p in result if _process_exists(p)]
+        zombies = [p for p in result if p not in alive]
+        if zombies:
+            print(f"  [检测] 端口 {port} 发现僵死 PID {zombies}（netstat 残留，已自动忽略）")
+        return alive
+
+    return result
 
 
 def get_process_command_line(pid: int) -> str:
@@ -87,11 +103,12 @@ def get_process_command_line(pid: int) -> str:
     Returns:
         命令行字符串；失败返回空字符串
     """
-    # 首选 wmic（Windows 10）
+    # 首选 wmic（Windows 10）——抑制 stderr 避免"wmic 不是内部命令"噪音
     try:
         out = subprocess.check_output(
             f"wmic process where ProcessId={pid} get CommandLine /format:list",
             shell=True, text=True, timeout=5,
+            stderr=subprocess.DEVNULL,
         )
         for line in out.splitlines():
             line = line.strip()
@@ -143,6 +160,107 @@ def _process_exists(pid: int) -> bool:
     except (subprocess.TimeoutExpired, OSError):
         # 超时或系统错误时保守返回 True（宁可拒绝也不误杀）
         return True
+
+
+def _get_process_start_time(pid: int) -> float | None:
+    """获取 Windows 进程的启动时间（Unix timestamp）。
+
+    通过 PowerShell 输出 ISO 8601 格式（ToString('o')），该格式仅含 ASCII
+    字符，不依赖系统区域设置——避免中文 Windows 上日期字符串乱码问题。
+
+    Args:
+        pid: 进程 ID
+
+    Returns:
+        进程启动时间的 Unix timestamp；失败返回 None
+    """
+    try:
+        # ISO 8601 格式（如 "2026-07-07T22:16:02.0000000+08:00"）
+        # 仅含 ASCII 字符，不受系统区域/编码影响
+        ps_cmd = (
+            "powershell -NoProfile -Command "
+            f"\"Get-Process -Id {pid} -ErrorAction SilentlyContinue | "
+            "ForEach-Object { $_.StartTime.ToString('o') }\""
+        )
+        out = subprocess.check_output(
+            ps_cmd, shell=True, text=True, timeout=10,
+            stderr=subprocess.DEVNULL,
+        )
+        dt_str = out.strip()
+        if not dt_str:
+            return None
+        # 解析 ISO 8601 格式
+        from datetime import datetime
+        try:
+            # Python 3.7+ 支持 ISO 8601 解析（含时区）
+            dt = datetime.fromisoformat(dt_str)
+            return dt.timestamp()
+        except ValueError:
+            # 降级：去掉纳秒部分重试
+            if "." in dt_str and "+" in dt_str:
+                try:
+                    main, rest = dt_str.split(".", 1)
+                    tz_pos = rest.index("+") if "+" in rest else rest.index("-")
+                    clean = main + rest[tz_pos:]
+                    dt = datetime.fromisoformat(clean)
+                    return dt.timestamp()
+                except (ValueError, IndexError):
+                    pass
+            return None
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError):
+        return None
+
+
+def _check_source_freshness(project_root: Path, pids: list[int]) -> bool:
+    """检查源码是否比运行中的服务进程更新。
+
+    若 src/ 下任何 .py 文件的 mtime 晚于所有服务进程的启动时间，
+    说明 StatReload 未能触发重载，源码修改未生效——需要强制重启。
+
+    这是 Windows Git Bash 下 uvicorn --reload 文件监听不可靠的补偿措施。
+
+    Args:
+        project_root: 项目根目录
+        pids: 当前在监听端口的存活进程 PID 列表
+
+    Returns:
+        True 如果所有进程都已加载最新源码（无需重启）
+        False 如果源码更新但进程未重载（需要强制重启）
+    """
+    if not pids:
+        return True  # 无进程在运行，谈不上"新鲜度"
+
+    # 获取 src/ 下最新 .py 文件的 mtime
+    src_dir = project_root / "src"
+    if not src_dir.is_dir():
+        return True
+
+    latest_source_mtime = 0.0
+    for py_file in src_dir.rglob("*.py"):
+        try:
+            mtime = py_file.stat().st_mtime
+            if mtime > latest_source_mtime:
+                latest_source_mtime = mtime
+        except OSError:
+            continue
+
+    if latest_source_mtime == 0.0:
+        return True  # 无源文件可检查
+
+    # 获取所有进程的启动时间，取最早的（最保守）
+    all_started_before_source = True
+    for pid in pids:
+        start_time = _get_process_start_time(pid)
+        if start_time is None:
+            # 无法获取启动时间——保守认为进程是旧的，需要重启
+            all_started_before_source = False
+            break
+        if start_time < latest_source_mtime:
+            # 进程在源码修改之前启动 → StatReload 未触发 → 旧代码在跑
+            all_started_before_source = False
+            break
+
+    return all_started_before_source
 
 
 def check_whitelist(pid: int, port: int, project_root: Path) -> tuple[bool, str]:
@@ -227,10 +345,55 @@ def kill_process(pid: int) -> bool:
         return False
 
 
+def _find_uvicorn_workers(project_root: Path) -> list[int]:
+    """查找所有属于本项目的 uvicorn worker 进程（不通过端口，通过命令行匹配）。
+
+    Windows 上 uvicorn reloader 的 worker 子进程可能不直接绑定端口，
+    导致 netstat 查不到。此函数通过扫描所有 Python 进程的命令行来补漏。
+
+    Returns:
+        应被终止的 PID 列表
+    """
+    worker_pids: list[int] = []
+    try:
+        ps_cmd = (
+            "powershell -NoProfile -Command "
+            "\"Get-CimInstance Win32_Process -Filter \\\"Name='python.exe'\\\" "
+            "| Select-Object ProcessId, CommandLine "
+            "| ForEach-Object { Write-Output \\\"$($_.ProcessId)|$($_.CommandLine)\\\" }\""
+        )
+        out = subprocess.check_output(
+            ps_cmd, shell=True, text=True, timeout=15,
+            stderr=subprocess.DEVNULL,
+        )
+        repo_name = project_root.name.lower()
+        for line in out.splitlines():
+            line = line.strip()
+            if not line or "|" not in line:
+                continue
+            try:
+                pid_str, cmdline = line.split("|", 1)
+                pid = int(pid_str.strip())
+                cmd_lower = cmdline.lower()
+                # 匹配 uvicorn worker 或本项目的 Python 进程
+                if "uvicorn" in cmd_lower and (
+                    repo_name in cmd_lower or "tianshu" in cmd_lower
+                ):
+                    worker_pids.append(pid)
+            except (ValueError, IndexError):
+                continue
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError):
+        pass
+    return worker_pids
+
+
 def stop_service(port: int, project_root: Path) -> tuple[int, list[str]]:
     """停止指定端口上的本项目 dev 进程。
 
-    流程：netstat → 获取 PID → 白名单检查 → taskkill。
+    三层清理策略（解决 Windows 上 uvicorn worker 不随 reloader 退出的问题）：
+    1. netstat LISTENING → 存活校验 → 白名单检查 → taskkill
+    2. 扫描所有 Python 进程命令行 → 匹配 uvicorn + 项目名 → taskkill
+    3. 等待后再次 netstat 确认——仍有存活 PID 则再次 taskkill
 
     Args:
         port: 目标端口
@@ -242,9 +405,12 @@ def stop_service(port: int, project_root: Path) -> tuple[int, list[str]]:
     errors: list[str] = []
     killed = 0
 
-    pids = parse_netstat_listeners(port)
-    if not pids:
-        return 0, []
+    # ════ 第 1 层：netstat 端口监听进程 ════
+    # 启用存活校验——过滤掉 Windows netstat 的僵死 TCP 表项
+    pids = parse_netstat_listeners(port, validate_liveness=True)
+    zombies = set(parse_netstat_listeners(port, validate_liveness=False)) - set(pids)
+    if zombies:
+        print(f"  [检测] 端口 {port} 发现僵死 PID {sorted(zombies)}（netstat 残留，已自动忽略）")
 
     for pid in pids:
         allowed, reason = check_whitelist(pid, port, project_root)
@@ -255,6 +421,32 @@ def stop_service(port: int, project_root: Path) -> tuple[int, list[str]]:
             killed += 1
         else:
             errors.append(f"终止 PID {pid} 失败（taskkill 返回非零）")
+
+    # ════ 第 2 层：扫描 uvicorn worker 进程 ════
+    # uvicorn reloader 的 worker 子进程可能不直接出现在 netstat 中
+    # 但它们的命令行包含 "uvicorn" 和项目名
+    worker_pids = _find_uvicorn_workers(project_root)
+    for pid in worker_pids:
+        if pid in pids:
+            continue  # 已处理过
+        if kill_process(pid):
+            killed += 1
+        else:
+            errors.append(f"终止 worker PID {pid} 失败（taskkill 返回非零）")
+
+    # ════ 第 3 层：二次验证——等待后重新检查端口 ════
+    if killed > 0:
+        time.sleep(1.0)
+        remaining = parse_netstat_listeners(port, validate_liveness=True)
+        for pid in remaining:
+            allowed, reason = check_whitelist(pid, port, project_root)
+            if not allowed:
+                errors.append(reason)
+                continue
+            if kill_process(pid):
+                killed += 1
+            else:
+                errors.append(f"终止残留 PID {pid} 失败（taskkill 返回非零）")
 
     return killed, errors
 
@@ -393,10 +585,6 @@ def main() -> None:
     log_dir = project_root / "logs" / "dev"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    # ════════ 1. 清理 .pyc 缓存 ════════
-    n = clean_pyc(project_root)
-    print(f"[清理] 已删除 {n} 个 __pycache__ / *.pyc 文件")
-
     # ════════ 2-3. 识别 + 终止旧进程 ════════
     if not args.no_kill:
         all_errors: list[str] = []
@@ -426,22 +614,82 @@ def main() -> None:
     if not args.no_kill:
         time.sleep(1.5)
 
+    # ════════ 清理 .pyc 缓存 ════════
+    # 必须在进程终止后运行——旧进程可能锁定 __pycache__ 文件导致 rmtree 静默失败
+    n = clean_pyc(project_root)
+    print(f"[清理] 已删除 {n} 个 __pycache__ / *.pyc 文件")
+
     # ════════ 4. 启动服务 ════════
     backend_ok = True
     frontend_ok = True
 
     if args.backend:
-        existing = parse_netstat_listeners(8000)
+        # 用存活校验读取端口占用——过滤僵死 PID（netstat TCP 表残留）
+        existing = parse_netstat_listeners(8000, validate_liveness=True)
         if existing:
-            print(f"[跳过] 后端已在端口 8000 运行 (PID {existing})")
+            # 检查源码新鲜度——补偿 Windows 下 StatReload 文件监听不可靠
+            if not args.no_kill and not _check_source_freshness(project_root, existing):
+                print(
+                    "[检测] 后端源码已更新但进程未重载"
+                    "（Windows StatReload 限制），强制重启..."
+                )
+                # 终止旧进程后重新启动
+                killed_count = 0
+                for pid in existing:
+                    if kill_process(pid):
+                        killed_count += 1
+                if killed_count > 0:
+                    print(f"  [终止] 强制终止 {killed_count} 个过期进程")
+                    time.sleep(1.5)
+                proc = start_backend(project_root, log_dir)
+                print(f"[启动] 后端 PID {proc.pid}，日志 → {log_dir / 'backend.log'}")
+            else:
+                if args.no_kill and not _check_source_freshness(project_root, existing):
+                    print(
+                        "[警告] 后端源码已更新但进程未重载——"
+                        "当前运行的是旧代码！建议去掉 --no-kill 重新执行。"
+                    )
+                print(f"[跳过] 后端已在端口 8000 运行 (PID {existing})")
         else:
             proc = start_backend(project_root, log_dir)
             print(f"[启动] 后端 PID {proc.pid}，日志 → {log_dir / 'backend.log'}")
 
     if args.frontend:
-        existing = parse_netstat_listeners(5173)
+        existing = parse_netstat_listeners(5173, validate_liveness=True)
         if existing:
-            print(f"[跳过] 前端已在端口 5173 运行 (PID {existing})")
+            need_restart = False
+            if not args.no_kill:
+                # 前端源码新鲜度——检查 frontend/src/ 目录
+                frontend_src = project_root / "frontend" / "src"
+                if frontend_src.is_dir():
+                    latest_fe_mtime = 0.0
+                    for f in frontend_src.rglob("*"):
+                        if not f.is_file():
+                            continue
+                        try:
+                            mtime = f.stat().st_mtime
+                            if mtime > latest_fe_mtime:
+                                latest_fe_mtime = mtime
+                        except OSError:
+                            continue
+                    if latest_fe_mtime > 0.0:
+                        for pid in existing:
+                            start_time = _get_process_start_time(pid)
+                            if start_time is not None and start_time < latest_fe_mtime:
+                                need_restart = True
+                                break
+            if need_restart:
+                print(
+                    "[检测] 前端源码已更新但进程未重载"
+                    "（Windows HMR 限制），强制重启..."
+                )
+                for pid in existing:
+                    kill_process(pid)
+                time.sleep(1.5)
+                proc = start_frontend(project_root, log_dir)
+                print(f"[启动] 前端 PID {proc.pid}，日志 → {log_dir / 'frontend.log'}")
+            else:
+                print(f"[跳过] 前端已在端口 5173 运行 (PID {existing})")
         else:
             proc = start_frontend(project_root, log_dir)
             print(f"[启动] 前端 PID {proc.pid}，日志 → {log_dir / 'frontend.log'}")
