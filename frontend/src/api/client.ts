@@ -423,7 +423,6 @@ export interface SparkStageResult {
   uncovered_step_types?: string[];
   errors?: string[];
   skipped?: boolean;  // true 表示该阶段因环境/配置原因被跳过
-
   // ── Phase 8: DEVELOPER 阶段标注输出 ──
   annotations?: {
     step_id: string;
