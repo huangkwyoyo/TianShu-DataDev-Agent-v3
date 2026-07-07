@@ -309,7 +309,10 @@ class SparkCompiler:
             step.input_alias, "FilterStep.input_alias"
         )
         op = step.operator.upper()
-        col_ref = self.renderer.render_column(step.left)
+        # 剥离表前缀——filter() 上下文中 DataFrame 已提供作用域
+        # "ft.pickup_at" → "pickup_at"，F.col() 不支持表名.列名语法
+        pure_column = step.left.split(".", 1)[-1] if "." in step.left else step.left
+        col_ref = self.renderer.render_column(pure_column)
 
         # 生成输出别名
         out_alias = f"_f{index}"

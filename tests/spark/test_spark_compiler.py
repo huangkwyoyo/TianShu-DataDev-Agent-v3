@@ -103,7 +103,8 @@ class TestCompileFilter:
 
         assert "od = inputs[" in result.raw_pyspark
         assert ".filter(" in result.raw_pyspark
-        assert 'F.col("od.order_status")' in result.raw_pyspark
+        # F.col() 只接受纯列名，filter 上下文剥离了表前缀 "od."
+        assert 'F.col("order_status")' in result.raw_pyspark
         assert "==" in result.raw_pyspark
         assert "'paid'" in result.raw_pyspark
 
