@@ -10,6 +10,21 @@
 - 注释应简洁明了，解释"为什么"而非"是什么"
 - 函数/类使用简短的中文 docstring 说明用途
 
+## .pyc 缓存清除
+
+**每次修改 Python 源码并重启服务前，必须清除字节码缓存，否则旧代码可能继续生效。**
+
+- Python 首次导入 `.py` 时编译为 `.pyc` 存入 `__pycache__/`，后续直接加载缓存，跳过源码读取
+- 修改源码但进程仍存活、或 `.pyc` 未被覆盖时，Python 可能加载过期缓存，导致修改"看起来没生效"
+- **强制规则**：任何涉及后端（`src/`）或测试（`tests/`）的修改完成后，执行以下命令清除全项目缓存：
+
+```bash
+find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null
+find . -name "*.pyc" -delete 2>/dev/null
+```
+
+- 服务器重启前必须先清缓存，再启动服务——顺序不可颠倒
+
 ## CodeGraph 使用策略
 
 **前置条件：仅当 `.codegraph/` 目录存在且 `codegraph_explore` MCP 工具可用时才启用。**
