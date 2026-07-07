@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 
 from tianshu_datadev.spark.models import (
@@ -23,6 +24,7 @@ from tianshu_datadev.spark.models import (
     SparkWindowStep,
 )
 from tianshu_datadev.spark.renderer import RenderError, SparkCodeRenderer
+from tianshu_datadev.spark.annotations import StepAnnotation
 
 # ════════════════════════════════════════════
 # 编译结果
@@ -790,6 +792,64 @@ class SparkCompiler:
         ]
         # 每行独立清洗，末尾不加换行（由 add_step 统一管理）
         return "\n".join(lines)
+
+    def _enhance_comment_with_annotation(
+        self,
+        comment: str,
+        annotation: StepAnnotation,
+    ) -> str:
+        """在已有结构性注释基础上增强——替换 Intent/Operation 文本，追加 Business 行。
+
+        不清空 Inputs/Output——它们由 _compile_xxx 生成，包含真实的输入输出列信息。
+        所有 LLM 来源文本必须经过 self.renderer.render_comment_text() 清洗。
+        职责分工：
+        - _build_comment_block():  结构性 5 行注释（Step / Intent / Operation / Inputs / Output）
+        - _enhance_comment_with_annotation(): LLM 语义增强（替换 Intent/Operation，追加 Business）
+
+        Args:
+            comment: _compile_xxx 返回的原结构性注释
+            annotation: StepAnnotation（LLM 语义标注）
+
+        Returns:
+            增强后的注释字符串
+        """
+        r = self.renderer
+
+        # 替换 Intent 行内容（保留 # Intent: 行前缀）
+        intent_text = (
+            annotation.intent.value
+            if hasattr(annotation.intent, "value")
+            else str(annotation.intent)
+        )
+        comment = re.sub(
+            r'^# Intent: .*$',
+            f'# Intent: {r.render_comment_text(intent_text)}',
+            comment,
+            count=1,
+            flags=re.MULTILINE,
+        )
+
+        # 替换 Operation 行内容（仅当 operation_summary 非空时）
+        if annotation.operation_summary:
+            comment = re.sub(
+                r'^# Operation: .*$',
+                f'# Operation: {r.render_comment_text(annotation.operation_summary)}',
+                comment,
+                count=1,
+                flags=re.MULTILINE,
+            )
+
+        # 在 Output 行后追加 Business 行
+        business_text = annotation.intent_detail
+        comment = re.sub(
+            r'^(# Output: .*)$',
+            rf'\1\n# Business: {r.render_comment_text(business_text)}',
+            comment,
+            count=1,
+            flags=re.MULTILINE,
+        )
+
+        return comment
 
     @staticmethod
     def _verify_no_comment_injection(raw: str, annotated: str) -> None:
