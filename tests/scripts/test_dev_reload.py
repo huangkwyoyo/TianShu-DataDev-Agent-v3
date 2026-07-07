@@ -75,7 +75,7 @@ Active Connections
 class TestCheckWhitelistBackend:
     """端口 8000 白名单：命令行必须含 uvicorn 且含 tianshu_datadev。"""
 
-    PROJECT_ROOT = Path("D:/Project/TianShu-DataDev-Agent-v3")
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
     def test_allows_uvicorn_with_tianshu(self):
         """uvicorn + tianshu_datadev → allowed。"""
@@ -108,12 +108,12 @@ class TestCheckWhitelistBackend:
 class TestCheckWhitelistFrontend:
     """端口 5173 白名单：vite/npm/node 且路径在项目 frontend/ 目录。"""
 
-    PROJECT_ROOT = Path("D:/Project/TianShu-DataDev-Agent-v3")
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
     def test_allows_vite_in_frontend_dir(self):
         """vite 且路径含 frontend → allowed。"""
         cmdline = (
-            "node D:\\Project\\TianShu-DataDev-Agent-v3\\frontend\\node_modules\\.bin\\vite"
+            f"node {PROJECT_ROOT / 'frontend' / 'node_modules' / '.bin' / 'vite'}"
             " --host 127.0.0.1 --port 5173"
         )
         with patch.object(dev_reload, "get_process_command_line", return_value=cmdline):
@@ -125,7 +125,7 @@ class TestCheckWhitelistFrontend:
         """node 且 cwd 在 frontend 目录 → allowed。"""
         cmdline = (
             r'C:\Program Files\nodejs\node.exe  '
-            r'D:\Project\TianShu-DataDev-Agent-v3\frontend\node_modules\.bin\vite.js'
+            fr'{PROJECT_ROOT}\frontend\node_modules\.bin\vite.js'
         )
         with patch.object(dev_reload, "get_process_command_line", return_value=cmdline):
             allowed, reason = dev_reload.check_whitelist(22192, 5173, self.PROJECT_ROOT)
@@ -148,12 +148,13 @@ class TestCheckWhitelistFrontend:
         ):
             allowed, reason = dev_reload.check_whitelist(22192, 5173, self.PROJECT_ROOT)
         assert allowed is False
+        assert "5173" in reason
 
 
 class TestCheckWhitelistUnknownPort:
     """未知端口一律拒绝。"""
 
-    PROJECT_ROOT = Path("D:/Project/TianShu-DataDev-Agent-v3")
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
     def test_rejects_unknown_port(self):
         """端口 3000 不在白名单中 → rejected。"""
@@ -260,7 +261,7 @@ class TestCliArgs:
 class TestStopServiceRejectsUnknown:
     """stop_service 遇到白名单外进程 → 返回 errors 而非崩溃。"""
 
-    PROJECT_ROOT = Path("D:/Project/TianShu-DataDev-Agent-v3")
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
     def test_reports_unknown_as_error(self):
         """白名单外进程 → killed=0，errors 非空。"""
