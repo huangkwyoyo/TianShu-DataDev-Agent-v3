@@ -1,0 +1,251 @@
+/* ── SparkStageResultPanel ── */
+
+.spark-stage-result {
+  padding: 0;
+}
+
+.spark-stage-result .panel-header {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.spark-stage-result .spark-stage-id {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-left: 8px;
+}
+
+.spark-stage-result .skipped-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: #fef7e0;
+  color: #e37400;
+  margin-left: 8px;
+}
+
+/* 跳过态面板边框呈黄色 */
+.spark-stage-result.stage-skipped {
+  border-left: 3px solid #e37400;
+}
+
+/* 概览统计条 */
+.spark-plan-summary {
+  padding: 8px 14px;
+  background: var(--bg-subtle);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.spark-plan-summary .stat-label {
+  color: var(--text-muted);
+  margin-right: 2px;
+}
+
+.spark-plan-summary .stat-value {
+  font-weight: 600;
+  color: var(--text);
+  margin-right: 12px;
+}
+
+/* 步骤表格 */
+.spark-step-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.spark-step-table th {
+  text-align: left;
+  padding: 6px 14px;
+  font-size: 11px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--panel-border);
+  background: var(--bg-subtle);
+  font-weight: 600;
+}
+
+.spark-step-table td {
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--panel-border);
+  vertical-align: top;
+}
+
+.spark-step-table .step-idx {
+  width: 32px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.spark-step-table .step-desc {
+  font-size: 12px;
+}
+
+.step-type-badge {
+  display: inline-block;
+  background: var(--accent-bg, #e8f0fe);
+  color: var(--accent, #1a73e8);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+/* 代码标签切换 */
+.spark-code-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--panel-border);
+  background: var(--bg-subtle);
+}
+
+.spark-code-tab {
+  padding: 6px 14px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+  border-bottom: 2px solid transparent;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.spark-code-tab:hover {
+  color: var(--text);
+  background: var(--bg-hover, rgba(0,0,0,0.03));
+}
+
+.spark-code-tab.active {
+  color: var(--accent, #1a73e8);
+  border-bottom-color: var(--accent, #1a73e8);
+  background: transparent;
+}
+
+/* PySpark 代码块 */
+.pyspark-code-block {
+  background: #1e1e2e;
+  color: #cdd6f4;
+  font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 14px;
+  margin: 0;
+  overflow-x: auto;
+  white-space: pre;
+  max-height: 500px;
+  overflow-y: auto;
+}
+
+.pyspark-code-block code {
+  font-family: inherit;
+}
+
+/* 验证结果徽章 */
+.validator-badge {
+  display: inline-block;
+  padding: 6px 14px;
+  margin: 10px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  border-radius: 4px;
+}
+
+.validator-badge.valid {
+  background: #e6f4ea;
+  color: #1e7e34;
+}
+
+.validator-badge.invalid {
+  background: #fce8e6;
+  color: #c5221f;
+}
+
+/* 对比结论徽章 */
+.verdict-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.verdict-badge.equiv {
+  background: #e6f4ea;
+  color: #1e7e34;
+}
+
+.verdict-badge.mismatch {
+  background: #fce8e6;
+  color: #c5221f;
+}
+
+/* 错误列表 */
+.spark-result-errors {
+  padding: 10px 14px;
+}
+
+.error-title {
+  color: #c5221f;
+  font-weight: 600;
+  margin: 0 0 6px;
+}
+
+.error-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.error-list li {
+  margin-bottom: 3px;
+}
+
+/* 跳过提示 */
+.spark-result-skipped {
+  padding: 14px;
+  font-size: 13px;
+  color: var(--text-muted);
+  background: var(--bg-subtle);
+  border-radius: 4px;
+  margin: 10px 14px;
+}
+
+/* 信息消息 */
+.spark-result-message {
+  padding: 14px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+/* 备注说明 */
+.spark-result-note {
+  padding: 8px 14px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+  margin: 0;
+}
+
+/* ── Phase 8: LLM 标注意图分类标签 ── */
+.intent-badge {
+  display: inline-block;
+  background: #e8f0fe;
+  color: #1a73e8;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+}
