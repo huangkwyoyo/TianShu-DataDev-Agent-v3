@@ -25,6 +25,18 @@ find . -name "*.pyc" -delete 2>/dev/null
 
 - 服务器重启前必须先清缓存，再启动服务——顺序不可颠倒
 
+## git pull 后强制重启规范
+
+**Windows Git Bash 环境下，`git pull` 后 Vite HMR 和 uvicorn --reload
+文件监听不可靠，必须执行 `./dev-reload.sh` 确保最新代码生效。**
+
+**Agent 行为规范：**
+- `git pull` 或 `git checkout` 完成后，必须立即执行 `./dev-reload.sh`
+- 脚本失败时不得跳过——输出包含端口、PID、命令行、日志路径，据此排查
+- 成功后直接报告结果，无需再问"需要重启吗"
+- 仅需重启一端时用 `--frontend` 或 `--backend`
+- **禁止在 `git pull` / `git checkout` 后使用 `--no-kill`**——该参数仅限手动诊断"补启动缺失服务"场景
+
 ## CodeGraph 使用策略
 
 **前置条件：仅当 `.codegraph/` 目录存在且 `codegraph_explore` MCP 工具可用时才启用。**
