@@ -196,8 +196,9 @@ class SparkCodeRenderer:
         """渲染过滤条件右值——列引用走 render_column()，字面量经安全扫描后返回。
 
         规则：
-        1. 含 "." 且不含引号 → 列引用，委托 render_column()
-        2. 其他 → 预格式化表达式，安全扫描后通过（拒绝危险模式和控制字符）
+        1. SqlLiteral 内部类型 → 提取 value 转为纯 Python 字符串（Phase 8C）
+        2. 含 "." 且不含引号 → 列引用，委托 render_column()
+        3. 其他 → 预格式化表达式，安全扫描后通过（拒绝危险模式和控制字符）
 
         Args:
             value: 过滤条件右值字符串
@@ -208,6 +209,19 @@ class SparkCodeRenderer:
         Raises:
             RenderError: 检测到危险内容或格式异常
         """
+        # Phase 8C: SqlLiteral 是编译器内部类型，在生成代码中必须转为纯字符串
+        # 匹配 SqlLiteral(value='...', is_sql_expr=...) → '...'
+        value = re.sub(
+            r"SqlLiteral\(value='([^']*)', is_sql_expr=(?:True|False)\)",
+            r"'\1'",
+            value,
+        )
+        # 处理值中可能含双引号的情况
+        value = re.sub(
+            r'SqlLiteral\(value="([^"]*)", is_sql_expr=(?:True|False)\)',
+            r"'\1'",
+            value,
+        )
         # 列引用检测——含点号且不含任何引号
         if "." in value and "'" not in value and '"' not in value:
             return SparkCodeRenderer.render_column(value)
@@ -506,6 +520,6 @@ class SparkCodeRenderer:
         return (
             "def transform(\n"
             "    inputs: Mapping[str, DataFrame],\n"
-            "    params: TransformParams | None = None,\n"
+            "    params: dict | None = None,\n"
             ") -> DataFrame:"
         )

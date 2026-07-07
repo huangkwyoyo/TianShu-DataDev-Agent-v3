@@ -61,6 +61,8 @@ class _CompileState:
     # 追踪每个 step 的输出变量名
     output_var_map: dict[int, str] = field(default_factory=dict)
     step_counter: int = 0
+    # Phase 8C: 别名追踪——前序步骤的输出变量映射，用于串联数据流
+    latest_alias: dict[str, str] = field(default_factory=dict)
 
     def next_step_id(self, step_type: str) -> str:
         """生成下一个 step_id。"""
@@ -146,25 +148,39 @@ class SparkCompiler:
             step_type = type(step).__name__
             step_id = state.next_step_id(step_type)
 
-            # 分发到具体的编译方法
+            # Phase 8C: 解析别名——前序步骤已产生的输出变量替换原始输入别名
+            resolved_input = state.latest_alias.get(getattr(step, "input_alias", ""))
+            resolved_left = state.latest_alias.get(getattr(step, "left_alias", ""))
+            resolved_right = state.latest_alias.get(getattr(step, "right_alias", ""))
+
+            # 分发到具体的编译方法（传入已解析的别名）
             if isinstance(step, SparkReadStep):
                 raw, comment = self._compile_read(step, step_id, i, len(plan.steps))
             elif isinstance(step, SparkFilterStep):
-                raw, comment = self._compile_filter(step, step_id, i, len(plan.steps))
+                raw, comment = self._compile_filter(step, step_id, i, len(plan.steps),
+                                                     resolved_input_alias=resolved_input)
             elif isinstance(step, SparkProjectStep):
-                raw, comment = self._compile_project(step, step_id, i, len(plan.steps))
+                raw, comment = self._compile_project(step, step_id, i, len(plan.steps),
+                                                      resolved_input_alias=resolved_input)
             elif isinstance(step, SparkSortStep):
-                raw, comment = self._compile_sort(step, step_id, i, len(plan.steps))
+                raw, comment = self._compile_sort(step, step_id, i, len(plan.steps),
+                                                   resolved_input_alias=resolved_input)
             elif isinstance(step, SparkLimitStep):
-                raw, comment = self._compile_limit(step, step_id, i, len(plan.steps))
+                raw, comment = self._compile_limit(step, step_id, i, len(plan.steps),
+                                                    resolved_input_alias=resolved_input)
             elif isinstance(step, SparkJoinStep):
-                raw, comment = self._compile_join(step, step_id, i, len(plan.steps))
+                raw, comment = self._compile_join(step, step_id, i, len(plan.steps),
+                                                   resolved_left=resolved_left,
+                                                   resolved_right=resolved_right)
             elif isinstance(step, SparkAggregateStep):
-                raw, comment = self._compile_aggregate(step, step_id, i, len(plan.steps))
+                raw, comment = self._compile_aggregate(step, step_id, i, len(plan.steps),
+                                                        resolved_input_alias=resolved_input)
             elif isinstance(step, SparkCaseWhenStep):
-                raw, comment = self._compile_case_when(step, step_id, i, len(plan.steps))
+                raw, comment = self._compile_case_when(step, step_id, i, len(plan.steps),
+                                                        resolved_input_alias=resolved_input)
             elif isinstance(step, SparkWindowStep):
-                raw, comment = self._compile_window(step, step_id, i, len(plan.steps))
+                raw, comment = self._compile_window(step, step_id, i, len(plan.steps),
+                                                     resolved_input_alias=resolved_input)
             else:
                 raw, comment = self._compile_unsupported(step, step_id, "unknown")
 
@@ -174,6 +190,34 @@ class SparkCompiler:
                 comment = self._enhance_comment_with_annotation(comment, annotation)
 
             state.add_step(step_id, raw, comment)
+
+            # Phase 8C: 更新别名追踪——后续步骤使用当前步骤的输出变量
+            out_alias = raw.split(" = ", 1)[0].strip()
+            if isinstance(step, SparkReadStep):
+                # ReadStep 引入新别名（如 ft, tz）
+                if not out_alias.startswith("#"):  # 跳过 UNSUPPORTED
+                    state.latest_alias[step.alias] = out_alias
+            elif isinstance(step, (SparkFilterStep, SparkProjectStep,
+                                   SparkSortStep, SparkLimitStep,
+                                   SparkAggregateStep, SparkCaseWhenStep,
+                                   SparkWindowStep)):
+                if not out_alias.startswith("#"):
+                    state.latest_alias[step.input_alias] = out_alias
+            elif isinstance(step, SparkJoinStep):
+                if not out_alias.startswith("#"):
+                    state.latest_alias[step.left_alias] = out_alias
+
+        # Phase 8C: 最后一个步骤的输出变量作为 return 值
+        last_var = state.latest_alias.get(
+            getattr(plan.steps[-1], "input_alias", "") if not isinstance(plan.steps[-1], SparkReadStep) else "",
+            ""
+        )
+        if not last_var:
+            # 尝试从最后一行 raw 代码提取输出变量
+            for line in reversed(state.raw_lines):
+                if "=" in line and not line.strip().startswith("#"):
+                    last_var = line.split("=", 1)[0].strip()
+                    break
 
         # 组装函数体
         body_raw = "\n".join(f"    {line}" for line in state.raw_lines[3:])  # 跳过导入
@@ -188,6 +232,11 @@ class SparkCompiler:
             body_annotated = f"{indented_comments}\n{code}"
         else:
             body_annotated = "\n".join(f"    {line}" for line in state.annotated_lines[3:])
+
+        # Phase 8C: 追加 return 语句
+        if last_var:
+            body_raw += f"\n    return {last_var}"
+            body_annotated += f"\n    return {last_var}"
 
         raw_pyspark = (
             f"{imports}\n\n\n"
@@ -249,12 +298,14 @@ class SparkCompiler:
 
     def _compile_filter(
         self, step: SparkFilterStep, step_id: str, index: int, total: int,
+        resolved_input_alias: str | None = None,
     ) -> tuple[str, str]:
         """编译 FilterStep → {out} = {input}.filter(...)。
 
         操作符从白名单映射到 Python 操作符。
+        resolved_input_alias: 前序步骤的输出别名（如 _f2），用于串联数据流。
         """
-        input_alias = self.renderer.validate_identifier(
+        input_alias = resolved_input_alias or self.renderer.validate_identifier(
             step.input_alias, "FilterStep.input_alias"
         )
         op = step.operator.upper()
@@ -277,7 +328,13 @@ class SparkCompiler:
             cond = f"~{col_ref}.isin({right_str})"
         elif op == "BETWEEN":
             right_str = self.renderer.render_filter_right(step.right)
-            cond = f"{col_ref}.between({right_str})"
+            # Phase 8C: BETWEEN 需要两个独立参数，不是列表
+            # right_str 格式为 "['v1', 'v2']"，提取两个值
+            vals = re.findall(r"'([^']*)'", right_str)
+            if len(vals) == 2:
+                cond = f"{col_ref}.between('{vals[0]}', '{vals[1]}')"
+            else:
+                cond = f"{col_ref}.between({right_str})"
         elif op == "LIKE":
             right_str = self.renderer.render_filter_right(step.right)
             cond = f"{col_ref}.like({right_str})"
@@ -299,9 +356,10 @@ class SparkCompiler:
 
     def _compile_project(
         self, step: SparkProjectStep, step_id: str, index: int, total: int,
+        resolved_input_alias: str | None = None,
     ) -> tuple[str, str]:
         """编译 ProjectStep → {out} = {input}.select(...)。"""
-        input_alias = self.renderer.validate_identifier(
+        input_alias = resolved_input_alias or self.renderer.validate_identifier(
             step.input_alias, "ProjectStep.input_alias"
         )
         out_alias = f"_p{index}"
@@ -334,9 +392,10 @@ class SparkCompiler:
 
     def _compile_sort(
         self, step: SparkSortStep, step_id: str, index: int, total: int,
+        resolved_input_alias: str | None = None,
     ) -> tuple[str, str]:
         """编译 SortStep → {out} = {input}.orderBy(*[...])。"""
-        input_alias = self.renderer.validate_identifier(
+        input_alias = resolved_input_alias or self.renderer.validate_identifier(
             step.input_alias or f"_p{index - 1}", "SortStep.input_alias"
         )
         out_alias = f"_s{index}"
@@ -366,9 +425,10 @@ class SparkCompiler:
 
     def _compile_limit(
         self, step: SparkLimitStep, step_id: str, index: int, total: int,
+        resolved_input_alias: str | None = None,
     ) -> tuple[str, str]:
         """编译 LimitStep → {out} = {input}.limit({n})。"""
-        input_alias = self.renderer.validate_identifier(
+        input_alias = resolved_input_alias or self.renderer.validate_identifier(
             step.input_alias or f"_s{index - 1}", "LimitStep.input_alias"
         )
         out_alias = f"_l{index}"
@@ -386,22 +446,24 @@ class SparkCompiler:
 
     def _compile_join(
         self, step: SparkJoinStep, step_id: str, index: int, total: int,
+        resolved_left: str | None = None, resolved_right: str | None = None,
     ) -> tuple[str, str]:
         """编译 JoinStep → {out} = {left}.join({right}, on=..., how=...)。
 
         Join 键使用 df["col"] 语法消除同名列歧义。
+        resolved_left/right: 前序步骤的输出别名，用于串联数据流。
         """
-        left = self.renderer.validate_identifier(
+        left = resolved_left or self.renderer.validate_identifier(
             step.left_alias, "JoinStep.left_alias"
         )
-        right = self.renderer.validate_identifier(
+        right = resolved_right or self.renderer.validate_identifier(
             step.right_alias, "JoinStep.right_alias"
         )
         out_alias = f"_j{index}"
 
-        # Join 条件——使用 df["col"] 语法避免同名歧义
-        left_key_ref = self.renderer.render_join_key(step.left_alias, step.left_key)
-        right_key_ref = self.renderer.render_join_key(step.right_alias, step.right_key)
+        # Join 条件——使用已解析的别名（可能是前序步骤的输出变量）
+        left_key_ref = self.renderer.render_join_key(left, step.left_key)
+        right_key_ref = self.renderer.render_join_key(right, step.right_key)
         condition = f"{left_key_ref} == {right_key_ref}"
 
         how = self.renderer.render_join_type(step.join_type)
@@ -418,13 +480,14 @@ class SparkCompiler:
 
     def _compile_aggregate(
         self, step: SparkAggregateStep, step_id: str, index: int, total: int,
+        resolved_input_alias: str | None = None,
     ) -> tuple[str, str]:
         """编译 AggregateStep → {out} = {input}.groupBy(...).agg(...)。
 
         COUNT(*) 且 input_column 为 None 时使用 F.lit(1)。
         无 group_keys 时为全局聚合（不含 groupBy）。
         """
-        input_alias = self.renderer.validate_identifier(
+        input_alias = resolved_input_alias or self.renderer.validate_identifier(
             step.input_alias, "AggregateStep.input_alias"
         )
         out_alias = f"_a{index}"
@@ -471,13 +534,14 @@ class SparkCompiler:
 
     def _compile_case_when(
         self, step: SparkCaseWhenStep, step_id: str, index: int, total: int,
+        resolved_input_alias: str | None = None,
     ) -> tuple[str, str]:
         """编译 CaseWhenStep → {out} = {input}.withColumn(col, F.when(...).otherwise(...))。
 
         每个分支必须携带结构化 condition（CaseWhenCondition AST），
         condition=None 时抛出 RenderError 阻断——labels-only 路径不进可执行 compiler。
         """
-        input_alias = self.renderer.validate_identifier(
+        input_alias = resolved_input_alias or self.renderer.validate_identifier(
             step.input_alias, "CaseWhenStep.input_alias"
         )
         out_alias = f"_c{index}"
@@ -614,13 +678,14 @@ class SparkCompiler:
 
     def _compile_window(
         self, step: SparkWindowStep, step_id: str, index: int, total: int,
+        resolved_input_alias: str | None = None,
     ) -> tuple[str, str]:
         """编译 WindowStep → {out} = {input}.withColumn(alias, fn.over(windowSpec))。
 
         每个 SparkWindowExpr 生成一个 withColumn 调用，多个表达式链式调用。
         帧边界仅在非标准默认值或显式指定时渲染。
         """
-        input_alias = self.renderer.validate_identifier(
+        input_alias = resolved_input_alias or self.renderer.validate_identifier(
             step.input_alias, "WindowStep.input_alias"
         )
         out_alias = f"_w{index}"
