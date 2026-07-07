@@ -2397,10 +2397,53 @@ class Pipeline:
             context.stage_results.get(stage_val, "NOT_EXECUTED"), "skipped"
         )
 
-        # ── Phase 8: DEVELOPER 结果构建（含标注数据）──
+        # ── 构建阶段特有结果内容（供前端面板渲染）──
         result: dict | None = None
-        if stage == SparkPipelineStage.DEVELOPER:
-            if current_status == "ok" and context.annotation_result is not None:
+        if current_status == "ok":
+            if stage == SparkPipelineStage.MAPPER and context.spark_plan is not None:
+                result = {
+                    "type": "mapper",
+                    "steps": [
+                        {
+                            "step_type": s.step_type.value if hasattr(s.step_type, "value") else str(s.step_type),
+                            "description": _summarize_step(s),
+                        }
+                        for s in context.spark_plan.steps
+                    ],
+                    "step_count": len(context.spark_plan.steps),
+                    "plan_id": context.spark_plan.plan_id,
+                }
+            elif stage == SparkPipelineStage.COMPILER and context.compile_result is not None:
+                result = {
+                    "type": "compiler",
+                    "pyspark_code": context.compile_result.annotated_pyspark,
+                    "raw_hash": context.compile_result.raw_hash,
+                    "step_count": len(context.compile_result.step_ids),
+                    "standalone_pyspark": context.standalone_pyspark,
+                }
+            elif stage == SparkPipelineStage.VALIDATOR:
+                result = {
+                    "type": "validator",
+                    "is_valid": context.stage_results.get("VALIDATOR") == "SUCCESS",
+                    "errors": [e for e in context.errors if e.startswith("[VALIDATOR]")],
+                }
+            elif stage == SparkPipelineStage.COMPARATOR and context.comparator_report is not None:
+                report = context.comparator_report
+                result = {
+                    "type": "comparator",
+                    "status": report.status.value if hasattr(report.status, "value") else str(report.status),
+                    "step_results": [
+                        {
+                            "step_type": r.step_type.value if hasattr(r.step_type, "value") else str(r.step_type),
+                            "verdict": r.verdict,
+                        }
+                        for r in report.step_results
+                    ] if report.step_results else [],
+                    "unsupported_types": report.unsupported_types,
+                    "uncovered_step_types": report.uncovered_step_types,
+                }
+            # ── Phase 8: DEVELOPER 结果构建（含标注数据）──
+            elif stage == SparkPipelineStage.DEVELOPER and context.annotation_result is not None:
                 ann = context.annotation_result
                 result = {
                     "type": "developer",
@@ -2424,15 +2467,28 @@ class Pipeline:
                         for w in ann.warnings
                     ],
                 }
-            else:
-                result = {
-                    "type": "developer",
-                    "message": (
-                        "LLM 语义标注失败"
-                        if current_status == "failed"
-                        else "LLM 语义标注阶段——未注入 SparkDeveloperService，已标记 SKIPPED"
-                    ),
-                    "skipped": current_status == "skipped",
+
+        # 信息型阶段——无论 ok/skipped 都返回解释消息
+        if stage == SparkPipelineStage.DEVELOPER and current_status != "ok":
+            result = {
+                "type": "developer",
+                "message": (
+                    "LLM 语义标注失败"
+                    if current_status == "failed"
+                    else "LLM 语义标注阶段——未注入 SparkDeveloperService，已标记 SKIPPED"
+                ),
+                "skipped": current_status == "skipped",
+            }
+                }
+            result = {
+                "type": "developer",
+                "message": (
+                    "LLM 语义标注失败"
+                    if current_status == "failed"
+                    else "LLM 语义标注阶段——未注入 SparkDeveloperService，已标记 SKIPPED"
+                ),
+                "skipped": current_status == "skipped",
+            }
                 }
 
         return {
@@ -2500,11 +2556,67 @@ class Pipeline:
     def _do_spark_compile(self, context: SparkStageContext) -> None:
         """执行 COMPILER 阶段——SparkPlan → PySpark DSL。"""
         from tianshu_datadev.spark.compiler import SparkCompiler
+        from tianshu_datadev.spark.models import SparkReadStep
 
         compiler = SparkCompiler()
         result = compiler.compile(context.spark_plan)
         context.compile_result = result
         context.stage_results["COMPILER"] = "SUCCESS"
+
+        # ── 生成独立可执行脚本（wrapper 格式，含 SparkSession 引导）──
+        raw_pyspark = result.raw_pyspark
+        # 提取所有 ReadStep 的 source_name
+        input_names: list[str] = []
+        for step in context.spark_plan.steps:
+            if isinstance(step, SparkReadStep):
+                input_names.append(step.source_name)
+
+        # 构建 wrapper 脚本
+        wrapper_lines: list[str] = []
+        wrapper_lines.append("from pyspark.sql import SparkSession")
+        wrapper_lines.append("from pyspark.sql.functions import *")
+        wrapper_lines.append("")
+        wrapper_lines.append("")
+        wrapper_lines.append("# 以下 transform 函数由编译器自动生成")
+        wrapper_lines.append("# 数据源需根据实际路径修改")
+        wrapper_lines.append("")
+        # 嵌入原始 raw_pyspark（含 transform 函数）
+        for line in raw_pyspark.split("\n"):
+            wrapper_lines.append(line)
+        wrapper_lines.append("")
+        wrapper_lines.append("")
+        wrapper_lines.append('if __name__ == "__main__":')
+        wrapper_lines.append('    spark = SparkSession.builder.appName("tianshu_datadev") \\')
+        wrapper_lines.append('        .master("local[*]") \\')
+        wrapper_lines.append('        .config("spark.sql.shuffle.partitions", "4") \\')
+        wrapper_lines.append('        .getOrCreate()')
+        wrapper_lines.append("")
+        wrapper_lines.append("    # ======================")
+        wrapper_lines.append("    # 1. 加载数据")
+        wrapper_lines.append("    # ======================")
+        wrapper_lines.append("    inputs = {")
+        for i, name in enumerate(input_names):
+            comma = "," if i < len(input_names) - 1 else ""
+            wrapper_lines.append(f'        "{name}": spark.read.csv("data/{name}.csv", header=True){comma}')
+        wrapper_lines.append("    }")
+        wrapper_lines.append("")
+        wrapper_lines.append("    # ======================")
+        wrapper_lines.append("    # 2. 执行转换")
+        wrapper_lines.append("    # ======================")
+        wrapper_lines.append("    result = transform(inputs)")
+        wrapper_lines.append("")
+        wrapper_lines.append("    # ======================")
+        wrapper_lines.append("    # 3. 输出结果")
+        wrapper_lines.append("    # ======================")
+        wrapper_lines.append('    print("=== 结果概要 ===")')
+        wrapper_lines.append("    result.printSchema()")
+        wrapper_lines.append('    print(f"行数: {result.count()}")')
+        wrapper_lines.append("    result.show(20, truncate=False)")
+        wrapper_lines.append("")
+        wrapper_lines.append('    print("=== 执行完毕 ===")')
+        wrapper_lines.append("    spark.stop()")
+
+        context.standalone_pyspark = "\n".join(wrapper_lines)
 
     def _do_spark_validate(self, context: SparkStageContext) -> None:
         """执行 VALIDATOR 阶段——PySpark DSL 安全校验。"""
@@ -2580,6 +2692,49 @@ def _safe_enum_value(obj, attr: str) -> str:
 # ════════════════════════════════════════════
 
 
+def _summarize_step(step: "SparkStep") -> str:
+    """生成 SparkPlan 步骤的人类可读摘要。
+
+    用于前端 SparkStageResultPanel 展示每个步骤的简要描述。
+    """
+    from tianshu_datadev.spark.models import (
+        SparkReadStep, SparkFilterStep, SparkJoinStep,
+        SparkAggregateStep, SparkProjectStep, SparkCaseWhenStep,
+        SparkWindowStep, SparkSortStep, SparkLimitStep,
+    )
+
+    if isinstance(step, SparkReadStep):
+        cols = f" ({len(step.required_columns)} 列)" if step.required_columns else ""
+        return f"读取 {step.alias} ← {step.source_name}{cols}"
+    elif isinstance(step, SparkFilterStep):
+        return f"过滤 {step.input_alias}: {step.left} {step.operator} {step.right}"
+    elif isinstance(step, SparkJoinStep):
+        jt = step.join_type.value if hasattr(step.join_type, "value") else str(step.join_type)
+        return f"{jt} JOIN {step.left_alias}.{step.left_key} = {step.right_alias}.{step.right_key}"
+    elif isinstance(step, SparkAggregateStep):
+        groups = ", ".join(step.group_keys) if step.group_keys else "(无分组)"
+        metrics = ", ".join(m.alias for m in step.metrics)
+        return f"聚合 {step.input_alias} by [{groups}] → {metrics}"
+    elif isinstance(step, SparkProjectStep):
+        cols = ", ".join(c.alias for c in step.columns[:5])
+        if len(step.columns) > 5:
+            cols += f"…(+{len(step.columns) - 5})"
+        return f"投影 {step.input_alias} → [{cols}]"
+    elif isinstance(step, SparkCaseWhenStep):
+        return f"CASE WHEN {step.input_alias} → {step.output_alias} ({len(step.branches)} 分支)"
+    elif isinstance(step, SparkWindowStep):
+        funcs = ", ".join(e.alias for e in step.expressions[:3])
+        if len(step.expressions) > 3:
+            funcs += f"…(+{len(step.expressions) - 3})"
+        return f"窗口 {step.input_alias}: {funcs}"
+    elif isinstance(step, SparkSortStep):
+        orders = ", ".join(f"{s.column} {s.direction.value if hasattr(s.direction, 'value') else s.direction}" for s in step.order_by)
+        return f"排序 {step.input_alias}: {orders}"
+    elif isinstance(step, SparkLimitStep):
+        return f"LIMIT {step.limit} on {step.input_alias}"
+    return f"{step.step_type.value if hasattr(step.step_type, 'value') else step.step_type}: {step}"
+
+
 @dataclass
 class SparkStageContext:
     """request_id 级别的 Spark 阶段中间产物缓存。
@@ -2589,6 +2744,7 @@ class SparkStageContext:
     """
     spark_plan: "SparkPlan | None" = None
     compile_result: "SparkCompileResult | None" = None
+    standalone_pyspark: str | None = None  # 独立可执行 PySpark 脚本（含 SparkSession 引导）
     comparator_report: "PlanComparisonReport | None" = None
     # ── Phase 8: DEVELOPER 阶段产物缓存 ──
     annotation_result: "AnnotatedSparkPlan | None" = None
