@@ -120,7 +120,7 @@ class PlanComparator:
         report = comparator.compare(sql_plan, spark_plan)
     """
 
-    # Phase 7B 启用的 step 类型（8 种：6A 5 种 + 6B 3 种）
+    # Phase 7B 启用的 step 类型（9 种：6A 5 种 + 6B 3 种 + 7C 1 种）
     _PHASE_7B_ENABLED_TYPES: set[str] = {
         "scan",
         "filter",
@@ -130,12 +130,12 @@ class PlanComparator:
         "aggregate",    # Phase 6B
         "join",         # Phase 6B
         "case_when",    # Phase 6B
+        "window",       # Phase 7C——compare_window_steps 已完整实现
     }
 
-    # 需要标记为 NOT_COVERED 的 step 类型（Phase 6C/未来）
+    # 需要标记为 NOT_COVERED 的 step 类型（未来）
     _NOT_YET_COVERED_TYPES: set[str] = {
-        "window",       # Phase 6C
-        "subquery",     # 尚未设计等价对比规则
+        "subquery",     # Spark 侧无 SubqueryStep 对应类型，无法设计等价规则
     }
 
     # Step 类型名 → 规范化类型名的映射（SQL 侧和 Spark 侧使用不同命名）

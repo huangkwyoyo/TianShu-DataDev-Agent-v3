@@ -1,8 +1,8 @@
 """Phase 7B PlanComparator 测试——SQL Plan ↔ Spark Plan 逻辑链路对比。
 
 覆盖：
-- 8 种 step 类型（scan/filter/project/sort/limit/aggregate/join/case_when）逻辑对比
-- window 类型标记 NOT_COVERED
+- 9 种 step 类型（scan/filter/project/sort/limit/aggregate/join/case_when/window）逻辑对比
+- subquery 类型标记 NOT_COVERED
 - PlanComparisonReport 结构完整性
 - PlanComparator 只读 SqlBuildPlan 结构化 artifact（不读 SQL 文本）
 - 状态禁止泛化 PASS
@@ -1028,7 +1028,7 @@ class TestPlanComparatorCaseWhenEquivalence:
 
 
 class TestPlanComparatorNotCovered:
-    """Phase 7B 未覆盖类型 → NOT_COVERED（仅 window，Phase 6C 覆盖）。"""
+    """Phase 7B+7C 未覆盖类型 → NOT_COVERED（仅 subquery 未覆盖）。"""
 
     def test_subquery_produces_step_result_entry(self):
         """subquery 类型 → step_results 中包含 UNSUPPORTED_COMPARISON 条目。"""
@@ -1128,14 +1128,7 @@ class TestPlanComparatorNotCovered:
                 SparkWindowStep(
                     step_type=SparkStepType.WINDOW,
                     input_alias="od",
-                    expressions=[
-                        SparkWindowExpr(
-                            function=SparkWindowFunction.ROW_NUMBER,
-                            alias="rn",
-                            partition_by=["region"],
-                            order_by=["amount"],
-                        ),
-                    ],
+                    expressions=[],
                 ),
             ]
         )
@@ -1143,8 +1136,42 @@ class TestPlanComparatorNotCovered:
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
 
-        assert report.status == ComparisonStatus.NOT_COVERED
-        assert "window" in report.uncovered_step_types
+        # window 已启用 → 不应是 NOT_COVERED
+        assert report.status != ComparisonStatus.NOT_COVERED
+        assert "window" not in report.uncovered_step_types
+
+    def test_window_now_enabled_not_not_covered(self):
+        """Window 类型已启用 → LOGIC_EQUIVALENT（非 NOT_COVERED）。"""
+        from tianshu_datadev.planning.sql_build_plan import WindowStep
+        from tianshu_datadev.spark.models import (
+            SparkWindowExpr,
+            SparkWindowFunction,
+            SparkWindowStep,
+        )
+
+        sql_plan = _make_sql_plan([
+            _make_sql_scan_step(),
+            WindowStep(
+                step_type="window",
+                step_id="step_window_001",
+                window_exprs=[],
+            ),
+        ])
+        spark_plan = _make_spark_plan([
+            _make_spark_read_step(),
+            SparkWindowStep(
+                step_type=SparkStepType.WINDOW,
+                input_alias="od",
+                expressions=[],
+            ),
+        ])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status != ComparisonStatus.NOT_COVERED
+        assert "window" not in report.uncovered_step_types
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
 
 
 # ════════════════════════════════════════════
@@ -1153,7 +1180,7 @@ class TestPlanComparatorNotCovered:
 
 
 class TestPlanComparatorMixedScenarios:
-    """混合 step 类型场景——部分已覆盖 + 部分未覆盖（Phase 7B）。"""
+    """混合 step 类型场景——全部已覆盖（Phase 7B+7C）。"""
 
     def test_covered_steps_with_uncovered_window(
         self,
@@ -1186,14 +1213,7 @@ class TestPlanComparatorMixedScenarios:
                 SparkWindowStep(
                     step_type=SparkStepType.WINDOW,
                     input_alias="od",
-                    expressions=[
-                        SparkWindowExpr(
-                            function=SparkWindowFunction.ROW_NUMBER,
-                            alias="rn",
-                            partition_by=["region"],
-                            order_by=["amount"],
-                        ),
-                    ],
+                    expressions=[],
                 ),
             ]
         )
@@ -1201,12 +1221,11 @@ class TestPlanComparatorMixedScenarios:
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
 
-        # 已覆盖部分等价 → 但存在未覆盖类型 → NOT_COVERED
-        assert report.status == ComparisonStatus.NOT_COVERED
-        assert "window" in report.uncovered_step_types
-        # 已覆盖部分应等价
-        covered_results = [r for r in report.step_results if r.step_type in ("scan", "filter")]
-        assert all(r.verdict == EquivalenceVerdict.EQUIVALENT for r in covered_results)
+        # 全部已覆盖 → LOGIC_EQUIVALENT
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
+        assert "window" not in report.uncovered_step_types
+        # 所有步骤应等价
+        assert all(r.verdict == EquivalenceVerdict.EQUIVALENT for r in report.step_results)
 
     def test_all_covered_but_mismatched_join(self):
         """全部已覆盖（含 join），但 join 别名不匹配 → LOGIC_MISMATCH。"""
@@ -1345,7 +1364,7 @@ class TestPlanComparisonReportStructure:
         assert "PASS" not in report.status.value
 
     def test_uncovered_types_marked(self):
-        """未覆盖类型在 uncovered_step_types 中正确标记——window 应在列表中。"""
+        """window 已启用 → 不再出现在 uncovered_step_types 中。"""
         from tianshu_datadev.planning.sql_build_plan import WindowStep
         from tianshu_datadev.spark.models import (
             SparkWindowExpr,
@@ -1369,14 +1388,7 @@ class TestPlanComparisonReportStructure:
                 SparkWindowStep(
                     step_type=SparkStepType.WINDOW,
                     input_alias="od",
-                    expressions=[
-                        SparkWindowExpr(
-                            function=SparkWindowFunction.ROW_NUMBER,
-                            alias="rn",
-                            partition_by=["region"],
-                            order_by=["amount"],
-                        ),
-                    ],
+                    expressions=[],
                 ),
             ]
         )
@@ -1384,8 +1396,42 @@ class TestPlanComparisonReportStructure:
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
 
-        assert report.status == ComparisonStatus.NOT_COVERED
-        assert "window" in report.uncovered_step_types
+        # window 已启用 → 不应是 NOT_COVERED
+        assert report.status != ComparisonStatus.NOT_COVERED
+        assert "window" not in report.uncovered_step_types
+
+    def test_window_now_enabled_not_not_covered(self):
+        """Window 类型已启用 → LOGIC_EQUIVALENT（非 NOT_COVERED）。"""
+        from tianshu_datadev.planning.sql_build_plan import WindowStep
+        from tianshu_datadev.spark.models import (
+            SparkWindowExpr,
+            SparkWindowFunction,
+            SparkWindowStep,
+        )
+
+        sql_plan = _make_sql_plan([
+            _make_sql_scan_step(),
+            WindowStep(
+                step_type="window",
+                step_id="step_window_001",
+                window_exprs=[],
+            ),
+        ])
+        spark_plan = _make_spark_plan([
+            _make_spark_read_step(),
+            SparkWindowStep(
+                step_type=SparkStepType.WINDOW,
+                input_alias="od",
+                expressions=[],
+            ),
+        ])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status != ComparisonStatus.NOT_COVERED
+        assert "window" not in report.uncovered_step_types
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
 
 
 # ════════════════════════════════════════════
@@ -1621,12 +1667,12 @@ class TestPlanComparatorCustomEnabledTypes:
         ]
         sql_plan = _make_sql_plan(sql_steps)
 
-        # Comparator → window 标记 NOT_COVERED
+        # Comparator → window 已启用，不再 NOT_COVERED
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
 
-        assert report.status == ComparisonStatus.NOT_COVERED
-        assert "window" in report.uncovered_step_types
+        assert report.status != ComparisonStatus.NOT_COVERED
+        assert "window" not in report.uncovered_step_types
 
     def test_contract_to_sql_steps_empty_input(self):
         """验证 input_tables 为空时返回空列表（防御行为）。"""
