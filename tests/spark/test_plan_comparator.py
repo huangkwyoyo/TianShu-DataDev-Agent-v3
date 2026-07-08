@@ -512,6 +512,49 @@ class TestPlanComparatorFilterEquivalence:
         assert "NOT" in rendered_left.upper()
         assert sql_filters[0].get("operator", "") == "PREDICATE_TREE"
 
+    def test_between_list_preserves_order_in_predicate_tree(self):
+        """BETWEEN 右值列表不可交换——[1,10] 和 [10,1] 应渲染为不同字符串。
+
+        IN/NOT_IN 列表可交换（语义等效），BETWEEN [low, high] 不可交换——
+        BETWEEN 10 AND 1 在 SQL 中恒为空集，排序后错误地等价于 BETWEEN 1 AND 10。
+        """
+        from tianshu_datadev.spark.plan_comparator import PlanComparator
+
+        # 构造嵌套谓词：AND(col > 0, BETWEEN(col, [1, 10]))
+        between_low_high = Predicate(
+            left=ColumnRef(table_ref="t", column_name="a", normalized_name="a"),
+            operator=PredicateOperator.GT,
+            right=SqlLiteral(value="0"),
+        )
+        between_10_1 = Predicate(
+            left=ColumnRef(table_ref="t", column_name="a", normalized_name="a"),
+            operator=PredicateOperator.BETWEEN,
+            right=[SqlLiteral(value="10"), SqlLiteral(value="1")],
+        )
+        nested_between_reversed = Predicate(
+            left=between_low_high,
+            operator=PredicateOperator.AND,
+            right=between_10_1,
+        )
+
+        sql_plan = _make_sql_plan([
+            _make_sql_scan_step(),
+            FilterStep(
+                step_type="filter",
+                step_id="step_filter_between",
+                predicate=nested_between_reversed,
+            ),
+        ])
+        sql_steps = PlanComparator._extract_sql_step_data(sql_plan)
+        sql_filters = [s for s in sql_steps if s.get("step_type") == "filter"]
+        assert len(sql_filters) == 1
+        rendered = sql_filters[0].get("left", "")
+
+        # BETWEEN 保序：[10,1] 不应被排序成 [1,10]
+        assert "[10,1]" in rendered, (
+            f"BETWEEN [10,1] 应保序不排序，实际渲染：{rendered}"
+        )
+
 
 class TestPlanComparatorProjectEquivalence:
     """Project 逻辑等价性对比。"""
@@ -570,19 +613,27 @@ class TestPlanComparatorSortEquivalence:
     """Sort 逻辑等价性对比。"""
 
     def test_sort_equivalent(self):
-        """相同排序规格 → LOGIC_EQUIVALENT。"""
+        """相同排序规格 → LOGIC_EQUIVALENT。
+
+        使用 ASC——两侧默认 null_order 均为 LAST（Spark F.asc()→LAST，SQL SortSpec 默认 LAST）。
+        DESC 场景两侧默认不同（SQL LAST vs Spark FIRST），参见 test_desc_default_nulls_mismatch_detected。
+        """
         sql_plan = _make_sql_plan(
             [
                 _make_sql_scan_step(),
                 _make_sql_sort_step(),
             ]
         )
+        # 切换为 ASC——确保两侧 null_order 默认均为 LAST
+        sql_plan.steps[1].order_by[0].direction = SortDirection.ASC
         spark_plan = _make_spark_plan(
             [
                 _make_spark_read_step(),
                 _make_spark_sort_step(),
             ]
         )
+        # 对齐为 ASC
+        spark_plan.steps[1].order_by[0].direction = SparkSortDirection.ASC
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -650,6 +701,79 @@ class TestPlanComparatorSortEquivalence:
         sort_results = [r for r in report.step_results if r.step_type == "sort"]
         assert len(sort_results) == 1
         assert sort_results[0].verdict == EquivalenceVerdict.NOT_EQUIVALENT
+
+    def test_desc_default_nulls_mismatch_detected(self):
+        """SQL DESC（默认 NULLS LAST）vs Spark DESC（默认 NULLS FIRST）→ NOT_EQUIVALENT。
+
+        Spark 编译器只生成 F.desc()，未显式指定 null_order。
+        F.desc() 默认 NULLS FIRST（Spark DataFrame API）。
+        SQL SortSpec 默认 NULLS LAST（不论方向）。
+        此差异应被 comparator 检测——固定 "LAST" 会导致误判为等价。
+        """
+        sql_plan = _make_sql_plan([
+            _make_sql_scan_step(),
+            SortStep(
+                step_type="sort",
+                step_id="step_sort_001",
+                order_by=[
+                    SortSpec(
+                        column="amount",
+                        direction=SortDirection.DESC,
+                        # 不显式指定 null_order → SQL 默认 LAST
+                    ),
+                ],
+            ),
+        ])
+        spark_plan = _make_spark_plan([
+            _make_spark_read_step(),
+            _make_spark_sort_step(),  # 默认 DESC
+        ])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        # DESC → Spark 侧 null_order 应为 "FIRST"，SQL 侧为 "LAST" → NOT_EQUIVALENT
+        sort_results = [r for r in report.step_results if r.step_type == "sort"]
+        assert len(sort_results) == 1
+        assert sort_results[0].verdict == EquivalenceVerdict.NOT_EQUIVALENT, (
+            f"DESC null_order 应检测到不匹配，实际：{sort_results[0].verdict}"
+        )
+
+    def test_asc_default_nulls_match(self):
+        """SQL ASC（默认 NULLS LAST）vs Spark ASC（默认 NULLS LAST）→ EQUIVALENT。
+
+        ASC 场景两侧 null_order 均为 LAST，应为等价。
+        """
+        sql_plan = _make_sql_plan([
+            _make_sql_scan_step(),
+            SortStep(
+                step_type="sort",
+                step_id="step_sort_001",
+                order_by=[
+                    SortSpec(
+                        column="amount",
+                        direction=SortDirection.ASC,
+                        # 不显式指定 null_order → SQL 默认 LAST
+                    ),
+                ],
+            ),
+        ])
+        spark_plan = _make_spark_plan([
+            _make_spark_read_step(),
+            _make_spark_sort_step(),  # 默认 DESC
+        ])
+        # 对齐方向为 ASC
+        spark_plan.steps[1].order_by[0].direction = SparkSortDirection.ASC
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        # ASC → 两侧 null_order 均为 "LAST" → EQUIVALENT
+        sort_results = [r for r in report.step_results if r.step_type == "sort"]
+        assert len(sort_results) == 1
+        assert sort_results[0].verdict == EquivalenceVerdict.EQUIVALENT, (
+            f"ASC 默认 null_order 应为 LATEST 等价，实际：{sort_results[0].verdict}"
+        )
 
 
 class TestPlanComparatorLimitEquivalence:
@@ -1487,7 +1611,7 @@ class TestPlanComparatorCustomEnabledTypes:
                 ContractOutputColumn(column_name="total_amt", alias="total_amt"),
             ],
             output_grain=["region_code"],
-            sort_spec=[ContractSort(column="total_amt", direction="DESC")],
+            sort_spec=[ContractSort(column="total_amt", direction="ASC")],
             limit_spec=ContractLimit(limit=100),
             business_keys=["region_code"],
             step_dag={"stmt_main": []},
@@ -2442,20 +2566,23 @@ class TestComparatorStatusMapping:
     """验证 ComparisonStatus → stage_result 映射表正确性（缺陷 5 门禁）。"""
 
     def test_comparator_status_to_stage_result_mapping(self):
-        """验证 ComparisonStatus → stage_result 映射表正确。"""
-        # 此映射表将被 _do_spark_compare 使用
-        _status_map = {
-            ComparisonStatus.LOGIC_EQUIVALENT: "SUCCESS",
-            ComparisonStatus.LOGIC_MISMATCH: "FAILURE",
-            ComparisonStatus.LOGIC_UNSUPPORTED: "HUMAN_REVIEW",
-            ComparisonStatus.NOT_COVERED: "HUMAN_REVIEW",
-            ComparisonStatus.NOT_EXECUTED: "SKIPPED",
-        }
+        """验证 Pipeline._map_comparator_status() 真实生产映射逻辑。
 
-        assert _status_map[ComparisonStatus.LOGIC_EQUIVALENT] == "SUCCESS"
-        assert _status_map[ComparisonStatus.LOGIC_MISMATCH] == "FAILURE"
-        assert _status_map[ComparisonStatus.LOGIC_UNSUPPORTED] == "HUMAN_REVIEW"
-        assert _status_map[ComparisonStatus.NOT_COVERED] == "HUMAN_REVIEW"
-        assert _status_map[ComparisonStatus.NOT_EXECUTED] == "SKIPPED"
-        # 防御：未知状态 → HUMAN_REVIEW
-        assert _status_map.get("UNKNOWN_STATUS", "HUMAN_REVIEW") == "HUMAN_REVIEW"
+        直接调 Pipeline 的生产静态方法——而非复制一份测试内局部映射表。
+        确保生产代码里映射改坏时此测试失败。
+        """
+        from tianshu_datadev.api.pipeline import Pipeline
+
+        assert Pipeline._map_comparator_status(ComparisonStatus.LOGIC_EQUIVALENT) == "SUCCESS"
+        assert Pipeline._map_comparator_status(ComparisonStatus.LOGIC_MISMATCH) == "FAILURE"
+        assert Pipeline._map_comparator_status(ComparisonStatus.LOGIC_UNSUPPORTED) == "HUMAN_REVIEW"
+        assert Pipeline._map_comparator_status(ComparisonStatus.NOT_COVERED) == "HUMAN_REVIEW"
+        assert Pipeline._map_comparator_status(ComparisonStatus.NOT_EXECUTED) == "SKIPPED"
+
+    def test_comparator_status_unknown_fallback(self):
+        """未知/未来新增的 ComparisonStatus → HUMAN_REVIEW（防御兜底）。"""
+        from tianshu_datadev.api.pipeline import Pipeline
+
+        # 防御：传入不存在的枚举值 → HUMAN_REVIEW
+        assert Pipeline._map_comparator_status("FUTURE_STATUS_XYZ") == "HUMAN_REVIEW"  # type: ignore[arg-type]
+        assert Pipeline._map_comparator_status(None) == "HUMAN_REVIEW"  # type: ignore[arg-type]

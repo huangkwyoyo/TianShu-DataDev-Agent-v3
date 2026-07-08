@@ -2742,13 +2742,30 @@ class Pipeline:
             for e in validation.errors:
                 context.errors.append(f"[VALIDATOR] {e.error_code}: {e.detail}")
 
+    @staticmethod
+    def _map_comparator_status(status) -> str:
+        """将 COMPARATOR 的 ComparisonStatus 映射为 Pipeline 的阶段结果字符串。
+
+        提取为独立方法方便测试——确保测试验证的是生产代码逻辑，而非测试内复制的局部映射表。
+        """
+        from tianshu_datadev.spark.plan_comparator import ComparisonStatus
+
+        _status_map: dict = {
+            ComparisonStatus.LOGIC_EQUIVALENT: "SUCCESS",
+            ComparisonStatus.LOGIC_MISMATCH: "FAILURE",
+            ComparisonStatus.LOGIC_UNSUPPORTED: "HUMAN_REVIEW",
+            ComparisonStatus.NOT_COVERED: "HUMAN_REVIEW",
+            ComparisonStatus.NOT_EXECUTED: "SKIPPED",
+        }
+        return _status_map.get(status, "HUMAN_REVIEW")
+
     def _do_spark_compare(
         self,
         artifacts: PipelineArtifactBundle,
         context: SparkStageContext,
     ) -> None:
         """执行 COMPARATOR 阶段——SQL ↔ Spark 逻辑对比。"""
-        from tianshu_datadev.spark.plan_comparator import ComparisonStatus, PlanComparator
+        from tianshu_datadev.spark.plan_comparator import PlanComparator
 
         comparator = PlanComparator()
         sql_plan = artifacts.sql_build_plan
@@ -2777,15 +2794,8 @@ class Pipeline:
         context.comparator_report = report
         # 根据 report.status 映射阶段结果——不再硬编码 SUCCESS
         # 详细状态保留在 comparator_report.status 中，derive_overall_status 消费
-        _status_map = {
-            ComparisonStatus.LOGIC_EQUIVALENT: "SUCCESS",
-            ComparisonStatus.LOGIC_MISMATCH: "FAILURE",
-            ComparisonStatus.LOGIC_UNSUPPORTED: "HUMAN_REVIEW",
-            ComparisonStatus.NOT_COVERED: "HUMAN_REVIEW",
-            ComparisonStatus.NOT_EXECUTED: "SKIPPED",
-        }
-        context.stage_results["COMPARATOR"] = _status_map.get(
-            report.status, "HUMAN_REVIEW",
+        context.stage_results["COMPARATOR"] = Pipeline._map_comparator_status(
+            report.status,
         )
 
     def _do_spark_physical_verify(

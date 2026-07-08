@@ -706,10 +706,15 @@ def compare_sort_steps(
     spark_keys: list[tuple[str, str, str]] = []
     for s in spark_sorts:
         for item in s.get("order_by", []) or []:
+            # Spark 编译器只生成 F.asc()/F.desc()，未显式指定 null_order。
+            # Spark DataFrame API 默认：F.asc() → NULLS LAST，F.desc() → NULLS FIRST。
+            # 此处按 direction 派生出实际默认 null_order，而非固定 "LAST"。
+            direction = (item.get("direction", "asc") or "asc").upper()
+            spark_null_order = "FIRST" if direction == "DESC" else "LAST"
             spark_keys.append((
                 normalize_field_name(item.get("column", "")),
-                (item.get("direction", "asc") or "asc").upper(),
-                "LAST",  # SparkSortSpec 无 null_order 字段。Spark SortOrder 默认：ASC→NULLS LAST，DESC→NULLS FIRST。此处容缺默认 "LAST"（大写，与 SQL .upper() 一致），仅当 SQL 显式 NULLS FIRST 时触发 NOT_EQUIVALENT
+                direction,
+                spark_null_order,
             ))
 
     if sql_keys != spark_keys:

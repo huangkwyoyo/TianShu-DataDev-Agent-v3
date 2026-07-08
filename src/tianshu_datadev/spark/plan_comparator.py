@@ -716,12 +716,14 @@ class PlanComparator:
         return isinstance(d, dict) and "left" in d and "operator" in d
 
     @staticmethod
-    def _render_operand(value: Any) -> str:
+    def _render_operand(value: Any, sort_list: bool = True) -> str:
         """将操作数统一渲染为规范字符串——消除 SQL/Spark 序列化差异。
 
         支持：ColumnRef dict（取 normalized_name）、SqlLiteral dict（取 value）、
-        list（IN/BETWEEN 右值——递归排序渲染）、None（IS_NULL/IS_NOT_NULL）。
+        list（IN/BETWEEN 右值）、None（IS_NULL/IS_NOT_NULL）。
         其他 dict 回退到 JSON 稳定序列化。
+
+        sort_list：是否排序列表元素。IN/NOT_IN 可交换→排序；BETWEEN 保序→不排序。
         """
         if value is None:
             return "<NULL>"
@@ -736,8 +738,10 @@ class PlanComparator:
             # 其他 dict（防御）→ JSON 稳定序列化（sort_keys 保证确定性）
             return json.dumps(value, sort_keys=True, default=str)
         if isinstance(value, list):
-            # IN / BETWEEN 右值列表 → 递归渲染并排序
-            rendered = sorted(PlanComparator._render_operand(v) for v in value)
+            # IN/NOT_IN 列表可交换→排序；BETWEEN [low, high] 保序→不排序
+            rendered = [PlanComparator._render_operand(v) for v in value]
+            if sort_list:
+                rendered.sort()
             return "[" + ",".join(rendered) + "]"
         return str(value)
 
@@ -750,6 +754,8 @@ class PlanComparator:
         OR 节点：同上，" OR " 拼接（也有可交换性）
         NOT 节点：单子树，不排序
         每层外层括号包裹，最外层再加一层括号。
+
+        BETWEEN 右值列表保序渲染——SQL 中 BETWEEN 10 AND 1 不等价于 BETWEEN 1 AND 10。
         """
 
         op = str(predicate.get("operator", "")).upper()
@@ -763,7 +769,9 @@ class PlanComparator:
         if not left_is_tree and not right_is_tree:
             # 叶子节点：直接渲染
             rendered_left = PlanComparator._render_operand(left)
-            rendered_right = PlanComparator._render_operand(right)
+            # BETWEEN 右值保序——不可交换
+            sort_right = op != "BETWEEN"
+            rendered_right = PlanComparator._render_operand(right, sort_list=sort_right)
             return f"({rendered_left} {op} {rendered_right})"
 
         # 非叶子节点：递归渲染子树
