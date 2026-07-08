@@ -1175,6 +1175,31 @@ class TestPlanComparatorMixedScenarios:
         # join 在 Phase 7B 已覆盖——left_table_ref="order_info" ≠ left_alias="od"
         assert report.status == ComparisonStatus.LOGIC_MISMATCH
 
+    def test_step_order_mismatch_detected(self):
+        """SQL [scan, filter, sort] vs Spark [scan, sort, filter] → NOT_EQUIVALENT。"""
+        # SQL：scan → filter → sort
+        sql_plan = _make_sql_plan([
+            _make_sql_scan_step(),
+            _make_sql_filter_step(),
+            _make_sql_sort_step(),
+        ])
+        # Spark：scan → sort → filter（顺序不同）
+        spark_plan = _make_spark_plan([
+            _make_spark_read_step(),
+            _make_spark_sort_step(),
+            _make_spark_filter_step(),
+        ])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        # 顺序不一致 → 应有 order 类型的 NOT_EQUIVALENT
+        order_results = [r for r in report.step_results if r.step_type == "order"]
+        assert len(order_results) == 1
+        assert order_results[0].verdict == EquivalenceVerdict.NOT_EQUIVALENT
+        # 整体状态也应为 LOGIC_MISMATCH
+        assert report.status == ComparisonStatus.LOGIC_MISMATCH
+
     def test_empty_both_sides(self):
         """双方均为空 steps——对比规则不支持（UNSUPPORTED_COMPARISON）。"""
         sql_plan = _make_sql_plan([])

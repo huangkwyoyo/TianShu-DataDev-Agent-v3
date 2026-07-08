@@ -222,6 +222,7 @@ class PlanComparator:
                 spark_steps=covered_spark,
                 sql_plan_hash=sql_plan_hash,
                 spark_plan_hash=spark_plan_hash,
+                check_order=True,  # 单 SqlBuildPlan 路径：启用顺序检查
             )
         else:
             # 无可对比的 step——全部 NOT_EXECUTED
@@ -346,6 +347,7 @@ class PlanComparator:
                 spark_steps=covered_spark,
                 sql_plan_hash=sql_plan_hash,
                 spark_plan_hash=spark_plan_hash,
+                check_order=False,  # SqlProgram 路径：DAG 扁平化后顺序无意义
             )
         else:
             # 无可对比的 step——全部 NOT_EXECUTED

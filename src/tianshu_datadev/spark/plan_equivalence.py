@@ -829,6 +829,7 @@ def compare_plans(
     spark_steps: list[dict[str, Any]],
     sql_plan_hash: str = "",
     spark_plan_hash: str = "",
+    check_order: bool = True,  # 新增：单 Plan 默认检查顺序，Program 关闭
 ) -> PlanEquivalenceResult:
     """对比 SQL 侧 SqlBuildPlan 与 Spark 侧 SparkPlan 的结构等价性。
 
@@ -923,6 +924,32 @@ def compare_plans(
         comparator = _STEP_COMPARATORS[stype]
         result = comparator(sql_steps_of_type, spark_steps_of_type)
         step_results.append(result)
+
+    # 步骤类型顺序签名检查——仅单 SqlBuildPlan 路径启用
+    # SqlProgram 经 DAG 扁平化 + _normalize_dag_steps 后顺序无意义
+    if check_order:
+        sql_signature = [
+            _SQL_TYPE_TO_NORMALIZED.get(
+                s.get("step_type", s.get("type", "")), s.get("step_type", "")
+            )
+            for s in sql_steps
+        ]
+        spark_signature = [
+            _SQL_TYPE_TO_NORMALIZED.get(s.get("step_type", ""), s.get("step_type", ""))
+            for s in spark_steps
+        ]
+        if sql_signature != spark_signature:
+            step_results.append(StepEquivalenceResult(
+                step_type="order",
+                verdict=EquivalenceVerdict.NOT_EQUIVALENT,
+                sql_count=len(sql_signature),
+                spark_count=len(spark_signature),
+                detail=(
+                    f"步骤类型顺序不一致："
+                    f"SQL {sql_signature}，"
+                    f"Spark {spark_signature}"
+                ),
+            ))
 
     # 计算 overall_verdict
     not_equivalent = [
