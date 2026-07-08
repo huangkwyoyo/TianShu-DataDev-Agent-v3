@@ -944,6 +944,48 @@ class TestPlanComparatorNotCovered:
         assert len(sub_results) >= 1
         assert sub_results[0].verdict == EquivalenceVerdict.UNSUPPORTED_COMPARISON
 
+    def test_compare_plans_directly_reports_subquery_step_result(self):
+        """直接调用 compare_plans() → subquery 产生 UNSUPPORTED_COMPARISON 条目。
+
+        与 test_subquery_produces_step_result_entry 的区别：
+        该测试绕过 PlanComparator.compare() 的上层 uncovered_types 补偿逻辑，
+        直接验证 compare_plans() 内部对 _NO_EQUIVALENCE_RULE_TYPES 类型的处理。
+        """
+        from tianshu_datadev.spark.plan_comparator import PlanComparator
+        from tianshu_datadev.spark.plan_equivalence import (
+            compare_plans,
+            EquivalenceVerdict,
+        )
+        from tianshu_datadev.planning.sql_build_plan import SubqueryStep
+
+        # 构造含 subquery 的 SqlBuildPlan steps
+        inner_plan = _make_sql_plan([
+            _make_sql_scan_step(table_ref="sub_t"),
+            _make_sql_project_step(),
+        ])
+        sql_plan = _make_sql_plan([
+            _make_sql_scan_step(),
+            SubqueryStep(
+                step_type="subquery",
+                step_id="step_sub_001",
+                alias="sub_alias",
+                inner_plan=inner_plan,
+                depth=1,
+            ),
+        ])
+        sql_steps = PlanComparator._extract_sql_step_data(sql_plan)
+        spark_steps = PlanComparator._extract_spark_step_data(
+            _make_spark_plan([_make_spark_read_step()])
+        )
+
+        # 直接调用 compare_plans——验证其内部对未知类型的处理
+        result = compare_plans(sql_steps, spark_steps)
+
+        # subquery 应在 step_results 中有 UNSUPPORTED_COMPARISON 条目
+        sub_results = [r for r in result.step_results if r.step_type == "subquery"]
+        assert len(sub_results) >= 1
+        assert sub_results[0].verdict == EquivalenceVerdict.UNSUPPORTED_COMPARISON
+
     def test_window_not_in_enabled_types(self):
         """Window 类型 → NOT_COVERED。"""
         from tianshu_datadev.planning.sql_build_plan import WindowStep

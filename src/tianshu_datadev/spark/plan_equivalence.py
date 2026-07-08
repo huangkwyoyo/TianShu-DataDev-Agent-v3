@@ -655,7 +655,7 @@ def compare_sort_steps(
             spark_keys.append((
                 normalize_field_name(item.get("column", "")),
                 (item.get("direction", "asc") or "asc").upper(),
-                "LAST",  # SparkSortSpec 无 null_order 字段，默认 LAST（大写，与 SQL .upper() 一致）
+                "LAST",  # SparkSortSpec 无 null_order 字段。Spark SortOrder 默认：ASC→NULLS LAST，DESC→NULLS FIRST。此处容缺默认 "LAST"（大写，与 SQL .upper() 一致），仅当 SQL 显式 NULLS FIRST 时触发 NOT_EQUIVALENT
             ))
 
     if sql_keys != spark_keys:
