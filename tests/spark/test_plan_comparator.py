@@ -430,6 +430,53 @@ class TestPlanComparatorFilterEquivalence:
             f"filter_result={[(r.step_type, r.verdict.value, r.detail[:100]) for r in report.step_results]}"
         )
 
+    def test_nested_predicate_tree_rendered_and_compared(self):
+        """嵌套 AND/OR 谓词 → 通过 PREDICATE_TREE 正确渲染并对比。"""
+        # 构造嵌套谓词：OR( AND(a > 1, b < 10), EQ(c, 0) )
+        # 即 WHERE (a > 1 AND b < 10) OR c = 0
+        nested_pred = Predicate(
+            left=Predicate(
+                left=Predicate(
+                    left=ColumnRef(table_ref="t", column_name="a", normalized_name="a"),
+                    operator=PredicateOperator.GT,
+                    right=SqlLiteral(value="1"),
+                ),
+                operator=PredicateOperator.AND,
+                right=Predicate(
+                    left=ColumnRef(table_ref="t", column_name="b", normalized_name="b"),
+                    operator=PredicateOperator.LT,
+                    right=SqlLiteral(value="10"),
+                ),
+            ),
+            operator=PredicateOperator.OR,
+            right=Predicate(
+                left=ColumnRef(table_ref="t", column_name="c", normalized_name="c"),
+                operator=PredicateOperator.EQ,
+                right=SqlLiteral(value="0"),
+            ),
+        )
+
+        sql_plan = _make_sql_plan([
+            _make_sql_scan_step(),
+            FilterStep(
+                step_type="filter",
+                step_id="step_filter_nested",
+                predicate=nested_pred,
+            ),
+        ])
+        # 提取 SQL 侧 step 数据，验证扁平化后 nested predicate 正确渲染
+        sql_steps = PlanComparator._extract_sql_step_data(sql_plan)
+
+        # 验证 SQL 侧 filter step 的 left 不是空字符串（缺陷 2 根因）
+        sql_filters = [s for s in sql_steps if s.get("step_type") == "filter"]
+        assert len(sql_filters) == 1
+        # 嵌套谓词扁平化后 left 应为规范字符串，非空
+        assert sql_filters[0].get("left", "") != ""
+        # operator 应为 PREDICATE_TREE
+        assert sql_filters[0].get("operator", "") == "PREDICATE_TREE"
+        # right 应为空（PREDICATE_TREE 模式下右值无意义）
+        assert sql_filters[0].get("right", "") == ""
+
 
 class TestPlanComparatorProjectEquivalence:
     """Project 逻辑等价性对比。"""

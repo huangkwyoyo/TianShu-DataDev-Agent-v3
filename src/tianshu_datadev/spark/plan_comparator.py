@@ -703,6 +703,91 @@ class PlanComparator:
         # scan / sort / limit / window 的对比字段已在顶层，无需额外扁平化
         return step_dict
 
+    # ── 嵌套谓词支持（缺陷 2） ──
+
+    @staticmethod
+    def _is_predicate_tree(d: dict) -> bool:
+        """结构判别：含 left + operator 键 → Predicate tree（嵌套）；否则是 ColumnRef/SqlLiteral。
+
+        ColumnRef dict 特征：normalized_name / column_name / table_ref
+        嵌套 Predicate dict 特征：left / operator / right
+        """
+        return isinstance(d, dict) and "left" in d and "operator" in d
+
+    @staticmethod
+    def _render_operand(value: Any) -> str:
+        """将操作数统一渲染为规范字符串——消除 SQL/Spark 序列化差异。
+
+        支持：ColumnRef dict（取 normalized_name）、SqlLiteral dict（取 value）、
+        list（IN/BETWEEN 右值——递归排序渲染）、None（IS_NULL/IS_NOT_NULL）。
+        其他 dict 回退到 JSON 稳定序列化。
+        """
+        if value is None:
+            return "<NULL>"
+        if isinstance(value, dict):
+            if "normalized_name" in value or "column_name" in value:
+                # ColumnRef → 归一化字段名（消去表前缀，防止后续 normalize_field_name 截断）
+                name = value.get("normalized_name") or value.get("column_name", "")
+                from tianshu_datadev.spark.plan_equivalence import normalize_field_name
+                return normalize_field_name(str(name)) if name else ""
+            if "value" in value:
+                # SqlLiteral → 提取值
+                return str(value["value"])
+            # 其他 dict（防御）→ JSON 稳定序列化（sort_keys 保证确定性）
+            import json
+            return json.dumps(value, sort_keys=True, default=str)
+        if isinstance(value, list):
+            # IN / BETWEEN 右值列表 → 递归渲染并排序
+            rendered = sorted(PlanComparator._render_operand(v) for v in value)
+            return "[" + ",".join(rendered) + "]"
+        return str(value)
+
+    @staticmethod
+    def _render_predicate_tree(predicate: dict) -> str:
+        """递归渲染嵌套谓词树为规范字符串。
+
+        叶子节点：通过 _render_operand 渲染 left/right，输出 (rendered_left operator rendered_right)
+        AND 节点：子树按字母序排序后 " AND " 拼接（可交换性）
+        OR 节点：同上，" OR " 拼接（也有可交换性）
+        NOT 节点：单子树，不排序
+        每层外层括号包裹，最外层再加一层括号。
+        """
+
+        op = str(predicate.get("operator", "")).upper()
+        left = predicate.get("left")
+        right = predicate.get("right")
+
+        # 判断是否为叶子节点：left 不是 Predicate tree
+        left_is_tree = PlanComparator._is_predicate_tree(left) if isinstance(left, dict) else False
+        right_is_tree = PlanComparator._is_predicate_tree(right) if isinstance(right, dict) else False
+
+        if not left_is_tree and not right_is_tree:
+            # 叶子节点：直接渲染
+            rendered_left = PlanComparator._render_operand(left)
+            rendered_right = PlanComparator._render_operand(right)
+            return f"({rendered_left} {op} {rendered_right})"
+
+        # 非叶子节点：递归渲染子树
+        parts: list[str] = []
+        if isinstance(left, dict) and left_is_tree:
+            parts.append(PlanComparator._render_predicate_tree(left))
+        else:
+            parts.append(PlanComparator._render_operand(left))
+
+        if isinstance(right, dict) and right_is_tree:
+            parts.append(PlanComparator._render_predicate_tree(right))
+        else:
+            right_str = PlanComparator._render_operand(right)
+            if right_str and right_str != "<NULL>":
+                parts.append(right_str)
+
+        # AND/OR 可交换——排序子树
+        if op in ("AND", "OR"):
+            parts.sort()
+
+        joiner = f" {op} "
+        return f"({joiner.join(parts)})"
+
     @staticmethod
     def _flatten_filter_step(step_dict: dict[str, Any]) -> dict[str, Any]:
         """扁平化 FilterStep——将 predicate 内的字段提升到顶层。
@@ -721,8 +806,17 @@ class PlanComparator:
         # 扁平化 left
         left_val = predicate.get("left", "")
         if isinstance(left_val, dict):
-            # ColumnRef → "table_ref.column_name"
-            left_val = PlanComparator._column_ref_to_string(left_val)
+            if PlanComparator._is_predicate_tree(left_val):
+                # 嵌套 Predicate tree → 递归渲染为规范字符串（整棵谓词树，不是仅 left）
+                rendered = PlanComparator._render_predicate_tree(predicate)
+                result = dict(step_dict)
+                result["left"] = rendered
+                result["operator"] = "PREDICATE_TREE"
+                result["right"] = ""
+                return result
+            else:
+                # ColumnRef → "table_ref.column_name"（原路径不变）
+                left_val = PlanComparator._column_ref_to_string(left_val)
 
         # 扁平化 right
         right_val = predicate.get("right", "")

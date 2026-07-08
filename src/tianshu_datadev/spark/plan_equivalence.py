@@ -226,23 +226,20 @@ def compare_filter_steps(
             detail=f"过滤条件数量不一致：SQL 侧 {sql_count} 个，Spark 侧 {spark_count} 个",
         )
 
-    # 归一化并排序
-    sql_normalized = sorted([
-        (
-            normalize_field_name(f.get("left", "")),
-            f.get("operator", "").upper(),
-            normalize_field_name(f.get("right", "")),
+    # 归一化辅助函数——处理 PREDICATE_TREE 特殊路径
+    def _normalize_filter_tuple(f: dict) -> tuple:
+        if str(f.get("operator", "")).upper() == "PREDICATE_TREE":
+            # 规范字符串已在 _render_predicate_tree 中预归一化（叶子节点消去表前缀）
+            # 直接对比，不走 normalize_field_name（否则遇到 table.column 中的 . 会截断）
+            return (f.get("left", ""), "PREDICATE_TREE", "")
+        return (
+            normalize_field_name(str(f.get("left", ""))),
+            str(f.get("operator", "")).upper(),
+            normalize_field_name(str(f.get("right", ""))),
         )
-        for f in sql_filters
-    ])
-    spark_normalized = sorted([
-        (
-            normalize_field_name(f.get("left", "")),
-            f.get("operator", "").upper(),
-            normalize_field_name(f.get("right", "")),
-        )
-        for f in spark_filters
-    ])
+
+    sql_normalized = sorted(_normalize_filter_tuple(f) for f in sql_filters)
+    spark_normalized = sorted(_normalize_filter_tuple(f) for f in spark_filters)
 
     if sql_normalized != spark_normalized:
         return StepEquivalenceResult(
