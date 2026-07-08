@@ -266,6 +266,41 @@ class TestPlanComparatorScanEquivalence:
 
         assert report.status == ComparisonStatus.LOGIC_MISMATCH
 
+    def test_scan_columns_mismatch_detected_by_alias(self):
+        """同 alias 下列集合不一致 → NOT_EQUIVALENT。"""
+        # SQL 侧：读 3 列
+        sql_plan = _make_sql_plan([
+            ScanStep(
+                step_type="scan",
+                step_id="step_scan_001",
+                table_ref="od",
+                required_columns=[
+                    ColumnRef(table_ref="od", column_name="order_id", normalized_name="order_id"),
+                    ColumnRef(table_ref="od", column_name="amount", normalized_name="amount"),
+                    ColumnRef(table_ref="od", column_name="status", normalized_name="status"),
+                ],
+            ),
+        ])
+        # Spark 侧：只读 2 列（缺少 status）
+        spark_plan = _make_spark_plan([
+            SparkReadStep(
+                step_type=SparkStepType.READ,
+                alias="od",
+                source_name="order_info",
+                input_key="order_info_key",
+                required_columns=["order_id", "amount"],
+            ),
+        ])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        # 列集合不同 → NOT_EQUIVALENT
+        scan_results = [r for r in report.step_results if r.step_type == "scan"]
+        assert len(scan_results) == 1
+        assert scan_results[0].verdict == EquivalenceVerdict.NOT_EQUIVALENT
+        assert "status" in scan_results[0].detail
+
 
 class TestPlanComparatorFilterEquivalence:
     """Filter 逻辑等价性对比。"""

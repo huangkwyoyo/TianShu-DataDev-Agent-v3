@@ -84,6 +84,19 @@ def normalize_field_name(name: str) -> str:
 # ════════════════════════════════════════════
 
 
+def _extract_column_name(col: Any) -> str:
+    """统一提取列名——兼容 ColumnRef dict（SQL 侧）和纯字符串（Spark 侧）。
+
+    ColumnRef dict 优先取 normalized_name，其次 column_name。
+    纯字符串直接归一化。
+    提取失败返回空字符串。
+    """
+    if isinstance(col, dict):
+        name = col.get("normalized_name") or col.get("column_name", "")
+        return normalize_field_name(str(name)) if name else ""
+    return normalize_field_name(str(col))
+
+
 def compare_scan_steps(
     sql_scans: list[dict[str, Any]],
     spark_reads: list[dict[str, Any]],
@@ -131,6 +144,50 @@ def compare_scan_steps(
             spark_count=spark_count,
             detail=f"输入表别名不一致：SQL 侧 {sql_aliases}，Spark 侧 {spark_aliases}",
         )
+
+    # ── 按 alias 分组收集列集合——全局 set 会丢失多表同名列信息 ──
+    def _collect_scan_columns(
+        scans: list[dict[str, Any]],
+        alias_key: str,
+        cols_key: str,
+    ) -> dict[str, set[str]]:
+        """按 alias 分组收集列集合。"""
+        result: dict[str, set[str]] = {}
+        for s in scans:
+            alias = normalize_field_name(s.get(alias_key, ""))
+            cols: set[str] = set()
+            for c in (s.get(cols_key, []) or []):
+                name = _extract_column_name(c)
+                if name:
+                    cols.add(name)
+            if cols:
+                result[alias] = cols
+        return result
+
+    sql_cols_by_alias = _collect_scan_columns(
+        sql_scans, "table_ref", "required_columns",
+    )
+    spark_cols_by_alias = _collect_scan_columns(
+        spark_reads, "alias", "required_columns",
+    )
+
+    # 仅在两侧共有的 alias 上对比（单侧有列集合不构成差异）
+    common_aliases = set(sql_cols_by_alias) & set(spark_cols_by_alias)
+    for alias in sorted(common_aliases):
+        if sql_cols_by_alias[alias] != spark_cols_by_alias[alias]:
+            only_sql = sql_cols_by_alias[alias] - spark_cols_by_alias[alias]
+            only_spark = spark_cols_by_alias[alias] - sql_cols_by_alias[alias]
+            return StepEquivalenceResult(
+                step_type="scan",
+                verdict=EquivalenceVerdict.NOT_EQUIVALENT,
+                sql_count=sql_count,
+                spark_count=spark_count,
+                detail=(
+                    f"表 '{alias}' 读取列集合不一致："
+                    f"仅在 SQL 侧 {only_sql or '无'}，"
+                    f"仅在 Spark 侧 {only_spark or '无'}"
+                ),
+            )
 
     return StepEquivalenceResult(
         step_type="scan",
