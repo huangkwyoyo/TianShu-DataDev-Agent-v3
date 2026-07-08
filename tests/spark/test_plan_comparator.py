@@ -1068,12 +1068,12 @@ class TestPlanComparatorNotCovered:
         该测试绕过 PlanComparator.compare() 的上层 uncovered_types 补偿逻辑，
         直接验证 compare_plans() 内部对 _NO_EQUIVALENCE_RULE_TYPES 类型的处理。
         """
+        from tianshu_datadev.planning.sql_build_plan import SubqueryStep
         from tianshu_datadev.spark.plan_comparator import PlanComparator
         from tianshu_datadev.spark.plan_equivalence import (
-            compare_plans,
             EquivalenceVerdict,
+            compare_plans,
         )
-        from tianshu_datadev.planning.sql_build_plan import SubqueryStep
 
         # 构造含 subquery 的 SqlBuildPlan steps
         inner_plan = _make_sql_plan([
@@ -1107,8 +1107,6 @@ class TestPlanComparatorNotCovered:
         """Window 类型 → NOT_COVERED。"""
         from tianshu_datadev.planning.sql_build_plan import WindowStep
         from tianshu_datadev.spark.models import (
-            SparkWindowExpr,
-            SparkWindowFunction,
             SparkWindowStep,
         )
 
@@ -1144,8 +1142,6 @@ class TestPlanComparatorNotCovered:
         """Window 类型已启用 → LOGIC_EQUIVALENT（非 NOT_COVERED）。"""
         from tianshu_datadev.planning.sql_build_plan import WindowStep
         from tianshu_datadev.spark.models import (
-            SparkWindowExpr,
-            SparkWindowFunction,
             SparkWindowStep,
         )
 
@@ -1188,8 +1184,6 @@ class TestPlanComparatorMixedScenarios:
         """已覆盖部分 + window 未覆盖 → NOT_COVERED。"""
         from tianshu_datadev.planning.sql_build_plan import WindowStep
         from tianshu_datadev.spark.models import (
-            SparkWindowExpr,
-            SparkWindowFunction,
             SparkWindowStep,
         )
 
@@ -1367,8 +1361,6 @@ class TestPlanComparisonReportStructure:
         """window 已启用 → 不再出现在 uncovered_step_types 中。"""
         from tianshu_datadev.planning.sql_build_plan import WindowStep
         from tianshu_datadev.spark.models import (
-            SparkWindowExpr,
-            SparkWindowFunction,
             SparkWindowStep,
         )
 
