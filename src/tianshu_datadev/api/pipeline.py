@@ -2748,7 +2748,7 @@ class Pipeline:
         context: SparkStageContext,
     ) -> None:
         """执行 COMPARATOR 阶段——SQL ↔ Spark 逻辑对比。"""
-        from tianshu_datadev.spark.plan_comparator import PlanComparator
+        from tianshu_datadev.spark.plan_comparator import ComparisonStatus, PlanComparator
 
         comparator = PlanComparator()
         sql_plan = artifacts.sql_build_plan
@@ -2775,7 +2775,18 @@ class Pipeline:
             return
 
         context.comparator_report = report
-        context.stage_results["COMPARATOR"] = "SUCCESS"
+        # 根据 report.status 映射阶段结果——不再硬编码 SUCCESS
+        # 详细状态保留在 comparator_report.status 中，derive_overall_status 消费
+        _status_map = {
+            ComparisonStatus.LOGIC_EQUIVALENT: "SUCCESS",
+            ComparisonStatus.LOGIC_MISMATCH: "FAILURE",
+            ComparisonStatus.LOGIC_UNSUPPORTED: "HUMAN_REVIEW",
+            ComparisonStatus.NOT_COVERED: "HUMAN_REVIEW",
+            ComparisonStatus.NOT_EXECUTED: "SKIPPED",
+        }
+        context.stage_results["COMPARATOR"] = _status_map.get(
+            report.status, "HUMAN_REVIEW",
+        )
 
     def _do_spark_physical_verify(
         self, artifacts: PipelineArtifactBundle, context: SparkStageContext,

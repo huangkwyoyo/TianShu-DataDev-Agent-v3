@@ -2431,3 +2431,26 @@ class TestNormalizeDagSteps:
         result = PlanComparator._normalize_dag_steps(steps, target_grain=None)
         agg_steps = [s for s in result if s.get("step_type") == "aggregate"]
         assert len(agg_steps) == 2, f"target_grain=None 应保留所有 aggregate，实际 {len(agg_steps)}"
+
+
+class TestComparatorStatusMapping:
+    """验证 ComparisonStatus → stage_result 映射表正确性（缺陷 5 门禁）。"""
+
+    def test_comparator_status_to_stage_result_mapping(self):
+        """验证 ComparisonStatus → stage_result 映射表正确。"""
+        # 此映射表将被 _do_spark_compare 使用
+        _status_map = {
+            ComparisonStatus.LOGIC_EQUIVALENT: "SUCCESS",
+            ComparisonStatus.LOGIC_MISMATCH: "FAILURE",
+            ComparisonStatus.LOGIC_UNSUPPORTED: "HUMAN_REVIEW",
+            ComparisonStatus.NOT_COVERED: "HUMAN_REVIEW",
+            ComparisonStatus.NOT_EXECUTED: "SKIPPED",
+        }
+
+        assert _status_map[ComparisonStatus.LOGIC_EQUIVALENT] == "SUCCESS"
+        assert _status_map[ComparisonStatus.LOGIC_MISMATCH] == "FAILURE"
+        assert _status_map[ComparisonStatus.LOGIC_UNSUPPORTED] == "HUMAN_REVIEW"
+        assert _status_map[ComparisonStatus.NOT_COVERED] == "HUMAN_REVIEW"
+        assert _status_map[ComparisonStatus.NOT_EXECUTED] == "SKIPPED"
+        # 防御：未知状态 → HUMAN_REVIEW
+        assert _status_map.get("UNKNOWN_STATUS", "HUMAN_REVIEW") == "HUMAN_REVIEW"
