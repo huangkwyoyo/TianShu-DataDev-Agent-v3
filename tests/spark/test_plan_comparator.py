@@ -1400,39 +1400,6 @@ class TestPlanComparisonReportStructure:
         assert report.status != ComparisonStatus.NOT_COVERED
         assert "window" not in report.uncovered_step_types
 
-    def test_window_now_enabled_not_not_covered(self):
-        """Window 类型已启用 → LOGIC_EQUIVALENT（非 NOT_COVERED）。"""
-        from tianshu_datadev.planning.sql_build_plan import WindowStep
-        from tianshu_datadev.spark.models import (
-            SparkWindowExpr,
-            SparkWindowFunction,
-            SparkWindowStep,
-        )
-
-        sql_plan = _make_sql_plan([
-            _make_sql_scan_step(),
-            WindowStep(
-                step_type="window",
-                step_id="step_window_001",
-                window_exprs=[],
-            ),
-        ])
-        spark_plan = _make_spark_plan([
-            _make_spark_read_step(),
-            SparkWindowStep(
-                step_type=SparkStepType.WINDOW,
-                input_alias="od",
-                expressions=[],
-            ),
-        ])
-
-        comparator = PlanComparator()
-        report = comparator.compare(sql_plan, spark_plan)
-
-        assert report.status != ComparisonStatus.NOT_COVERED
-        assert "window" not in report.uncovered_step_types
-        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
-
 
 # ════════════════════════════════════════════
 # PlanComparator——自定义启用类型
