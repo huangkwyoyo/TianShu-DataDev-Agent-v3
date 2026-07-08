@@ -615,8 +615,8 @@ class TestPlanComparatorSortEquivalence:
     def test_sort_equivalent(self):
         """相同排序规格 → LOGIC_EQUIVALENT。
 
-        使用 ASC——两侧默认 null_order 均为 LAST（Spark F.asc()→LAST，SQL SortSpec 默认 LAST）。
-        DESC 场景两侧默认不同（SQL LAST vs Spark FIRST），参见 test_desc_default_nulls_mismatch_detected。
+        使用 DESC——两侧默认 null_order 均为 LAST（Spark ORDER BY DESC→NULLS LAST，SQL SortSpec 默认 LAST）。
+        ASC 场景两侧默认不同（SQL LAST vs Spark FIRST），参见 test_asc_default_nulls_mismatch_detected。
         """
         sql_plan = _make_sql_plan(
             [
@@ -624,16 +624,12 @@ class TestPlanComparatorSortEquivalence:
                 _make_sql_sort_step(),
             ]
         )
-        # 切换为 ASC——确保两侧 null_order 默认均为 LAST
-        sql_plan.steps[1].order_by[0].direction = SortDirection.ASC
         spark_plan = _make_spark_plan(
             [
                 _make_spark_read_step(),
                 _make_spark_sort_step(),
             ]
         )
-        # 对齐为 ASC
-        spark_plan.steps[1].order_by[0].direction = SparkSortDirection.ASC
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -669,8 +665,11 @@ class TestPlanComparatorSortEquivalence:
 
         assert report.status == ComparisonStatus.LOGIC_MISMATCH
 
-    def test_sort_nulls_first_vs_default_last_not_equivalent(self):
-        """SQL NULLS FIRST vs Spark 默认 LAST → NOT_EQUIVALENT。"""
+    def test_sort_nulls_first_vs_desc_default_not_equivalent(self):
+        """SQL DESC NULLS FIRST vs Spark DESC 默认 NULLS LAST → NOT_EQUIVALENT。
+
+        Spark ORDER BY DESC 默认 NULLS LAST，SQL 显式 NULLS FIRST 产生差异。
+        """
         from tianshu_datadev.planning.models import NullOrder
 
         sql_plan = _make_sql_plan([
@@ -681,7 +680,7 @@ class TestPlanComparatorSortEquivalence:
                 order_by=[
                     SortSpec(
                         column="amount",
-                        direction=SortDirection.ASC,
+                        direction=SortDirection.DESC,
                         null_order=NullOrder.FIRST,
                     ),
                 ],
@@ -689,10 +688,8 @@ class TestPlanComparatorSortEquivalence:
         ])
         spark_plan = _make_spark_plan([
             _make_spark_read_step(),
-            _make_spark_sort_step(),  # 默认 DESC，先把方向对齐
+            _make_spark_sort_step(),  # 默认 DESC → NULLS LAST
         ])
-        # 对齐方向为 ASC
-        spark_plan.steps[1].order_by[0].direction = SparkSortDirection.ASC
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
@@ -702,13 +699,11 @@ class TestPlanComparatorSortEquivalence:
         assert len(sort_results) == 1
         assert sort_results[0].verdict == EquivalenceVerdict.NOT_EQUIVALENT
 
-    def test_desc_default_nulls_mismatch_detected(self):
-        """SQL DESC（默认 NULLS LAST）vs Spark DESC（默认 NULLS FIRST）→ NOT_EQUIVALENT。
+    def test_desc_default_nulls_match(self):
+        """SQL DESC（默认 NULLS LAST）vs Spark DESC（默认 NULLS LAST）→ EQUIVALENT。
 
-        Spark 编译器只生成 F.desc()，未显式指定 null_order。
-        F.desc() 默认 NULLS FIRST（Spark DataFrame API）。
-        SQL SortSpec 默认 NULLS LAST（不论方向）。
-        此差异应被 comparator 检测——固定 "LAST" 会导致误判为等价。
+        Spark SQL ORDER BY DESC 默认 NULLS LAST，SQL SortSpec 也默认 LAST。
+        两侧一致，应为等价。
         """
         sql_plan = _make_sql_plan([
             _make_sql_scan_step(),
@@ -726,23 +721,23 @@ class TestPlanComparatorSortEquivalence:
         ])
         spark_plan = _make_spark_plan([
             _make_spark_read_step(),
-            _make_spark_sort_step(),  # 默认 DESC
+            _make_spark_sort_step(),  # 默认 DESC → NULLS LAST
         ])
 
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
 
-        # DESC → Spark 侧 null_order 应为 "FIRST"，SQL 侧为 "LAST" → NOT_EQUIVALENT
         sort_results = [r for r in report.step_results if r.step_type == "sort"]
         assert len(sort_results) == 1
-        assert sort_results[0].verdict == EquivalenceVerdict.NOT_EQUIVALENT, (
-            f"DESC null_order 应检测到不匹配，实际：{sort_results[0].verdict}"
+        assert sort_results[0].verdict == EquivalenceVerdict.EQUIVALENT, (
+            f"DESC 默认 null_order 应等价，实际：{sort_results[0].verdict}"
         )
 
-    def test_asc_default_nulls_match(self):
-        """SQL ASC（默认 NULLS LAST）vs Spark ASC（默认 NULLS LAST）→ EQUIVALENT。
+    def test_asc_default_nulls_mismatch_detected(self):
+        """SQL ASC（默认 NULLS LAST）vs Spark ASC（默认 NULLS FIRST）→ NOT_EQUIVALENT。
 
-        ASC 场景两侧 null_order 均为 LAST，应为等价。
+        Spark SQL ORDER BY ASC 默认 NULLS FIRST，SQL SortSpec 默认 LAST。
+        此差异应被 comparator 检测。
         """
         sql_plan = _make_sql_plan([
             _make_sql_scan_step(),
@@ -768,11 +763,10 @@ class TestPlanComparatorSortEquivalence:
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
 
-        # ASC → 两侧 null_order 均为 "LAST" → EQUIVALENT
         sort_results = [r for r in report.step_results if r.step_type == "sort"]
         assert len(sort_results) == 1
-        assert sort_results[0].verdict == EquivalenceVerdict.EQUIVALENT, (
-            f"ASC 默认 null_order 应为 LATEST 等价，实际：{sort_results[0].verdict}"
+        assert sort_results[0].verdict == EquivalenceVerdict.NOT_EQUIVALENT, (
+            f"ASC null_order 应检测到不匹配，实际：{sort_results[0].verdict}"
         )
 
 
@@ -1611,7 +1605,7 @@ class TestPlanComparatorCustomEnabledTypes:
                 ContractOutputColumn(column_name="total_amt", alias="total_amt"),
             ],
             output_grain=["region_code"],
-            sort_spec=[ContractSort(column="total_amt", direction="ASC")],
+            sort_spec=[ContractSort(column="total_amt", direction="DESC")],
             limit_spec=ContractLimit(limit=100),
             business_keys=["region_code"],
             step_dag={"stmt_main": []},

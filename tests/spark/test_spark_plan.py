@@ -814,10 +814,10 @@ class TestPlanEquivalence:
         assert result.verdict == EquivalenceVerdict.NOT_EQUIVALENT
 
     def test_sort_equivalent(self):
-        """相同排序——等价（ASC——两侧 null_order 默认均为 LAST）。"""
+        """相同排序——等价（DESC——两侧 null_order 默认均为 LAST）。"""
         result = compare_sort_steps(
-            [{"order_by": [{"column": "total_amount", "direction": "ASC"}]}],
-            [{"order_by": [{"column": "total_amount", "direction": "asc"}]}],
+            [{"order_by": [{"column": "total_amount", "direction": "DESC"}]}],
+            [{"order_by": [{"column": "total_amount", "direction": "desc"}]}],
         )
         assert result.verdict == EquivalenceVerdict.EQUIVALENT
 

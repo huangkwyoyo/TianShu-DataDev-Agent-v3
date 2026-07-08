@@ -917,7 +917,7 @@ class TestC4D4LogicEquivalence:
                 ContractOutputColumn(column_name="region_code", alias="region_code"),
                 ContractOutputColumn(column_name="total_amt", alias="total_amt"),
             ],
-            sort_spec=[ContractSort(column="total_amt", direction="ASC")],
+            sort_spec=[ContractSort(column="total_amt", direction="DESC")],
             limit_spec=ContractLimit(limit=100),
             case_when_labels=[
                 CaseWhenLabelSpec(
