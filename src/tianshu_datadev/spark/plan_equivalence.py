@@ -640,20 +640,22 @@ def compare_sort_steps(
         )
 
     # 收集所有排序规格
-    sql_keys: list[tuple[str, str]] = []
+    sql_keys: list[tuple[str, str, str]] = []
     for s in sql_sorts:
         for item in s.get("order_by", []) or []:
             sql_keys.append((
                 normalize_field_name(item.get("column", "")),
                 (item.get("direction", "asc") or "asc").upper(),
+                (item.get("null_order", "last") or "last").upper(),
             ))
 
-    spark_keys: list[tuple[str, str]] = []
+    spark_keys: list[tuple[str, str, str]] = []
     for s in spark_sorts:
         for item in s.get("order_by", []) or []:
             spark_keys.append((
                 normalize_field_name(item.get("column", "")),
                 (item.get("direction", "asc") or "asc").upper(),
+                "LAST",  # SparkSortSpec 无 null_order 字段，默认 LAST（大写，与 SQL .upper() 一致）
             ))
 
     if sql_keys != spark_keys:
@@ -758,10 +760,11 @@ _SQL_TYPE_TO_NORMALIZED: dict[str, str] = {
     "limit": "limit",
 }
 
-# 暂不支持等价对比的 step 类型
-_UNSUPPORTED_STEP_TYPES: set[str] = {
-    "subquery",  # SubqueryStep——Phase 4.6 新增，等价对比规则 Phase 7 设计
-}
+# 无等价对比规则的 step 类型。
+# 与 PlanComparator._NOT_YET_COVERED_TYPES 的区别：
+#   - 此集合：对比规则不存在（如 subquery——Spark 侧无对应类型，无法设计规则）
+#   - _NOT_YET_COVERED_TYPES：规则已存在但本 Phase 未启用（如 Phase 7B 的 window）
+_NO_EQUIVALENCE_RULE_TYPES: set[str] = {"subquery"}
 
 
 def compare_plans(
@@ -815,12 +818,22 @@ def compare_plans(
         sql_steps_of_type = sql_by_type.get(stype, [])
         spark_steps_of_type = spark_by_type.get(stype, [])
 
-        if stype in _UNSUPPORTED_STEP_TYPES:
+        if stype in _NO_EQUIVALENCE_RULE_TYPES:
             unsupported_types.append(stype)
+            step_results.append(StepEquivalenceResult(
+                step_type=stype,
+                verdict=EquivalenceVerdict.UNSUPPORTED_COMPARISON,
+                detail=f"'{stype}' 无等价对比规则（_NO_EQUIVALENCE_RULE_TYPES）",
+            ))
             continue
 
         if stype not in _STEP_COMPARATORS:
             unsupported_types.append(stype)
+            step_results.append(StepEquivalenceResult(
+                step_type=stype,
+                verdict=EquivalenceVerdict.UNSUPPORTED_COMPARISON,
+                detail=f"未知 step 类型 '{stype}'——不在 _STEP_COMPARATORS 注册表中",
+            ))
             continue
 
         if not sql_steps_of_type and spark_steps_of_type:

@@ -501,6 +501,39 @@ class TestPlanComparatorSortEquivalence:
 
         assert report.status == ComparisonStatus.LOGIC_MISMATCH
 
+    def test_sort_nulls_first_vs_default_last_not_equivalent(self):
+        """SQL NULLS FIRST vs Spark 默认 LAST → NOT_EQUIVALENT。"""
+        from tianshu_datadev.planning.models import NullOrder
+
+        sql_plan = _make_sql_plan([
+            _make_sql_scan_step(),
+            SortStep(
+                step_type="sort",
+                step_id="step_sort_001",
+                order_by=[
+                    SortSpec(
+                        column="amount",
+                        direction=SortDirection.ASC,
+                        null_order=NullOrder.FIRST,
+                    ),
+                ],
+            ),
+        ])
+        spark_plan = _make_spark_plan([
+            _make_spark_read_step(),
+            _make_spark_sort_step(),  # 默认 DESC，先把方向对齐
+        ])
+        # 对齐方向为 ASC
+        spark_plan.steps[1].order_by[0].direction = SparkSortDirection.ASC
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        # null_order 不同 → NOT_EQUIVALENT
+        sort_results = [r for r in report.step_results if r.step_type == "sort"]
+        assert len(sort_results) == 1
+        assert sort_results[0].verdict == EquivalenceVerdict.NOT_EQUIVALENT
+
 
 class TestPlanComparatorLimitEquivalence:
     """Limit 逻辑等价性对比。"""
@@ -879,6 +912,37 @@ class TestPlanComparatorCaseWhenEquivalence:
 
 class TestPlanComparatorNotCovered:
     """Phase 7B 未覆盖类型 → NOT_COVERED（仅 window，Phase 6C 覆盖）。"""
+
+    def test_subquery_produces_step_result_entry(self):
+        """subquery 类型 → step_results 中包含 UNSUPPORTED_COMPARISON 条目。"""
+        from tianshu_datadev.planning.sql_build_plan import SubqueryStep
+
+        # 构造含 subquery 的 SqlBuildPlan（最小 inner_plan）
+        inner_plan = _make_sql_plan([
+            _make_sql_scan_step(table_ref="sub_t"),
+            _make_sql_project_step(),
+        ])
+        sql_plan = _make_sql_plan([
+            _make_sql_scan_step(),
+            SubqueryStep(
+                step_type="subquery",
+                step_id="step_sub_001",
+                alias="sub_alias",
+                inner_plan=inner_plan,
+                depth=1,
+            ),
+        ])
+        spark_plan = _make_spark_plan([
+            _make_spark_read_step(),
+        ])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        # subquery 应在 step_results 中有条目
+        sub_results = [r for r in report.step_results if r.step_type == "subquery"]
+        assert len(sub_results) >= 1
+        assert sub_results[0].verdict == EquivalenceVerdict.UNSUPPORTED_COMPARISON
 
     def test_window_not_in_enabled_types(self):
         """Window 类型 → NOT_COVERED。"""
