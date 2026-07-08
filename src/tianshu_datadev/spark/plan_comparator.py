@@ -2,8 +2,8 @@
 
 封装 Phase 5 plan_equivalence.py 的 9 条对比规则和 compare_plans() 入口。
 只读取 SqlBuildPlan 结构化 artifact——不读取 SQL 文本。
-默认覆盖 8 类 step：scan/filter/project/sort/limit/aggregate/join/case_when。
-window/subquery 仍标记 NOT_COVERED。
+默认覆盖 9 类 step：scan/filter/project/sort/limit/aggregate/join/case_when/window。
+subquery 仍标记 NOT_COVERED（Spark 侧无 SubqueryStep 对应类型）。
 
 状态语义（精确区分）：
 - NOT_EXECUTED：整个对比流程尚未执行
@@ -34,6 +34,7 @@ from tianshu_datadev.spark.plan_equivalence import (
     PlanEquivalenceResult,
     StepEquivalenceResult,
     compare_plans,
+    normalize_field_name,
 )
 
 # ════════════════════════════════════════════
@@ -728,13 +729,11 @@ class PlanComparator:
             if "normalized_name" in value or "column_name" in value:
                 # ColumnRef → 归一化字段名（消去表前缀，防止后续 normalize_field_name 截断）
                 name = value.get("normalized_name") or value.get("column_name", "")
-                from tianshu_datadev.spark.plan_equivalence import normalize_field_name
                 return normalize_field_name(str(name)) if name else ""
             if "value" in value:
                 # SqlLiteral → 提取值
                 return str(value["value"])
             # 其他 dict（防御）→ JSON 稳定序列化（sort_keys 保证确定性）
-            import json
             return json.dumps(value, sort_keys=True, default=str)
         if isinstance(value, list):
             # IN / BETWEEN 右值列表 → 递归渲染并排序
