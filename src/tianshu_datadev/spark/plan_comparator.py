@@ -777,13 +777,17 @@ class PlanComparator:
         if isinstance(right, dict) and right_is_tree:
             parts.append(PlanComparator._render_predicate_tree(right))
         else:
-            right_str = PlanComparator._render_operand(right)
-            if right_str and right_str != "<NULL>":
-                parts.append(right_str)
+            parts.append(PlanComparator._render_operand(right))
 
         # AND/OR 可交换——排序子树
         if op in ("AND", "OR"):
             parts.sort()
+            joiner = f" {op} "
+            return f"({joiner.join(parts)})"
+
+        # NOT 单子树——不排序，不依赖 right 值
+        if op == "NOT":
+            return f"(NOT {parts[0]})" if parts else "(NOT <EMPTY>)"
 
         joiner = f" {op} "
         return f"({joiner.join(parts)})"

@@ -477,6 +477,41 @@ class TestPlanComparatorFilterEquivalence:
         # right 应为空（PREDICATE_TREE 模式下右值无意义）
         assert sql_filters[0].get("right", "") == ""
 
+    def test_not_predicate_rendered_correctly(self):
+        """NOT 谓词 → 渲染结果包含 NOT 标记。"""
+        not_pred = Predicate(
+            left=Predicate(
+                left=ColumnRef(table_ref="t", column_name="a", normalized_name="a"),
+                operator=PredicateOperator.GT,
+                right=SqlLiteral(value="1"),
+            ),
+            operator=PredicateOperator.NOT,
+            right=None,
+        )
+
+        sql_plan = _make_sql_plan([
+            _make_sql_scan_step(),
+            FilterStep(
+                step_type="filter",
+                step_id="step_filter_not",
+                predicate=not_pred,
+            ),
+        ])
+        spark_plan = _make_spark_plan([
+            _make_spark_read_step(),
+            _make_spark_filter_step(),
+        ])
+
+        from tianshu_datadev.spark.plan_comparator import PlanComparator
+        sql_steps = PlanComparator._extract_sql_step_data(sql_plan)
+
+        sql_filters = [s for s in sql_steps if s.get("step_type") == "filter"]
+        assert len(sql_filters) == 1
+        rendered_left = sql_filters[0].get("left", "")
+        # NOT 标记不应丢失
+        assert "NOT" in rendered_left.upper()
+        assert sql_filters[0].get("operator", "") == "PREDICATE_TREE"
+
 
 class TestPlanComparatorProjectEquivalence:
     """Project 逻辑等价性对比。"""
