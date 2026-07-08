@@ -238,6 +238,8 @@ def compare_filter_steps(
             normalize_field_name(str(f.get("right", ""))),
         )
 
+    # 对两侧 filter 条件排序后对比集合等价性——利用 AND/OR 可交换性，
+    # 同一 filter step 内的子句顺序不影响语义。步骤间顺序由 check_order 保护。
     sql_normalized = sorted(_normalize_filter_tuple(f) for f in sql_filters)
     spark_normalized = sorted(_normalize_filter_tuple(f) for f in spark_filters)
 
@@ -367,6 +369,14 @@ def compare_aggregate_steps(
             sql_count=0,
             spark_count=0,
         )
+
+    # 防御性断言：DAG 归一化确保每侧最多 1 个 aggregate step。
+    # 如果未来 builder 产出多 aggregate（如优化器拆分 count(distinct)），
+    # 此断言会立即暴露问题，避免静默跳检。
+    assert len(sql_aggs) == len(spark_aggs) == 1, (
+        f"compare_aggregate_steps 假设每侧最多 1 个 aggregate step，"
+        f"实际 SQL={len(sql_aggs)}, Spark={len(spark_aggs)}"
+    )
 
     sql_agg = sql_aggs[0]
     spark_agg = spark_aggs[0]
@@ -564,6 +574,21 @@ def compare_case_when_steps(
                 sql_count=sql_count,
                 spark_count=spark_count,
                 detail=f"CASE WHEN[{i}] ELSE 值不一致：SQL 侧 '{sql_else}'，Spark 侧 '{spark_else}'",
+            )
+
+        # 对比输出别名——与 project/window 行为一致，两边都为空时视为等价
+        sql_alias = normalize_field_name(sql_cw.get("alias", "") or "")
+        spark_alias = normalize_field_name(spark_cw.get("output_alias", "") or "")
+        if sql_alias != spark_alias:
+            return StepEquivalenceResult(
+                step_type="case_when",
+                verdict=EquivalenceVerdict.NOT_EQUIVALENT,
+                sql_count=sql_count,
+                spark_count=spark_count,
+                detail=(
+                    f"CASE WHEN[{i}] 输出别名不一致："
+                    f"SQL 侧 '{sql_alias}'，Spark 侧 '{spark_alias}'"
+                ),
             )
 
     return StepEquivalenceResult(

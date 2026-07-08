@@ -1,30 +1,53 @@
-Status: DONE
-Commits:
-- 8296c78 feat: dev_reload.py 核心脚本——清理 + 白名单杀进程 + 启动 + 健康检查
-Tests: 21 passed, 0 failed, 0 skipped (dev_reload 单元测试); 2153 passed, 11 skipped (全量回归，1 failed 为预存在 LLM API key 测试，3 errors 为预存在 PermissionError)
-Concerns: build_parser 的默认值逻辑与 brief 有差异——brief 使用 action="store_true"，但测试期望无参数时 backend=True，故改用 store_false + dest 反向 + set_defaults 实现。tests/scripts/test_dev_reload.py 修复了 2 处 PROJECT_ROOT → self.PROJECT_ROOT 的 NameError。
+# Task 2 报告：scan 列集合按 alias 分组对比（缺陷 4）
 
-## Task Review
+## 状态
 
-### Spec Compliance
-Verdict: ❌
-Gaps:
-- **Minor: build_parser 实现偏离 Spec**：brief 要求 `action="store_true"` 配合 main() 中 `if not args.backend and not args.frontend` 回退逻辑，实际实现使用了 `action="store_false"` + 交叉 dest + `set_defaults`。功能等价（CLI 行为一致），但实现模式与 brief 给出的 spec 代码不同。报告中已自述此差异，属于已知偏差。
-- **测试数据差异**：brief 预期 16 passed，实际报告 21 passed。这本身不是 bug，但说明测试规模超出了 brief 的基线预期（可能是额外补充了测试用例）。
+**DONE**
 
-### Code Quality
-Verdict: Approved
-Findings:
-- [Minor] **未使用的 import**：`import os` 在文件中从未使用，是从 brief 模板带入的残留。
-- [Minor] **clean_pyc 双重遍历**：先删除 `__pycache__` 目录，再用 `rglob("*.pyc")` 遍历全项目——已随 `__pycache__` 删除的 `.pyc` 会被第二次无意义扫描。不影响正确性，但有轻微性能浪费。
-- [Minor] **main() 中冗余回退逻辑**：`build_parser` 已通过 `set_defaults(backend=True, frontend=True)` 设置默认值，main() 中 `if not args.backend and not args.frontend` 分支仅在同时传 `--backend --frontend` 时触发（将两值均置回 True）。功能正确但逻辑路径令人困惑，与 `set_defaults` 存在语义重叠。
+## 提交
 
-### Summary
-Needs Fix（Spec 偏离 + 3 个 Minor）
-- 建议将 `build_parser` 对齐到 brief 的 `action="store_true"` 模式，或更新 brief 中的 spec 代码以匹配当前实现。
-- 3 个 Minor 项不阻塞合并，建议择机修复。
+```
+2ffa1ef fix(comparator): scan 列集合按 alias 分组对比
+```
 
-## Fix Report
-Fixed: Minor (unused import os)
-Not fixed: Minor (clean_pyc double traversal —— 防御性), Minor (main() redundant fallback —— 防御性)
-Tests after fix: 21 passed
+## 测试结果
+
+### Step 2：失败确认（TDD 红）
+
+```bash
+python -m pytest tests/spark/test_plan_comparator.py::TestPlanComparatorScanEquivalence::test_scan_columns_mismatch_detected_by_alias -v
+```
+**FAILED** — 现有代码未检查 required_columns，SQL 侧 3 列 vs Spark 侧 2 列仍返回 EQUIVALENT（错误），验证了缺陷存在。
+
+### Step 5：实现后测试通过
+
+```bash
+python -m pytest tests/spark/test_plan_comparator.py::TestPlanComparatorScanEquivalence -v
+```
+**3 passed** — 原有 2 个测试（等价、别名不等）+ 新增 1 个（列集合不等）全部通过。
+
+### 回归测试
+
+```bash
+python -m pytest tests/spark/test_plan_comparator.py -v
+```
+**46 passed** — 全部 46 个测试通过，未破坏 filter/project/sort/limit/aggregate/join/case_when/not_covered/混合场景/多语句/归一化 等现有逻辑。
+
+## 变更内容
+
+### `src/tianshu_datadev/spark/plan_equivalence.py`
+
+- 新增 `_extract_column_name(col) -> str`：统一提取列名，兼容 SQL 侧 ColumnRef dict（优先取 `normalized_name`）和 Spark 侧纯字符串
+- `compare_scan_steps()`：在别名对比通过后、EQUIVALENT return 之前，插入按 alias 分组的列集合对比逻辑：
+  - 内部函数 `_collect_scan_columns` 按 alias 收集 `set[str]`
+  - 仅在两侧共有的 alias 上对比
+  - 不一致时返回 `NOT_EQUIVALENT`，detail 含仅在 SQL/Spark 侧的列名
+  - 任一侧 `required_columns` 为空时跳过该 alias 的列对比（向后兼容）
+
+### `tests/spark/test_plan_comparator.py`
+
+- 新增 `test_scan_columns_mismatch_detected_by_alias`：SQL 侧 3 列（含 status）、Spark 侧 2 列（缺 status），同 alias "od" —— 验证返回 NOT_EQUIVALENT 且 detail 包含 "status"
+
+## 关注点
+
+无。

@@ -189,8 +189,8 @@ class PlanComparator:
 
         # Step 1.5：规范化 BETWEEN 右值——SQL 侧和 Spark 侧序列化格式不同，
         # 需在进入 compare_plans 前统一为规范形式 [v1,v2]
-        self._normalize_between_rights(sql_steps_data)
-        self._normalize_between_rights(spark_steps_data)
+        self._normalize_filter_rights(sql_steps_data)
+        self._normalize_filter_rights(spark_steps_data)
 
         # Step 2：计算 hash
         sql_plan_hash = SqlBuildPlan.generate_plan_hash(sql_plan)
@@ -314,8 +314,8 @@ class PlanComparator:
         sql_steps_data = self._normalize_dag_steps(sql_steps_data, target_grain=target_grain)
 
         # Step 1.5：规范化 BETWEEN 右值——SQL 侧和 Spark 侧序列化格式不同
-        self._normalize_between_rights(sql_steps_data)
-        self._normalize_between_rights(spark_steps_data)
+        self._normalize_filter_rights(sql_steps_data)
+        self._normalize_filter_rights(spark_steps_data)
 
         # Step 2：计算 hash
         sql_plan_hash = self._compute_sql_program_hash(sql_program)
@@ -666,13 +666,15 @@ class PlanComparator:
         accumulator: list[dict[str, Any]],
     ) -> None:
         """递归提取子查询中的嵌套 step——结构化展开，不读 SQL 文本。"""
-        step_dict = step.model_dump(exclude_none=True)
+        # 使用 mode='json' 确保枚举值序列化为字符串，与 _extract_*_step_data 保持一致
+        step_dict = step.model_dump(mode="json", exclude_none=True)
         if step_dict.get("step_type") == "subquery":
             inner_plan_data = step_dict.get("inner_plan")
             if inner_plan_data and isinstance(inner_plan_data, dict):
                 inner_steps = inner_plan_data.get("steps", [])
                 for inner_step in inner_steps:
-                    accumulator.append(inner_step)
+                    # 经 _normalize_step_dict 扁平化，确保字段名在 plan_equivalence 对比时一致
+                    accumulator.append(PlanComparator._normalize_step_dict(inner_step))
 
     @staticmethod
     def _normalize_step_dict(step_dict: dict[str, Any]) -> dict[str, Any]:
@@ -837,8 +839,11 @@ class PlanComparator:
         elif right_val is None:
             right_val = ""
         elif isinstance(right_val, list):
-            # BETWEEN 谓词：right 是 SqlLiteral 列表，逐元素提取 value
-            right_val = PlanComparator._normalize_between_list(right_val)
+            # BETWEEN/IN/NOT_IN 谓词：right 是 SqlLiteral 列表，逐元素提取 value
+            # IN/NOT_IN 需排序（列表元素可交换），BETWEEN 保序
+            operator_str = str(predicate.get("operator", "")).upper()
+            sort_list = operator_str in ("IN", "NOT_IN")
+            right_val = PlanComparator._normalize_list_values(right_val, sort_values=sort_list)
 
         # 扁平化 operator 保持不变
         operator_val = predicate.get("operator", "")
@@ -1015,20 +1020,23 @@ class PlanComparator:
         return str(column)
 
     @staticmethod
-    def _normalize_between_list(items: list[Any]) -> str:
-        """将 BETWEEN 右值列表规范化为 [v1,v2] 形式。
+    def _normalize_list_values(items: list[Any], sort_values: bool = False) -> str:
+        """将 BETWEEN/IN/NOT_IN 的右值列表规范化为 [v1,v2,...] 字符串。
 
         SQL 侧 model_dump(mode='json') 将 SqlLiteral 列表序列化为
         [{'value': '...', 'is_sql_expr': false}, ...] 格式。
-        此方法逐元素提取 value 字段，生成确定性规范字符串，
-        使 SQL 侧与 Spark 侧（Python repr）可正确比较。
-        """
+        此方法逐元素提取 value 字段，生成确定性规范字符串。
+
+        sort_values=True 用于 IN/NOT_IN（列表元素可交换→排序），
+        False 用于 BETWEEN（[low, high] 顺序不可交换→保序）。"""
         values: list[str] = []
         for item in items:
             if isinstance(item, dict):
                 values.append(str(item.get("value", "")))
             else:
                 values.append(str(item))
+        if sort_values:
+            values.sort()
         return "[" + ",".join(values) + "]"
 
     @staticmethod
@@ -1047,7 +1055,8 @@ class PlanComparator:
             return right_str
 
         # 从 "SqlLiteral(value='...', ...)" 或 "{'value': '...', ...}" 中提取 value
-        values = re.findall(r"value['\"]?\s*[:=]\s*['\"]?([^'\",}\s)]+)", right_str)
+        # 捕获组允许空格——datetime 类型的 BETWEEN 右值如 "2026-01-01 00:00:00" 需完整提取
+        values = re.findall(r"value['\"]?\s*[:=]\s*['\"]?([^'\",})]+)", right_str)
         if values:
             return "[" + ",".join(values) + "]"
         return right_str
@@ -1068,29 +1077,52 @@ class PlanComparator:
         return self._TYPE_NORMALIZE_MAP.get(step_type, step_type)
 
     @staticmethod
-    def _normalize_between_rights(steps_data: list[dict[str, Any]]) -> None:
-        """原地规范化所有 filter step 的 BETWEEN 右值。
+    def _normalize_filter_rights(steps_data: list[dict[str, Any]]) -> None:
+        """原地规范化所有 filter step 的右值。
 
-        SQL 侧的 BETWEEN 右值在 _flatten_filter_step 中已由
-        _normalize_between_list 处理（list → 规范字符串）。
-        此方法处理 Spark 侧——其 right 字段是 Python repr 字符串，
-        需提取 value 后重写为规范形式。
+        处理三种场景：
+        1. BETWEEN/IN/NOT_IN——SQL 侧 right 是 SqlLiteral 列表，Spark 侧是
+           Python repr 字符串。统一提取为规范字符串 [v1,v2,...]。
+           BETWEEN 保序，IN/NOT_IN 排序（列表元素可交换）。
+        2. IS_NULL/IS_NOT_NULL——SQL 侧 right 为 None/空，Spark 侧可为任意值。
+           统一为规范占位符 <NULL>（与 _render_operand 行为一致）。
 
-        对非 filter 或非 BETWEEN 的 step 无操作。
+        对非 filter step 无操作。
         """
+        # 需要列表归一化的操作符
+        _list_ops = {"BETWEEN", "IN", "NOT_IN"}
+        # 需要排序的列表操作符（IN/NOT_IN 元素可交换）
+        _sorted_list_ops = {"IN", "NOT_IN"}
+        # 单目操作符（right 应为占位符）
+        _nullary_ops = {"IS_NULL", "IS_NOT_NULL"}
+
         for s in steps_data:
             stype = s.get("step_type", "")
             if stype != "filter":
                 continue
             operator = str(s.get("operator", "")).upper()
-            if operator != "BETWEEN":
-                continue
             right_val = s.get("right", "")
-            if isinstance(right_val, list):
-                # SQL 侧已在 _flatten_filter_step 处理过，此处防御
-                s["right"] = PlanComparator._normalize_between_list(right_val)
-            elif isinstance(right_val, str):
-                s["right"] = PlanComparator._normalize_between_right_string(right_val)
+
+            if operator in _list_ops:
+                sort_vals = operator in _sorted_list_ops
+                if isinstance(right_val, list):
+                    # SQL 侧已在 _flatten_filter_step 处理过，此处防御
+                    s["right"] = PlanComparator._normalize_list_values(
+                        right_val, sort_values=sort_vals
+                    )
+                elif isinstance(right_val, str):
+                    s["right"] = PlanComparator._normalize_between_right_string(right_val)
+                    # IN/NOT_IN 需排序——对提取后的值重新排序
+                    if sort_vals and s["right"].startswith("["):
+                        inner = s["right"][1:-1]
+                        if inner:
+                            parts = inner.split(",")
+                            parts.sort()
+                            s["right"] = "[" + ",".join(parts) + "]"
+            elif operator in _nullary_ops:
+                # IS_NULL/IS_NOT_NULL：统一 right 为 <NULL> 占位符
+                # SQL 侧 right=None（flatten 后为 ""），Spark 侧可能为任意值
+                s["right"] = "<NULL>"
 
     @staticmethod
     def _count_type(

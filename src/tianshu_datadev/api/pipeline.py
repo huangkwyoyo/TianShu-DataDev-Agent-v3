@@ -2743,7 +2743,7 @@ class Pipeline:
                 context.errors.append(f"[VALIDATOR] {e.error_code}: {e.detail}")
 
     @staticmethod
-    def _map_comparator_status(status) -> str:
+    def _map_comparator_status(status: "ComparisonStatus") -> str:  # noqa: F821
         """将 COMPARATOR 的 ComparisonStatus 映射为 Pipeline 的阶段结果字符串。
 
         提取为独立方法方便测试——确保测试验证的是生产代码逻辑，而非测试内复制的局部映射表。

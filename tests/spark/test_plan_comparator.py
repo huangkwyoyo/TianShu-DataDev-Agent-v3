@@ -430,6 +430,241 @@ class TestPlanComparatorFilterEquivalence:
             f"filter_result={[(r.step_type, r.verdict.value, r.detail[:100]) for r in report.step_results]}"
         )
 
+    def test_filter_in_equivalent(self):
+        """IN 操作符双向等价——多元素列表排序后规范字符串一致。"""
+        from tianshu_datadev.planning.models import Predicate, SqlLiteral
+
+        sql_predicate = Predicate(
+            left=ColumnRef(
+                table_ref="ft", column_name="status",
+                normalized_name="status",
+            ),
+            operator=PredicateOperator.IN,
+            right=[
+                SqlLiteral(value="paid", is_sql_expr=False),
+                SqlLiteral(value="shipped", is_sql_expr=False),
+            ],
+        )
+        sql_filter = FilterStep(
+            step_type="filter", step_id="step_filter_in",
+            predicate=sql_predicate,
+        )
+        # Spark 侧 IN 右值为 Python repr 字符串（模拟 Mapper 产出）
+        spark_filter = SparkFilterStep(
+            step_type=SparkStepType.FILTER,
+            input_alias="ft",
+            operator="IN",
+            left="ft.status",
+            right="[SqlLiteral(value='shipped', is_sql_expr=False),"
+            " SqlLiteral(value='paid', is_sql_expr=False)]",
+        )
+        sql_plan = _make_sql_plan([
+            ScanStep(
+                step_type="scan", step_id="scan_ft", table_ref="ft",
+                required_columns=[
+                    ColumnRef(table_ref="ft", column_name="status",
+                              normalized_name="status"),
+                ],
+            ),
+            sql_filter,
+        ])
+        spark_plan = _make_spark_plan([
+            SparkReadStep(
+                step_type=SparkStepType.READ, alias="ft",
+                source_name="fact_table", input_key="fact_table_key",
+                required_columns=["status"],
+            ),
+            spark_filter,
+        ])
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+        # IN 列表排序后应等价——[paid,shipped] vs [shipped,paid] → 排序后同为 [paid,shipped]
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
+
+    def test_filter_not_in_equivalent(self):
+        """NOT_IN 操作符双向等价——否定语义 + 列表排序。"""
+        from tianshu_datadev.planning.models import Predicate, SqlLiteral
+
+        sql_predicate = Predicate(
+            left=ColumnRef(
+                table_ref="ft", column_name="status",
+                normalized_name="status",
+            ),
+            operator=PredicateOperator.NOT_IN,
+            right=[
+                SqlLiteral(value="cancelled", is_sql_expr=False),
+                SqlLiteral(value="returned", is_sql_expr=False),
+            ],
+        )
+        sql_filter = FilterStep(
+            step_type="filter", step_id="step_filter_not_in",
+            predicate=sql_predicate,
+        )
+        spark_filter = SparkFilterStep(
+            step_type=SparkStepType.FILTER,
+            input_alias="ft",
+            operator="NOT_IN",
+            left="ft.status",
+            right="[SqlLiteral(value='returned', is_sql_expr=False),"
+            " SqlLiteral(value='cancelled', is_sql_expr=False)]",
+        )
+        sql_plan = _make_sql_plan([
+            ScanStep(
+                step_type="scan", step_id="scan_ft", table_ref="ft",
+                required_columns=[
+                    ColumnRef(table_ref="ft", column_name="status",
+                              normalized_name="status"),
+                ],
+            ),
+            sql_filter,
+        ])
+        spark_plan = _make_spark_plan([
+            SparkReadStep(
+                step_type=SparkStepType.READ, alias="ft",
+                source_name="fact_table", input_key="fact_table_key",
+                required_columns=["status"],
+            ),
+            spark_filter,
+        ])
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
+
+    def test_filter_is_null_equivalent(self):
+        """IS_NULL 单目操作符——right=None → <NULL> 渲染与 Spark 侧一致。"""
+        from tianshu_datadev.planning.models import Predicate
+
+        sql_predicate = Predicate(
+            left=ColumnRef(
+                table_ref="ft", column_name="remark",
+                normalized_name="remark",
+            ),
+            operator=PredicateOperator.IS_NULL,
+            right=None,
+        )
+        sql_filter = FilterStep(
+            step_type="filter", step_id="step_filter_is_null",
+            predicate=sql_predicate,
+        )
+        spark_filter = SparkFilterStep(
+            step_type=SparkStepType.FILTER,
+            input_alias="ft",
+            operator="IS_NULL",
+            left="ft.remark",
+            right="<NULL>",
+        )
+        sql_plan = _make_sql_plan([
+            ScanStep(
+                step_type="scan", step_id="scan_ft", table_ref="ft",
+                required_columns=[
+                    ColumnRef(table_ref="ft", column_name="remark",
+                              normalized_name="remark"),
+                ],
+            ),
+            sql_filter,
+        ])
+        spark_plan = _make_spark_plan([
+            SparkReadStep(
+                step_type=SparkStepType.READ, alias="ft",
+                source_name="fact_table", input_key="fact_table_key",
+                required_columns=["remark"],
+            ),
+            spark_filter,
+        ])
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
+
+    def test_filter_is_not_null_equivalent(self):
+        """IS_NOT_NULL 否定单目操作符——右侧均映射为 <NULL> 后等价。"""
+        from tianshu_datadev.planning.models import Predicate
+
+        sql_predicate = Predicate(
+            left=ColumnRef(
+                table_ref="ft", column_name="remark",
+                normalized_name="remark",
+            ),
+            operator=PredicateOperator.IS_NOT_NULL,
+            right=None,
+        )
+        sql_filter = FilterStep(
+            step_type="filter", step_id="step_filter_is_not_null",
+            predicate=sql_predicate,
+        )
+        spark_filter = SparkFilterStep(
+            step_type=SparkStepType.FILTER,
+            input_alias="ft",
+            operator="IS_NOT_NULL",
+            left="ft.remark",
+            right="<NULL>",
+        )
+        sql_plan = _make_sql_plan([
+            ScanStep(
+                step_type="scan", step_id="scan_ft", table_ref="ft",
+                required_columns=[
+                    ColumnRef(table_ref="ft", column_name="remark",
+                              normalized_name="remark"),
+                ],
+            ),
+            sql_filter,
+        ])
+        spark_plan = _make_spark_plan([
+            SparkReadStep(
+                step_type=SparkStepType.READ, alias="ft",
+                source_name="fact_table", input_key="fact_table_key",
+                required_columns=["remark"],
+            ),
+            spark_filter,
+        ])
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
+
+    def test_filter_like_equivalent(self):
+        """LIKE 操作符双向等价——字符串模式匹配保留原样。"""
+        from tianshu_datadev.planning.models import Predicate, SqlLiteral
+
+        sql_predicate = Predicate(
+            left=ColumnRef(
+                table_ref="ft", column_name="name",
+                normalized_name="name",
+            ),
+            operator=PredicateOperator.LIKE,
+            right=SqlLiteral(value="%pattern%", is_sql_expr=False),
+        )
+        sql_filter = FilterStep(
+            step_type="filter", step_id="step_filter_like",
+            predicate=sql_predicate,
+        )
+        spark_filter = SparkFilterStep(
+            step_type=SparkStepType.FILTER,
+            input_alias="ft",
+            operator="LIKE",
+            left="ft.name",
+            right="%pattern%",
+        )
+        sql_plan = _make_sql_plan([
+            ScanStep(
+                step_type="scan", step_id="scan_ft", table_ref="ft",
+                required_columns=[
+                    ColumnRef(table_ref="ft", column_name="name",
+                              normalized_name="name"),
+                ],
+            ),
+            sql_filter,
+        ])
+        spark_plan = _make_spark_plan([
+            SparkReadStep(
+                step_type=SparkStepType.READ, alias="ft",
+                source_name="fact_table", input_key="fact_table_key",
+                required_columns=["name"],
+            ),
+            spark_filter,
+        ])
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
+
     def test_nested_predicate_tree_rendered_and_compared(self):
         """嵌套 AND/OR 谓词 → 通过 PREDICATE_TREE 正确渲染并对比。"""
         # 构造嵌套谓词：OR( AND(a > 1, b < 10), EQ(c, 0) )
@@ -554,6 +789,99 @@ class TestPlanComparatorFilterEquivalence:
         assert "[10,1]" in rendered, (
             f"BETWEEN [10,1] 应保序不排序，实际渲染：{rendered}"
         )
+
+    def test_between_normalization_with_datetime_spaces(self):
+        """BETWEEN 右值含空格时间戳——正则应完整提取不截断。
+
+        回归验证 IM-02：捕获组移除 \\s 后，datetime 值如
+        "2026-01-01 00:00:00" 应被完整提取，而非在空格处截断为 "2026-01-01"。
+        """
+        from tianshu_datadev.spark.plan_comparator import PlanComparator
+
+        # 构造含空格时间戳的 Spark 侧 repr 字符串
+        right_str = (
+            "[SqlLiteral(value='2026-01-01 00:00:00', is_sql_expr=False),"
+            " SqlLiteral(value='2026-01-31 23:59:59', is_sql_expr=False)]"
+        )
+        result = PlanComparator._normalize_between_right_string(right_str)
+        # 应完整提取含空格的时间戳
+        assert "2026-01-01 00:00:00" in result, (
+            f"时间戳含空格值应完整提取，实际：{result}"
+        )
+        assert "2026-01-31 23:59:59" in result, (
+            f"时间戳含空格值应完整提取，实际：{result}"
+        )
+
+    def test_between_datetime_full_comparison(self):
+        """端到端验证含空格时间戳的 BETWEEN filter 双向等价。
+
+        SQL 侧 right 为 SqlLiteral 列表，Spark 侧 right 为 Python repr 字符串——
+        两边的 BETWEEN 右值都含带空格的时间戳，正则提取后应被正确归一化。
+        """
+        from tianshu_datadev.planning.models import Predicate, SqlLiteral
+
+        # SQL 侧：BETWEEN 右值为 SqlLiteral 对象列表（含空格时间戳）
+        sql_predicate = Predicate(
+            left=ColumnRef(
+                table_ref="ft",
+                column_name="pickup_datetime",
+                normalized_name="pickup_datetime",
+            ),
+            operator=PredicateOperator.BETWEEN,
+            right=[
+                SqlLiteral(value="2026-01-01 00:00:00", is_sql_expr=False),
+                SqlLiteral(value="2026-01-31 23:59:59", is_sql_expr=False),
+            ],
+        )
+        sql_filter = FilterStep(
+            step_type="filter",
+            step_id="step_filter_between_dt",
+            predicate=sql_predicate,
+        )
+
+        # Spark 侧：BETWEEN 右值为 Python repr 字符串（模拟 Mapper 产出）
+        spark_filter = SparkFilterStep(
+            step_type=SparkStepType.FILTER,
+            input_alias="ft",
+            operator="BETWEEN",
+            left="ft.pickup_datetime",
+            right="[SqlLiteral(value='2026-01-01 00:00:00', is_sql_expr=False),"
+            " SqlLiteral(value='2026-01-31 23:59:59', is_sql_expr=False)]",
+        )
+
+        sql_plan = _make_sql_plan(
+            [
+                ScanStep(
+                    step_type="scan",
+                    step_id="scan_ft",
+                    table_ref="ft",
+                    required_columns=[
+                        ColumnRef(
+                            table_ref="ft",
+                            column_name="pickup_datetime",
+                            normalized_name="pickup_datetime",
+                        ),
+                    ],
+                ),
+                sql_filter,
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                SparkReadStep(
+                    step_type=SparkStepType.READ,
+                    alias="ft",
+                    source_name="fact_table",
+                    input_key="fact_table_key",
+                    required_columns=["pickup_datetime"],
+                ),
+                spark_filter,
+            ]
+        )
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
 
 
 class TestPlanComparatorProjectEquivalence:
@@ -1128,6 +1456,108 @@ class TestPlanComparatorCaseWhenEquivalence:
                     step_type=SparkStepType.CASE_WHEN,
                     input_alias="od",
                     output_alias="label",
+                    branches=[SparkCaseWhenBranch(label="normal")],
+                    else_value="other",
+                ),
+            ]
+        )
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
+
+    def test_case_when_alias_mismatch(self):
+        """SQL alias 与 Spark output_alias 不一致 → LOGIC_MISMATCH。"""
+        from tianshu_datadev.planning.sql_build_plan import CaseWhenStep
+        from tianshu_datadev.spark.models import (
+            SparkCaseWhenBranch,
+            SparkCaseWhenStep,
+        )
+
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                CaseWhenStep(
+                    step_type="case_when",
+                    step_id="step_cw_001",
+                    cases=[
+                        WhenBranch(
+                            condition=Predicate(
+                                left=ColumnRef(
+                                    table_ref="order_info",
+                                    column_name="status",
+                                    normalized_name="status",
+                                ),
+                                operator=PredicateOperator.EQ,
+                                right=SqlLiteral(value="paid"),
+                            ),
+                            result=SqlLiteral(value="normal"),
+                        ),
+                    ],
+                    else_value=SqlLiteral(value="other"),
+                    alias="label",
+                ),
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                SparkCaseWhenStep(
+                    step_type=SparkStepType.CASE_WHEN,
+                    input_alias="od",
+                    output_alias="wrong_label",
+                    branches=[SparkCaseWhenBranch(label="normal")],
+                    else_value="other",
+                ),
+            ]
+        )
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_MISMATCH
+
+    def test_case_when_alias_both_empty(self):
+        """两侧 alias/output_alias 均为空字符串 → LOGIC_EQUIVALENT（边界行为）。"""
+        from tianshu_datadev.planning.sql_build_plan import CaseWhenStep
+        from tianshu_datadev.spark.models import (
+            SparkCaseWhenBranch,
+            SparkCaseWhenStep,
+        )
+
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                CaseWhenStep(
+                    step_type="case_when",
+                    step_id="step_cw_001",
+                    cases=[
+                        WhenBranch(
+                            condition=Predicate(
+                                left=ColumnRef(
+                                    table_ref="order_info",
+                                    column_name="status",
+                                    normalized_name="status",
+                                ),
+                                operator=PredicateOperator.EQ,
+                                right=SqlLiteral(value="paid"),
+                            ),
+                            result=SqlLiteral(value="normal"),
+                        ),
+                    ],
+                    else_value=SqlLiteral(value="other"),
+                    alias="",
+                ),
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                SparkCaseWhenStep(
+                    step_type=SparkStepType.CASE_WHEN,
+                    input_alias="od",
+                    output_alias="",
                     branches=[SparkCaseWhenBranch(label="normal")],
                     else_value="other",
                 ),
