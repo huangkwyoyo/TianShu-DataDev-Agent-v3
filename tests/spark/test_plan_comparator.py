@@ -3010,3 +3010,88 @@ class TestComparatorStatusMapping:
         # 防御：传入不存在的枚举值 → HUMAN_REVIEW
         assert Pipeline._map_comparator_status("FUTURE_STATUS_XYZ") == "HUMAN_REVIEW"  # type: ignore[arg-type]
         assert Pipeline._map_comparator_status(None) == "HUMAN_REVIEW"  # type: ignore[arg-type]
+
+
+class TestPlanComparatorStepExtraction:
+    """验证 _normalize_step_dict 中各 step 类型的扁平化提取逻辑。"""
+
+    def test_flatten_window_step(self):
+        """WindowStep 中 ColumnRef/SortSpec → 扁平化为字符串。"""
+        from tianshu_datadev.planning.models import (
+            ColumnRef, NullOrder, SortDirection, SortSpec,
+            WindowExpr, WindowFunction,
+        )
+
+        step_dict = {
+            "step_type": "window",
+            "step_id": "win_001",
+            "window_exprs": [
+                WindowExpr(
+                    function=WindowFunction.ROW_NUMBER,
+                    alias="rn",
+                    partition_by=[
+                        ColumnRef(
+                            table_ref="od", column_name="dept_id", normalized_name="dept_id",
+                        ),
+                    ],
+                    order_by=[
+                        SortSpec(column="salary", direction=SortDirection.DESC,
+                                 null_order=NullOrder.LAST),
+                    ],
+                ).model_dump(mode="json", exclude_none=True)
+            ],
+        }
+
+        result = PlanComparator._flatten_window_step(step_dict)
+        exprs = result.get("window_exprs", [])
+        assert len(exprs) == 1
+        assert exprs[0]["partition_by"] == ["dept_id"]
+        # order_by 应包含 direction 和 null_order
+        assert "salary desc last" in str(exprs[0]["order_by"]).lower()
+
+    def test_window_full_pipeline_flattening(self):
+        """端到端：WindowStep 经过 _normalize_step_dict → partition_by/order_by 为字符串。
+
+        创建 WindowStep 模型对象（含 window_exprs 中的 ColumnRef 和 SortSpec）
+        → model_dump → _normalize_step_dict。
+        验证输出的 window_exprs 中 partition_by 和 order_by 已被正确扁平化为字符串。
+        """
+        from tianshu_datadev.planning.models import (
+            ColumnRef, NullOrder, SortDirection, SortSpec,
+            WindowExpr, WindowFunction,
+        )
+        from tianshu_datadev.planning.sql_build_plan import WindowStep
+
+        win_step = WindowStep(
+            step_type="window",
+            step_id="win_full_pipeline",
+            window_exprs=[
+                WindowExpr(
+                    function=WindowFunction.ROW_NUMBER,
+                    alias="rn",
+                    partition_by=[
+                        ColumnRef(table_ref="od", column_name="dept_id", normalized_name="dept_id"),
+                    ],
+                    order_by=[
+                        SortSpec(column="salary", direction=SortDirection.DESC,
+                                 null_order=NullOrder.LAST),
+                    ],
+                ),
+            ],
+        )
+        step_dict = win_step.model_dump(mode="json", exclude_none=True)
+        result = PlanComparator._normalize_step_dict(step_dict)
+        assert result["step_type"] == "window"
+        exprs = result.get("window_exprs", [])
+        assert len(exprs) == 1, f"应有 1 个 window_expr，实际：{len(exprs)}"
+        # window_exprs[0] 中的 partition_by 已扁平化为字符串列表
+        assert exprs[0].get("partition_by") == ["dept_id"], (
+            f"partition_by 应为 ['dept_id']，实际：{exprs[0].get('partition_by')}"
+        )
+        # window_exprs[0] 中的 order_by 已扁平化为字符串列表
+        order_by = exprs[0].get("order_by", [])
+        assert len(order_by) == 1, f"order_by 应有 1 项，实际：{order_by}"
+        order_str = order_by[0].lower()
+        assert "salary" in order_str, f"order_by 应含 salary，实际：{order_str}"
+        assert "desc" in order_str, f"order_by 应含 desc，实际：{order_str}"
+        assert "last" in order_str, f"order_by 应含 last，实际：{order_str}"

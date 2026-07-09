@@ -805,7 +805,7 @@ class TestPlanEquivalence:
             ],
         }
         spark_win = {
-            "window_exprs": [
+            "expressions": [
                 {"function": "RANK", "alias": "rn",
                  "partition_by": ["a"], "order_by": ["b"]},
             ],

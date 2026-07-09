@@ -703,7 +703,9 @@ class PlanComparator:
             return PlanComparator._flatten_aggregate_step(step_dict)
         if step_type == "case_when":
             return PlanComparator._flatten_case_when_step(step_dict)
-        # scan / sort / limit / window 的对比字段已在顶层，无需额外扁平化
+        if step_type == "window":
+            return PlanComparator._flatten_window_step(step_dict)
+        # scan / sort / limit 的对比字段已在顶层，无需额外扁平化
         return step_dict
 
     # ── 嵌套谓词支持（缺陷 2） ──
@@ -1000,6 +1002,152 @@ class PlanComparator:
                 result["default_value"] = str(else_val)
         else:
             result["default_value"] = ""
+
+        return result
+
+    @staticmethod
+    def _render_frame_boundary(boundary: dict) -> str:
+        """将 FrameBoundary dict 渲染为规范字符串。
+
+        FrameBoundary 格式：{"kind": "UNBOUNDED_PRECEDING", "offset": None}
+        """
+        kind = str(boundary.get("kind", "")).upper()
+        offset = boundary.get("offset")
+        if offset is not None:
+            return f"{kind}({offset})"
+        return kind
+
+    @staticmethod
+    def _render_sort_spec(spec: dict) -> str:
+        """将 SortSpec dict 渲染为规范字符串。
+
+        SortSpec 格式：{"column": "amount", "direction": "ASC", "null_order": "LAST"}
+        输出： "amount ASC LAST"
+        """
+        col = normalize_field_name(str(spec.get("column", "")))
+        direction = str(spec.get("direction", "ASC")).upper()
+        null_order = str(spec.get("null_order", "LAST")).upper()
+        return f"{col} {direction} {null_order}"
+
+    @staticmethod
+    def _flatten_window_step(step_dict: dict[str, Any]) -> dict[str, Any]:
+        """扁平化 WindowStep——将 ColumnRef/SortSpec 归一化为字符串。
+
+        SQL 侧 WindowStep.model_dump() 后：
+        - partition_by: list[ColumnRef] → 每个 ColumnRef 有 normalized_name/column_name/table_ref
+        - order_by: list[SortSpec] → 每个 SortSpec 有 column/direction/null_order
+        - frame: WindowFrame | None
+
+        扁平化规则：
+        - partition_by: ColumnRef → normalized_name 字符串（经 normalize_field_name）
+        - order_by: SortSpec → "column direction null_order" 字符串（经 normalize_field_name），
+          保留 direction/null_order 顺序语义
+        - frame: WindowFrame dict → "frame_type:start:end" 规范字符串
+        """
+        result = dict(step_dict)
+
+        # 扁平化 partition_by
+        raw_partition = result.pop("partition_by", []) or []
+        flattened_partition = []
+        for p in raw_partition:
+            if isinstance(p, dict):
+                # ColumnRef dict → 提取 normalized_name
+                name = p.get("normalized_name", "") or p.get("column_name", "")
+                flattened_partition.append(normalize_field_name(str(name)))
+            else:
+                flattened_partition.append(normalize_field_name(str(p)))
+        result["partition_by"] = flattened_partition
+
+        # 扁平化 order_by
+        raw_order = result.pop("order_by", []) or []
+        flattened_order = []
+        for o in raw_order:
+            if isinstance(o, dict):
+                # SortSpec dict → "column direction null_order"
+                flattened_order.append(PlanComparator._render_sort_spec(o))
+            else:
+                flattened_order.append(normalize_field_name(str(o)))
+        result["order_by"] = flattened_order
+
+        # 扁平化 input_column（ColumnRef → 字符串）
+        raw_input = result.pop("input", None)
+        if raw_input and isinstance(raw_input, dict):
+            if "normalized_name" in raw_input or "column_name" in raw_input:
+                name = raw_input.get("normalized_name", "") or raw_input.get("column_name", "")
+                result["input_column"] = normalize_field_name(str(name))
+            elif "value" in raw_input:
+                # SqlLiteral → 直接取 value
+                result["input_column"] = str(raw_input["value"])
+
+        # 扁平化 frame
+        raw_frame = result.pop("frame", None)
+        if raw_frame and isinstance(raw_frame, dict):
+            frame_type = str(raw_frame.get("frame_type", "RANGE")).upper()
+            start = raw_frame.get("start", {})
+            end = raw_frame.get("end", {})
+            start_str = PlanComparator._render_frame_boundary(start)
+            end_str = PlanComparator._render_frame_boundary(end)
+            result["frame"] = f"{frame_type}:{start_str}:{end_str}"
+
+        # 保留原有 window_exprs 键（用于 _extract_sql_step_data 匹配）
+        # 但每个 expr 中的 partition_by/order_by 也需扁平化
+        raw_exprs = result.get("window_exprs", []) or []
+        if raw_exprs:
+            flat_exprs = []
+            for expr in raw_exprs:
+                flat_expr = dict(expr) if isinstance(expr, dict) else expr
+                if isinstance(flat_expr, dict):
+                    # 扁平化 partition_by
+                    raw_p = flat_expr.pop("partition_by", []) or []
+                    flat_expr["partition_by"] = [
+                        normalize_field_name(str(
+                            p.get("normalized_name", "") or p.get("column_name", "") or str(p)
+                        )) if isinstance(p, dict) else normalize_field_name(str(p))
+                        for p in raw_p
+                    ]
+                    # 扁平化 order_by
+                    raw_o = flat_expr.pop("order_by", []) or []
+                    flat_expr["order_by"] = [
+                        PlanComparator._render_sort_spec(o) if isinstance(o, dict) else normalize_field_name(str(o))
+                        for o in raw_o
+                    ]
+                    # 扁平化 input
+                    raw_input_expr = flat_expr.pop("input", None)
+                    if raw_input_expr and isinstance(raw_input_expr, dict):
+                        if "normalized_name" in raw_input_expr or "column_name" in raw_input_expr:
+                            name = raw_input_expr.get("normalized_name", "") or raw_input_expr.get("column_name", "")
+                            flat_expr["input_column"] = normalize_field_name(str(name))
+                        elif "value" in raw_input_expr:
+                            flat_expr["input_column"] = str(raw_input_expr["value"])
+                    # 扁平化 frame
+                    raw_frame_expr = flat_expr.pop("frame", None)
+                    if raw_frame_expr and isinstance(raw_frame_expr, dict):
+                        ft = str(raw_frame_expr.get("frame_type", "RANGE")).upper()
+                        st = PlanComparator._render_frame_boundary(raw_frame_expr.get("start", {}))
+                        et = PlanComparator._render_frame_boundary(raw_frame_expr.get("end", {}))
+                        flat_expr["frame"] = f"{ft}:{st}:{et}"
+                flat_exprs.append(flat_expr)
+            result["window_exprs"] = flat_exprs
+
+        # 同样扁平化 expressions（Spark 侧兼容）
+        raw_exprs2 = result.get("expressions", []) or []
+        if raw_exprs2:
+            flat_exprs2 = []
+            for expr in raw_exprs2:
+                flat_expr = dict(expr) if isinstance(expr, dict) else expr
+                if isinstance(flat_expr, dict):
+                    raw_p = flat_expr.pop("partition_by", []) or []
+                    flat_expr["partition_by"] = [
+                        normalize_field_name(str(p)) if isinstance(p, dict) else normalize_field_name(str(p))
+                        for p in raw_p
+                    ]
+                    raw_o = flat_expr.pop("order_by", []) or []
+                    flat_expr["order_by"] = [
+                        PlanComparator._render_sort_spec(o) if isinstance(o, dict) else normalize_field_name(str(o))
+                        for o in raw_o
+                    ]
+                flat_exprs2.append(flat_expr)
+            result["expressions"] = flat_exprs2
 
         return result
 
