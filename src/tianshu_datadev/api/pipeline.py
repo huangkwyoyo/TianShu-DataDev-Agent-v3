@@ -1826,6 +1826,46 @@ class Pipeline:
             program_cleanup_error=data.get("program_cleanup_error"),
         )
 
+    def check_artifacts_status(self, request_id: str) -> dict:
+        """检查指定 request_id 的 artifacts 是否就绪——供前端 Spark 按钮 gating 使用。
+
+        不返回 artifact 内容，仅返回状态标记和产物类型列表。
+        前端可通过此端点判断是否允许触发 Spark 管线阶段。
+
+        Args:
+            request_id: Pipeline 请求 ID
+
+        Returns:
+            {
+                "request_id": str,
+                "artifacts_ready": bool,
+                "available_artifacts": [str, ...],  # 已就绪的产物类型列表
+            }
+        """
+        bundle = self.export_artifacts(request_id)
+        if bundle is None:
+            return {
+                "request_id": request_id,
+                "artifacts_ready": False,
+                "available_artifacts": [],
+            }
+        available: list[str] = []
+        if bundle.sql_build_plan is not None:
+            available.append("sql_build_plan")
+        if bundle.data_transform_contract is not None:
+            available.append("data_transform_contract")
+        if bundle.compiled_sql is not None:
+            available.append("compiled_sql")
+        if bundle.snapshot_manifest is not None:
+            available.append("snapshot_manifest")
+        # artifacts_ready = contract 存在（Spark MAPPER 的最低要求）
+        artifacts_ready = bundle.data_transform_contract is not None
+        return {
+            "request_id": request_id,
+            "artifacts_ready": artifacts_ready,
+            "available_artifacts": available,
+        }
+
     # ── Phase 4.5B 前端 SPA 专用方法 ──────────────────────
 
     def get_templates(self) -> list[dict]:
@@ -2396,15 +2436,15 @@ class Pipeline:
 
         elif stage == SparkPipelineStage.COMPARATOR:
             if artifacts.sql_build_plan is None:
-                missing.append("sql_build_plan")
+                missing.append("sql_build_plan（请先执行 编译执行 生成 SQL Plan）")
             if context.spark_plan is None:
                 missing.append("spark_plan（请先执行 MAPPER 阶段）")
             if artifacts.data_transform_contract is None:
-                missing.append("data_transform_contract")
+                missing.append("data_transform_contract（请先执行 编译执行 生成 Contract）")
 
         elif stage == SparkPipelineStage.PHYSICAL_VERIFIER:
             if artifacts.compiled_sql is None:
-                missing.append("compiled_sql")
+                missing.append("compiled_sql（请先执行 编译执行 生成 Compiled SQL）")
             if context.compile_result is None:
                 missing.append("spark compile_result（请先执行 COMPILER 阶段）")
 
@@ -2439,7 +2479,11 @@ class Pipeline:
         artifacts = self.export_artifacts(request_id)
         if artifacts is None:
             raise SparkDependencyMissingError(
-                stage, [f"request_id '{request_id}' 对应的 artifacts 不存在或已过期"]
+                stage, [
+                    f"request_id '{request_id}' 对应的 artifacts 不存在或已过期。"
+                    f"请先在编辑器中点击「编译执行」生成基础产物（Contract + SQL Plan），"
+                    f"然后再触发 Spark 管线阶段。"
+                ]
             )
 
         # Step 2: 获取 Spark 上下文

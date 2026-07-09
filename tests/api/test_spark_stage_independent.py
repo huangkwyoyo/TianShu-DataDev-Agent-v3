@@ -390,3 +390,106 @@ class TestLlmTraceNodeUnit:
         assert node.token_usage["total_tokens"] == 150
         assert node.latency_ms == 350
         assert node.status == "valid"
+
+
+# ── Artifacts 状态检查端点测试 ──
+
+
+class TestArtifactsStatusEndpoint:
+    """GET /api/artifacts/{request_id}/status 端点测试。"""
+
+    def test_nonexistent_request_id(self, client):
+        """不存在的 request_id → artifacts_ready=false + 空列表。"""
+        resp = client.get("/api/artifacts/nonexistent_req_12345/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["request_id"] == "nonexistent_req_12345"
+        assert data["artifacts_ready"] is False
+        assert data["available_artifacts"] == []
+
+    def test_parse_only_not_ready(self, client, golden_spec_passing):
+        """仅 parse（无 execute）→ artifacts_ready=false（缺少 contract）。"""
+        try:
+            import duckdb  # noqa: F401
+        except ImportError:
+            pytest.skip("DuckDB 未安装")
+
+        # 仅 parse-rich（不执行 execute-rich）
+        parse_resp = client.post("/api/spec/parse-rich", json={
+            "markdown_text": golden_spec_passing,
+        })
+        assert parse_resp.status_code == 200
+        request_id = parse_resp.json()["request_id"]
+        assert request_id, "request_id 不应为空"
+
+        resp = client.get(f"/api/artifacts/{request_id}/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["request_id"] == request_id
+        # 仅 parse 存入 {parsed_spec}，没有 contract
+        assert data["artifacts_ready"] is False
+
+    def test_execute_rich_ready(self, client, golden_spec_passing):
+        """execute-rich 成功后 → artifacts_ready=true + contract 就绪。"""
+        try:
+            import duckdb  # noqa: F401
+        except ImportError:
+            pytest.skip("DuckDB 未安装")
+
+        exec_resp = client.post("/api/execute-rich", json={
+            "markdown_text": golden_spec_passing,
+            "table_mapping": {"tf": "test_fact"},
+            "table_paths": {"test_fact": _CSV_PATH},
+        })
+        assert exec_resp.status_code == 200
+        request_id = exec_resp.json()["request_id"]
+        assert request_id, "request_id 不应为空"
+
+        resp = client.get(f"/api/artifacts/{request_id}/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["request_id"] == request_id
+        assert data["artifacts_ready"] is True
+        assert "data_transform_contract" in data["available_artifacts"]
+        assert "sql_build_plan" in data["available_artifacts"]
+
+
+class TestSparkDependencyMissingErrorMessage:
+    """SPARK_DEPENDENCY_MISSING 错误消息包含用户引导。"""
+
+    def test_artifacts_not_found_has_guidance(self, client):
+        """artifacts 不存在时，错误消息引导用户先执行「编译执行」。"""
+        resp = client.post("/api/spark/compile", json={
+            "request_id": "req_nonexistent_99999",
+        })
+        assert resp.status_code == 422
+        data = resp.json()
+        assert data["error_code"] == "SPARK_DEPENDENCY_MISSING"
+        # 新增引导文字：提示用户先点击「编译执行」
+        assert "编译执行" in data["message"]
+
+    def test_mapper_missing_contract_has_guidance(self, client, golden_spec_passing):
+        """MAPPER 缺少 contract 时，错误消息包含引导。"""
+        try:
+            import duckdb  # noqa: F401
+        except ImportError:
+            pytest.skip("DuckDB 未安装")
+
+        # 仅 parse（不执行 execute-rich），直接调 MAPPER
+        parse_resp = client.post("/api/spec/parse-rich", json={
+            "markdown_text": golden_spec_passing,
+        })
+        assert parse_resp.status_code == 200
+        request_id = parse_resp.json()["request_id"]
+        # 注意：parse 后 artifacts_ready=false，但 export_artifacts 不返回 None
+        # 因为 parse_only 已存入 {parsed_spec}。MAPPER 会走到
+        # _check_stage_dependencies → data_transform_contract 缺失路径。
+        resp = client.post("/api/spark/map", json={
+            "request_id": request_id,
+        })
+        assert resp.status_code == 422
+        data = resp.json()
+        assert data["error_code"] == "SPARK_DEPENDENCY_MISSING"
+        # MAPPER 依赖 data_transform_contract——消息含引导
+        assert "data_transform_contract" in data["message"]
+        assert "编译执行" in data["message"]

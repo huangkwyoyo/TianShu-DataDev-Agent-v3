@@ -448,3 +448,15 @@ export function runSparkStage(
 ): Promise<SparkStageResponse> {
   return apiPost<SparkStageResponse>(`/spark/${stage}`, { request_id: requestId });
 }
+
+/** Artifacts 状态响应 */
+export interface ArtifactsStatusResponse {
+  request_id: string;
+  artifacts_ready: boolean;
+  available_artifacts: string[];
+}
+
+/** 检查 artifacts 是否就绪——供 Spark 按钮 gating 使用 */
+export function checkArtifactsStatus(requestId: string): Promise<ArtifactsStatusResponse> {
+  return apiGet<ArtifactsStatusResponse>(`/artifacts/${requestId}/status`);
+}

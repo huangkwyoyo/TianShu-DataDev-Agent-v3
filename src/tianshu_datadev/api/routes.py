@@ -197,6 +197,18 @@ async def execute_pipeline_rich(request: Request, body: ExecuteRequest):
     return result
 
 
+@api_router.get("/artifacts/{request_id}/status")
+async def get_artifacts_status(request: Request, request_id: str):
+    """检查指定 request_id 的 artifacts 是否就绪——供前端 Spark 按钮 gating 使用。
+
+    返回 artifacts_ready 标记 + 已就绪的产物类型列表。
+    artifacts_ready=true 表示可安全触发 Spark MAPPER 阶段。
+    """
+    pipeline = request.app.state.pipeline
+    result = pipeline.check_artifacts_status(request_id)
+    return result
+
+
 @api_router.get("/package-rich/{request_id}")
 async def get_package_rich(request: Request, request_id: str):
     """前端专用：获取 ReviewPackage 文件树——返回 PackageRichResponse。

@@ -24,6 +24,7 @@ import {
   runAll,
   getPackageRich,
   sparkVerify,
+  checkArtifactsStatus,
   ApiError,
   SpecRichResponse,
   PlanRichResponse,
@@ -63,6 +64,9 @@ interface AppState {
   sparkStages: StageInfo[];
   sparkVerifyResult: SparkVerifyResponse | null;
 
+  // Spark 管线——仅 artifacts_ready 时可触发单阶段
+  artifactsReady: boolean;
+
   // Spark 单阶段触发的产物内容（供面板展示）
   sparkStageResult: { stage: string; result: SparkStageResult; status: string } | null;
 
@@ -85,6 +89,7 @@ export default function App() {
     packageResult: null,
     sparkStages: [],
     sparkVerifyResult: null,
+    artifactsReady: false,
     sparkStageResult: null,
     llmTraces: null,
   });
@@ -167,6 +172,7 @@ export default function App() {
         packageResult: null,
         requestId: result.request_id,
         activePanel: 'parse',
+        artifactsReady: false,  // parse 不产生 contract
         sparkStageResult: null,
       }),
     );
@@ -186,12 +192,13 @@ export default function App() {
         packageResult: null,
         requestId: result.request_id,
         activePanel: 'plan',
+        artifactsReady: false,  // plan 不产生 contract
         sparkStageResult: null,
       }),
     );
   };
 
-  /** 执行 */
+  /** 执行——编译执行成功后验证 artifacts 就绪状态 */
   const handleExecute = () => {
     if (!state.markdownText.trim()) {
       update({ error: { error_code: 'EMPTY_INPUT', message: '请输入 DeveloperSpec 内容', field_ref: 'markdown_text' } });
@@ -199,17 +206,30 @@ export default function App() {
     }
     runAction(
       () => executeRich(state.markdownText),
-      (result) => ({
-        executeResult: result,
-        packageResult: null,
-        requestId: result.request_id,
-        activePanel: 'sql',
-        llmTraces: (result as ExecuteRichResponse).llm_traces || null,
-        // 重置 Spark 状态——新的 execute 需要重新执行 Spark 阶段
-        sparkStages: [],
-        sparkVerifyResult: null,
-        sparkStageResult: null,
-      }),
+      async (result) => {
+        // execute-rich 成功后异步验证 artifacts 是否真正就绪
+        let artifactsReady = false;
+        if (result.request_id) {
+          try {
+            const status = await checkArtifactsStatus(result.request_id);
+            artifactsReady = status.artifacts_ready;
+          } catch {
+            artifactsReady = false;
+          }
+        }
+        return {
+          executeResult: result,
+          packageResult: null,
+          requestId: result.request_id,
+          activePanel: 'sql' as Panel,
+          llmTraces: (result as ExecuteRichResponse).llm_traces || null,
+          artifactsReady,
+          // 重置 Spark 状态——新的 execute 需要重新执行 Spark 阶段
+          sparkStages: [],
+          sparkVerifyResult: null,
+          sparkStageResult: null,
+        };
+      },
     );
   };
 
@@ -222,12 +242,23 @@ export default function App() {
     runAction(
       () => runAll(state.markdownText),
       async (result) => {
+        // run-all 成功后异步验证 artifacts 是否就绪
+        let artifactsReady = false;
+        if (result.request_id) {
+          try {
+            const status = await checkArtifactsStatus(result.request_id);
+            artifactsReady = status.artifacts_ready;
+          } catch {
+            artifactsReady = false;
+          }
+        }
         // 如果管线执行失败（Validator 阻断等），不尝试获取 package
         // pipeline_error 和 pipeline_stages 由 runAction 自动提取并展示在 PipelineStageIndicator
         if (result.pipeline_error) {
           return {
             requestId: result.request_id,
             activePanel: 'sql' as Panel,
+            artifactsReady,
             llmTraces: (result as RunAllResponse).llm_traces || null,
             sparkStageResult: null,
           };
@@ -250,6 +281,7 @@ export default function App() {
             packageResult: pkg,
             requestId: result.request_id,
             activePanel: 'package' as Panel,
+            artifactsReady,
             sparkStageResult: null,
             llmTraces: (result as RunAllResponse).llm_traces || null,
             // SQL 管线成功——设置全部 8 阶段为 ok，使指示灯在成功后仍然可见
@@ -268,6 +300,7 @@ export default function App() {
           return {
             requestId: result.request_id,
             activePanel: 'sql' as Panel,
+            artifactsReady,
             llmTraces: (result as RunAllResponse).llm_traces || null,
             sparkStageResult: null,
             error: {
@@ -400,6 +433,7 @@ export default function App() {
             </button>
             <SparkStageButtons
               requestId={state.requestId}
+              artifactsReady={state.artifactsReady}
               stages={state.sparkStages}
               onStageComplete={handleSparkStageComplete}
               onError={(err) => update({ error: err })}

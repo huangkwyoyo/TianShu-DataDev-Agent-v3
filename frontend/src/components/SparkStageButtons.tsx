@@ -87,13 +87,14 @@ function stageIcon(status: string): string {
 
 interface Props {
   requestId: string | null;
+  artifactsReady: boolean;  // artifacts 是否就绪（execute-rich 成功后为 true）
   stages: SparkStageItem[];
   onStageComplete: (response: SparkStageResponse) => void;
   onError: (error: ApiError) => void;
   disabled: boolean;  // 顶层禁用（如 isLoading）
 }
 
-export function SparkStageButtons({ requestId, stages, onStageComplete, onError, disabled }: Props) {
+export function SparkStageButtons({ requestId, artifactsReady, stages, onStageComplete, onError, disabled }: Props) {
   const [loadingStage, setLoadingStage] = useState<string | null>(null);
 
   const available = useMemo(() => computeAvailableStages(stages), [stages]);
@@ -104,7 +105,7 @@ export function SparkStageButtons({ requestId, stages, onStageComplete, onError,
   }
 
   const handleClick = async (stageEnum: string) => {
-    if (!requestId || disabled || loadingStage) return;
+    if (!requestId || !artifactsReady || disabled || loadingStage) return;
     const slug = STAGE_TO_SLUG[stageEnum];
     setLoadingStage(stageEnum);
     try {
@@ -130,14 +131,16 @@ export function SparkStageButtons({ requestId, stages, onStageComplete, onError,
         const isLoading = loadingStage === stageEnum;
         const cn = STAGE_CN[stageEnum] || stageEnum;
 
-        // 无 requestId 时全部按钮不可用
-        const hasRequest = !!requestId;
+        // artifacts 未就绪时全部按钮不可用
+        const hasRequest = !!requestId && artifactsReady;
         const isDisabled = !hasRequest || !isAvailable || disabled || !!loadingStage;
-        const tooltip = !hasRequest
+        const tooltip = !requestId
           ? '请先执行"编译执行"获取 request_id'
-          : isAvailable
-            ? `执行 ${cn} 阶段`
-            : `${cn}：缺少前置产物`;
+          : !artifactsReady
+            ? '请先执行"编译执行"生成 Contract 等基础产物'
+            : isAvailable
+              ? `执行 ${cn} 阶段`
+              : `${cn}：缺少前置产物`;
 
         return (
           <button
