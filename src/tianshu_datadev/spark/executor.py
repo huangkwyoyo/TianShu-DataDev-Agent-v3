@@ -121,6 +121,7 @@ _ALLOWED_ENV_VARS: frozenset[str] = frozenset({
     "TMP",
     "JAVA_HOME",
     "SPARK_HOME",
+    "HADOOP_HOME",         # Windows 必需——winutils.exe 所在目录
     "PYSPARK_PYTHON",
     "PYSPARK_DRIVER_PYTHON",
 })
