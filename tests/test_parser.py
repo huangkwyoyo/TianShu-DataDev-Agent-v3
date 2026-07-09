@@ -623,3 +623,96 @@ class TestParserHashDeterminism:
         spec2 = parser.parse(text2)
 
         assert spec1.spec_hash != spec2.spec_hash
+
+
+# ════════════════════════════════════════════
+# V2 测试——unique_keys 解析 W005/W006
+# ════════════════════════════════════════════
+
+
+class TestUniqueKeysParserV2:
+    """V2 parser unique_keys 解析测试。"""
+
+    def test_parser_rejects_invalid_unique_keys(self):
+        """YAML unique_keys: "not_a_list" → ParseWarning W005。"""
+        parser = DeveloperSpecParser()
+        text = """\
+```markdown
+---
+spec:
+  type: aggregate_table
+  target_table: ads.test
+  target_grain: [dt]
+  summary: "测试 W005"
+  source_tables:
+    - name: test.table1
+      alias: t1
+      key_columns:
+        - name: id
+          type: bigint
+      unique_keys: not_a_list
+  metrics:
+    - metric_name: cnt
+      aggregation: COUNT
+      input_column: id
+      alias: cnt
+  dimensions:
+    - dimension_name: dt
+      column_ref: dt
+  output_columns:
+    - name: dt
+      type: date
+    - name: cnt
+      type: bigint
+---
+# 测试 W005
+```"""
+        spec = parser.parse(text)
+        w005_warnings = [w for w in spec.parse_warnings if w.warning_id == "W005"]
+        assert len(w005_warnings) >= 1, f"应有 W005 警告，实际 warnings: {spec.parse_warnings}"
+
+    def test_parser_accepts_valid_unique_keys(self):
+        """YAML unique_keys: [[location_id], [zone_name, borough]]
+        → InputTableDecl.unique_keys 正确解析。
+        """
+        parser = DeveloperSpecParser()
+        text = """\
+```markdown
+---
+spec:
+  type: aggregate_table
+  target_table: silver.taxi_zone
+  target_grain: [location_id]
+  summary: "测试合法 unique_keys"
+  source_tables:
+    - name: silver.taxi_zone
+      alias: tz
+      key_columns:
+        - name: location_id
+          type: bigint
+        - name: zone_name
+          type: varchar
+        - name: borough
+          type: varchar
+      unique_keys:
+        - [location_id]
+        - [zone_name, borough]
+  metrics:
+    - metric_name: cnt
+      aggregation: COUNT
+      input_column: location_id
+      alias: cnt
+  dimensions:
+    - dimension_name: location_id
+      column_ref: location_id
+  output_columns:
+    - name: location_id
+      type: bigint
+    - name: cnt
+      type: bigint
+---
+# 测试合法 unique_keys
+```"""
+        spec = parser.parse(text)
+        table = spec.input_tables[0]
+        assert table.unique_keys == [["location_id"], ["zone_name", "borough"]]

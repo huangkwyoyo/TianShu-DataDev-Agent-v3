@@ -412,7 +412,7 @@ class DeveloperSpecParser:
                 if not isinstance(raw_unique_keys, list):
                     if parse_warnings is not None:
                         parse_warnings.append(ParseWarning(
-                            code="W005",
+                            warning_id="W005",
                             message=f"表 '{alias}' 的 unique_keys 必须是列表，"
                                     f"收到 {type(raw_unique_keys).__name__}——已忽略",
                             field_ref=f"{alias}.unique_keys",
@@ -423,7 +423,7 @@ class DeveloperSpecParser:
                         if not isinstance(kg, list) or len(kg) == 0:
                             if parse_warnings is not None:
                                 parse_warnings.append(ParseWarning(
-                                    code="W005",
+                                    warning_id="W005",
                                     message=f"表 '{alias}' 的 unique_keys[{i}] 必须是非空列表——已跳过",
                                     field_ref=f"{alias}.unique_keys[{i}]",
                                 ))
@@ -444,7 +444,7 @@ class DeveloperSpecParser:
                         if unknown:
                             if parse_warnings is not None:
                                 parse_warnings.append(ParseWarning(
-                                    code="W006",
+                                    warning_id="W006",
                                     message=f"表 '{alias}' 的 unique_keys[{i}] 引用了未知列："
                                             f"{unknown}——已跳过，不保留为唯一性证据",
                                     field_ref=f"{alias}.unique_keys[{i}]",

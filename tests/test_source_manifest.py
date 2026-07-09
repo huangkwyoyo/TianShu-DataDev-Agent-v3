@@ -201,3 +201,85 @@ def _find_column(manifest, table_ref: str, normalized_name: str) -> ManifestColu
                 if col.normalized_name == normalized_name:
                     return col
     return None
+
+
+# ════════════════════════════════════════════
+# V2 测试——unique_keys 合并 + Registry PK + role/ key_column_names 透传
+# ════════════════════════════════════════════
+
+
+class TestUniqueKeysMergeV2:
+    """V2 unique_keys 合并逻辑测试。"""
+
+    def test_merge_unique_keys_from_registry_pk(self):
+        """Registry 返回 primary_key=["loc_id"] → manifest.unique_keys 含 ["loc_id"]。"""
+        from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer
+        from tianshu_datadev.developer_spec.source_manifest import _merge_unique_keys_from_sources
+
+        normalizer = FieldNormalizer()
+        # 测试模块级合并函数：Registry primary_key 应合并到 unique_keys
+        result = _merge_unique_keys_from_sources(
+            [["loc_id"]],   # Registry primary_key 作为 unique_keys 来源
+            None,            # Registry unique_keys
+            normalizer=normalizer,
+        )
+        assert ["loc_id"] in result
+
+    def test_builder_transmits_role_and_key_columns(self):
+        """InputTableDecl(role="dim", key_columns=[ColumnDecl("Location_ID")])
+        → ManifestTable.role="dim", key_column_names_normalized=["location_id"]。
+        """
+        from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer
+        from tianshu_datadev.developer_spec.models import (
+            ColumnDecl,
+            InputTableDecl,
+            ParsedDeveloperSpec,
+            SafePhysicalTableName,
+        )
+        from tianshu_datadev.developer_spec.source_manifest import SourceManifestBuilder
+
+        normalizer = FieldNormalizer()
+        builder = SourceManifestBuilder(normalizer=normalizer)
+
+        # 构建一个最小 InputTableDecl
+        spec = ParsedDeveloperSpec(
+            spec_id="test_v2",
+            spec_hash="abc123",
+            title="test",
+            description="test",
+            input_tables=[
+                InputTableDecl(
+                    table_alias="tz",
+                    source_table=SafePhysicalTableName("silver.taxi_zone"),
+                    role="dim",
+                    key_columns=[
+                        ColumnDecl(
+                            column_name="Location_ID",
+                            normalized_name=normalizer.normalize("Location_ID"),
+                            data_type="bigint",
+                        ),
+                    ],
+                ),
+            ],
+            metrics=[],
+            dimensions=[],
+            output_spec={"columns": [], "grain": []},  # type: ignore[arg-type]
+        )
+
+        manifest, _ = builder.build(spec)
+        table = manifest.tables[0]
+        assert table.role == "dim"
+        assert "location_id" in table.key_column_names_normalized
+
+    def test_unique_keys_preserves_original_order(self):
+        """unique_keys: [["zone_name", "borough"]] → 保留原始顺序，不排序。"""
+        from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer
+        from tianshu_datadev.developer_spec.source_manifest import _normalize_unique_keys_list
+
+        normalizer = FieldNormalizer()
+        result = _normalize_unique_keys_list(
+            [["zone_name", "borough"]], normalizer=normalizer
+        )
+        assert result == [["zone_name", "borough"]]
+        # 不应被排序为 [["borough", "zone_name"]]
+        assert result != [["borough", "zone_name"]]
