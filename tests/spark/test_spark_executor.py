@@ -398,8 +398,10 @@ def test_execute_loads_inputs_by_alias_from_index():
     import json
     import tempfile
     from pathlib import Path
+
     import pyarrow as pa
     import pyarrow.parquet as pq
+
     from tianshu_datadev.spark.executor import LocalSparkExecutor
 
     with tempfile.TemporaryDirectory(prefix="tianshu_test_snap_") as tmp_dir:
