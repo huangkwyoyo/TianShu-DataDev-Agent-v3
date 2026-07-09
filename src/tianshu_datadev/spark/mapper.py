@@ -29,6 +29,7 @@ from tianshu_datadev.artifacts.models import (
     WindowSpecSummary,
 )
 
+from ._alias_generator import generate_step_alias
 from .models import (
     ContractGap,
     SparkAggFunction,
@@ -696,47 +697,39 @@ def _infer_input_alias_from_columns(
 # ════════════════════════════════════════════
 
 
-def _get_step_output_alias(step, index: int) -> str:
-    """返回编译器将赋予该步骤的输出别名。
-
-    命名规则与 compiler.py 的 out_alias 赋值保持严格一致：
-    - ReadStep → step.alias（如 "od"）
-    - FilterStep → _f{index}
-    - ProjectStep → _p{index}
-    - SortStep → _s{index}
-    - LimitStep → _l{index}
-    - JoinStep → _j{index}
-    - AggregateStep → _a{index}
-    - CaseWhenStep → _c{index}
-    - WindowStep → _w{index}
+def _get_step_output_alias(
+    step, used_aliases: set[str], is_last_project: bool = False,
+) -> str:
+    """返回编译器将赋予该步骤的输出别名——委托 alias generator 确保一致。
 
     Args:
         step: SparkPlan 步骤实例
-        index: 步骤在 plan.steps 中的全局位置索引（0-based）
+        used_aliases: 已用别名集合（会被原地修改）
+        is_last_project: 是否为管线中最后一个 ProjectStep
 
     Returns:
         编译器将赋予该步骤的输出变量名
     """
     if isinstance(step, SparkReadStep):
-        return step.alias
-    if isinstance(step, SparkFilterStep):
-        return f"_f{index}"
-    if isinstance(step, SparkProjectStep):
-        return f"_p{index}"
-    if isinstance(step, SparkSortStep):
-        return f"_s{index}"
-    if isinstance(step, SparkLimitStep):
-        return f"_l{index}"
+        alias = step.alias
+        used_aliases.add(alias)
+        return alias
     if isinstance(step, SparkJoinStep):
-        return f"_j{index}"
-    if isinstance(step, SparkAggregateStep):
-        return f"_a{index}"
-    if isinstance(step, SparkCaseWhenStep):
-        return f"_c{index}"
-    if isinstance(step, SparkWindowStep):
-        return f"_w{index}"
-    # 未知步骤类型——保守返回占位符
-    return f"_u{index}"
+        return generate_step_alias(
+            step, left_alias=step.left_alias, right_alias=step.right_alias,
+            used_aliases=used_aliases,
+        )
+    if isinstance(step, SparkProjectStep):
+        input_alias = getattr(step, "input_alias", "")
+        return generate_step_alias(
+            step, input_alias=input_alias, used_aliases=used_aliases,
+            is_last_project=is_last_project,
+        )
+    # 单输入步骤：Filter / Sort / Limit / Aggregate / CaseWhen / Window
+    input_alias = getattr(step, "input_alias", "")
+    return generate_step_alias(
+        step, input_alias=input_alias, used_aliases=used_aliases,
+    )
 
 
 def _chain_input_aliases(steps: list) -> None:
@@ -749,13 +742,32 @@ def _chain_input_aliases(steps: list) -> None:
     - SparkReadStep：数据源，无输入依赖，仅记录其输出供后续步骤引用
     - SparkJoinStep：使用 left_alias/right_alias 指定输入，不使用 input_alias
 
+    Phase 9B：使用数据流式别名——与 compiler.py 共享 _alias_generator 确保一致。
+
     Args:
         steps: 已排序的步骤列表（会被原地修改）
     """
     prev_output: str | None = None
+    used_aliases: set[str] = set()
+
+    # 预计算最后一个 ProjectStep 索引 + 预注册 Read 别名
+    last_project_idx = -1
+    for j, s in enumerate(steps):
+        if isinstance(s, SparkProjectStep):
+            last_project_idx = j
+        if isinstance(s, SparkReadStep):
+            used_aliases.add(s.alias)
 
     for i, step in enumerate(steps):
-        cur_output = _get_step_output_alias(step, i)
+        # 预填 input_alias——在生成输出别名之前，确保生成器能看到正确的输入
+        if not isinstance(step, (SparkReadStep, SparkJoinStep)):
+            if hasattr(step, "input_alias") and getattr(step, "input_alias", None) == "":
+                if prev_output is not None:
+                    step.input_alias = prev_output
+
+        # 生成输出别名（与 compiler.py 共享逻辑）
+        is_last = isinstance(step, SparkProjectStep) and i == last_project_idx
+        cur_output = _get_step_output_alias(step, used_aliases, is_last)
 
         # ReadStep 为数据源——无输入依赖，仅记录输出供后续步骤引用
         if isinstance(step, SparkReadStep):
@@ -766,10 +778,5 @@ def _chain_input_aliases(steps: list) -> None:
         if isinstance(step, SparkJoinStep):
             prev_output = cur_output
             continue
-
-        # 填充空的 input_alias——已显式设置的字段不受影响
-        if hasattr(step, 'input_alias') and getattr(step, 'input_alias', None) == "":
-            if prev_output is not None:
-                step.input_alias = prev_output
 
         prev_output = cur_output

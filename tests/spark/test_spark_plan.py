@@ -586,29 +586,29 @@ class TestSparkPlanMapper:
                     f"FilterStep[{i}] input_alias 应为 'od'，实际为 {step.input_alias!r}"
                 )
             elif isinstance(step, SparkProjectStep):
-                # 前一步是 FilterStep(index)，编译器输出为 _f{index}
+                # 前一步是 FilterStep，输出为 {input}_filtered
                 assert step.input_alias != "", (
                     f"ProjectStep[{i}] input_alias 不应为空（R3 修复验证）"
                 )
-                assert step.input_alias.startswith("_f"), (
-                    f"ProjectStep[{i}] input_alias 应指向 FilterStep 输出，"
-                    f"实际为 {step.input_alias!r}"
+                assert "_filtered" in step.input_alias, (
+                    f"ProjectStep[{i}] input_alias 应指向 FilterStep 输出"
+                    f"（含 '_filtered'），实际为 {step.input_alias!r}"
                 )
             elif isinstance(step, SparkSortStep):
                 assert step.input_alias != "", (
                     f"SortStep[{i}] input_alias 不应为空（R3 修复验证）"
                 )
-                assert step.input_alias.startswith("_p"), (
-                    f"SortStep[{i}] input_alias 应指向 ProjectStep 输出，"
-                    f"实际为 {step.input_alias!r}"
+                assert "_output" in step.input_alias or "_selected" in step.input_alias, (
+                    f"SortStep[{i}] input_alias 应指向 ProjectStep 输出"
+                    f"（含 '_output' 或 '_selected'），实际为 {step.input_alias!r}"
                 )
             elif isinstance(step, SparkLimitStep):
                 assert step.input_alias != "", (
                     f"LimitStep[{i}] input_alias 不应为空（R3 修复验证）"
                 )
-                assert step.input_alias.startswith("_s"), (
-                    f"LimitStep[{i}] input_alias 应指向 SortStep 输出，"
-                    f"实际为 {step.input_alias!r}"
+                assert "_sorted" in step.input_alias, (
+                    f"LimitStep[{i}] input_alias 应指向 SortStep 输出"
+                    f"（含 '_sorted'），实际为 {step.input_alias!r}"
                 )
 
     def test_input_alias_chain_full_contract_no_empty_aliases(self):

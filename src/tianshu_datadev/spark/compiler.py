@@ -11,6 +11,8 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 
+from tianshu_datadev.spark._alias_generator import generate_step_alias
+from tianshu_datadev.spark.annotations import StepAnnotation
 from tianshu_datadev.spark.models import (
     SparkAggregateStep,
     SparkCaseWhenStep,
@@ -24,7 +26,6 @@ from tianshu_datadev.spark.models import (
     SparkWindowStep,
 )
 from tianshu_datadev.spark.renderer import RenderError, SparkCodeRenderer
-from tianshu_datadev.spark.annotations import StepAnnotation
 
 # ════════════════════════════════════════════
 # 编译结果
@@ -63,6 +64,10 @@ class _CompileState:
     step_counter: int = 0
     # Phase 8C: 别名追踪——前序步骤的输出变量映射，用于串联数据流
     latest_alias: dict[str, str] = field(default_factory=dict)
+    # Phase 9B: 已用别名集合——用于数据流式命名的唯一性冲突检测
+    used_aliases: set[str] = field(default_factory=set)
+    # Phase 9B: 最后一个 ProjectStep 的全局索引（-1 表示不存在）
+    last_project_idx: int = -1
 
     def next_step_id(self, step_type: str) -> str:
         """生成下一个 step_id。"""
@@ -143,6 +148,18 @@ class SparkCompiler:
             for a in annotations:
                 if hasattr(a, "step_id") and a.step_id:
                     ann_map[a.step_id] = a
+
+        # ── Phase 9B: 预计算最后一个 ProjectStep 索引 + 初始化 Read 别名 ──
+        state.last_project_idx = -1
+        for j, s in enumerate(plan.steps):
+            if isinstance(s, SparkProjectStep):
+                state.last_project_idx = j
+            # 预注册 ReadStep 的 table_ref 别名——后续步骤的 input_alias 可能与之冲突
+            if isinstance(s, SparkReadStep):
+                state.used_aliases.add(s.alias)
+        # 暂存至实例属性——编译方法通过 self 访问
+        self._used_aliases = state.used_aliases
+        self._last_project_idx = state.last_project_idx
 
         for i, step in enumerate(plan.steps):
             step_type = type(step).__name__
@@ -314,8 +331,10 @@ class SparkCompiler:
         pure_column = step.left.split(".", 1)[-1] if "." in step.left else step.left
         col_ref = self.renderer.render_column(pure_column)
 
-        # 生成输出别名
-        out_alias = f"_f{index}"
+        # Phase 9B: 数据流式别名
+        out_alias = generate_step_alias(
+            step, input_alias=input_alias, used_aliases=self._used_aliases,
+        )
 
         if self.renderer.is_unary_operator(op):
             # IS_NULL / IS_NOT_NULL
@@ -365,7 +384,12 @@ class SparkCompiler:
         input_alias = resolved_input_alias or self.renderer.validate_identifier(
             step.input_alias, "ProjectStep.input_alias"
         )
-        out_alias = f"_p{index}"
+        # Phase 9B: 数据流式别名——最后一个 Project 用 _output，中间用 _selected
+        is_last = (index == self._last_project_idx)
+        out_alias = generate_step_alias(
+            step, input_alias=input_alias, used_aliases=self._used_aliases,
+            is_last_project=is_last,
+        )
 
         col_strs: list[str] = []
         for col in step.columns:
@@ -401,7 +425,9 @@ class SparkCompiler:
         input_alias = resolved_input_alias or self.renderer.validate_identifier(
             step.input_alias or f"_p{index - 1}", "SortStep.input_alias"
         )
-        out_alias = f"_s{index}"
+        out_alias = generate_step_alias(
+            step, input_alias=input_alias, used_aliases=self._used_aliases,
+        )
 
         sort_strs: list[str] = []
         for spec in step.order_by:
@@ -434,7 +460,9 @@ class SparkCompiler:
         input_alias = resolved_input_alias or self.renderer.validate_identifier(
             step.input_alias or f"_s{index - 1}", "LimitStep.input_alias"
         )
-        out_alias = f"_l{index}"
+        out_alias = generate_step_alias(
+            step, input_alias=input_alias, used_aliases=self._used_aliases,
+        )
 
         raw = f"{out_alias} = {input_alias}.limit({step.limit})"
 
@@ -462,7 +490,10 @@ class SparkCompiler:
         right = resolved_right or self.renderer.validate_identifier(
             step.right_alias, "JoinStep.right_alias"
         )
-        out_alias = f"_j{index}"
+        out_alias = generate_step_alias(
+            step, left_alias=left, right_alias=right,
+            used_aliases=self._used_aliases,
+        )
 
         # Join 条件——使用已解析的别名（可能是前序步骤的输出变量）
         left_key_ref = self.renderer.render_join_key(left, step.left_key)
@@ -493,7 +524,9 @@ class SparkCompiler:
         input_alias = resolved_input_alias or self.renderer.validate_identifier(
             step.input_alias, "AggregateStep.input_alias"
         )
-        out_alias = f"_a{index}"
+        out_alias = generate_step_alias(
+            step, input_alias=input_alias, used_aliases=self._used_aliases,
+        )
 
         # Group key 列引用
         group_cols = ", ".join(
@@ -547,7 +580,9 @@ class SparkCompiler:
         input_alias = resolved_input_alias or self.renderer.validate_identifier(
             step.input_alias, "CaseWhenStep.input_alias"
         )
-        out_alias = f"_c{index}"
+        out_alias = generate_step_alias(
+            step, input_alias=input_alias, used_aliases=self._used_aliases,
+        )
         output_col = self.renderer.validate_identifier(
             step.output_alias, "CaseWhenStep.output_alias"
         )
@@ -691,7 +726,9 @@ class SparkCompiler:
         input_alias = resolved_input_alias or self.renderer.validate_identifier(
             step.input_alias, "WindowStep.input_alias"
         )
-        out_alias = f"_w{index}"
+        out_alias = generate_step_alias(
+            step, input_alias=input_alias, used_aliases=self._used_aliases,
+        )
 
         if not step.expressions:
             # 空表达式列表——直通赋值（无操作）

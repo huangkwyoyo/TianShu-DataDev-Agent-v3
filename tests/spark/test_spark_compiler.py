@@ -7,6 +7,7 @@ import re
 import pytest
 
 from tianshu_datadev.artifacts.models import CaseWhenCondition
+from tianshu_datadev.spark.annotations import StepAnnotation, StepIntent
 from tianshu_datadev.spark.compiler import SparkCompiler
 from tianshu_datadev.spark.models import (
     SparkAggFunction,
@@ -26,7 +27,6 @@ from tianshu_datadev.spark.models import (
     SparkSortSpec,
     SparkSortStep,
 )
-from tianshu_datadev.spark.annotations import StepAnnotation, StepIntent
 from tianshu_datadev.spark.renderer import RenderError
 
 
@@ -1642,8 +1642,8 @@ class TestCompileWindow:
         plan = _make_plan(step)
         result = SparkCompiler().compile(plan)
 
-        # 空表达式应生成直通赋值 _w0 = df，不含裸注释行
-        assert "_w0 = df" in result.raw_pyspark
+        # 空表达式应生成直通赋值 df_windowed = df，不含裸注释行
+        assert "df_windowed = df" in result.raw_pyspark
         assert "# WINDOW" not in result.raw_pyspark
         assert "# Step:" in result.annotated_pyspark
 
