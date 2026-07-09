@@ -214,10 +214,15 @@ class DeveloperSpecParser:
         # 4. 一次性递归检测禁止的自由 SQL 字段（替代各子解析器中 9 处重复检查）
         self._check_all_forbidden_fields(spec_dict)
 
-        # 5. 解析各子部分（_check_all_forbidden_fields 已在上一步扫描全局，
+        # 5. 初始化 warnings 容器（子解析器需要追加警告）
+        parse_warnings: list[ParseWarning] = []
+
+        # 6. 解析各子部分（_check_all_forbidden_fields 已在上一步扫描全局，
         # 各子解析器中不再需要重复调用 _check_forbidden_sql_fields）
         # 注意：compute_steps 必须在 joins 之前解析——join 可能引用 step_name
-        input_tables = self._parse_input_tables(spec_dict.get("source_tables", []))
+        input_tables = self._parse_input_tables(
+            spec_dict.get("source_tables", []), parse_warnings=parse_warnings
+        )
         metrics = self._parse_metrics(spec_dict.get("metrics", []), input_tables)
         dimensions = self._parse_dimensions(spec_dict.get("dimensions", []))
         compute_steps = self._parse_compute_steps(spec_dict.get("compute_steps"), input_tables)
@@ -225,17 +230,16 @@ class DeveloperSpecParser:
         time_range = self._parse_time_range(spec_dict.get("time_range"))
         output_spec = self._parse_output_spec(spec_dict)
 
-        # 6. 提取标题
+        # 7. 提取标题
         title = self._extract_title(md_body) or spec_dict.get("summary", "Untitled")
 
-        # 7. 组装描述
+        # 8. 组装描述
         summary = spec_dict.get("summary", "")
         description_parts = [p for p in [summary, md_body] if p]
         description = "\n\n".join(description_parts)
 
-        # 8. 执行允许/禁止检查
+        # 9. 执行允许/禁止检查
         open_questions: list[OpenQuestion] = []
-        parse_warnings: list[ParseWarning] = []
 
         self._validate_seven_rejections(spec_dict, input_tables, metrics, joins, output_spec)
         parse_warnings.extend(self._validate_six_allowances(spec_dict, input_tables, joins, time_range))
@@ -357,7 +361,9 @@ class DeveloperSpecParser:
 
     # ── 子解析器 ──
 
-    def _parse_input_tables(self, raw_tables: list[dict]) -> list[InputTableDecl]:
+    def _parse_input_tables(
+        self, raw_tables: list[dict], parse_warnings: list[ParseWarning] | None = None
+    ) -> list[InputTableDecl]:
         """解析 source_tables 列表为 InputTableDecl 列表。
 
         同时执行 7 项禁止检查：
@@ -399,6 +405,55 @@ class DeveloperSpecParser:
             raw_row = raw.get("row_count")
             row_count, raw_row_count = _normalize_row_count(str(raw_row)) if raw_row else (None, None)
 
+            # ── V2 新增：解析 unique_keys ──
+            raw_unique_keys = raw.get("unique_keys")
+            unique_keys = None
+            if raw_unique_keys is not None:
+                if not isinstance(raw_unique_keys, list):
+                    if parse_warnings is not None:
+                        parse_warnings.append(ParseWarning(
+                            code="W005",
+                            message=f"表 '{alias}' 的 unique_keys 必须是列表，"
+                                    f"收到 {type(raw_unique_keys).__name__}——已忽略",
+                            field_ref=f"{alias}.unique_keys",
+                        ))
+                else:
+                    validated = []
+                    for i, kg in enumerate(raw_unique_keys):
+                        if not isinstance(kg, list) or len(kg) == 0:
+                            if parse_warnings is not None:
+                                parse_warnings.append(ParseWarning(
+                                    code="W005",
+                                    message=f"表 '{alias}' 的 unique_keys[{i}] 必须是非空列表——已跳过",
+                                    field_ref=f"{alias}.unique_keys[{i}]",
+                                ))
+                            continue
+                        # 校验列名存在于 key_columns/business_columns 中
+                        # 直接用原始 dict 提取列名，避免重复 _parse_columns 调用
+                        all_col_names = {
+                            c.get("name", "") for c in key_cols + biz_cols
+                            if isinstance(c, dict)
+                        }
+                        all_col_names_normalized = {
+                            self._normalizer.normalize(n) for n in all_col_names
+                        }
+                        unknown = [
+                            k for k in kg
+                            if self._normalizer.normalize(k) not in all_col_names_normalized
+                        ]
+                        if unknown:
+                            if parse_warnings is not None:
+                                parse_warnings.append(ParseWarning(
+                                    code="W006",
+                                    message=f"表 '{alias}' 的 unique_keys[{i}] 引用了未知列："
+                                            f"{unknown}——已跳过，不保留为唯一性证据",
+                                    field_ref=f"{alias}.unique_keys[{i}]",
+                                ))
+                            continue  # 跳过该组，不保留——防止误放行
+                        validated.append(kg)
+                    if validated:
+                        unique_keys = validated
+
             tables.append(InputTableDecl(
                 table_alias=alias,
                 source_table=raw.get("name", ""),
@@ -412,6 +467,7 @@ class DeveloperSpecParser:
                 time_field=raw.get("time_field"),
                 key_columns=self._parse_columns(key_cols, f"table {alias} key_columns"),
                 business_columns=self._parse_columns(biz_cols, f"table {alias} business_columns"),
+                unique_keys=unique_keys,  # ── V2 新增
             ))
 
         return tables
