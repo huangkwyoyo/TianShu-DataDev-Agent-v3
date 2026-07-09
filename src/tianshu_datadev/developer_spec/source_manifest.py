@@ -204,18 +204,12 @@ class SourceManifestBuilder:
             # 提取主键（来自 key_columns 中标记 unique=True 的字段）
             primary_key = [c.column_name for c in input_t.key_columns if c.unique]
 
-            # 同步 primary_key 到 unique_keys——主键天然是唯一键
-            unique_keys: list[list[str]] = []
-            if primary_key:
-                unique_keys.append(list(primary_key))
-
             tables.append(ManifestTable(
                 table_ref=input_t.table_alias,
                 source_table=input_t.source_table,
                 columns=columns,
                 primary_key=primary_key if primary_key else None,
                 foreign_keys=None,  # DeveloperSpec 不声明外键，由 SchemaRegistry 补充
-                unique_keys=unique_keys if unique_keys else None,
                 estimated_row_count=input_t.row_count,
             ))
 
@@ -272,17 +266,6 @@ class SourceManifestBuilder:
                     )
                     for fk in reg_fks
                 ]
-
-            # 从 SchemaRegistry 补充 unique_keys（合并而非覆盖）
-            reg_unique_keys = registry_meta.get("unique_keys")
-            if reg_unique_keys:
-                existing = table.unique_keys or []
-                merged = {tuple(sorted(g)) for g in existing}
-                for kg in reg_unique_keys:
-                    if isinstance(kg, list):
-                        merged.add(tuple(sorted(kg)))
-                if merged:
-                    object.__setattr__(table, "unique_keys", [list(g) for g in merged])
 
             # 逐字段对比
             for col in table.columns:
@@ -526,21 +509,11 @@ def build_manifest_from_spec(spec: ParsedDeveloperSpec) -> SourceManifest:
             for s in spec.output_spec.sort:
                 _add(s.column)
 
-        # 提取主键（来自 key_columns 中标记 unique=True 的字段）
-        primary_key = [c.column_name for c in t.key_columns if c.unique]
-
-        # 同步 primary_key 到 unique_keys
-        unique_keys: list[list[str]] = []
-        if primary_key:
-            unique_keys.append(list(primary_key))
-
         tables.append(
             ManifestTable(
                 table_ref=t.table_alias,
                 source_table=t.source_table,
                 columns=cols,
-                primary_key=primary_key if primary_key else None,
-                unique_keys=unique_keys if unique_keys else None,
                 estimated_row_count=t.row_count,
             )
         )

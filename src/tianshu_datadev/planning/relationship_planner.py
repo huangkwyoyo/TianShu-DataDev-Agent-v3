@@ -60,11 +60,11 @@ class FakeRelationshipPlanner:
         """基于 DeveloperSpec 构建 RelationshipHypothesis。
 
         Phase 1B 仅处理显式 Join 声明——不进行字段名匹配推理。
-        manifest 参数保留接口，供 Phase 4 使用。
+        manifest 用于 LEFT JOIN 唯一性安全门禁（Phase 1 新增）。
 
         Args:
             spec: 已解析的 DeveloperSpec
-            manifest: 可选的 SourceManifest（Phase 1B 不使用，保留接口）
+            manifest: 可选的 SourceManifest——用于查询右表 unique_keys
 
         Returns:
             (RelationshipHypothesis, list[OpenQuestion])
@@ -72,11 +72,14 @@ class FakeRelationshipPlanner:
         open_questions: list[OpenQuestion] = []
         candidates: list[JoinCandidate] = []
 
+        # 构建 unique_keys 查询表（供 LEFT JOIN 安全门禁使用）
+        table_unique_keys = self._build_unique_keys_lookup(manifest)
+
         # 从显式声明提取候选
         if spec.joins:
             for join_decl in spec.joins:
                 candidate = self._build_candidate(join_decl, spec)
-                open_q = self._rate_and_decide(candidate)
+                open_q = self._rate_and_decide(candidate, table_unique_keys)
                 if open_q:
                     open_questions.append(open_q)
                 else:
@@ -118,11 +121,22 @@ class FakeRelationshipPlanner:
             join_type=self._map_join_type(join_decl),
         )
 
-    def _rate_and_decide(self, candidate: JoinCandidate) -> OpenQuestion | None:
+    def _rate_and_decide(
+        self,
+        candidate: JoinCandidate,
+        table_unique_keys: dict[str, list[list[str]]] | None = None,
+    ) -> OpenQuestion | None:
         """对候选调用 Validator 定级，填充 evidence，按等级决定去向。
 
+        Phase 1 新增：STRONG + LEFT JOIN 时检查右表联结键唯一性，
+        无证据则生成 blocking OpenQuestion。
+
+        Args:
+            candidate: Join 候选
+            table_unique_keys: {table_ref: unique_keys} 查询表
+
         Returns:
-            OpenQuestion（WEAK/NONE 时）或 None（STRONG/MEDIUM 通过时）。
+            OpenQuestion（WEAK/NONE/不安全时）或 None（通过时）。
         """
         # 判断字段名归一化后是否匹配
         names_match = candidate.left_key_normalized == candidate.right_key_normalized
@@ -221,7 +235,53 @@ class FakeRelationshipPlanner:
                 blocking=False,
             )
 
-        # STRONG → 无需 open_question
+        # STRONG → LEFT JOIN 唯一性安全门禁
+        if level == JoinEvidenceLevel.STRONG:
+            return self._check_left_join_safety_gate(candidate, table_unique_keys)
+
+        return None
+
+    # ── LEFT JOIN 安全门禁 ──
+
+    def _check_left_join_safety_gate(
+        self,
+        candidate: JoinCandidate,
+        table_unique_keys: dict[str, list[list[str]]] | None,
+    ) -> OpenQuestion | None:
+        """STRONG 通过后，对 LEFT JOIN 做右表联结键唯一性检查。
+
+        只有 LEFT JOIN 需要此门禁——INNER/RIGHT/FULL 不触发。
+        无唯一性证据时返回 blocking OpenQuestion。
+
+        Args:
+            candidate: 已通过 STRONG 评级的 Join 候选
+            table_unique_keys: {table_ref: unique_keys} 查询表
+
+        Returns:
+            OpenQuestion（不安全时）或 None（安全通过）。
+        """
+        if candidate.join_type != JoinType.LEFT:
+            return None
+
+        # 查询右表的 unique_keys
+        right_unique = None
+        if table_unique_keys:
+            right_unique = table_unique_keys.get(candidate.right_table)
+
+        is_safe, desc = self._validator.check_left_join_safety(
+            right_table_unique_keys=right_unique,
+            right_join_key=candidate.right_key,
+        )
+
+        if not is_safe:
+            return OpenQuestion(
+                question_id=f"Q-JOIN-SAFETY-{candidate.candidate_id}",
+                source="relationship",
+                field_ref=f"{candidate.right_table}.{candidate.right_key}",
+                description=desc,
+                blocking=True,  # 阻断——不允许静默笛卡尔积
+            )
+
         return None
 
     # ── 辅助 ──
@@ -257,6 +317,28 @@ class FakeRelationshipPlanner:
                     curr.append(1 + min(prev[j], curr[-1], prev[j - 1]))
             prev = curr
         return prev[-1]
+
+    @staticmethod
+    def _build_unique_keys_lookup(
+        manifest: SourceManifest | None,
+    ) -> dict[str, list[list[str]]]:
+        """从 SourceManifest 构建 {table_ref: unique_keys} 查询表。
+
+        供 LEFT JOIN 唯一性安全门禁使用。
+
+        Args:
+            manifest: 源数据清单，None 时返回空 dict
+
+        Returns:
+            {table_ref: [[col1, col2], ...]} 映射
+        """
+        if manifest is None:
+            return {}
+        lookup: dict[str, list[list[str]]] = {}
+        for table in manifest.tables:
+            if table.unique_keys:
+                lookup[table.table_ref] = table.unique_keys
+        return lookup
 
     @staticmethod
     def _build_checks(
@@ -609,12 +691,15 @@ class RelationshipPlanner:
         open_questions: list[OpenQuestion] = []
         candidates: list[JoinCandidate] = []
 
+        # 构建 unique_keys 查询表（供 LEFT JOIN 安全门禁使用）
+        table_unique_keys = self._fake._build_unique_keys_lookup(manifest)
+
         # 步骤 1：先处理显式声明（不变——高优先级）
         explicit_candidates: dict[tuple[str, str], JoinCandidate] = {}
         if spec.joins:
             for join_decl in spec.joins:
                 candidate = self._fake._build_candidate(join_decl, spec)
-                open_q = self._fake._rate_and_decide(candidate)
+                open_q = self._fake._rate_and_decide(candidate, table_unique_keys)
                 if open_q:
                     open_questions.append(open_q)
                 else:
@@ -646,7 +731,7 @@ class RelationshipPlanner:
                 continue
 
             candidate = self._build_llm_candidate(item)
-            open_q = self._rate_and_decide_llm(candidate, item["confidence"])
+            open_q = self._rate_and_decide_llm(candidate, item["confidence"], table_unique_keys)
             if open_q:
                 open_questions.append(open_q)
                 # MEDIUM（非阻断人审）→ 候选仍加入流程，供人工确认后采纳
@@ -721,13 +806,20 @@ class RelationshipPlanner:
         return mapping.get(join_type_str, JoinType.INNER)
 
     def _rate_and_decide_llm(
-        self, candidate: JoinCandidate, llm_confidence: str
+        self,
+        candidate: JoinCandidate,
+        llm_confidence: str,
+        table_unique_keys: dict[str, list[list[str]]] | None = None,
     ) -> OpenQuestion | None:
         """对 LLM 推断的候选调用 Validator 定级——与显式声明的区别在于 has_explicit_decl=False。
+
+        LLM confidence 不作为唯一性证据——LEFT JOIN 安全门禁只信任
+        ManifestTable.unique_keys / primary_key 等确定性来源。
 
         Args:
             candidate: LLM 推断的 JoinCandidate（未填充 evidence）
             llm_confidence: LLM 的置信度标签（high/medium/low）
+            table_unique_keys: {table_ref: unique_keys} 查询表
 
         Returns:
             OpenQuestion 或 None
@@ -828,6 +920,10 @@ class RelationshipPlanner:
                 ),
                 blocking=False,
             )
+
+        # STRONG → LEFT JOIN 唯一性安全门禁
+        if level == JoinEvidenceLevel.STRONG:
+            return self._fake._check_left_join_safety_gate(candidate, table_unique_keys)
 
         return None
 
