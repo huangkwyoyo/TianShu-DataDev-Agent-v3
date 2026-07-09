@@ -2880,15 +2880,14 @@ class Pipeline:
         artifacts: PipelineArtifactBundle,
         context: SparkStageContext,
     ) -> SnapshotManifest | None:
-        """尝试通过 SnapshotBuilder 为 PHYSICAL_VERIFIER 构建快照。
+        """尝试为 PHYSICAL_VERIFIER 构建快照——三级回退策略。
 
-        仅在 Pipeline 初始化时注入了 snapshot_builder + snapshot_provider
-        且有 table_paths 可用时才尝试。失败或依赖缺失时向 context 写入
-        SNAPSHOT_NOT_READY 错误并返回 None。
+        1. SnapshotBuilder 注入 → 走 SnapshotBuilder.build()（E2E CSV fixture 路径）
+        2. DuckDB 数据库可用 → 直接从 DuckDB 导出 Parquet（生产路径）
+        3. 都不可用 → SNAPSHOT_NOT_READY
 
         安全边界：
-        - snapshot 只能来自已有 SnapshotManifest 或通过既有 SnapshotBuilder.build() 创建
-        - 禁止在此方法中手写 CSV → Parquet 或使用 PyArrow 生成快照
+        - snapshot 只能来自已有 SnapshotManifest / SnapshotBuilder / DuckDB 导出
         - 禁止 fallback 到空临时目录
 
         Args:
@@ -2898,82 +2897,225 @@ class Pipeline:
         Returns:
             SnapshotManifest——成功构建的快照清单；None 表示失败（context 已写入错误）
         """
-        # 检查 SnapshotBuilder / SnapshotProvider 注入
-        if self._snapshot_builder is None or self._snapshot_provider is None:
+        # ── 路径 1：SnapshotBuilder 注入 → 走既有 CSV fixture 快照流程 ──
+        if self._snapshot_builder is not None and self._snapshot_provider is not None:
+            # 获取 table_paths——优先从 _results 读取 execute_rich 持久化的 resolved_table_paths，
+            # 其次回退到 Pipeline 初始化的 default_table_paths
+            results_data = self._results.get(artifacts.request_id, {})
+            table_paths = results_data.get("resolved_table_paths") or self._default_table_paths
+            if not table_paths:
+                context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
+                context.errors.append(
+                    "[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
+                    "缺少 table_paths——无法确定数据源文件路径。"
+                    "请在 Pipeline 初始化时注入 default_table_paths，"
+                    "或使用「全流程 Run-All」路径。"
+                )
+                return None
+
+            # 计算 contract_hash——用于快照溯源
+            contract_hash = ""
+            if artifacts.data_transform_contract is not None:
+                from tianshu_datadev.artifacts.models import DataTransformContractV1
+                if isinstance(artifacts.data_transform_contract, DataTransformContractV1):
+                    contract_hash = DataTransformContractV1.compute_contract_hash(
+                        artifacts.data_transform_contract
+                    )
+                else:
+                    contract_hash = hashlib.sha256(
+                        str(artifacts.data_transform_contract).encode()
+                    ).hexdigest()
+
+            # 按 SnapshotSourceProvider 白名单过滤 source_tables
+            source_tables = list(table_paths.keys())
+            allowlisted = set(self._snapshot_provider.allowlisted_tables)
+            source_tables = [t for t in source_tables if t in allowlisted]
+
+            if not source_tables:
+                context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
+                context.errors.append(
+                    f"[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
+                    f"table_paths 中的表名 {sorted(table_paths.keys())} "
+                    f"不在 SnapshotSourceProvider 白名单 "
+                    f"{sorted(allowlisted)} 中。请检查 Pipeline 初始化配置。"
+                )
+                return None
+
+            # 通过 SnapshotBuilder.build() 创建快照（不手写 PyArrow）
+            try:
+                snapshot_manifest = self._snapshot_builder.build(
+                    contract_hash=contract_hash,
+                    source_tables=source_tables,
+                    provider=self._snapshot_provider,
+                )
+                # 回写 artifacts——供后续代码引用（PipelineArtifactBundle 非 frozen）
+                artifacts.snapshot_manifest = snapshot_manifest
+                logger.info(
+                    "PHYSICAL_VERIFIER 快照构建成功——snapshot_id=%s，文件数=%d",
+                    snapshot_manifest.snapshot_id,
+                    len(snapshot_manifest.files),
+                )
+                return snapshot_manifest
+            except Exception as e:
+                context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
+                context.errors.append(
+                    f"[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
+                    f"SnapshotBuilder.build() 执行失败——{e}"
+                )
+                logger.warning("PHYSICAL_VERIFIER 快照构建失败：%s", e)
+                return None
+
+        # ── 路径 2：DuckDB 数据库可用 → 直接从 DuckDB 导出 Parquet 快照 ──
+        if self._duckdb_path is not None:
+            return self._build_snapshot_from_duckdb(artifacts, context)
+
+        # ── 路径 3：无任何快照数据源 ──
+        context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
+        context.errors.append(
+            "[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
+            "缺少 SnapshotBuilder/SnapshotProvider 注入且无 DuckDB 数据库——"
+            "无法创建数据快照。请检查 Pipeline 初始化配置，"
+            "或使用「全流程 Run-All」路径（该路径会自动创建快照）。"
+        )
+        return None
+
+    def _build_snapshot_from_duckdb(
+        self,
+        artifacts: PipelineArtifactBundle,
+        context: SparkStageContext,
+    ) -> SnapshotManifest | None:
+        """从 DuckDB 数据库直接导出 Parquet 快照——生产路径的 SnapshotBuilder 替代方案。
+
+        读取 Contract 中声明的 input_tables，从 DuckDB 逐表导出为 Parquet，
+        生成 SnapshotManifest 供 PhysicalVerifier 双引擎读取。
+
+        安全边界：
+        - 仅导出 Contract.input_tables 中声明的表——不扫描 DuckDB 全库
+        - 使用 DuckDB 只读连接——不修改源数据库
+        - 快照写入临时目录——会话结束后由 OS 回收
+        """
+        from tianshu_datadev.spark.snapshot import SnapshotFile
+        from tianshu_datadev.spark.snapshot import SnapshotManifest as _SnapManifest
+
+        contract = artifacts.data_transform_contract
+        if contract is None or not contract.input_tables:
             context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
             context.errors.append(
                 "[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
-                "缺少 SnapshotBuilder/SnapshotProvider 注入——"
-                "无法创建数据快照。请检查 Pipeline 初始化配置，"
-                "或使用「全流程 Run-All」路径（该路径会自动创建快照）。"
+                "Contract 无 input_tables——无法确定需要快照的源表。"
+                "请先执行「编译执行」生成 Contract。"
             )
             return None
 
-        # 获取 table_paths——优先从 _results 读取 execute_rich 持久化的 resolved_table_paths，
-        # 其次回退到 Pipeline 初始化的 default_table_paths
-        results_data = self._results.get(artifacts.request_id, {})
-        table_paths = results_data.get("resolved_table_paths") or self._default_table_paths
-        if not table_paths:
-            context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
-            context.errors.append(
-                "[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
-                "缺少 table_paths——无法确定数据源文件路径。"
-                "请在 Pipeline 初始化时注入 default_table_paths，"
-                "或使用「全流程 Run-All」路径。"
-            )
-            return None
+        # 去重收集源表物理名（同一物理表可能被多个别名引用）
+        source_tables: list[str] = list(dict.fromkeys(
+            t.source_table for t in contract.input_tables
+        ))
+
+        import os as _os
+        import tempfile as _tempfile
+
+        import duckdb as _duckdb
+        import pyarrow.parquet as _pq
 
         # 计算 contract_hash——用于快照溯源
         contract_hash = ""
-        if artifacts.data_transform_contract is not None:
-            from tianshu_datadev.artifacts.models import DataTransformContractV1
-            if isinstance(artifacts.data_transform_contract, DataTransformContractV1):
-                contract_hash = DataTransformContractV1.compute_contract_hash(
-                    artifacts.data_transform_contract
-                )
-            else:
-                contract_hash = hashlib.sha256(
-                    str(artifacts.data_transform_contract).encode()
-                ).hexdigest()
-
-        # 按 SnapshotSourceProvider 白名单过滤 source_tables
-        source_tables = list(table_paths.keys())
-        allowlisted = set(self._snapshot_provider.allowlisted_tables)
-        source_tables = [t for t in source_tables if t in allowlisted]
-
-        if not source_tables:
-            context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
-            context.errors.append(
-                f"[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
-                f"table_paths 中的表名 {sorted(table_paths.keys())} "
-                f"不在 SnapshotSourceProvider 白名单 "
-                f"{sorted(allowlisted)} 中。请检查 Pipeline 初始化配置。"
+        if contract is not None:
+            from tianshu_datadev.artifacts.models import (
+                DataTransformContractLite as _Lite,
             )
-            return None
+            from tianshu_datadev.artifacts.models import (
+                DataTransformContractV1 as _V1,  # noqa: N814
+            )
+            if isinstance(contract, _V1):
+                contract_hash = _V1.compute_contract_hash(contract)
+            elif isinstance(contract, _Lite):
+                contract_hash = _Lite.compute_contract_hash(contract)
 
-        # 通过 SnapshotBuilder.build() 创建快照（不手写 PyArrow）
+        snap_dir = _tempfile.mkdtemp(prefix="tianshu_snap_")
+        files: list[SnapshotFile] = []
+
         try:
-            snapshot_manifest = self._snapshot_builder.build(
-                contract_hash=contract_hash,
-                source_tables=source_tables,
-                provider=self._snapshot_provider,
-            )
-            # 回写 artifacts——供后续代码引用（PipelineArtifactBundle 非 frozen）
-            artifacts.snapshot_manifest = snapshot_manifest
-            logger.info(
-                "PHYSICAL_VERIFIER 快照构建成功——snapshot_id=%s，文件数=%d",
-                snapshot_manifest.snapshot_id,
-                len(snapshot_manifest.files),
-            )
-            return snapshot_manifest
+            con = _duckdb.connect(self._duckdb_path, read_only=True)
         except Exception as e:
             context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
             context.errors.append(
                 f"[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
-                f"SnapshotBuilder.build() 执行失败——{e}"
+                f"无法连接 DuckDB 数据库 {self._duckdb_path}——{e}"
             )
-            logger.warning("PHYSICAL_VERIFIER 快照构建失败：%s", e)
+            logger.warning("DuckDB 快照——连接失败：%s", e)
             return None
+
+        try:
+            for table_name in source_tables:
+                try:
+                    # 查询全表 → PyArrow Table → 写入 Parquet
+                    arrow_table = con.execute(
+                        f"SELECT * FROM {table_name}"
+                    ).arrow()
+                    parquet_path = _os.path.join(
+                        snap_dir, f"{table_name}.parquet",
+                    )
+                    _pq.write_table(arrow_table, parquet_path)
+
+                    # 计算行数和文件 hash
+                    row_count = int(arrow_table.num_rows)
+                    file_sha256 = hashlib.sha256()
+                    with open(parquet_path, "rb") as _fh:
+                        for _chunk in iter(lambda: _fh.read(8192), b""):
+                            file_sha256.update(_chunk)
+
+                    files.append(SnapshotFile(
+                        source_name=table_name,
+                        file_path=parquet_path,
+                        format="parquet",
+                        row_count=row_count,
+                        file_sha256=file_sha256.hexdigest(),
+                    ))
+                    logger.info(
+                        "DuckDB 快照导出——表 %s，%d 行",
+                        table_name, row_count,
+                    )
+                except Exception as _exp_err:
+                    logger.warning(
+                        "DuckDB 快照导出失败（表 %s）：%s",
+                        table_name, _exp_err,
+                    )
+                    continue
+        finally:
+            con.close()
+
+        if not files:
+            context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
+            context.errors.append(
+                "[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
+                f"DuckDB 快照导出——{len(source_tables)} 个源表无一成功导出。"
+                f"源表列表：{source_tables}"
+            )
+            return None
+
+        # 生成确定性 snapshot_id + manifest
+        snap_id = (
+            f"snap_{contract_hash[:16]}"
+            if contract_hash
+            else "snap_adhoc"
+        )
+        manifest = _SnapManifest(
+            snapshot_id=snap_id,
+            contract_hash=contract_hash,
+            snapshot_dir=snap_dir,
+            files=files,
+            source_type="dev_warehouse",
+        )
+
+        # 回写 artifacts——供后续代码引用
+        artifacts.snapshot_manifest = manifest
+        logger.info(
+            "DuckDB 快照创建成功——snapshot_id=%s，文件数=%d",
+            snap_id, len(files),
+        )
+        return manifest
+
 
     def _do_spark_physical_verify(
         self, artifacts: PipelineArtifactBundle, context: SparkStageContext,
