@@ -25,6 +25,9 @@ node_modules/
 generated/review_packages/
 frontend/generated/
 
+# Superpowers 内部跟踪文件
+.superpowers/
+
 # CodeGraph 索引
 .codegraph/
 frontend/dist/
