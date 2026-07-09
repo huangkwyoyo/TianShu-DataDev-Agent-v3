@@ -1103,3 +1103,41 @@ class TestRealSparkExecution:
             f" DuckDB 行数：{report.duckdb_result.raw_row_count if report.duckdb_result else 'N/A'}"
             f" Spark 行数：{report.spark_result.raw_row_count if report.spark_result else 'N/A'}"
         )
+
+
+# ════════════════════════════════════════════
+# Task 4: inputs[别名] 全链路 E2E 回归
+# ════════════════════════════════════════════
+
+
+def test_spark_inputs_alias_resolves_end_to_end():
+    """回归：快照物理名 + 索引别名 ft，PySpark inputs['ft'] 全链路解析，无 KeyError。"""
+    import pytest
+    pytest.importorskip("pyspark")
+    import json
+    import os
+    import shutil
+    import tempfile
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from tianshu_datadev.spark.executor import LocalSparkExecutor
+
+    # 用 tempfile.mkdtemp 创建快照目录（tmp_path 在 asyncio_mode=strict 下权限受限）
+    snapshot_dir = tempfile.mkdtemp(prefix="tianshu_e2e_alias_")
+    try:
+        pq.write_table(
+            pa.table({"amount": [10, 20]}),
+            os.path.join(snapshot_dir, "fact_trips_sample.parquet"),
+        )
+        with open(os.path.join(snapshot_dir, "_inputs_index.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"ft": "fact_trips_sample.parquet"}, f)
+
+        # executor 要求定义 transform(inputs)，由内部输出收集器调用
+        code = "def transform(inputs):\n    return inputs['ft']"
+        result = LocalSparkExecutor().execute(code, data_dir=snapshot_dir)
+        assert result.status.name == "SUCCESS", result.error_message
+    finally:
+        shutil.rmtree(snapshot_dir, ignore_errors=True)
