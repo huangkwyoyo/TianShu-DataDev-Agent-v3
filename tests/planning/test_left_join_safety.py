@@ -24,7 +24,7 @@ from tianshu_datadev.planning.relationship_planner import (
     FakeRelationshipPlanner,
     RelationshipPlanner,
 )
-from tianshu_datadev.planning.relationship_validator import RelationshipValidator
+from tianshu_datadev.planning.relationship_validator import JoinSafetyTableInfo, RelationshipValidator
 from tianshu_datadev.planning.sql_build_plan import (
     JoinStep,
     ScanStep,
@@ -90,7 +90,7 @@ class TestCheckLeftJoinSafety:
         validator = RelationshipValidator()
         is_safe, desc = validator.check_left_join_safety(
             right_table_unique_keys=None,
-            right_join_key="user_id",
+            right_join_key_normalized="user_id",
         )
         assert is_safe is False
         assert desc is not None
@@ -101,7 +101,7 @@ class TestCheckLeftJoinSafety:
         validator = RelationshipValidator()
         is_safe, desc = validator.check_left_join_safety(
             right_table_unique_keys=[],
-            right_join_key="user_id",
+            right_join_key_normalized="user_id",
         )
         assert is_safe is False
 
@@ -110,17 +110,17 @@ class TestCheckLeftJoinSafety:
         validator = RelationshipValidator()
         is_safe, desc = validator.check_left_join_safety(
             right_table_unique_keys=[["user_id"]],
-            right_join_key="user_id",
+            right_join_key_normalized="user_id",
         )
         assert is_safe is True
         assert desc is None
 
     def test_case_insensitive_match(self):
-        """大小写不敏感匹配 → safe。"""
+        """归一化后的唯一键匹配 → safe（V2 中 unique_keys 已由 Builder 预归一化）。"""
         validator = RelationshipValidator()
         is_safe, desc = validator.check_left_join_safety(
-            right_table_unique_keys=[["User_ID"]],
-            right_join_key="user_id",
+            right_table_unique_keys=[["user_id"]],
+            right_join_key_normalized="user_id",
         )
         assert is_safe is True
 
@@ -129,7 +129,7 @@ class TestCheckLeftJoinSafety:
         validator = RelationshipValidator()
         is_safe, desc = validator.check_left_join_safety(
             right_table_unique_keys=[["user_id", "order_date"]],
-            right_join_key="user_id",
+            right_join_key_normalized="user_id",
         )
         # 复合键中 len != 1，不匹配
         assert is_safe is False
@@ -139,7 +139,7 @@ class TestCheckLeftJoinSafety:
         validator = RelationshipValidator()
         is_safe, desc = validator.check_left_join_safety(
             right_table_unique_keys=[["order_id"], ["product_id"]],
-            right_join_key="user_id",
+            right_join_key_normalized="user_id",
         )
         assert is_safe is False
         assert desc is not None
@@ -323,12 +323,12 @@ class TestLeftJoinSafetyGate:
 class TestRelationshipPlannerDelegateGate:
     """验证 RelationshipPlanner(adapter=None) 通过 _fake 正确委托安全门禁。
 
-    这类测试防止 _build_unique_keys_lookup / _check_left_join_safety_gate
+    这类测试防止 _build_join_safety_info / _check_left_join_safety_gate
     被错误地以 self._method() 而非 self._fake._method() 调用的回归。
     """
 
-    def test_delegate_build_unique_keys_lookup(self):
-        """_fake._build_unique_keys_lookup 可从 RelationshipPlanner 访问。"""
+    def test_delegate_build_join_safety_info(self):
+        """_fake._build_join_safety_info 可从 RelationshipPlanner 访问。"""
         manifest = _make_manifest(
             table_ref="t1",
             source_table="test.t1",
@@ -351,14 +351,15 @@ class TestRelationshipPlannerDelegateGate:
         manifest.tables.append(t2)
 
         planner = RelationshipPlanner(adapter=None)
-        lookup = planner._fake._build_unique_keys_lookup(manifest)
+        lookup = planner._fake._build_join_safety_info(manifest)
 
         assert "t1" in lookup
-        # _build_unique_keys_lookup 返回的是 unique_keys 列表本身（分组），不做合并
-        assert ["id"] in lookup["t1"]
-        assert ["code"] in lookup["t1"]
-        # 未声明 unique_keys 的表不会出现在 lookup 中
-        assert "t2" not in lookup
+        assert isinstance(lookup["t1"], JoinSafetyTableInfo)
+        assert ["id"] in lookup["t1"].unique_keys
+        assert ["code"] in lookup["t1"].unique_keys
+        # 现在所有表都出现在 lookup 中（[] 表示已查询但无声明）
+        assert "t2" in lookup
+        assert lookup["t2"].unique_keys == []
 
     def test_delegate_check_left_join_safety_blocks(self):
         """_fake._check_left_join_safety_gate 返回 blocking OpenQuestion（无覆盖）。"""
@@ -396,8 +397,8 @@ class TestRelationshipPlannerDelegateGate:
         candidate.evidence.generate_evidence_chain_yaml()
 
         # 右表无 unique_keys → 应阻断
-        table_unique_keys = {"td": []}
-        question = planner._fake._check_left_join_safety_gate(candidate, table_unique_keys)
+        join_safety_info = {"td": JoinSafetyTableInfo(unique_keys=[], role=None, key_column_names_normalized=[])}
+        question = planner._fake._check_left_join_safety_gate(candidate, join_safety_info)
         assert question is not None
         assert question.blocking is True
         assert "Q-JOIN-SAFETY" in question.question_id
@@ -439,8 +440,8 @@ class TestRelationshipPlannerDelegateGate:
         candidate.evidence.generate_evidence_chain_yaml()
 
         # 右表 unique_keys 覆盖 dim_id → 应通过
-        table_unique_keys = {"td": [["dim_id"]]}
-        question = planner._fake._check_left_join_safety_gate(candidate, table_unique_keys)
+        join_safety_info = {"td": JoinSafetyTableInfo(unique_keys=[["dim_id"]], role=None, key_column_names_normalized=[])}
+        question = planner._fake._check_left_join_safety_gate(candidate, join_safety_info)
         assert question is None
 
     def test_delegate_inner_join_skips(self):
@@ -479,8 +480,8 @@ class TestRelationshipPlannerDelegateGate:
         candidate.evidence.generate_evidence_chain_yaml()
 
         # INNER JOIN 不触发门禁
-        table_unique_keys = {"td": []}
-        question = planner._fake._check_left_join_safety_gate(candidate, table_unique_keys)
+        join_safety_info = {"td": JoinSafetyTableInfo(unique_keys=[], role=None, key_column_names_normalized=[])}
+        question = planner._fake._check_left_join_safety_gate(candidate, join_safety_info)
         assert question is None
 
 
