@@ -30,6 +30,31 @@ from tianshu_datadev.spark.snapshot import (
     SnapshotSourceType,
 )
 
+
+def _make_local_fixture_builder(tmpdir: str):
+    """在 tmpdir 下创建 fact_trips_sample.csv 和对应 provider，返回 (provider, builder)。
+
+    供别名校验和侧车索引测试使用——创建 2 行样例 CSV 后构造 LOCAL_FIXTURE provider。
+    tmpdir 为绝对路径字符串（使用 tempfile.mkdtemp 创建，避免 pytest tmp_path 权限冲突）。
+    """
+    # 写 2 行样例 CSV
+    csv_content = "trip_id,fare\n1,10.5\n2,20.0\n"
+    csv_path = os.path.join(tmpdir, "fact_trips_sample.csv")
+    with open(csv_path, "w", encoding="utf-8") as fp:
+        fp.write(csv_content)
+
+    provider = SnapshotSourceProvider(
+        provider_id="test_provider_001",
+        source_type=SnapshotSourceType.LOCAL_FIXTURE,
+        connection_alias="test",
+        allowlisted_tables=["fact_trips_sample"],
+        base_path=tmpdir,
+        description="测试用本地 fixture",
+    )
+    builder = SnapshotBuilder(output_dir=os.path.join(tmpdir, "snap"))
+    return provider, builder
+
+
 # ════════════════════════════════════════════
 # Fixtures
 # ════════════════════════════════════════════
@@ -651,6 +676,73 @@ class TestSnapshotManifest:
             contract_hash="test",
         )
         assert manifest.deidentification == "none"
+
+
+# ════════════════════════════════════════════
+# SnapshotBuilder 别名 + 侧车索引测试（Task 1）
+# ════════════════════════════════════════════
+
+
+class TestSnapshotBuilderAliases:
+    """SnapshotBuilder.build() 别名校验 + _inputs_index 侧车写入。"""
+
+    def test_build_source_name_uses_alias_file_keeps_physical(self):
+        """table_aliases 提供时——SnapshotFile.source_name 用别名，磁盘文件名保持物理名。"""
+        import tempfile
+        tmpdir = tempfile.mkdtemp(prefix="tianshu_alias_")
+        try:
+            provider, builder = _make_local_fixture_builder(tmpdir)
+            manifest = builder.build(
+                contract_hash="c_hash",
+                source_tables=["fact_trips_sample"],
+                provider=provider,
+                table_aliases={"fact_trips_sample": "ft"},
+            )
+            f = next(x for x in manifest.files if x.file_path.endswith(".parquet"))
+            # source_name 是别名
+            assert f.source_name == "ft"
+            # 磁盘文件名仍是物理名
+            assert f.file_path.endswith("fact_trips_sample.parquet")
+            assert os.path.isfile(f.file_path)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_build_writes_inputs_index(self):
+        """写入 _inputs_index.json——{别名: 物理文件名}。"""
+        import json
+        import tempfile
+        tmpdir = tempfile.mkdtemp(prefix="tianshu_index_")
+        try:
+            provider, builder = _make_local_fixture_builder(tmpdir)
+            manifest = builder.build(
+                contract_hash="c_hash",
+                source_tables=["fact_trips_sample"],
+                provider=provider,
+                table_aliases={"fact_trips_sample": "ft"},
+            )
+            index_path = os.path.join(manifest.snapshot_dir, "_inputs_index.json")
+            assert os.path.isfile(index_path)
+            with open(index_path, encoding="utf-8") as fp:
+                index = json.load(fp)
+            assert index == {"ft": "fact_trips_sample.parquet"}
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_build_without_aliases_keeps_physical_source_name(self):
+        """未提供 table_aliases——source_name 回退物理名（向后兼容）。"""
+        import tempfile
+        tmpdir = tempfile.mkdtemp(prefix="tianshu_noalias_")
+        try:
+            provider, builder = _make_local_fixture_builder(tmpdir)
+            manifest = builder.build(
+                contract_hash="c_hash",
+                source_tables=["fact_trips_sample"],
+                provider=provider,
+            )
+            f = next(x for x in manifest.files if x.file_path.endswith(".parquet"))
+            assert f.source_name == "fact_trips_sample"
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ════════════════════════════════════════════

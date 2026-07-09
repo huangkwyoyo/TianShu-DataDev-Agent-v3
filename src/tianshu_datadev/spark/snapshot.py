@@ -114,6 +114,10 @@ class SnapshotManifest(StrictModel):
     deidentification: str = "none"          # "none" / "masked_pii" / "synthetic"
 
 
+# 快照目录内的 inputs 索引侧车文件名——executor prologue 据此按别名装载 inputs
+_INPUTS_INDEX_FILENAME = "_inputs_index.json"
+
+
 # ════════════════════════════════════════════
 # SnapshotBuilder
 # ════════════════════════════════════════════
@@ -177,6 +181,7 @@ class SnapshotBuilder:
         source_tables: list[str],
         provider: SnapshotSourceProvider,
         sampling: SamplingSpec | None = None,
+        table_aliases: dict[str, str] | None = None,
     ) -> SnapshotManifest:
         """构建快照——从白名单数据源生成不可变 Parquet 快照。
 
@@ -194,6 +199,8 @@ class SnapshotBuilder:
             source_tables: 需要快照的表名列表（对应 inputs dict 的 key）
             provider: 数据源提供方配置（必须在白名单内）
             sampling: 采样策略（默认 full）
+            table_aliases: 物理表名 → 别名（inputs dict 的 key）映射。
+                           提供时 SnapshotFile.source_name 置为别名，磁盘文件仍用物理名。
 
         Returns:
             SnapshotManifest——包含完整溯源链
@@ -227,14 +234,18 @@ class SnapshotBuilder:
                 provider=provider,
                 snapshot_dir=snapshot_dir,
                 sampling_spec=spec,
+                table_aliases=table_aliases,
             )
+            # 写 inputs 索引侧车——executor prologue 按别名装载 inputs
+            self._write_inputs_index(snapshot_dir, files)
         else:
             # 非 LOCAL_FIXTURE：占位清单（Phase 7B+ 实现实际写入）
             files: list[SnapshotFile] = []
+            _aliases = table_aliases or {}
             for table_name in sorted(source_tables):
                 file_path = os.path.join(snapshot_dir, f"{table_name}.parquet")
                 files.append(SnapshotFile(
-                    source_name=table_name,
+                    source_name=_aliases.get(table_name, table_name),
                     file_path=file_path,
                     format="parquet",
                     row_count=0,           # Phase 7B 填充
@@ -508,6 +519,7 @@ class SnapshotBuilder:
         provider: SnapshotSourceProvider,
         snapshot_dir: str,
         sampling_spec: SamplingSpec,
+        table_aliases: dict[str, str] | None = None,
     ) -> list[SnapshotFile]:
         """从本地 fixture 文件写入 Parquet 快照——Phase 7A 核心实现。
 
@@ -525,6 +537,7 @@ class SnapshotBuilder:
             provider: 数据源提供方（source_type 必须为 LOCAL_FIXTURE）
             snapshot_dir: 快照输出目录
             sampling_spec: 采样策略
+            table_aliases: 物理表名 → 别名映射。提供时 source_name 用别名。
 
         Returns:
             SnapshotFile 列表——含真实 row_count 和 file_sha256
@@ -533,6 +546,7 @@ class SnapshotBuilder:
             FileNotFoundError: fixture 文件不存在
         """
         os.makedirs(snapshot_dir, exist_ok=True)
+        _aliases = table_aliases or {}
 
         files: list[SnapshotFile] = []
         for table_name in sorted(source_tables):
@@ -545,7 +559,7 @@ class SnapshotBuilder:
             # 应用采样
             table = self._apply_sampling(table, sampling_spec)
 
-            # 写入 Parquet
+            # 磁盘文件名保持物理名——DuckDB 视图注册依赖物理文件名
             parquet_path = os.path.join(snapshot_dir, f"{table_name}.parquet")
             pq.write_table(table, parquet_path)
 
@@ -554,7 +568,8 @@ class SnapshotBuilder:
             file_sha256 = self._compute_file_sha256(parquet_path)
 
             files.append(SnapshotFile(
-                source_name=table_name,
+                # source_name 用别名（inputs dict 的 key）——无别名时回退物理名
+                source_name=_aliases.get(table_name, table_name),
                 file_path=parquet_path,
                 format="parquet",
                 row_count=row_count,
@@ -562,3 +577,15 @@ class SnapshotBuilder:
             ))
 
         return files
+
+    @staticmethod
+    def _write_inputs_index(snapshot_dir: str, files: list[SnapshotFile]) -> None:
+        """写 inputs 索引侧车——记录 {source_name(别名): 物理文件名}。
+
+        executor prologue 读取此索引，按别名装载 Parquet 为 inputs dict。
+        与 DuckDB 的 glob-by-stem 视图注册互不干扰（索引为 .json，非 .parquet）。
+        """
+        index = {f.source_name: os.path.basename(f.file_path) for f in files}
+        index_path = os.path.join(snapshot_dir, _INPUTS_INDEX_FILENAME)
+        with open(index_path, "w", encoding="utf-8") as fp:
+            json.dump(index, fp, sort_keys=True, ensure_ascii=False)
