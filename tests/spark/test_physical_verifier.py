@@ -1115,29 +1115,24 @@ def test_spark_inputs_alias_resolves_end_to_end():
     import pytest
     pytest.importorskip("pyspark")
     import json
-    import os
-    import shutil
     import tempfile
+    from pathlib import Path
 
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     from tianshu_datadev.spark.executor import LocalSparkExecutor
 
-    # 用 tempfile.mkdtemp 创建快照目录（tmp_path 在 asyncio_mode=strict 下权限受限）
-    snapshot_dir = tempfile.mkdtemp(prefix="tianshu_e2e_alias_")
-    try:
+    with tempfile.TemporaryDirectory(prefix="tianshu_e2e_alias_") as snapshot_dir:
         pq.write_table(
             pa.table({"amount": [10, 20]}),
-            os.path.join(snapshot_dir, "fact_trips_sample.parquet"),
+            str(Path(snapshot_dir) / "fact_trips_sample.parquet"),
         )
-        with open(os.path.join(snapshot_dir, "_inputs_index.json"), "w",
-                  encoding="utf-8") as f:
-            json.dump({"ft": "fact_trips_sample.parquet"}, f)
+        (Path(snapshot_dir) / "_inputs_index.json").write_text(
+            json.dumps({"ft": "fact_trips_sample.parquet"}), encoding="utf-8"
+        )
 
         # executor 要求定义 transform(inputs)，由内部输出收集器调用
         code = "def transform(inputs):\n    return inputs['ft']"
         result = LocalSparkExecutor().execute(code, data_dir=snapshot_dir)
         assert result.status.name == "SUCCESS", result.error_message
-    finally:
-        shutil.rmtree(snapshot_dir, ignore_errors=True)
