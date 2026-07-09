@@ -813,6 +813,99 @@ class TestPlanEquivalence:
         result = compare_window_steps([sql_win], [spark_win])
         assert result.verdict == EquivalenceVerdict.NOT_EQUIVALENT
 
+    def test_window_partition_order_equivalent(self):
+        """相同 partition_by + order_by（含 direction）→ 等价。"""
+        win_expr = {
+            "function": "ROW_NUMBER", "alias": "rn",
+            "partition_by": ["dept_id"], "order_by": ["salary DESC LAST"],
+        }
+        sql_windows = [{"window_exprs": [win_expr]}]
+        spark_windows = [{"expressions": [win_expr]}]
+        result = compare_window_steps(sql_windows, spark_windows)
+        assert result.verdict == EquivalenceVerdict.EQUIVALENT
+
+    def test_window_order_reversed_not_equivalent(self):
+        """ORDER BY salary DESC, name ASC vs 相反顺序 → NOT_EQUIVALENT。"""
+        sql_win = {
+            "window_exprs": [
+                {"function": "RANK", "alias": "rk",
+                 "partition_by": ["dept_id"],
+                 "order_by": ["salary DESC LAST", "name ASC LAST"]},
+            ],
+        }
+        spark_win = {
+            "expressions": [
+                {"function": "RANK", "alias": "rk",
+                 "partition_by": ["dept_id"],
+                 "order_by": ["name ASC LAST", "salary DESC LAST"]},
+            ],
+        }
+        result = compare_window_steps([sql_win], [spark_win])
+        assert result.verdict == EquivalenceVerdict.NOT_EQUIVALENT
+
+    def test_window_input_column_diff_not_equivalent(self):
+        """SUM(amount) vs SUM(discount) → NOT_EQUIVALENT。"""
+        sql_win = {
+            "window_exprs": [
+                {"function": "SUM", "alias": "total",
+                 "input_column": "amount",
+                 "partition_by": ["dept_id"]},
+            ],
+        }
+        spark_win = {
+            "expressions": [
+                {"function": "SUM", "alias": "total",
+                 "input_column": "discount",
+                 "partition_by": ["dept_id"]},
+            ],
+        }
+        result = compare_window_steps([sql_win], [spark_win])
+        assert result.verdict == EquivalenceVerdict.NOT_EQUIVALENT
+
+    def test_window_frame_diff_not_equivalent(self):
+        """ROWS vs RANGE → NOT_EQUIVALENT。"""
+        sql_win = {
+            "window_exprs": [
+                {"function": "SUM", "alias": "total",
+                 "input_column": "amount",
+                 "partition_by": ["dept_id"],
+                 "order_by": ["salary ASC LAST"],
+                 "frame": "ROWS:UNBOUNDED_PRECEDING:CURRENT_ROW"},
+            ],
+        }
+        spark_win = {
+            "expressions": [
+                {"function": "SUM", "alias": "total",
+                 "input_column": "amount",
+                 "partition_by": ["dept_id"],
+                 "order_by": ["salary ASC LAST"],
+                 "frame": "RANGE:UNBOUNDED_PRECEDING:CURRENT_ROW"},
+            ],
+        }
+        result = compare_window_steps([sql_win], [spark_win])
+        assert result.verdict == EquivalenceVerdict.NOT_EQUIVALENT
+
+    def test_window_multi_expr_partial_mismatch(self):
+        """多个 window expr 中一个不一致 → 检测到 NOT_EQUIVALENT。"""
+        sql_wins = [{
+            "window_exprs": [
+                {"function": "ROW_NUMBER", "alias": "rn",
+                 "partition_by": ["dept_id"], "order_by": ["salary DESC LAST"]},
+                {"function": "SUM", "alias": "total", "input_column": "amount",
+                 "partition_by": ["dept_id"]},
+            ],
+        }]
+        spark_wins = [{
+            "expressions": [
+                {"function": "ROW_NUMBER", "alias": "rn",
+                 "partition_by": ["dept_id"], "order_by": ["salary DESC LAST"]},
+                {"function": "AVG", "alias": "total", "input_column": "amount",
+                 "partition_by": ["dept_id"]},
+            ],
+        }]
+        result = compare_window_steps(sql_wins, spark_wins)
+        assert result.verdict == EquivalenceVerdict.NOT_EQUIVALENT
+
     def test_sort_equivalent(self):
         """相同排序——等价（DESC——两侧 null_order 默认均为 LAST）。"""
         result = compare_sort_steps(

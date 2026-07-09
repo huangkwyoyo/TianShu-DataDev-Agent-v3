@@ -606,12 +606,13 @@ def compare_window_steps(
     """对比 SQL WindowStep 与 Spark WindowStep 的结构等价性。
 
     等价条件：
-    1. 数量相同（通常为 1）
-    2. 每个窗口表达式的 (function, alias, partition_by, order_by) 等价
+    1. 数量相同
+    2. 每个窗口表达式的 (function, alias, input_column, partition_by, order_by, frame) 等价
+    3. order_by 保持顺序（ORDER BY a,b != ORDER BY b,a）
 
     Args:
-        sql_windows: SQL 侧 WindowStep 的 model_dump 列表
-        spark_windows: Spark 侧 SparkWindowStep 的 model_dump 列表
+        sql_windows: SQL 侧 WindowStep 的 model_dump 列表（已扁平化）
+        spark_windows: Spark 侧 SparkWindowStep 的 model_dump 列表（已扁平化）
 
     Returns:
         StepEquivalenceResult
@@ -636,42 +637,49 @@ def compare_window_steps(
             detail=f"窗口步骤数量不一致：SQL 侧 {sql_count} 个，Spark 侧 {spark_count} 个",
         )
 
-    # 收集所有窗口表达式（跨多个 WindowStep 聚合）
-    sql_exprs: set[tuple[str, ...]] = set()
-    for w in sql_windows:
-        for expr in w.get("window_exprs", []) or w.get("expressions", []):
-            func = expr.get("function", "").upper()
-            alias = normalize_field_name(expr.get("alias", ""))
-            partition = tuple(sorted([
-                normalize_field_name(p) for p in (expr.get("partition_by", []) or [])
-            ]))
-            order = tuple(sorted([
-                normalize_field_name(o) for o in (expr.get("order_by", []) or [])
-            ]))
-            sql_exprs.add((func, alias, partition, order))
+    # 收集所有窗口表达式
+    def _extract_exprs(windows: list[dict], field_key: str) -> list[tuple]:
+        """从 window steps 中提取表达式元组。"""
+        exprs = []
+        for w in windows:
+            for expr in w.get(field_key, []) or w.get("expressions", []):
+                func = str(expr.get("function", "")).upper()
+                alias = normalize_field_name(expr.get("alias", ""))
+                # input_column（SUM/AVG/COUNT/LAG/LEAD 需要，排名函数不需要）
+                input_col = normalize_field_name(expr.get("input_column", "") or "")
+                # partition_by——去重但保序（两边独立排序后再比）
+                partition = tuple(sorted([
+                    normalize_field_name(str(p)) for p in (expr.get("partition_by", []) or [])
+                ]))
+                # order_by——保留原始顺序（ORDER BY a,b != ORDER BY b,a）
+                # 已扁平化为字符串列表，每个元素含 direction 和 null_order
+                order = tuple(
+                    normalize_field_name(str(o)) for o in (expr.get("order_by", []) or [])
+                )
+                # frame——窗口帧边界（ROWS/RANGE BETWEEN ... AND ...）
+                frame_raw = expr.get("frame", "")
+                frame = normalize_field_name(str(frame_raw)) if frame_raw else ""
+                exprs.append((func, alias, input_col, partition, order, frame))
+        return exprs
 
-    spark_exprs: set[tuple[str, ...]] = set()
-    for w in spark_windows:
-        for expr in w.get("expressions", []):
-            func = str(expr.get("function", "")).upper()
-            alias = normalize_field_name(expr.get("alias", ""))
-            partition = tuple(sorted([
-                normalize_field_name(p) for p in (expr.get("partition_by", []) or [])
-            ]))
-            order = tuple(sorted([
-                normalize_field_name(o) for o in (expr.get("order_by", []) or [])
-            ]))
-            spark_exprs.add((func, alias, partition, order))
+    sql_exprs = _extract_exprs(sql_windows, "window_exprs")
+    spark_exprs = _extract_exprs(spark_windows, "expressions")
 
-    if sql_exprs != spark_exprs:
+    # 比较方式：先规范化每组——partition 已排序可比较，order 保留原序
+    sql_set: set[tuple] = set(sql_exprs)
+    spark_set: set[tuple] = set(spark_exprs)
+
+    if sql_set != spark_set:
+        only_sql = sql_set - spark_set
+        only_spark = spark_set - sql_set
         return StepEquivalenceResult(
             step_type="window",
             verdict=EquivalenceVerdict.NOT_EQUIVALENT,
             sql_count=sql_count,
             spark_count=spark_count,
             detail=(
-                f"窗口表达式不一致——仅在 SQL 侧：{sql_exprs - spark_exprs}，"
-                f"仅在 Spark 侧：{spark_exprs - sql_exprs}"
+                f"窗口表达式不一致——仅在 SQL 侧：{list(only_sql)}，"
+                f"仅在 Spark 侧：{list(only_spark)}"
             ),
         )
 
