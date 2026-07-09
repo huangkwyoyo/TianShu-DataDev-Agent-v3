@@ -316,7 +316,7 @@ export function buildPlanRich(
 ): Promise<PlanRichResponse> {
   return apiPost('/plan-rich', {
     markdown_text: markdownText,
-    table_mapping: tableMapping || null,
+    table_mapping: (tableMapping && Object.keys(tableMapping).length > 0) ? tableMapping : null,
   });
 }
 
@@ -328,8 +328,8 @@ export function executeRich(
 ): Promise<ExecuteRichResponse> {
   return apiPost('/execute-rich', {
     markdown_text: markdownText,
-    table_mapping: tableMapping || null,
-    table_paths: tablePaths || null,
+    table_mapping: (tableMapping && Object.keys(tableMapping).length > 0) ? tableMapping : null,
+    table_paths: (tablePaths && Object.keys(tablePaths).length > 0) ? tablePaths : null,
   });
 }
 
@@ -341,8 +341,8 @@ export function runAll(
 ): Promise<RunAllResponse> {
   return apiPost('/run-all', {
     markdown_text: markdownText,
-    table_mapping: tableMapping || null,
-    table_paths: tablePaths || null,
+    table_mapping: (tableMapping && Object.keys(tableMapping).length > 0) ? tableMapping : null,
+    table_paths: (tablePaths && Object.keys(tablePaths).length > 0) ? tablePaths : null,
   });
 }
 

@@ -74,6 +74,46 @@ def _discover_nyc_duckdb() -> str | None:
     return None
 
 
+def _inject_snapshot_deps(pipeline: Pipeline, fixture_paths: dict[str, str]) -> None:
+    """仅在存在显式配置/default_table_paths 时注入 SnapshotBuilder + SnapshotSourceProvider。
+
+    白名单仅来自显式发现的 CSV fixture 文件——禁止自动扫描目录全量加入。
+    不满足条件时不做任何操作，PHYSICAL_VERIFIER 将返回 SNAPSHOT_NOT_READY。
+
+    Args:
+        pipeline: Pipeline 实例（已创建，含 default_table_paths）
+        fixture_paths: 表名 → CSV 绝对路径映射（来自 _discover_csv_fixtures）
+    """
+    if not fixture_paths:
+        return
+
+    from tianshu_datadev.spark.snapshot import (
+        SnapshotBuilder,
+        SnapshotSourceProvider,
+        SnapshotSourceType,
+    )
+
+    # 使用 fixtures 根目录作为 base_path——子目录中的文件由 execute_rich 主路径处理
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    )
+    fixtures_dir = os.path.join(repo_root, "tests", "fixtures")
+
+    provider = SnapshotSourceProvider(
+        provider_id="e2e_csv_fixtures",
+        source_type=SnapshotSourceType.LOCAL_FIXTURE,
+        connection_alias="local",
+        allowlisted_tables=sorted(fixture_paths.keys()),
+        base_path=fixtures_dir,
+        description="E2E 测试 CSV fixture 文件——白名单来自显式发现结果",
+    )
+    # 使用临时目录作为快照输出根目录——避免累积磁盘文件
+    import tempfile as _tempfile
+    output_dir = _tempfile.mkdtemp(prefix="tianshu_snapshots_")
+    builder = SnapshotBuilder(output_dir=output_dir)
+    pipeline.inject_snapshot_deps(builder, provider)
+
+
 def create_app(pipeline: Pipeline | None = None) -> FastAPI:
     """创建 FastAPI 应用实例。
 
@@ -140,11 +180,15 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
         # 自动发现 NYC 数据仓库 DuckDB 文件
         db_path = _discover_nyc_duckdb()
         if os.environ.get("TIANSHU_E2E_MODE") == "true":
+            fixture_paths = _discover_csv_fixtures()
             pipeline = Pipeline(
-                default_table_paths=_discover_csv_fixtures(),
+                default_table_paths=fixture_paths,
                 duckdb_path=db_path,
                 developer_service=spark_developer_service,
             )
+            # ── 注入 SnapshotBuilder + SnapshotSourceProvider（仅当存在显式配置时）──
+            # 白名单仅来自显式发现的 CSV fixture 文件，禁止自动扫描目录全量加入
+            _inject_snapshot_deps(pipeline, fixture_paths)
         else:
             pipeline = Pipeline(
                 duckdb_path=db_path,

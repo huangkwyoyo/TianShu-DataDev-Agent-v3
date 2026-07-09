@@ -63,8 +63,8 @@ export function SparkStageResultPanel({ stage, result, status, visible }: Props)
         </div>
       )}
 
-      {/* 跳过态——所有阶段共用 */}
-      {result.skipped && result.message && (
+      {/* 跳过态——所有阶段共用（PHYSICAL_VERIFIER 有自己的 skipped 展示区，不重复渲染） */}
+      {result.skipped && result.message && stage !== 'PHYSICAL_VERIFIER' && (
         <div className="spark-result-skipped">
           ⏭️ {result.message}
         </div>

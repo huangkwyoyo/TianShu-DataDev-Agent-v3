@@ -209,6 +209,23 @@ class Pipeline:
         self._spark_contexts: dict[str, SparkStageContext] = {}
         # ── LLM 调用追踪（request-scoped cache）──
         self._llm_traces: dict[str, dict[str, LlmTraceNode]] = {}
+
+    def inject_snapshot_deps(
+        self,
+        snapshot_builder: SnapshotBuilder,
+        snapshot_provider: SnapshotSourceProvider,
+    ) -> None:
+        """注入 SnapshotBuilder + SnapshotSourceProvider——供 create_app 延迟注入。
+
+        Pipeline.__init__ 中这两个依赖默认为 None，因为生产环境不需要快照功能。
+        E2E 测试模式下，create_app 发现 CSV fixture 文件后通过此方法注入。
+
+        Args:
+            snapshot_builder: SnapshotBuilder 实例
+            snapshot_provider: SnapshotSourceProvider 实例（白名单来自显式配置）
+        """
+        self._snapshot_builder = snapshot_builder
+        self._snapshot_provider = snapshot_provider
         # request_id → {node_name: LlmTraceNode}
 
     # ── 缓存生命周期管理 ──────────────────────────────
@@ -2365,6 +2382,7 @@ class Pipeline:
             "contract": contract,  # 新增——供 Spark 管线使用
             "llm_traces": self._get_llm_traces(request_id),  # 新增——LLM 调用追踪
             "snapshot_manifest": snapshot_manifest,  # 新增——供 PHYSICAL_VERIFIER 使用
+            "resolved_table_paths": resolved_paths,  # 新增——供 PHYSICAL_VERIFIER 回溯数据源路径
         })
 
         return {
@@ -2842,6 +2860,106 @@ class Pipeline:
         # 细粒度对比结果由 comparator_report.status 承载，derive_overall_status 消费
         context.stage_results["COMPARATOR"] = "SUCCESS"
 
+    def _try_build_snapshot_for_physical_verify(
+        self,
+        artifacts: PipelineArtifactBundle,
+        context: SparkStageContext,
+    ) -> SnapshotManifest | None:
+        """尝试通过 SnapshotBuilder 为 PHYSICAL_VERIFIER 构建快照。
+
+        仅在 Pipeline 初始化时注入了 snapshot_builder + snapshot_provider
+        且有 table_paths 可用时才尝试。失败或依赖缺失时向 context 写入
+        SNAPSHOT_NOT_READY 错误并返回 None。
+
+        安全边界：
+        - snapshot 只能来自已有 SnapshotManifest 或通过既有 SnapshotBuilder.build() 创建
+        - 禁止在此方法中手写 CSV → Parquet 或使用 PyArrow 生成快照
+        - 禁止 fallback 到空临时目录
+
+        Args:
+            artifacts: Pipeline 中间产物包（snapshot_manifest 字段会被回写）
+            context: Spark 阶段上下文（错误写入 stage_results + errors）
+
+        Returns:
+            SnapshotManifest——成功构建的快照清单；None 表示失败（context 已写入错误）
+        """
+        # 检查 SnapshotBuilder / SnapshotProvider 注入
+        if self._snapshot_builder is None or self._snapshot_provider is None:
+            context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
+            context.errors.append(
+                "[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
+                "缺少 SnapshotBuilder/SnapshotProvider 注入——"
+                "无法创建数据快照。请检查 Pipeline 初始化配置，"
+                "或使用「全流程 Run-All」路径（该路径会自动创建快照）。"
+            )
+            return None
+
+        # 获取 table_paths——优先从 _results 读取 execute_rich 持久化的 resolved_table_paths，
+        # 其次回退到 Pipeline 初始化的 default_table_paths
+        results_data = self._results.get(artifacts.request_id, {})
+        table_paths = results_data.get("resolved_table_paths") or self._default_table_paths
+        if not table_paths:
+            context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
+            context.errors.append(
+                "[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
+                "缺少 table_paths——无法确定数据源文件路径。"
+                "请在 Pipeline 初始化时注入 default_table_paths，"
+                "或使用「全流程 Run-All」路径。"
+            )
+            return None
+
+        # 计算 contract_hash——用于快照溯源
+        contract_hash = ""
+        if artifacts.data_transform_contract is not None:
+            from tianshu_datadev.artifacts.models import DataTransformContractV1
+            if isinstance(artifacts.data_transform_contract, DataTransformContractV1):
+                contract_hash = DataTransformContractV1.compute_contract_hash(
+                    artifacts.data_transform_contract
+                )
+            else:
+                contract_hash = hashlib.sha256(
+                    str(artifacts.data_transform_contract).encode()
+                ).hexdigest()
+
+        # 按 SnapshotSourceProvider 白名单过滤 source_tables
+        source_tables = list(table_paths.keys())
+        allowlisted = set(self._snapshot_provider.allowlisted_tables)
+        source_tables = [t for t in source_tables if t in allowlisted]
+
+        if not source_tables:
+            context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
+            context.errors.append(
+                f"[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
+                f"table_paths 中的表名 {sorted(table_paths.keys())} "
+                f"不在 SnapshotSourceProvider 白名单 "
+                f"{sorted(allowlisted)} 中。请检查 Pipeline 初始化配置。"
+            )
+            return None
+
+        # 通过 SnapshotBuilder.build() 创建快照（不手写 PyArrow）
+        try:
+            snapshot_manifest = self._snapshot_builder.build(
+                contract_hash=contract_hash,
+                source_tables=source_tables,
+                provider=self._snapshot_provider,
+            )
+            # 回写 artifacts——供后续代码引用（PipelineArtifactBundle 非 frozen）
+            artifacts.snapshot_manifest = snapshot_manifest
+            logger.info(
+                "PHYSICAL_VERIFIER 快照构建成功——snapshot_id=%s，文件数=%d",
+                snapshot_manifest.snapshot_id,
+                len(snapshot_manifest.files),
+            )
+            return snapshot_manifest
+        except Exception as e:
+            context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
+            context.errors.append(
+                f"[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
+                f"SnapshotBuilder.build() 执行失败——{e}"
+            )
+            logger.warning("PHYSICAL_VERIFIER 快照构建失败：%s", e)
+            return None
+
     def _do_spark_physical_verify(
         self, artifacts: PipelineArtifactBundle, context: SparkStageContext,
     ) -> None:
@@ -2886,11 +3004,16 @@ class Pipeline:
             snapshot_dir = artifacts.snapshot_manifest.snapshot_dir
             snapshot_id = artifacts.snapshot_manifest.snapshot_id
 
-        # 无快照目录时使用临时目录——PhysicalVerifier 仍会尝试 DuckDB 端
+        # 无快照清单时——尝试通过 SnapshotBuilder 实时构建（禁止空目录兜底）
         if snapshot_dir is None:
-            import tempfile
-            snapshot_dir = tempfile.mkdtemp(prefix="tianshu_snap_")
-            snapshot_id = "adhoc"
+            snapshot_manifest = self._try_build_snapshot_for_physical_verify(
+                artifacts, context,
+            )
+            if snapshot_manifest is None:
+                # _try_build_snapshot_for_physical_verify 已将 SNAPSHOT_NOT_READY 错误写入 context
+                return
+            snapshot_dir = snapshot_manifest.snapshot_dir
+            snapshot_id = snapshot_manifest.snapshot_id
 
         # Step 4：提取排序键（从 SparkPlan 的 SortStep 中获取）
         order_keys: list[str] = []

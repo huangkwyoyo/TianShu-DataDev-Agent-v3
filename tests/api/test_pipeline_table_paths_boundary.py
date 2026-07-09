@@ -133,8 +133,9 @@ class TestCreateAppE2EMode:
 
     def test_production_mode_no_csv_discovery(self, monkeypatch):
         """生产模式（默认）——不自动发现 CSV fixture。"""
-        # 确保环境变量未设置
-        monkeypatch.delenv("TIANSHU_E2E_MODE", raising=False)
+        # 使用 setenv 而非 delenv——因为 .env 文件中有 TIANSHU_E2E_MODE=true，
+        # load_dotenv() 仅在 key not in os.environ 时加载，setenv 可阻止回填
+        monkeypatch.setenv("TIANSHU_E2E_MODE", "false")
 
         # 生产模式创建 app——Pipeline 不带 default_table_paths
         app = create_app()

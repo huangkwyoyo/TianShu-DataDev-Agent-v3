@@ -72,6 +72,10 @@ interface AppState {
 
   // LLM 调用追踪（各阶段累积）
   llmTraces: Record<string, LlmTraceNode> | null;
+
+  // 数据源映射——编译执行和全流程时传入后端
+  tableMapping: Record<string, string>;
+  tablePaths: Record<string, string>;
 }
 
 export default function App() {
@@ -92,6 +96,8 @@ export default function App() {
     artifactsReady: false,
     sparkStageResult: null,
     llmTraces: null,
+    tableMapping: {},
+    tablePaths: {},
   });
 
   /** 更新部分状态 */
@@ -205,7 +211,7 @@ export default function App() {
       return;
     }
     runAction(
-      () => executeRich(state.markdownText),
+      () => executeRich(state.markdownText, state.tableMapping, state.tablePaths),
       async (result) => {
         // execute-rich 成功后异步验证 artifacts 是否真正就绪
         let artifactsReady = false;
@@ -240,7 +246,7 @@ export default function App() {
       return;
     }
     runAction(
-      () => runAll(state.markdownText),
+      () => runAll(state.markdownText, state.tableMapping, state.tablePaths),
       async (result) => {
         // run-all 成功后异步验证 artifacts 是否就绪
         let artifactsReady = false;
