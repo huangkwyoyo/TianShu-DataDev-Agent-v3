@@ -370,13 +370,18 @@ def compare_aggregate_steps(
             spark_count=0,
         )
 
-    # 防御性断言：DAG 归一化确保每侧最多 1 个 aggregate step。
-    # 如果未来 builder 产出多 aggregate（如优化器拆分 count(distinct)），
-    # 此断言会立即暴露问题，避免静默跳检。
-    assert len(sql_aggs) == len(spark_aggs) == 1, (
-        f"compare_aggregate_steps 假设每侧最多 1 个 aggregate step，"
-        f"实际 SQL={len(sql_aggs)}, Spark={len(spark_aggs)}"
-    )
+    # 当前设计仅支持每侧 1 个 aggregate step，多 aggregate 返回 NOT_EQUIVALENT
+    if len(sql_aggs) != 1 or len(spark_aggs) != 1:
+        return StepEquivalenceResult(
+            step_type="aggregate",
+            verdict=EquivalenceVerdict.NOT_EQUIVALENT,
+            sql_count=len(sql_aggs),
+            spark_count=len(spark_aggs),
+            detail=(
+                f"compare_aggregate_steps 暂不支持多 aggregate 对比，"
+                f"实际 SQL={len(sql_aggs)}, Spark={len(spark_aggs)}"
+            ),
+        )
 
     sql_agg = sql_aggs[0]
     spark_agg = spark_aggs[0]

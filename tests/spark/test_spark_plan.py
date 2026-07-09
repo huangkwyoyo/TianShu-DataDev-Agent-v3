@@ -742,6 +742,20 @@ class TestPlanEquivalence:
         )
         assert result.verdict == EquivalenceVerdict.NOT_EQUIVALENT
 
+    def test_aggregate_multi_step_not_equivalent(self):
+        """多 aggregate step 时不崩溃，返回 NOT_EQUIVALENT。"""
+        sql_aggs = [
+            {"group_keys": ["a"], "metrics": [{"function": "COUNT", "alias": "cnt_a"}]},
+            {"group_keys": ["b"], "metrics": [{"function": "SUM", "alias": "sum_b"}]},
+        ]
+        spark_aggs = [
+            {"group_keys": ["a"], "metrics": [{"function": "COUNT", "alias": "cnt_a"}]},
+            {"group_keys": ["b"], "metrics": [{"function": "SUM", "alias": "sum_b"}]},
+        ]
+        result = compare_aggregate_steps(sql_aggs, spark_aggs)
+        # 不崩溃，返回 NOT_EQUIVALENT（暂不支持多 aggregate 对比）
+        assert result.verdict == EquivalenceVerdict.NOT_EQUIVALENT
+
     def test_project_equivalent(self):
         """相同投影——等价。"""
         sql_projects = [{
