@@ -486,7 +486,7 @@ class LocalSparkExecutor:
         注入内容：
         - 创建 local[1] 模式的 SparkSession（关闭 UI 和自适应查询）
         - 导出 F（pyspark.sql.functions）供 DSL 代码使用
-        - 从 SPARK_DATA_DIR 环境变量读取 Parquet 快照为 inputs 字典（key=文件名 stem）
+        - 从 SPARK_DATA_DIR 读取快照数据为 inputs 字典：优先读 _inputs_index.json 按别名装载，无索引时回退 glob-by-stem
 
         Args:
             code: 原始 PySpark DSL 代码（编译器产出的 transform 函数）
