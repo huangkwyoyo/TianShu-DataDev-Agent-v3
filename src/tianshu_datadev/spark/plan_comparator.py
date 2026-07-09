@@ -836,8 +836,12 @@ class PlanComparator:
         # 扁平化 right
         right_val = predicate.get("right", "")
         if isinstance(right_val, dict):
-            # ColumnRef 或 SqlLiteral
-            right_val = PlanComparator._column_ref_to_string(right_val)
+            if PlanComparator._is_predicate_tree(right_val):
+                # 嵌套 Predicate tree → 递归渲染为规范字符串
+                right_val = PlanComparator._render_predicate_tree(right_val)
+            else:
+                # ColumnRef 或 SqlLiteral
+                right_val = PlanComparator._column_ref_to_string(right_val)
         elif right_val is None:
             right_val = ""
         elif isinstance(right_val, list):
