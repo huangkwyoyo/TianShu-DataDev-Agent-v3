@@ -6,7 +6,24 @@ LLM/Fake 只能提候选——等级由 Validator 确定性计算。
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 from .relationship_hypothesis import EvidenceAction, JoinEvidenceLevel
+
+
+@dataclass
+class JoinSafetyTableInfo:
+    """LEFT JOIN 安全门禁所需的表唯一性元数据。
+
+    由 _build_join_safety_info 从 SourceManifest 构建，
+    传给 check_left_join_safety 做唯一性判断。
+    """
+    unique_keys: list[list[str]] = field(default_factory=list)
+    """已声明的唯一键组（已归一化）。[] 表示"已查询但无声明"，区别于 None 表示"未查询"。"""
+    role: str | None = None
+    """表角色——"fact" | "dim" | None。"""
+    key_column_names_normalized: list[str] = field(default_factory=list)
+    """key_columns 列名（已归一化），用于判断 join key 是否属于维度键。"""
 
 
 class RelationshipValidator:
@@ -111,12 +128,13 @@ class RelationshipValidator:
                 return "NONE：类型不兼容——静默忽略"
             return "NONE：无任何匹配信号——静默忽略"
 
-    # ── LEFT JOIN 唯一性安全门禁 ──
+    # ── LEFT JOIN 唯一性安全门禁（V2：预归一化 + JoinSafetyTableInfo + 分层文案）──
 
     def check_left_join_safety(
         self,
         right_table_unique_keys: list[list[str]] | None,
-        right_join_key: str,
+        right_join_key_normalized: str,
+        right_join_safety_info: JoinSafetyTableInfo | None = None,
     ) -> tuple[bool, str | None]:
         """检查 LEFT JOIN 右表联结键是否有唯一性保证。
 
@@ -126,10 +144,17 @@ class RelationshipValidator:
 
         Phase 1 仅支持单列联结键。复合键去重延后到 Phase 2。
 
+        V2 变更：
+        - right_join_key_normalized 已由调用方经 FieldNormalizer 归一化传入
+        - unique_keys 已由 Builder 预归一化
+        - Validator 内部不做任何 .lower() ——接收即假定已归一化
+        - right_join_safety_info 提供 role/key_column_names 用于增强阻断文案
+
         Args:
-            right_table_unique_keys: 右表的 unique_keys 列表（来自 ManifestTable），
-                                     每个元素是一组列名。None 表示无任何唯一性声明。
-            right_join_key: 右表联结键的原始字段名（非归一化）。
+            right_table_unique_keys: 右表的 unique_keys 列表（已归一化）。None 表示未查询。
+            right_join_key_normalized: 右表联结键——已由调用方经 FieldNormalizer 归一化传入。
+            right_join_safety_info: 右表的完整安全信息（含 role + key_column_names_normalized），
+                                    用于生成更精准的阻断提示。None 时退化为 V1 行为。
 
         Returns:
             (is_safe, description) 二元组。
@@ -138,30 +163,56 @@ class RelationshipValidator:
         """
         # 无任何唯一性声明 → unsafe
         if not right_table_unique_keys:
-            return (
-                False,
-                f"LEFT JOIN 右表 '{right_join_key}' 无唯一性保证："
-                f"右表未声明 primary_key 且 ManifestTable.unique_keys 为空。"
-                f"若该键有重复值，将导致静默笛卡尔积、左表度量值膨胀。"
-                f"请在 DeveloperSpec 中为右表声明 unique_keys，或提供去重策略说明。",
+            return self._build_unsafe_result_no_unique_keys(
+                right_join_key_normalized, right_join_safety_info
             )
 
-        # 归一化比较——大小写不敏感
-        right_key_lower = right_join_key.lower()
-
+        # 检查是否有唯一键组覆盖 join key（Phase 1 仅支持单列键）
         for key_group in right_table_unique_keys:
-            group_lower = [k.lower() for k in key_group]
-            # Phase 1：仅支持单列唯一键精确覆盖
-            if right_key_lower in group_lower and len(key_group) == 1:
+            if right_join_key_normalized in key_group and len(key_group) == 1:
                 return (True, None)
 
-        # 有 unique_keys 声明但不覆盖当前联结键 → unsafe
+        # 有唯一键声明但不覆盖当前联结键 → unsafe
         declared = "; ".join(", ".join(g) for g in right_table_unique_keys)
         return (
             False,
-            f"LEFT JOIN 右表联结键 '{right_join_key}' 不被任何唯一键覆盖。"
+            f"LEFT JOIN 右表联结键 '{right_join_key_normalized}' 不被任何唯一键覆盖。"
             f"右表已声明唯一键：[{declared}]，"
-            f"均不包含 '{right_join_key}'。"
+            f"均不包含 '{right_join_key_normalized}'。"
             f"若该键有重复值，将导致静默笛卡尔积。"
-            f"请确认联结键选择正确，或为 '{right_join_key}' 声明唯一性。",
+            f"请确认联结键选择正确，或为 '{right_join_key_normalized}' 声明唯一性。",
+        )
+
+    def _build_unsafe_result_no_unique_keys(
+        self,
+        right_join_key_normalized: str,
+        safety_info: JoinSafetyTableInfo | None,
+    ) -> tuple[bool, str]:
+        """构建"无唯一性声明"的阻断结果——dim 表生成增强文案。
+
+        策略：
+        - role=dim 且 join_key ∈ key_column_names_normalized → 增强文案（提示声明 unique: true 或 unique_keys）
+        - 其他 → 通用阻断文案
+        """
+        # 场景 2：dim 表 + join_key 属于 key_column_names_normalized → 增强文案
+        if (
+            safety_info is not None
+            and safety_info.role == "dim"
+            and right_join_key_normalized in safety_info.key_column_names_normalized
+        ):
+            return (
+                False,
+                f"dim 表的 key_column '{right_join_key_normalized}' 未声明唯一性。"
+                f"请在 DeveloperSpec 中为该列添加 'unique: true'，"
+                f"或在 source_tables 对应条目中声明 "
+                f"unique_keys: [['{right_join_key_normalized}']]。"
+                f"若该键确实有重复值，请提供去重策略说明。",
+            )
+        # 场景 1：通用阻断——无任何唯一性声明
+        return (
+            False,
+            f"LEFT JOIN 右表 '{right_join_key_normalized}' 无唯一性保证："
+            f"右表未声明 primary_key 且 unique_keys 为空。"
+            f"若该键有重复值，将导致静默笛卡尔积、左表度量值膨胀。"
+            f"请在 DeveloperSpec 中为右表声明 unique_keys，或提供去重策略说明。",
         )
