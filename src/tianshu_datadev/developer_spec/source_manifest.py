@@ -204,12 +204,18 @@ class SourceManifestBuilder:
             # 提取主键（来自 key_columns 中标记 unique=True 的字段）
             primary_key = [c.column_name for c in input_t.key_columns if c.unique]
 
+            # 同步 primary_key 到 unique_keys——主键天然是唯一键
+            unique_keys: list[list[str]] = []
+            if primary_key:
+                unique_keys.append(list(primary_key))
+
             tables.append(ManifestTable(
                 table_ref=input_t.table_alias,
                 source_table=input_t.source_table,
                 columns=columns,
                 primary_key=primary_key if primary_key else None,
                 foreign_keys=None,  # DeveloperSpec 不声明外键，由 SchemaRegistry 补充
+                unique_keys=unique_keys if unique_keys else None,
                 estimated_row_count=input_t.row_count,
             ))
 
@@ -266,6 +272,17 @@ class SourceManifestBuilder:
                     )
                     for fk in reg_fks
                 ]
+
+            # 从 SchemaRegistry 补充 unique_keys（合并而非覆盖）
+            reg_unique_keys = registry_meta.get("unique_keys")
+            if reg_unique_keys:
+                existing = table.unique_keys or []
+                merged = {tuple(sorted(g)) for g in existing}
+                for kg in reg_unique_keys:
+                    if isinstance(kg, list):
+                        merged.add(tuple(sorted(kg)))
+                if merged:
+                    object.__setattr__(table, "unique_keys", [list(g) for g in merged])
 
             # 逐字段对比
             for col in table.columns:
@@ -509,11 +526,21 @@ def build_manifest_from_spec(spec: ParsedDeveloperSpec) -> SourceManifest:
             for s in spec.output_spec.sort:
                 _add(s.column)
 
+        # 提取主键（来自 key_columns 中标记 unique=True 的字段）
+        primary_key = [c.column_name for c in t.key_columns if c.unique]
+
+        # 同步 primary_key 到 unique_keys
+        unique_keys: list[list[str]] = []
+        if primary_key:
+            unique_keys.append(list(primary_key))
+
         tables.append(
             ManifestTable(
                 table_ref=t.table_alias,
                 source_table=t.source_table,
                 columns=cols,
+                primary_key=primary_key if primary_key else None,
+                unique_keys=unique_keys if unique_keys else None,
                 estimated_row_count=t.row_count,
             )
         )
@@ -522,3 +549,65 @@ def build_manifest_from_spec(spec: ParsedDeveloperSpec) -> SourceManifest:
         spec_hash=spec.spec_hash,
         tables=tables,
     )
+
+
+# ════════════════════════════════════════════
+# 模块级 unique_keys 合并工具函数（V2 新增）
+# ════════════════════════════════════════════
+
+
+def _normalize_unique_keys_list(
+    keys: list[list[str]] | None,
+    normalizer: FieldNormalizer,
+) -> list[list[str]]:
+    """将 unique_keys 列表归一化：列名经 FieldNormalizer 处理、组间去重。
+
+    原则：
+    - 每个键组内保留原始声明顺序，仅归一化每个列名的大小写/分隔符
+    - 组间去重用 tuple(normalized_names) 做 set key
+    - 不改变组内列的顺序——unique_keys 是事实源
+    - 模块级纯函数，SourceManifestBuilder 和 build_manifest_from_spec 共用
+
+    Args:
+        keys: 原始 unique_keys 列表，None 等价于 []
+        normalizer: FieldNormalizer 实例，由调用方传入
+
+    Returns:
+        归一化后的唯一键组列表，组间无重复，组内顺序保留首次声明。
+    """
+    if not keys:
+        return []
+    seen: set[tuple[str, ...]] = set()
+    result: list[list[str]] = []
+    for kg in keys:
+        if not kg:
+            continue
+        normalized = [normalizer.normalize(k) for k in kg]
+        key_tuple = tuple(normalized)
+        if key_tuple not in seen:
+            seen.add(key_tuple)
+            result.append(normalized)
+    return result
+
+
+def _merge_unique_keys_from_sources(
+    *sources: list[list[str]] | None,
+    normalizer: FieldNormalizer,
+) -> list[list[str]]:
+    """合并多个来源的 unique_keys，经归一化去重后返回。
+
+    各来源等同对待，统一 set 去重。来源优先级由调用方控制传参顺序。
+    模块级纯函数，SourceManifestBuilder 和 build_manifest_from_spec 共用。
+
+    Args:
+        *sources: 多个 unique_keys 来源，None 等价于 []
+        normalizer: FieldNormalizer 实例
+
+    Returns:
+        去重后的归一化唯一键组列表。
+    """
+    all_keys: list[list[str]] = []
+    for src in sources:
+        if src:
+            all_keys.extend(src)
+    return _normalize_unique_keys_list(all_keys, normalizer) if all_keys else []
