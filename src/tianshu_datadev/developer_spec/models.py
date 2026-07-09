@@ -14,7 +14,7 @@ import re
 from enum import Enum
 from typing import Annotated
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # ════════════════════════════════════════════
 # 基础
@@ -423,6 +423,11 @@ class InputTableDecl(StrictModel):
     time_field: str | None = None
     key_columns: list[ColumnDecl] = []  # 从 YAML key_columns 解析
     business_columns: list[ColumnDecl] = []  # 从 YAML business_columns 解析
+    # ── V2 新增 ──
+    unique_keys: list[list[str]] | None = None
+    """开发者显式声明的唯一键集合。每个元素是一组列名，表示这组列在表中值唯一。
+    示例：unique_keys: [["location_id"], ["zone_name", "borough"]]
+    由 _parse_input_tables 从 YAML source_tables[*].unique_keys 解析。"""
 
 
 class LegacyDescriptionDSLWarning(UserWarning):
@@ -694,6 +699,21 @@ class ManifestTable(StrictModel):
     columns: list[ManifestColumn] = []
     primary_key: list[str] | None = None
     foreign_keys: list[ForeignKeyRef] | None = None
+    unique_keys: list[list[str]] | None = None
+    """已知唯一键集合——每个元素是一组列名的列表，表示这组列在表中值唯一。
+
+    primary_key 自动视为唯一键之一，构建时由 SourceManifestBuilder 同步写入。
+    SchemaRegistry 可补充额外的唯一索引信息。
+    用于 LEFT JOIN 右表唯一性安全门禁——无覆盖 join key 的唯一键时阻断。
+    """
+    # ── V2 新增 ──
+    role: str | None = None
+    """表角色——"fact" | "dim" | None。从 InputTableDecl.role 透传。
+    用于 LEFT JOIN 安全门禁生成更精准的阻断提示。"""
+    key_column_names_normalized: list[str] = Field(default_factory=list)
+    """key_columns 的归一化列名集合。由 SourceManifestBuilder 从
+    InputTableDecl.key_columns 提取，经 FieldNormalizer.normalize() 处理。
+    用于 LEFT JOIN 安全门禁判断 join key 是否属于维度键。"""
     estimated_row_count: int | None = None
 
 
