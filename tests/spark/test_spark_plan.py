@@ -799,6 +799,24 @@ class TestPlanEquivalence:
         )
         assert result.verdict == EquivalenceVerdict.NOT_EQUIVALENT
 
+    def test_case_when_condition_unsupported(self):
+        """相同 labels 不同 condition → UNSUPPORTED_COMPARISON（SQL 侧有 condition）。"""
+        sql_cw = [{"labels": ["high"], "default_value": "low", "alias": "level",
+                   "has_conditions": True, "condition_comparison_supported": False}]
+        spark_cw = [{"branches": [{"label": "high"}], "else_value": "low",
+                     "output_alias": "level"}]
+        result = compare_case_when_steps(sql_cw, spark_cw)
+        assert result.verdict == EquivalenceVerdict.UNSUPPORTED_COMPARISON
+
+    def test_case_when_no_condition_still_equivalent(self):
+        """无 condition 的 CASE WHEN（仅 labels）→ 仍为 EQUIVALENT。"""
+        sql_cw = [{"labels": ["high"], "default_value": "low", "alias": "level",
+                   "has_conditions": False, "condition_comparison_supported": False}]
+        spark_cw = [{"branches": [{"label": "high"}], "else_value": "low",
+                     "output_alias": "level"}]
+        result = compare_case_when_steps(sql_cw, spark_cw)
+        assert result.verdict == EquivalenceVerdict.EQUIVALENT
+
     def test_window_equivalent(self):
         """相同窗口函数——等价。"""
         win_expr = {

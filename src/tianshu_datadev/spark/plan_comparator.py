@@ -920,9 +920,13 @@ class PlanComparator:
                         or right_col.get("column_name", "")
                     )
 
+        # ← 新增：Spark 侧键名兼容（仅 .get()，不 pop——compare_join_steps 仍读 left_alias/right_alias）
+        if "left_table_ref" not in result or not result.get("left_table_ref"):
+            result["left_table_ref"] = str(result.get("left_alias", ""))
+        if "right_table_ref" not in result or not result.get("right_table_ref"):
+            result["right_table_ref"] = str(result.get("right_alias", ""))
+
         # 防御性默认值——确保对比函数访问时不抛 KeyError
-        if "left_table_ref" not in result:
-            result["left_table_ref"] = ""
         if "left_key" not in result:
             result["left_key"] = ""
         if "right_key" not in result:
@@ -972,36 +976,66 @@ class PlanComparator:
 
     @staticmethod
     def _flatten_case_when_step(step_dict: dict[str, Any]) -> dict[str, Any]:
-        """扁平化 CaseWhenStep——cases → labels，else_value SqlLiteral → default_value 字符串。
+        """扁平化 CaseWhenStep——cases/branches → labels，else_value → default_value 字符串。
 
-        SQL CaseWhenStep 模型：
-        - cases: list[WhenBranch]，每个含 result: SqlLiteral → 提取 value 为 labels
-        - else_value: SqlLiteral | None → 提取 value 为 default_value
-        - alias: SafeIdentifier（对比函数不消费，保留不丢失）
+        兼容 SQL 侧（cases）和 Spark 侧（branches）两种模型结构：
+        - SQL CaseWhenStep：cases: list[WhenBranch]，每条含 result: SqlLiteral → labels
+        - Spark CaseWhenStep：branches: list[SparkCaseWhenBranch]，每条含 label: str → labels
+        对比函数分别从 SQL 侧读 labels、Spark 侧读 branches，
+        本函数确保两种来源都被正确提取且不破坏各侧所需字段。
         """
         result = dict(step_dict)
 
-        # cases → labels: 提取每个 WhenBranch 的 result.value
+        # 从 cases（SQL 侧）或 branches（Spark 侧）提取 labels
+        # SQL 侧：pop cases；Spark 侧：保留 branches（比较函数直接读取 branches）
         raw_cases = result.pop("cases", [])
         labels: list[str] = []
-        for c in raw_cases:
-            if isinstance(c, dict):
-                res = c.get("result", {})
-                if isinstance(res, dict):
-                    labels.append(str(res.get("value", "")))
+        if raw_cases:
+            # SQL 侧：提取每个 WhenBranch 的 result.value
+            for c in raw_cases:
+                if isinstance(c, dict):
+                    res = c.get("result", {})
+                    if isinstance(res, dict):
+                        labels.append(str(res.get("value", "")))
+                    else:
+                        labels.append(str(res))
+        else:
+            # Spark 侧：从 branches 提取 label（不 pop——comparison 仍读 branches）
+            for b in (result.get("branches") or []):
+                if isinstance(b, dict):
+                    labels.append(str(b.get("label", "")))
                 else:
-                    labels.append(str(res))
+                    labels.append(str(b))
         result["labels"] = labels
 
-        # else_value SqlLiteral → default_value 字符串
-        else_val = result.pop("else_value", None)
+        # 检测 condition 存在性（保留标记供 compare_case_when_steps 消费）
+        # WhenBranch 的 condition 为 Predicate | None，raw_condition 为 SqlRawExpression | None
+        has_conditions = False
+        if isinstance(raw_cases, list):
+            for c in raw_cases:
+                if isinstance(c, dict):
+                    cond = c.get("condition")      # Predicate dict | None
+                    raw_cond = c.get("raw_condition")  # SqlRawExpression dict | None
+                    if cond is not None or raw_cond is not None:
+                        has_conditions = True
+                        break
+        result["has_conditions"] = has_conditions
+        result["condition_comparison_supported"] = False
+
+        # else_value → default_value 字符串
+        # SQL 侧：else_value 为 SqlLiteral dict → pop 并提取 value
+        # Spark 侧：else_value 已是字符串 → 保留原字段（comparison 读取 else_value）
+        else_val = result.get("else_value")
         if else_val is not None:
             if isinstance(else_val, dict):
                 result["default_value"] = str(else_val.get("value", ""))
+                del result["else_value"]
             else:
                 result["default_value"] = str(else_val)
+                # Spark 侧保留 else_value——comparison 仍从该字段取值
         else:
             result["default_value"] = ""
+            result.setdefault("else_value", "")
 
         return result
 
@@ -1211,14 +1245,18 @@ class PlanComparator:
 
     @staticmethod
     def _extract_spark_step_data(spark_plan: SparkPlan) -> list[dict[str, Any]]:
-        """从 SparkPlan 提取结构化 step 数据。
+        """从 SparkPlan 提取结构化 step 数据并通过 _normalize_step_dict 扁平化。
 
-        使用 mode='json' 确保 SparkStepType 等枚举序列化为字符串值。
+        统一路径：Spark 侧与 SQL 侧均经过 _normalize_step_dict 扁平化，
+        确保两侧的 filter/project/join/aggregate/case_when/window 字段
+        在进入 compare_plans 前已归一化为相同格式。
         """
-        return [
-            step.model_dump(mode="json", exclude_none=True)
-            for step in spark_plan.steps
-        ]
+        steps: list[dict[str, Any]] = []
+        for step in spark_plan.steps:
+            step_dict = step.model_dump(mode="json", exclude_none=True)
+            step_dict = PlanComparator._normalize_step_dict(step_dict)  # 新增：统一扁平化
+            steps.append(step_dict)
+        return steps
 
     def _normalize_type(self, step_type: str) -> str:
         """将 step 类型名归一化（read → scan 等）。"""
@@ -1271,6 +1309,146 @@ class PlanComparator:
                 # IS_NULL/IS_NOT_NULL：统一 right 为 <NULL> 占位符
                 # SQL 侧 right=None（flatten 后为 ""），Spark 侧可能为任意值
                 s["right"] = "<NULL>"
+
+    @staticmethod
+    def _render_frame_boundary(boundary: dict) -> str:
+        """渲染 FrameBoundary dict 为规范边界字符串。
+
+        例如：
+        {"kind": "UNBOUNDED_PRECEDING"} → "UNBOUNDED_PRECEDING"
+        {"kind": "CURRENT_ROW"} → "CURRENT_ROW"
+        {"kind": "N_PRECEDING", "offset": 3} → "3 PRECEDING"
+        """
+        if not boundary:
+            return "UNBOUNDED_PRECEDING"
+        kind = str(boundary.get("kind", "UNBOUNDED_PRECEDING")).upper()
+        offset = boundary.get("offset")
+        if kind == "N_PRECEDING" and offset is not None:
+            return f"{offset} PRECEDING"
+        if kind == "N_FOLLOWING" and offset is not None:
+            return f"{offset} FOLLOWING"
+        return kind
+
+    @staticmethod
+    def _render_sort_spec(spec) -> str:
+        """将 SortSpec dict 或字符串渲染为规范化排序字符串。
+
+        处理两种输入：
+        1. SortSpec dict: {"column": "salary", "direction": "ASC", "null_order": "LAST"}
+           → "salary ASC LAST"
+        2. 字符串: "salary ASC LAST"（已有 null_order）
+           或 "salary ASC"（无 null_order，按 SortSpec 默认值补）→ "salary ASC LAST"
+        """
+        if isinstance(spec, str):
+            spec_str = spec.strip()
+            upper_part = spec_str.upper()
+            # 检查是否已包含 null_order 信息
+            if upper_part.endswith(" FIRST") or upper_part.endswith(" LAST"):
+                return normalize_field_name(spec_str)
+            # 无 null_order，按 SortSpec 默认 NullOrder.LAST 补全
+            return normalize_field_name(f"{spec_str} LAST")
+        # SortSpec dict
+        column = spec.get("column", "")
+        direction = str(spec.get("direction", "ASC")).upper()
+        null_order = str(spec.get("null_order", "LAST")).upper()
+        return normalize_field_name(f"{column} {direction} {null_order}")
+
+    @staticmethod
+    def _flatten_expr_frame(expr: dict) -> None:
+        """统一窗口表达式中的 frame 字段为合并字符串格式 "type:start:end"。
+
+        处理两种格式：
+        1. Spark 分离格式：frame_type（字符串）+ frame_start（字符串）+ frame_end（字符串）
+        2. SQL WindowFrame dict 格式：frame 为 {"frame_type": ..., "start": {...}, "end": {...}}
+        """
+        # Spark 分离格式
+        frame_type = expr.pop("frame_type", None)
+        if frame_type is not None:
+            ft = str(frame_type).upper()
+            fs = str(expr.pop("frame_start", "unbounded_preceding")).upper()
+            fe = str(expr.pop("frame_end", "current_row")).upper()
+            expr["frame"] = f"{ft}:{fs}:{fe}"
+            return
+
+        # SQL WindowFrame dict 格式
+        frame = expr.pop("frame", None)
+        if isinstance(frame, dict):
+            ft = str(frame.get("frame_type", "RANGE")).upper()
+            fs = PlanComparator._render_frame_boundary(frame.get("start", {}))
+            fe = PlanComparator._render_frame_boundary(frame.get("end", {}))
+            expr["frame"] = f"{ft}:{fs}:{fe}"
+
+    @staticmethod
+    def _flatten_window_step(step_dict: dict[str, Any]) -> dict[str, Any]:
+        """扁平化 WindowStep——统一 window_exprs 和 expressions 两套字段格式。
+
+        SQL 侧（window_exprs）：
+        - partition_by: ColumnRef 列表 → 字符串列表
+        - order_by: SortSpec 列表 → 字符串列表（_render_sort_spec）
+        - input: ColumnRef dict → input_column 字符串
+        - frame: WindowFrame dict → "TYPE:START:END" 合并字符串
+
+        Spark 侧（expressions）：
+        - partition_by: 已是字符串列表 → normalize_field_name
+        - order_by: 已是字符串列表 → _render_sort_spec（补 null_order）
+        - input: dict → input_column 字符串
+        - frame_type/frame_start/frame_end → "TYPE:START:END" 合并字符串
+        """
+        result = dict(step_dict)
+
+        # Step 1: 处理 window_exprs（SQL 侧）
+        raw_exprs = result.get("window_exprs", []) or []
+        if raw_exprs:
+            flat_exprs = []
+            for expr in raw_exprs:
+                flat_expr = dict(expr) if isinstance(expr, dict) else expr
+                if isinstance(flat_expr, dict):
+                    # partition_by: ColumnRef dict 列表 → 字符串列表
+                    raw_p = flat_expr.pop("partition_by", []) or []
+                    flat_expr["partition_by"] = [
+                        normalize_field_name(str(p.get("normalized_name") or p.get("column_name", "")))
+                        for p in raw_p if isinstance(p, dict)
+                    ]
+                    # order_by: SortSpec dict 列表 → 字符串列表
+                    raw_o = flat_expr.pop("order_by", []) or []
+                    flat_expr["order_by"] = [PlanComparator._render_sort_spec(o) for o in raw_o if o]
+                    # input: ColumnRef dict → input_column 字符串
+                    raw_input = flat_expr.pop("input", None)
+                    if raw_input is not None and isinstance(raw_input, dict):
+                        name = raw_input.get("normalized_name", "") or raw_input.get("column_name", "")
+                        flat_expr["input_column"] = normalize_field_name(str(name))
+                    # frame: WindowFrame dict → 合并字符串
+                    PlanComparator._flatten_expr_frame(flat_expr)
+                flat_exprs.append(flat_expr)
+            result["window_exprs"] = flat_exprs
+
+        # Step 2: 处理 expressions（Spark 侧）
+        raw_exprs2 = result.get("expressions", []) or []
+        if raw_exprs2:
+            flat_exprs2 = []
+            for expr in raw_exprs2:
+                flat_expr = dict(expr) if isinstance(expr, dict) else expr
+                if isinstance(flat_expr, dict):
+                    # partition_by: 已是字符串列表 → normalize_field_name
+                    raw_p = flat_expr.pop("partition_by", []) or []
+                    flat_expr["partition_by"] = [normalize_field_name(str(p)) for p in raw_p if p]
+                    # order_by: 已是字符串列表 → _render_sort_spec
+                    raw_o = flat_expr.pop("order_by", []) or []
+                    flat_expr["order_by"] = [PlanComparator._render_sort_spec(o) for o in raw_o if o]
+                    # input_column 扁平化（Spark 侧 input_column 可能已为字符串）
+                    raw_input_expr = flat_expr.pop("input", None)
+                    if raw_input_expr is not None and isinstance(raw_input_expr, dict):
+                        name = raw_input_expr.get("normalized_name", "") or raw_input_expr.get("column_name", "")
+                        flat_expr["input_column"] = normalize_field_name(str(name))
+                    elif flat_expr.get("input_column") is not None:
+                        # 字符串格式的 input_column 无需进一步处理
+                        pass
+                    # frame: frame_type/frame_start/frame_end → 合并字符串
+                    PlanComparator._flatten_expr_frame(flat_expr)
+                flat_exprs2.append(flat_expr)
+            result["expressions"] = flat_exprs2
+
+        return result
 
     @staticmethod
     def _count_type(

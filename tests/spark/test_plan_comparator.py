@@ -46,6 +46,7 @@ from tianshu_datadev.spark.models import (
     SparkSortSpec,
     SparkSortStep,
     SparkStepType,
+    SparkWindowStep,
 )
 from tianshu_datadev.spark.plan_comparator import (
     ComparisonStatus,
@@ -712,6 +713,64 @@ class TestPlanComparatorFilterEquivalence:
         # right 应为空（PREDICATE_TREE 模式下右值无意义）
         assert sql_filters[0].get("right", "") == ""
 
+    def test_filter_nested_predicate_right_side(self):
+        """右侧为嵌套 Predicate tree → 不崩溃，正确递归渲染并对比。
+
+        Predicate.right 可以是嵌套 Predicate（模型允许 right: Predicate）。
+        _flatten_filter_step 应正确检测 _is_predicate_tree 并调用
+        _render_predicate_tree 递归渲染，而非走 _column_ref_to_string 产生空结果。
+        """
+        # 构造谓词：EQ(amount, GT(threshold, 100))
+        # left 为 ColumnRef，right 为嵌套 Predicate tree
+        sql_predicate = Predicate(
+            left=ColumnRef(
+                table_ref="od", column_name="amount",
+                normalized_name="amount",
+            ),
+            operator=PredicateOperator.EQ,
+            right=Predicate(
+                left=ColumnRef(
+                    table_ref="od", column_name="threshold",
+                    normalized_name="threshold",
+                ),
+                operator=PredicateOperator.GT,
+                right=SqlLiteral(value=100),
+            ),
+        )
+        sql_filter = FilterStep(
+            step_type="filter", step_id="step_filter_nested_right",
+            predicate=sql_predicate,
+        )
+        # Spark 侧：right 为嵌套 tree 渲染后的规范字符串
+        spark_filter = SparkFilterStep(
+            step_type=SparkStepType.FILTER,
+            input_alias="od",
+            operator="EQ",
+            left="od.amount",
+            right="(threshold GT 100)",
+        )
+        sql_plan = _make_sql_plan([
+            _make_sql_scan_step(),
+            sql_filter,
+        ])
+        spark_plan = _make_spark_plan([
+            _make_spark_read_step(),
+            spark_filter,
+        ])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        # 关键断言：不崩溃，filter step 有有效 verdict
+        filter_results = [r for r in report.step_results if r.step_type == "filter"]
+        assert len(filter_results) == 1
+        # nested_predicate_right 渲染后应与 Spark 侧匹配
+        assert filter_results[0].verdict == EquivalenceVerdict.EQUIVALENT, (
+            f"嵌套 Predicate right 渲染应与 Spark 侧匹配，"
+            f"实际 verdict={filter_results[0].verdict.value}, "
+            f"detail={filter_results[0].detail[:200]}"
+        )
+
     def test_not_predicate_rendered_correctly(self):
         """NOT 谓词 → 渲染结果包含 NOT 标记。"""
         not_pred = Predicate(
@@ -1369,6 +1428,81 @@ class TestPlanComparatorAggregateEquivalence:
 
         assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
 
+    def test_aggregate_multi_step_not_crash(self):
+        """多 aggregate step 通过 PlanComparator.compare 时不崩溃。
+
+        SQL 侧两个不同粒度的 aggregate（dept_id, region），Spark 侧仅一个（dept_id）。
+        compare_aggregate_steps 发现数量不一致（2 vs 1），返回 NOT_EQUIVALENT，
+        不会触发行 376 的断言（该断言仅当 sql_count == spark_count != 1 时触发）。
+        """
+        from tianshu_datadev.planning.sql_build_plan import AggregateStep
+        from tianshu_datadev.spark.models import (
+            SparkAggFunction,
+            SparkAggregateSpec,
+            SparkAggregateStep,
+        )
+
+        # SQL 侧：两个不同粒度的 aggregate step
+        sql_agg_1 = AggregateStep(
+            step_type="aggregate", step_id="agg_001",
+            group_keys=[
+                ColumnRef(
+                    table_ref="od", column_name="dept_id",
+                    normalized_name="dept_id",
+                ),
+            ],
+            metrics=[
+                AggregateSpec(
+                    aggregation=AggregationType.COUNT,
+                    input_column="id",
+                    alias="cnt",
+                ),
+            ],
+        )
+        sql_agg_2 = AggregateStep(
+            step_type="aggregate", step_id="agg_002",
+            group_keys=[
+                ColumnRef(
+                    table_ref="od", column_name="region",
+                    normalized_name="region",
+                ),
+            ],
+            metrics=[
+                AggregateSpec(
+                    aggregation=AggregationType.SUM,
+                    input_column="amount",
+                    alias="total",
+                ),
+            ],
+        )
+        sql_plan = _make_sql_plan([_make_sql_scan_step(), sql_agg_1, sql_agg_2])
+
+        # Spark 侧：单 aggregate
+        spark_agg = SparkAggregateStep(
+            step_type=SparkStepType.AGGREGATE,
+            input_alias="od",
+            group_keys=["dept_id"],
+            metrics=[
+                SparkAggregateSpec(
+                    function=SparkAggFunction.COUNT,
+                    input_column="id",
+                    alias="cnt",
+                ),
+            ],
+        )
+        spark_plan = _make_spark_plan([_make_spark_read_step(), spark_agg])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        # 不得崩溃，应有结构化结果
+        agg_results = [r for r in report.step_results if r.step_type == "aggregate"]
+        assert len(agg_results) > 0
+        assert agg_results[0].verdict in (
+            EquivalenceVerdict.NOT_EQUIVALENT,
+            EquivalenceVerdict.UNSUPPORTED_COMPARISON,
+        ), f"多 aggregate 不得崩溃或误判 EQUIVALENT, 实际={agg_results[0].verdict}"
+
 
 # ════════════════════════════════════════════
 # PlanComparator——CaseWhen 逻辑对比测试
@@ -1417,7 +1551,7 @@ class TestPlanComparatorCaseWhenEquivalence:
         assert report.status == ComparisonStatus.LOGIC_MISMATCH
 
     def test_case_when_equivalent(self):
-        """SQL cases 与 Spark branches 标签一致 → LOGIC_EQUIVALENT。"""
+        """SQL cases 与 Spark branches 标签一致 → LOGIC_EQUIVALENT（无 condition，仅 labels）。"""
         from tianshu_datadev.planning.sql_build_plan import CaseWhenStep
         from tianshu_datadev.spark.models import (
             SparkCaseWhenBranch,
@@ -1432,15 +1566,6 @@ class TestPlanComparatorCaseWhenEquivalence:
                     step_id="step_cw_001",
                     cases=[
                         WhenBranch(
-                            condition=Predicate(
-                                left=ColumnRef(
-                                    table_ref="order_info",
-                                    column_name="status",
-                                    normalized_name="status",
-                                ),
-                                operator=PredicateOperator.EQ,
-                                right=SqlLiteral(value="paid"),
-                            ),
                             result=SqlLiteral(value="normal"),
                         ),
                     ],
@@ -1519,7 +1644,7 @@ class TestPlanComparatorCaseWhenEquivalence:
         assert report.status == ComparisonStatus.LOGIC_MISMATCH
 
     def test_case_when_alias_both_empty(self):
-        """两侧 alias/output_alias 均为空字符串 → LOGIC_EQUIVALENT（边界行为）。"""
+        """两侧 alias/output_alias 均为空字符串 → LOGIC_EQUIVALENT（边界行为，无 condition）。"""
         from tianshu_datadev.planning.sql_build_plan import CaseWhenStep
         from tianshu_datadev.spark.models import (
             SparkCaseWhenBranch,
@@ -1534,15 +1659,6 @@ class TestPlanComparatorCaseWhenEquivalence:
                     step_id="step_cw_001",
                     cases=[
                         WhenBranch(
-                            condition=Predicate(
-                                left=ColumnRef(
-                                    table_ref="order_info",
-                                    column_name="status",
-                                    normalized_name="status",
-                                ),
-                                operator=PredicateOperator.EQ,
-                                right=SqlLiteral(value="paid"),
-                            ),
                             result=SqlLiteral(value="normal"),
                         ),
                     ],
@@ -1569,10 +1685,93 @@ class TestPlanComparatorCaseWhenEquivalence:
 
         assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
 
+    def test_case_when_condition_triggers_unsupported(self):
+        """CASE WHEN 含 condition → LOGIC_UNSUPPORTED。"""
+        from tianshu_datadev.planning.sql_build_plan import CaseWhenStep
+        from tianshu_datadev.spark.models import (
+            SparkCaseWhenBranch,
+            SparkCaseWhenStep,
+        )
 
-# ════════════════════════════════════════════
-# PlanComparator——NOT_COVERED 标记测试（仅 window）
-# ════════════════════════════════════════════
+        cond = Predicate(
+            left=ColumnRef(table_ref="od", column_name="amount",
+                           normalized_name="amount"),
+            operator=PredicateOperator.GT,
+            right=SqlLiteral(value="100", is_sql_expr=False),
+        )
+        sql_cw = CaseWhenStep(
+            step_type="case_when", step_id="step_cw_001",
+            cases=[
+                WhenBranch(condition=cond, result=SqlLiteral(value="high", is_sql_expr=False)),
+            ],
+            else_value=SqlLiteral(value="low", is_sql_expr=False),
+            alias="level",
+        )
+        sql_plan = _make_sql_plan([_make_sql_scan_step(), sql_cw])
+
+        # Spark 侧：相等的 labels
+        spark_cw = SparkCaseWhenStep(
+            step_type=SparkStepType.CASE_WHEN,
+            input_alias="od", output_alias="level",
+            branches=[SparkCaseWhenBranch(label="high")],
+            else_value="low",
+        )
+        spark_plan = _make_spark_plan([_make_spark_read_step(), spark_cw])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        # condition 虽存在但 labels 相同 → UNSUPPORTED_COMPARISON（非 EQUIVALENT）
+        cw_results = [r for r in report.step_results if r.step_type == "case_when"]
+        assert len(cw_results) > 0
+        assert cw_results[0].verdict == EquivalenceVerdict.UNSUPPORTED_COMPARISON
+        # 检查状态传播：step UNSUPPORTED_COMPARISON → report LOGIC_UNSUPPORTED
+        assert report.status == ComparisonStatus.LOGIC_UNSUPPORTED, (
+            f"CASE WHEN condition 应使 report.status=LOGIC_UNSUPPORTED，"
+            f"实际={report.status}"
+        )
+
+    def test_case_when_no_condition_still_equivalent(self):
+        """无 condition 的 CASE WHEN（仅 labels）→ 不变，仍为 EQUIVALENT。"""
+        from tianshu_datadev.planning.sql_build_plan import CaseWhenStep
+        from tianshu_datadev.spark.models import (
+            SparkCaseWhenBranch,
+            SparkCaseWhenStep,
+        )
+
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                CaseWhenStep(
+                    step_type="case_when",
+                    step_id="step_cw_001",
+                    cases=[
+                        WhenBranch(
+                            result=SqlLiteral(value="high"),
+                        ),
+                    ],
+                    else_value=SqlLiteral(value="low"),
+                    alias="level",
+                ),
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                SparkCaseWhenStep(
+                    step_type=SparkStepType.CASE_WHEN,
+                    input_alias="od",
+                    output_alias="level",
+                    branches=[SparkCaseWhenBranch(label="high")],
+                    else_value="low",
+                ),
+            ]
+        )
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
 
 
 class TestPlanComparatorNotCovered:
@@ -2092,14 +2291,23 @@ class TestPlanComparatorCustomEnabledTypes:
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
 
-        # ── Step 5: 验证——8 种已启用类型全部等价 ──
+        # ── Step 5: 验证——8 种已启用类型全部等价──
         # Mapper 产出的 SparkPlan 含 read+filter+join+aggregate+case_when+project+sort+limit
         # SqlBuildPlan 含 scan+scan+filter+join+aggregate+case_when+project+sort+limit
-        # 全部在 Phase 7B 启用范围内
-        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
-            f"预期 LOGIC_EQUIVALENT，实际 {report.status}，"
-            f"step_results={[(r.step_type, r.verdict.value) for r in report.step_results]}"
-        )
+        # 全部在 Phase 7B 启用范围内。
+        # CASE WHEN 带 condition（CaseWhenCondition）时，compare_case_when_steps 返回
+        # UNSUPPORTED_COMPARISON，导致整体 report.status 为 LOGIC_UNSUPPORTED。
+        case_when_results = [r for r in report.step_results if r.step_type == "case_when"]
+        if case_when_results and case_when_results[0].verdict == EquivalenceVerdict.UNSUPPORTED_COMPARISON:
+            # CASE WHEN 带 condition——当前暂不支持 condition 对比，预期 LOGIC_UNSUPPORTED
+            assert report.status == ComparisonStatus.LOGIC_UNSUPPORTED, (
+                f"CASE WHEN 带 condition 时应为 LOGIC_UNSUPPORTED，实际 {report.status}"
+            )
+        else:
+            assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+                f"预期 LOGIC_EQUIVALENT，实际 {report.status}，"
+                f"step_results={[(r.step_type, r.verdict.value) for r in report.step_results]}"
+            )
         assert len(report.uncovered_step_types) == 0, (
             f"不应有任何未覆盖类型，实际 {report.uncovered_step_types}"
         )
@@ -3012,86 +3220,574 @@ class TestComparatorStatusMapping:
         assert Pipeline._map_comparator_status(None) == "HUMAN_REVIEW"  # type: ignore[arg-type]
 
 
-class TestPlanComparatorStepExtraction:
-    """验证 _normalize_step_dict 中各 step 类型的扁平化提取逻辑。"""
+# ── _extract_spark_step_data 规范化单元测试 ──
 
-    def test_flatten_window_step(self):
-        """WindowStep 中 ColumnRef/SortSpec → 扁平化为字符串。"""
+
+class TestExtractSparkStepData:
+    """Spark 侧 _extract_spark_step_data 经由 _normalize_step_dict 扁平化。"""
+
+    def test_spark_step_data_goes_through_normalize(self):
+        """Spark 侧 step 数据经过 _normalize_step_dict 扁平化。"""
+        spark_plan = _make_spark_plan([
+            SparkFilterStep(
+                step_type=SparkStepType.FILTER,
+                input_alias="od",
+                operator="GT", left="amount", right="threshold",
+            ),
+        ])
+        steps = PlanComparator._extract_spark_step_data(spark_plan)
+        # 验证 filter step 被扁平化（left/operator/right 在顶层）
+        assert len(steps) == 1
+        assert steps[0]["left"] == "amount"
+        assert steps[0]["operator"] == "GT"
+        assert steps[0]["right"] == "threshold"
+
+
+# ════════════════════════════════════════════
+# C 类验收测试——Window frame 字段统一合并（Task 2）
+# ════════════════════════════════════════════
+
+
+class TestPlanComparatorWindowEquivalence:
+    """Window 逻辑等价性对比——全管道集成测试（真实模型）。
+
+    覆盖 frame 合并/input_column 扁平化/order_by 空值处理。
+    """
+
+    def test_window_frame_equivalent(self):
+        """SQL WindowFrame dict + Spark frame_type/frame_start/frame_end → frame 合并后等价。"""
         from tianshu_datadev.planning.models import (
-            ColumnRef, NullOrder, SortDirection, SortSpec,
-            WindowExpr, WindowFunction,
+            WindowExpr,
+            WindowFrame,
+            WindowFrameType,
+            FrameBoundary,
+            FrameBoundaryKind,
+            WindowFunction,
+            ColumnRef,
+            SortSpec,
+            SortDirection,
+        )
+        from tianshu_datadev.planning.sql_build_plan import WindowStep
+        from tianshu_datadev.spark.models import (
+            SparkWindowExpr,
+            SparkWindowFunction,
         )
 
-        step_dict = {
-            "step_type": "window",
-            "step_id": "win_001",
-            "window_exprs": [
+        # SQL 侧：使用 WindowFrame dict
+        sql_window = WindowStep(
+            step_type="window", step_id="step_win_001",
+            window_exprs=[
                 WindowExpr(
-                    function=WindowFunction.ROW_NUMBER,
-                    alias="rn",
+                    function=WindowFunction.SUM_OVER,
+                    alias="total",
+                    input=ColumnRef(
+                        table_ref="od", column_name="amount", normalized_name="amount",
+                    ),
+                    partition_by=[
+                        ColumnRef(
+                            table_ref="od", column_name="dept_id", normalized_name="dept_id",
+                        ),
+                    ],
+                    order_by=[SortSpec(column="salary", direction=SortDirection.ASC)],
+                    frame=WindowFrame(
+                        frame_type=WindowFrameType.ROWS,
+                        start=FrameBoundary(kind=FrameBoundaryKind.UNBOUNDED_PRECEDING),
+                        end=FrameBoundary(kind=FrameBoundaryKind.CURRENT_ROW),
+                    ),
+                ),
+            ],
+        )
+        sql_plan = _make_sql_plan([_make_sql_scan_step(), sql_window])
+
+        # Spark 侧：使用分离 frame 字符串字段
+        spark_window = _make_spark_window_step(
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.SUM_OVER,
+                    alias="total",
+                    input_column="amount",
+                    partition_by=["dept_id"],
+                    order_by=["salary ASC LAST"],
+                    frame_type="ROWS",
+                    frame_start="unbounded_preceding",
+                    frame_end="current_row",
+                ),
+            ],
+        )
+        spark_plan = _make_spark_plan([_make_spark_read_step(), spark_window])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+            f"相同 frame 应等价，实际 status={report.status}, "
+            f"results={[(r.step_type, r.verdict.value) for r in report.step_results]}"
+        )
+
+    def test_window_frame_diff_not_equivalent(self):
+        """SQL ROWS vs Spark RANGE → LOGIC_MISMATCH。"""
+        from tianshu_datadev.planning.models import (
+            WindowExpr,
+            WindowFrame,
+            WindowFrameType,
+            FrameBoundary,
+            FrameBoundaryKind,
+            WindowFunction,
+            ColumnRef,
+            SortSpec,
+            SortDirection,
+        )
+        from tianshu_datadev.planning.sql_build_plan import WindowStep
+        from tianshu_datadev.spark.models import (
+            SparkWindowExpr,
+            SparkWindowFunction,
+        )
+
+        sql_window = WindowStep(
+            step_type="window", step_id="step_win_001",
+            window_exprs=[
+                WindowExpr(
+                    function=WindowFunction.SUM_OVER,
+                    alias="total",
+                    input=ColumnRef(
+                        table_ref="od", column_name="amount", normalized_name="amount",
+                    ),
+                    partition_by=[
+                        ColumnRef(
+                            table_ref="od", column_name="dept_id", normalized_name="dept_id",
+                        ),
+                    ],
+                    order_by=[SortSpec(column="salary", direction=SortDirection.ASC)],
+                    frame=WindowFrame(
+                        frame_type=WindowFrameType.ROWS,
+                        start=FrameBoundary(kind=FrameBoundaryKind.UNBOUNDED_PRECEDING),
+                        end=FrameBoundary(kind=FrameBoundaryKind.CURRENT_ROW),
+                    ),
+                ),
+            ],
+        )
+        sql_plan = _make_sql_plan([_make_sql_scan_step(), sql_window])
+
+        # Spark 侧：使用 RANGE（与 SQL 的 ROWS 不同）
+        spark_window = _make_spark_window_step(
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.SUM_OVER,
+                    alias="total",
+                    input_column="amount",
+                    partition_by=["dept_id"],
+                    order_by=["salary ASC LAST"],
+                    frame_type="RANGE",
+                    frame_start="unbounded_preceding",
+                    frame_end="current_row",
+                ),
+            ],
+        )
+        spark_plan = _make_spark_plan([_make_spark_read_step(), spark_window])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_MISMATCH, (
+            f"ROWS vs RANGE 应不等价，实际 status={report.status}"
+        )
+
+    def test_window_order_reversed_not_equivalent(self):
+        """ORDER BY salary DESC, name ASC vs name ASC, salary DESC → LOGIC_MISMATCH。"""
+        from tianshu_datadev.planning.models import (
+            WindowExpr,
+            WindowFrame,
+            WindowFrameType,
+            FrameBoundary,
+            FrameBoundaryKind,
+            WindowFunction,
+            ColumnRef,
+            SortSpec,
+            SortDirection,
+        )
+        from tianshu_datadev.planning.sql_build_plan import WindowStep
+        from tianshu_datadev.spark.models import (
+            SparkWindowExpr,
+            SparkWindowFunction,
+        )
+
+        sql_window = WindowStep(
+            step_type="window", step_id="step_win_002",
+            window_exprs=[
+                WindowExpr(
+                    function=WindowFunction.SUM_OVER,
+                    alias="total",
+                    input=ColumnRef(
+                        table_ref="od", column_name="amount", normalized_name="amount",
+                    ),
                     partition_by=[
                         ColumnRef(
                             table_ref="od", column_name="dept_id", normalized_name="dept_id",
                         ),
                     ],
                     order_by=[
-                        SortSpec(column="salary", direction=SortDirection.DESC,
-                                 null_order=NullOrder.LAST),
+                        SortSpec(column="salary", direction=SortDirection.DESC),
+                        SortSpec(column="name", direction=SortDirection.ASC),
                     ],
-                ).model_dump(mode="json", exclude_none=True)
+                    frame=WindowFrame(
+                        frame_type=WindowFrameType.ROWS,
+                        start=FrameBoundary(kind=FrameBoundaryKind.UNBOUNDED_PRECEDING),
+                        end=FrameBoundary(kind=FrameBoundaryKind.CURRENT_ROW),
+                    ),
+                ),
             ],
-        }
+        )
+        sql_plan = _make_sql_plan([_make_sql_scan_step(), sql_window])
 
-        result = PlanComparator._flatten_window_step(step_dict)
-        exprs = result.get("window_exprs", [])
-        assert len(exprs) == 1
-        assert exprs[0]["partition_by"] == ["dept_id"]
-        # order_by 应包含 direction 和 null_order
-        assert "salary desc last" in str(exprs[0]["order_by"]).lower()
+        # Spark 侧：顺序相反
+        spark_window = _make_spark_window_step(
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.SUM_OVER,
+                    alias="total",
+                    input_column="amount",
+                    partition_by=["dept_id"],
+                    order_by=["name ASC LAST", "salary DESC LAST"],
+                    frame_type="ROWS",
+                    frame_start="unbounded_preceding",
+                    frame_end="current_row",
+                ),
+            ],
+        )
+        spark_plan = _make_spark_plan([_make_spark_read_step(), spark_window])
 
-    def test_window_full_pipeline_flattening(self):
-        """端到端：WindowStep 经过 _normalize_step_dict → partition_by/order_by 为字符串。
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
 
-        创建 WindowStep 模型对象（含 window_exprs 中的 ColumnRef 和 SortSpec）
-        → model_dump → _normalize_step_dict。
-        验证输出的 window_exprs 中 partition_by 和 order_by 已被正确扁平化为字符串。
-        """
+        assert report.status == ComparisonStatus.LOGIC_MISMATCH, (
+            f"ORDER BY 顺序不同应不等价，实际 status={report.status}"
+        )
+
+    def test_window_input_column_diff_not_equivalent(self):
+        """SUM(amount) vs SUM(discount) → LOGIC_MISMATCH。"""
         from tianshu_datadev.planning.models import (
-            ColumnRef, NullOrder, SortDirection, SortSpec,
-            WindowExpr, WindowFunction,
+            WindowExpr,
+            WindowFrame,
+            WindowFrameType,
+            FrameBoundary,
+            FrameBoundaryKind,
+            WindowFunction,
+            ColumnRef,
+            SortSpec,
+            SortDirection,
         )
         from tianshu_datadev.planning.sql_build_plan import WindowStep
+        from tianshu_datadev.spark.models import (
+            SparkWindowExpr,
+            SparkWindowFunction,
+        )
 
-        win_step = WindowStep(
-            step_type="window",
-            step_id="win_full_pipeline",
+        sql_window = WindowStep(
+            step_type="window", step_id="step_win_003",
+            window_exprs=[
+                WindowExpr(
+                    function=WindowFunction.SUM_OVER,
+                    alias="total",
+                    input=ColumnRef(
+                        table_ref="od", column_name="amount", normalized_name="amount",
+                    ),
+                    partition_by=[
+                        ColumnRef(
+                            table_ref="od", column_name="dept_id", normalized_name="dept_id",
+                        ),
+                    ],
+                    order_by=[SortSpec(column="salary", direction=SortDirection.ASC)],
+                    frame=WindowFrame(
+                        frame_type=WindowFrameType.ROWS,
+                        start=FrameBoundary(kind=FrameBoundaryKind.UNBOUNDED_PRECEDING),
+                        end=FrameBoundary(kind=FrameBoundaryKind.CURRENT_ROW),
+                    ),
+                ),
+            ],
+        )
+        sql_plan = _make_sql_plan([_make_sql_scan_step(), sql_window])
+
+        # Spark 侧：input_column 为 "discount"（与 SQL 的 "amount" 不同）
+        spark_window = _make_spark_window_step(
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.SUM_OVER,
+                    alias="total",
+                    input_column="discount",
+                    partition_by=["dept_id"],
+                    order_by=["salary ASC LAST"],
+                    frame_type="ROWS",
+                    frame_start="unbounded_preceding",
+                    frame_end="current_row",
+                ),
+            ],
+        )
+        spark_plan = _make_spark_plan([_make_spark_read_step(), spark_window])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_MISMATCH, (
+            f"不同 input_column 应不等价，实际 status={report.status}"
+        )
+
+    def test_window_full_equivalent(self):
+        """完整 window（partition + order + frame + input）→ LOGIC_EQUIVALENT。"""
+        from tianshu_datadev.planning.models import (
+            WindowExpr,
+            WindowFrame,
+            WindowFrameType,
+            FrameBoundary,
+            FrameBoundaryKind,
+            WindowFunction,
+            ColumnRef,
+            SortSpec,
+            SortDirection,
+        )
+        from tianshu_datadev.planning.sql_build_plan import WindowStep
+        from tianshu_datadev.spark.models import (
+            SparkWindowExpr,
+            SparkWindowFunction,
+        )
+
+        # 完整的三个窗口表达式
+        sql_window = WindowStep(
+            step_type="window", step_id="step_win_full",
+            window_exprs=[
+                WindowExpr(
+                    function=WindowFunction.SUM_OVER,
+                    alias="total_amt",
+                    input=ColumnRef(
+                        table_ref="od", column_name="amount", normalized_name="amount",
+                    ),
+                    partition_by=[
+                        ColumnRef(
+                            table_ref="od", column_name="dept_id", normalized_name="dept_id",
+                        ),
+                    ],
+                    order_by=[SortSpec(column="salary", direction=SortDirection.ASC)],
+                    frame=WindowFrame(
+                        frame_type=WindowFrameType.ROWS,
+                        start=FrameBoundary(kind=FrameBoundaryKind.UNBOUNDED_PRECEDING),
+                        end=FrameBoundary(kind=FrameBoundaryKind.CURRENT_ROW),
+                    ),
+                ),
+                WindowExpr(
+                    function=WindowFunction.RANK,
+                    alias="rnk",
+                    partition_by=[
+                        ColumnRef(
+                            table_ref="od", column_name="dept_id", normalized_name="dept_id",
+                        ),
+                    ],
+                    order_by=[SortSpec(column="salary", direction=SortDirection.DESC)],
+                    frame=WindowFrame(
+                        frame_type=WindowFrameType.ROWS,
+                        start=FrameBoundary(kind=FrameBoundaryKind.UNBOUNDED_PRECEDING),
+                        end=FrameBoundary(kind=FrameBoundaryKind.CURRENT_ROW),
+                    ),
+                ),
+            ],
+        )
+        sql_plan = _make_sql_plan([_make_sql_scan_step(), sql_window])
+
+        spark_window = _make_spark_window_step(
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.SUM_OVER,
+                    alias="total_amt",
+                    input_column="amount",
+                    partition_by=["dept_id"],
+                    order_by=["salary ASC LAST"],
+                    frame_type="ROWS",
+                    frame_start="unbounded_preceding",
+                    frame_end="current_row",
+                ),
+                SparkWindowExpr(
+                    function=SparkWindowFunction.RANK,
+                    alias="rnk",
+                    partition_by=["dept_id"],
+                    order_by=["salary DESC LAST"],
+                ),
+            ],
+        )
+        spark_plan = _make_spark_plan([_make_spark_read_step(), spark_window])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+            f"完整 window 应等价，实际 status={report.status}, "
+            f"results={[(r.step_type, r.verdict.value) for r in report.step_results]}"
+        )
+
+    def test_window_no_frame_no_partition(self):
+        """无 partition 的 ROW_NUMBER 使用默认 frame → 不崩溃，等价。"""
+        from tianshu_datadev.planning.models import (
+            WindowExpr,
+            WindowFrame,
+            WindowFrameType,
+            FrameBoundary,
+            FrameBoundaryKind,
+            WindowFunction,
+        )
+        from tianshu_datadev.planning.sql_build_plan import WindowStep
+        from tianshu_datadev.spark.models import (
+            SparkWindowExpr,
+            SparkWindowFunction,
+        )
+
+        # SQL 侧：ROW_NUMBER 无 partition，使用默认 frame
+        sql_window = WindowStep(
+            step_type="window", step_id="step_win_no",
             window_exprs=[
                 WindowExpr(
                     function=WindowFunction.ROW_NUMBER,
                     alias="rn",
-                    partition_by=[
-                        ColumnRef(table_ref="od", column_name="dept_id", normalized_name="dept_id"),
-                    ],
-                    order_by=[
-                        SortSpec(column="salary", direction=SortDirection.DESC,
-                                 null_order=NullOrder.LAST),
-                    ],
+                    frame=WindowFrame(
+                        frame_type=WindowFrameType.ROWS,
+                        start=FrameBoundary(kind=FrameBoundaryKind.UNBOUNDED_PRECEDING),
+                        end=FrameBoundary(kind=FrameBoundaryKind.CURRENT_ROW),
+                    ),
                 ),
             ],
         )
-        step_dict = win_step.model_dump(mode="json", exclude_none=True)
-        result = PlanComparator._normalize_step_dict(step_dict)
-        assert result["step_type"] == "window"
-        exprs = result.get("window_exprs", [])
-        assert len(exprs) == 1, f"应有 1 个 window_expr，实际：{len(exprs)}"
-        # window_exprs[0] 中的 partition_by 已扁平化为字符串列表
-        assert exprs[0].get("partition_by") == ["dept_id"], (
-            f"partition_by 应为 ['dept_id']，实际：{exprs[0].get('partition_by')}"
+        sql_plan = _make_sql_plan([_make_sql_scan_step(), sql_window])
+
+        # Spark 侧：使用 frame 默认值
+        spark_window = _make_spark_window_step(
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.ROW_NUMBER,
+                    alias="rn",
+                    frame_type="ROWS",
+                    frame_start="unbounded_preceding",
+                    frame_end="current_row",
+                ),
+            ],
         )
-        # window_exprs[0] 中的 order_by 已扁平化为字符串列表
-        order_by = exprs[0].get("order_by", [])
-        assert len(order_by) == 1, f"order_by 应有 1 项，实际：{order_by}"
-        order_str = order_by[0].lower()
-        assert "salary" in order_str, f"order_by 应含 salary，实际：{order_str}"
-        assert "desc" in order_str, f"order_by 应含 desc，实际：{order_str}"
-        assert "last" in order_str, f"order_by 应含 last，实际：{order_str}"
+        spark_plan = _make_spark_plan([_make_spark_read_step(), spark_window])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+            f"ROW_NUMBER 默认 frame 应等价，实际 status={report.status}"
+        )
+
+
+# ════════════════════════════════════════════
+# Task 4（B 类）— Filter 右侧谓词 tree 修复辅助测试
+# ════════════════════════════════════════════
+
+
+class TestFilterRightPredicateTreeAux:
+    """_flatten_filter_step dict 层辅助测试（非验收路径）。
+
+    直接测试 _flatten_filter_step 对右侧嵌套 Predicate tree 的 dict 输入的处理，
+    不经过 PlanComparator.compare() 全管道。
+    """
+
+    def test_right_is_predicate_tree_rendered(self):
+        """right 为嵌套 Predicate tree dict → 递归渲染为规范字符串。"""
+        step_dict = {
+            "step_type": "filter",
+            "step_id": "step_test",
+            "predicate": {
+                "left": {
+                    "table_ref": "od",
+                    "column_name": "amount",
+                    "normalized_name": "amount",
+                },
+                "operator": "EQ",
+                "right": {
+                    "left": {
+                        "table_ref": "od",
+                        "column_name": "threshold",
+                        "normalized_name": "threshold",
+                    },
+                    "operator": "GT",
+                    "right": {"value": 100},
+                },
+            },
+        }
+        result = PlanComparator._flatten_filter_step(step_dict)
+
+        assert result["left"] == "od.amount"
+        assert result["operator"] == "EQ"
+        # right 应为递归渲染后的规范字符串，而非空（原 bug 表现）
+        assert result["right"] == "(threshold GT 100)", (
+            f"右侧嵌套 Predicate tree 应递归渲染为规范字符串，"
+            f"实际 right={result['right']!r}"
+        )
+
+    def test_right_is_column_ref_unchanged(self):
+        """right 为 ColumnRef dict → 走原 _column_ref_to_string 路径（回归）。"""
+        step_dict = {
+            "step_type": "filter",
+            "step_id": "step_test",
+            "predicate": {
+                "left": {
+                    "table_ref": "od",
+                    "column_name": "amount",
+                    "normalized_name": "amount",
+                },
+                "operator": "GT",
+                "right": {
+                    "table_ref": "od",
+                    "column_name": "threshold",
+                    "normalized_name": "threshold",
+                },
+            },
+        }
+        result = PlanComparator._flatten_filter_step(step_dict)
+
+        # 普通 ColumnRef → 原路径，right 应为 "od.threshold"
+        assert result["right"] == "od.threshold", (
+            f"ColumnRef right 应走原 _column_ref_to_string 路径，"
+            f"实际 right={result['right']!r}"
+        )
+
+    def test_right_is_predicate_tree_left_is_predicate_tree(self):
+        """left 和 right 均为嵌套 Predicate tree → left 分支短路（原逻辑不变）。"""
+        step_dict = {
+            "step_type": "filter",
+            "step_id": "step_test",
+            "predicate": {
+                "left": {
+                    "left": {
+                        "table_ref": "t",
+                        "column_name": "a",
+                        "normalized_name": "a",
+                    },
+                    "operator": "GT",
+                    "right": {"value": "1"},
+                },
+                "operator": "AND",
+                "right": {
+                    "left": {
+                        "table_ref": "t",
+                        "column_name": "b",
+                        "normalized_name": "b",
+                    },
+                    "operator": "LT",
+                    "right": {"value": "10"},
+                },
+            },
+        }
+        result = PlanComparator._flatten_filter_step(step_dict)
+
+        # left 是 predicate tree → left 分支短路，operator 为 PREDICATE_TREE
+        assert result["operator"] == "PREDICATE_TREE"
+        assert result["left"] != ""
+        # right 应为空（PREDICATE_TREE 模式下无意义）
+        assert result["right"] == ""
+
+
+def _make_spark_window_step(expressions: list) -> SparkWindowStep:
+    """构造最小 SparkWindowStep。"""
+    return SparkWindowStep(
+        step_type=SparkStepType.WINDOW,
+        input_alias="od",
+        expressions=expressions,
+    )

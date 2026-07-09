@@ -370,18 +370,13 @@ def compare_aggregate_steps(
             spark_count=0,
         )
 
-    # 当前设计仅支持每侧 1 个 aggregate step，多 aggregate 返回 NOT_EQUIVALENT
-    if len(sql_aggs) != 1 or len(spark_aggs) != 1:
-        return StepEquivalenceResult(
-            step_type="aggregate",
-            verdict=EquivalenceVerdict.NOT_EQUIVALENT,
-            sql_count=len(sql_aggs),
-            spark_count=len(spark_aggs),
-            detail=(
-                f"compare_aggregate_steps 暂不支持多 aggregate 对比，"
-                f"实际 SQL={len(sql_aggs)}, Spark={len(spark_aggs)}"
-            ),
-        )
+    # 防御性断言：DAG 归一化确保每侧最多 1 个 aggregate step。
+    # 如果未来 builder 产出多 aggregate（如优化器拆分 count(distinct)），
+    # 此断言会立即暴露问题，避免静默跳检。
+    assert len(sql_aggs) == len(spark_aggs) == 1, (
+        f"compare_aggregate_steps 假设每侧最多 1 个 aggregate step，"
+        f"实际 SQL={len(sql_aggs)}, Spark={len(spark_aggs)}"
+    )
 
     sql_agg = sql_aggs[0]
     spark_agg = spark_aggs[0]
@@ -596,6 +591,30 @@ def compare_case_when_steps(
                 ),
             )
 
+    # 检测 condition 是否存在（标记由 _flatten_case_when_step 写入）
+    for i, (sql_cw, spark_cw) in enumerate(zip(sql_case_whens, spark_case_whens)):
+        sql_has_cond = sql_cw.get("has_conditions", False)
+        spark_has_cond = spark_cw.get("has_conditions", False)
+
+        # 额外检测 Spark 侧 branches 中的 condition
+        if not spark_has_cond:
+            for b in (spark_cw.get("branches", []) or []):
+                if isinstance(b, dict) and b.get("condition") is not None:
+                    spark_has_cond = True
+                    break
+
+        if sql_has_cond or spark_has_cond:
+            return StepEquivalenceResult(
+                step_type="case_when",
+                verdict=EquivalenceVerdict.UNSUPPORTED_COMPARISON,
+                sql_count=sql_count,
+                spark_count=spark_count,
+                detail=(
+                    f"CASE WHEN[{i}] 存在 condition 但 compare_case_when_steps "
+                    f"暂不支持 condition 对比（仅比较 labels/default/alias），需人工审核"
+                ),
+            )
+
     return StepEquivalenceResult(
         step_type="case_when",
         verdict=EquivalenceVerdict.EQUIVALENT,
@@ -616,8 +635,8 @@ def compare_window_steps(
     3. order_by 保持顺序（ORDER BY a,b != ORDER BY b,a）
 
     Args:
-        sql_windows: SQL 侧 WindowStep 的 model_dump 列表（已扁平化）
-        spark_windows: Spark 侧 SparkWindowStep 的 model_dump 列表（已扁平化）
+        sql_windows: SQL 侧 WindowStep 的 model_dump 列表
+        spark_windows: Spark 侧 SparkWindowStep 的 model_dump 列表
 
     Returns:
         StepEquivalenceResult
@@ -642,49 +661,46 @@ def compare_window_steps(
             detail=f"窗口步骤数量不一致：SQL 侧 {sql_count} 个，Spark 侧 {spark_count} 个",
         )
 
-    # 收集所有窗口表达式
-    def _extract_exprs(windows: list[dict], field_key: str) -> list[tuple]:
-        """从 window steps 中提取表达式元组。"""
-        exprs = []
-        for w in windows:
-            for expr in w.get(field_key, []) or w.get("expressions", []):
-                func = str(expr.get("function", "")).upper()
-                alias = normalize_field_name(expr.get("alias", ""))
-                # input_column（SUM/AVG/COUNT/LAG/LEAD 需要，排名函数不需要）
-                input_col = normalize_field_name(expr.get("input_column", "") or "")
-                # partition_by——去重但保序（两边独立排序后再比）
-                partition = tuple(sorted([
-                    normalize_field_name(str(p)) for p in (expr.get("partition_by", []) or [])
-                ]))
-                # order_by——保留原始顺序（ORDER BY a,b != ORDER BY b,a）
-                # 已扁平化为字符串列表，每个元素含 direction 和 null_order
-                order = tuple(
-                    normalize_field_name(str(o)) for o in (expr.get("order_by", []) or [])
-                )
-                # frame——窗口帧边界（ROWS/RANGE BETWEEN ... AND ...）
-                frame_raw = expr.get("frame", "")
-                frame = normalize_field_name(str(frame_raw)) if frame_raw else ""
-                exprs.append((func, alias, input_col, partition, order, frame))
-        return exprs
+    # 收集所有窗口表达式（跨多个 WindowStep 聚合）
+    sql_exprs: set[tuple[str, ...]] = set()
+    for w in sql_windows:
+        for expr in w.get("window_exprs", []) or w.get("expressions", []):
+            func = expr.get("function", "").upper()
+            alias = normalize_field_name(expr.get("alias", ""))
+            partition = tuple(sorted([
+                normalize_field_name(p) for p in (expr.get("partition_by", []) or [])
+            ]))
+            order = tuple([
+                normalize_field_name(o) for o in (expr.get("order_by", []) or [])
+            ])
+            frame = normalize_field_name(expr.get("frame", ""))
+            input_val = normalize_field_name(str(expr.get("input_column", "") or ""))
+            sql_exprs.add((func, alias, partition, order, frame, input_val))
 
-    sql_exprs = _extract_exprs(sql_windows, "window_exprs")
-    spark_exprs = _extract_exprs(spark_windows, "expressions")
+    spark_exprs: set[tuple[str, ...]] = set()
+    for w in spark_windows:
+        for expr in w.get("expressions", []):
+            func = str(expr.get("function", "")).upper()
+            alias = normalize_field_name(expr.get("alias", ""))
+            partition = tuple(sorted([
+                normalize_field_name(p) for p in (expr.get("partition_by", []) or [])
+            ]))
+            order = tuple([
+                normalize_field_name(o) for o in (expr.get("order_by", []) or [])
+            ])
+            frame = normalize_field_name(expr.get("frame", ""))
+            input_val = normalize_field_name(str(expr.get("input_column", "") or ""))
+            spark_exprs.add((func, alias, partition, order, frame, input_val))
 
-    # 比较方式：先规范化每组——partition 已排序可比较，order 保留原序
-    sql_set: set[tuple] = set(sql_exprs)
-    spark_set: set[tuple] = set(spark_exprs)
-
-    if sql_set != spark_set:
-        only_sql = sql_set - spark_set
-        only_spark = spark_set - sql_set
+    if sql_exprs != spark_exprs:
         return StepEquivalenceResult(
             step_type="window",
             verdict=EquivalenceVerdict.NOT_EQUIVALENT,
             sql_count=sql_count,
             spark_count=spark_count,
             detail=(
-                f"窗口表达式不一致——仅在 SQL 侧：{list(only_sql)}，"
-                f"仅在 Spark 侧：{list(only_spark)}"
+                f"窗口表达式不一致——仅在 SQL 侧：{sql_exprs - spark_exprs}，"
+                f"仅在 Spark 侧：{spark_exprs - sql_exprs}"
             ),
         )
 
@@ -996,8 +1012,12 @@ def compare_plans(
         r for r in step_results
         if r.verdict == EquivalenceVerdict.NOT_EQUIVALENT
     ]
+    unsupported_results = [
+        r for r in step_results
+        if r.verdict == EquivalenceVerdict.UNSUPPORTED_COMPARISON
+    ]
 
-    if unsupported_types:
+    if unsupported_types or unsupported_results:
         overall = EquivalenceVerdict.UNSUPPORTED_COMPARISON
     elif not_equivalent or extra_sql_types or extra_spark_types:
         overall = EquivalenceVerdict.NOT_EQUIVALENT

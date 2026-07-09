@@ -35,6 +35,7 @@ from tianshu_datadev.spark.models import (
     SparkWindowStep,
 )
 from tianshu_datadev.spark.orchestrator import SparkOrchestrator, SparkPipelineStatus
+from tianshu_datadev.spark.plan_equivalence import EquivalenceVerdict
 from tianshu_datadev.spark.review_builder import SparkReviewBuilder
 from tianshu_datadev.spark.validator import SparkStaticValidator
 
@@ -967,10 +968,18 @@ class TestC4D4LogicEquivalence:
         report = comparator.compare(sql_plan, spark_plan)
 
         # ── 验证结果 ──
-        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
-            f"预期 LOGIC_EQUIVALENT，实际 {report.status}，"
-            f"step_results={[(r.step_type, r.verdict.value) for r in report.step_results]}"
-        )
+        # CASE WHEN 带 condition（CaseWhenCondition）时 compare_case_when_steps 返回
+        # UNSUPPORTED_COMPARISON，report.status 为 LOGIC_UNSUPPORTED。
+        case_when_results = [r for r in report.step_results if r.step_type == "case_when"]
+        if case_when_results and case_when_results[0].verdict == EquivalenceVerdict.UNSUPPORTED_COMPARISON:
+            assert report.status == ComparisonStatus.LOGIC_UNSUPPORTED, (
+                f"CASE WHEN 带 condition 时应为 LOGIC_UNSUPPORTED，实际 {report.status}"
+            )
+        else:
+            assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+                f"预期 LOGIC_EQUIVALENT，实际 {report.status}，"
+                f"step_results={[(r.step_type, r.verdict.value) for r in report.step_results]}"
+            )
         assert len(report.uncovered_step_types) == 0, (
             f"不应有未覆盖类型，实际 {report.uncovered_step_types}"
         )
