@@ -578,3 +578,117 @@ class TestSqlCompilerNoSilentDedup:
         assert "LEFT JOIN" in sql.sql.upper(), (
             f"SQL 应包含 LEFT JOIN，实际输出:\n{sql.sql}"
         )
+
+
+# ════════════════════════════════════════════
+# V2 测试——dim 表增强文案 + JoinSafetyTableInfo + FieldNormalizer
+# ════════════════════════════════════════════
+
+
+class TestLeftJoinSafetyV2:
+    """LEFT JOIN 安全门禁 V2 新功能测试。"""
+
+    def test_dim_key_without_unique_blocks(self):
+        """role=dim + join_key ∈ key_column_names → blocking，文案含 unique: true 和建议。"""
+        from tianshu_datadev.planning.relationship_validator import JoinSafetyTableInfo
+
+        validator = RelationshipValidator()
+        safety_info = JoinSafetyTableInfo(
+            unique_keys=[],
+            role="dim",
+            key_column_names_normalized=["location_id"],
+        )
+        is_safe, desc = validator.check_left_join_safety(
+            right_table_unique_keys=[],
+            right_join_key_normalized="location_id",
+            right_join_safety_info=safety_info,
+        )
+        assert is_safe is False
+        assert desc is not None
+        assert "unique: true" in desc
+        assert "unique_keys: [['location_id']]" in desc
+        assert "key_column" in desc
+
+    def test_dim_key_with_unique_keys_passes(self):
+        """role=dim 但 unique_keys 已声明 → 通过。"""
+        from tianshu_datadev.planning.relationship_validator import JoinSafetyTableInfo
+
+        validator = RelationshipValidator()
+        safety_info = JoinSafetyTableInfo(
+            unique_keys=[["location_id"]],
+            role="dim",
+            key_column_names_normalized=["location_id"],
+        )
+        is_safe, desc = validator.check_left_join_safety(
+            right_table_unique_keys=[["location_id"]],
+            right_join_key_normalized="location_id",
+            right_join_safety_info=safety_info,
+        )
+        assert is_safe is True
+        assert desc is None
+
+    def test_fact_no_unique_blocks(self):
+        """role=fact + 无 unique_keys → blocking，文案不含 key_column 措辞。"""
+        from tianshu_datadev.planning.relationship_validator import JoinSafetyTableInfo
+
+        validator = RelationshipValidator()
+        safety_info = JoinSafetyTableInfo(
+            unique_keys=[],
+            role="fact",
+            key_column_names_normalized=["order_id"],
+        )
+        is_safe, desc = validator.check_left_join_safety(
+            right_table_unique_keys=[],
+            right_join_key_normalized="order_id",
+            right_join_safety_info=safety_info,
+        )
+        assert is_safe is False
+        assert desc is not None
+        # fact 表不应出现 dim 表专属的 key_column 增强文案
+        assert "key_column" not in desc
+
+    def test_field_normalizer_handles_special_chars(self):
+        """key_column 声明为 "Location ID"（含空格），经 FieldNormalizer 归一化后匹配成功。
+
+        证明 .lower() 不够——必须走 FieldNormalizer（处理空格/分隔符）。
+        """
+        from tianshu_datadev.planning.relationship_validator import JoinSafetyTableInfo
+
+        validator = RelationshipValidator()
+        # key_column_names_normalized 应该已经由 Builder 侧的 FieldNormalizer 处理过
+        # "Location ID" → FieldNormalizer.normalize() → "location_id"
+        safety_info = JoinSafetyTableInfo(
+            unique_keys=[],
+            role="dim",
+            key_column_names_normalized=["location_id"],
+        )
+        is_safe, desc = validator.check_left_join_safety(
+            right_table_unique_keys=[],
+            right_join_key_normalized="location_id",
+            right_join_safety_info=safety_info,
+        )
+        # 应匹配——因为 "location_id" == "location_id"
+        assert is_safe is False  # 阻断（无 unique_keys）
+        assert desc is not None
+        # 但文案应该是 dim 增强版（因为 join_key 匹配了 key_column_names_normalized）
+        assert "key_column" in desc
+
+    def test_join_safety_info_default_factory(self):
+        """JoinSafetyTableInfo() 默认构造——各字段默认值正确，安全门禁正常阻断。"""
+        from tianshu_datadev.planning.relationship_validator import JoinSafetyTableInfo
+
+        info = JoinSafetyTableInfo()
+        assert info.unique_keys == []
+        assert info.role is None
+        assert info.key_column_names_normalized == []
+
+        validator = RelationshipValidator()
+        is_safe, desc = validator.check_left_join_safety(
+            right_table_unique_keys=info.unique_keys if info else None,
+            right_join_key_normalized="some_key",
+            right_join_safety_info=info,
+        )
+        # 空 unique_keys → unsafe，role=None → 走通用文案而非 dim 增强
+        assert is_safe is False
+        assert desc is not None
+        assert "key_column" not in desc  # role 不是 dim
