@@ -713,6 +713,64 @@ class TestPlanComparatorFilterEquivalence:
         # right 应为空（PREDICATE_TREE 模式下右值无意义）
         assert sql_filters[0].get("right", "") == ""
 
+    def test_filter_nested_predicate_right_side(self):
+        """右侧为嵌套 Predicate tree → 不崩溃，正确递归渲染并对比。
+
+        Predicate.right 可以是嵌套 Predicate（模型允许 right: Predicate）。
+        _flatten_filter_step 应正确检测 _is_predicate_tree 并调用
+        _render_predicate_tree 递归渲染，而非走 _column_ref_to_string 产生空结果。
+        """
+        # 构造谓词：EQ(amount, GT(threshold, 100))
+        # left 为 ColumnRef，right 为嵌套 Predicate tree
+        sql_predicate = Predicate(
+            left=ColumnRef(
+                table_ref="od", column_name="amount",
+                normalized_name="amount",
+            ),
+            operator=PredicateOperator.EQ,
+            right=Predicate(
+                left=ColumnRef(
+                    table_ref="od", column_name="threshold",
+                    normalized_name="threshold",
+                ),
+                operator=PredicateOperator.GT,
+                right=SqlLiteral(value=100),
+            ),
+        )
+        sql_filter = FilterStep(
+            step_type="filter", step_id="step_filter_nested_right",
+            predicate=sql_predicate,
+        )
+        # Spark 侧：right 为嵌套 tree 渲染后的规范字符串
+        spark_filter = SparkFilterStep(
+            step_type=SparkStepType.FILTER,
+            input_alias="od",
+            operator="EQ",
+            left="od.amount",
+            right="(threshold GT 100)",
+        )
+        sql_plan = _make_sql_plan([
+            _make_sql_scan_step(),
+            sql_filter,
+        ])
+        spark_plan = _make_spark_plan([
+            _make_spark_read_step(),
+            spark_filter,
+        ])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        # 关键断言：不崩溃，filter step 有有效 verdict
+        filter_results = [r for r in report.step_results if r.step_type == "filter"]
+        assert len(filter_results) == 1
+        # nested_predicate_right 渲染后应与 Spark 侧匹配
+        assert filter_results[0].verdict == EquivalenceVerdict.EQUIVALENT, (
+            f"嵌套 Predicate right 渲染应与 Spark 侧匹配，"
+            f"实际 verdict={filter_results[0].verdict.value}, "
+            f"detail={filter_results[0].detail[:200]}"
+        )
+
     def test_not_predicate_rendered_correctly(self):
         """NOT 谓词 → 渲染结果包含 NOT 标记。"""
         not_pred = Predicate(
@@ -1369,6 +1427,81 @@ class TestPlanComparatorAggregateEquivalence:
         report = comparator.compare(sql_plan, spark_plan)
 
         assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
+
+    def test_aggregate_multi_step_not_crash(self):
+        """多 aggregate step 通过 PlanComparator.compare 时不崩溃。
+
+        SQL 侧两个不同粒度的 aggregate（dept_id, region），Spark 侧仅一个（dept_id）。
+        compare_aggregate_steps 发现数量不一致（2 vs 1），返回 NOT_EQUIVALENT，
+        不会触发行 376 的断言（该断言仅当 sql_count == spark_count != 1 时触发）。
+        """
+        from tianshu_datadev.planning.sql_build_plan import AggregateStep
+        from tianshu_datadev.spark.models import (
+            SparkAggFunction,
+            SparkAggregateSpec,
+            SparkAggregateStep,
+        )
+
+        # SQL 侧：两个不同粒度的 aggregate step
+        sql_agg_1 = AggregateStep(
+            step_type="aggregate", step_id="agg_001",
+            group_keys=[
+                ColumnRef(
+                    table_ref="od", column_name="dept_id",
+                    normalized_name="dept_id",
+                ),
+            ],
+            metrics=[
+                AggregateSpec(
+                    aggregation=AggregationType.COUNT,
+                    input_column="id",
+                    alias="cnt",
+                ),
+            ],
+        )
+        sql_agg_2 = AggregateStep(
+            step_type="aggregate", step_id="agg_002",
+            group_keys=[
+                ColumnRef(
+                    table_ref="od", column_name="region",
+                    normalized_name="region",
+                ),
+            ],
+            metrics=[
+                AggregateSpec(
+                    aggregation=AggregationType.SUM,
+                    input_column="amount",
+                    alias="total",
+                ),
+            ],
+        )
+        sql_plan = _make_sql_plan([_make_sql_scan_step(), sql_agg_1, sql_agg_2])
+
+        # Spark 侧：单 aggregate
+        spark_agg = SparkAggregateStep(
+            step_type=SparkStepType.AGGREGATE,
+            input_alias="od",
+            group_keys=["dept_id"],
+            metrics=[
+                SparkAggregateSpec(
+                    function=SparkAggFunction.COUNT,
+                    input_column="id",
+                    alias="cnt",
+                ),
+            ],
+        )
+        spark_plan = _make_spark_plan([_make_spark_read_step(), spark_agg])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        # 不得崩溃，应有结构化结果
+        agg_results = [r for r in report.step_results if r.step_type == "aggregate"]
+        assert len(agg_results) > 0
+        assert agg_results[0].verdict in (
+            EquivalenceVerdict.NOT_EQUIVALENT,
+            EquivalenceVerdict.UNSUPPORTED_COMPARISON,
+        ), f"多 aggregate 不得崩溃或误判 EQUIVALENT, 实际={agg_results[0].verdict}"
 
 
 # ════════════════════════════════════════════
@@ -3541,6 +3674,114 @@ class TestPlanComparatorWindowEquivalence:
         assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
             f"ROW_NUMBER 默认 frame 应等价，实际 status={report.status}"
         )
+
+
+# ════════════════════════════════════════════
+# Task 4（B 类）— Filter 右侧谓词 tree 修复辅助测试
+# ════════════════════════════════════════════
+
+
+class TestFilterRightPredicateTreeAux:
+    """_flatten_filter_step dict 层辅助测试（非验收路径）。
+
+    直接测试 _flatten_filter_step 对右侧嵌套 Predicate tree 的 dict 输入的处理，
+    不经过 PlanComparator.compare() 全管道。
+    """
+
+    def test_right_is_predicate_tree_rendered(self):
+        """right 为嵌套 Predicate tree dict → 递归渲染为规范字符串。"""
+        step_dict = {
+            "step_type": "filter",
+            "step_id": "step_test",
+            "predicate": {
+                "left": {
+                    "table_ref": "od",
+                    "column_name": "amount",
+                    "normalized_name": "amount",
+                },
+                "operator": "EQ",
+                "right": {
+                    "left": {
+                        "table_ref": "od",
+                        "column_name": "threshold",
+                        "normalized_name": "threshold",
+                    },
+                    "operator": "GT",
+                    "right": {"value": 100},
+                },
+            },
+        }
+        result = PlanComparator._flatten_filter_step(step_dict)
+
+        assert result["left"] == "od.amount"
+        assert result["operator"] == "EQ"
+        # right 应为递归渲染后的规范字符串，而非空（原 bug 表现）
+        assert result["right"] == "(threshold GT 100)", (
+            f"右侧嵌套 Predicate tree 应递归渲染为规范字符串，"
+            f"实际 right={result['right']!r}"
+        )
+
+    def test_right_is_column_ref_unchanged(self):
+        """right 为 ColumnRef dict → 走原 _column_ref_to_string 路径（回归）。"""
+        step_dict = {
+            "step_type": "filter",
+            "step_id": "step_test",
+            "predicate": {
+                "left": {
+                    "table_ref": "od",
+                    "column_name": "amount",
+                    "normalized_name": "amount",
+                },
+                "operator": "GT",
+                "right": {
+                    "table_ref": "od",
+                    "column_name": "threshold",
+                    "normalized_name": "threshold",
+                },
+            },
+        }
+        result = PlanComparator._flatten_filter_step(step_dict)
+
+        # 普通 ColumnRef → 原路径，right 应为 "od.threshold"
+        assert result["right"] == "od.threshold", (
+            f"ColumnRef right 应走原 _column_ref_to_string 路径，"
+            f"实际 right={result['right']!r}"
+        )
+
+    def test_right_is_predicate_tree_left_is_predicate_tree(self):
+        """left 和 right 均为嵌套 Predicate tree → left 分支短路（原逻辑不变）。"""
+        step_dict = {
+            "step_type": "filter",
+            "step_id": "step_test",
+            "predicate": {
+                "left": {
+                    "left": {
+                        "table_ref": "t",
+                        "column_name": "a",
+                        "normalized_name": "a",
+                    },
+                    "operator": "GT",
+                    "right": {"value": "1"},
+                },
+                "operator": "AND",
+                "right": {
+                    "left": {
+                        "table_ref": "t",
+                        "column_name": "b",
+                        "normalized_name": "b",
+                    },
+                    "operator": "LT",
+                    "right": {"value": "10"},
+                },
+            },
+        }
+        result = PlanComparator._flatten_filter_step(step_dict)
+
+        # left 是 predicate tree → left 分支短路，operator 为 PREDICATE_TREE
+        assert result["operator"] == "PREDICATE_TREE"
+        assert result["left"] != ""
+        # right 应为空（PREDICATE_TREE 模式下无意义）
+        assert result["right"] == ""
 
 
 def _make_spark_window_step(expressions: list) -> SparkWindowStep:
