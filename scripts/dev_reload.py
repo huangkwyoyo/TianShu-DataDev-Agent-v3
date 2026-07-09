@@ -345,28 +345,43 @@ def kill_process(pid: int) -> bool:
         return False
 
 
-def _find_uvicorn_workers(project_root: Path) -> list[int]:
+def _find_uvicorn_workers(
+    project_root: Path,
+    known_parent_pids: set[int] | None = None,
+) -> list[int]:
     """查找所有属于本项目的 uvicorn worker 进程（不通过端口，通过命令行匹配）。
 
-    Windows 上 uvicorn reloader 的 worker 子进程可能不直接绑定端口，
-    导致 netstat 查不到。此函数通过扫描所有 Python 进程的命令行来补漏。
+    Windows 上 uvicorn reloader 的 worker 子进程通过 multiprocessing.spawn 启动，
+    命令行不含 "uvicorn" 或项目名，netstat 查不到。此函数分两个阶段补漏：
+
+    阶段 1：直接匹配 reloader/server 进程（命令行含 uvicorn + 项目名）
+    阶段 2：检测孤儿 worker——命令行含 multiprocessing.spawn + spawn_main
+            且 parent_pid 在 known_parent_pids 中（关联到本项目端口），父进程已死
+
+    Args:
+        project_root: 项目根目录
+        known_parent_pids: 已知的本项目 reloader PID 集合（含僵尸 PID）——
+                           仅其孤儿子进程会被阶段 2 匹配，避免误杀其他应用的 worker
 
     Returns:
         应被终止的 PID 列表
     """
     worker_pids: list[int] = []
     try:
-        ps_cmd = (
-            "powershell -NoProfile -Command "
-            "\"Get-CimInstance Win32_Process -Filter \\\"Name='python.exe'\\\" "
-            "| Select-Object ProcessId, CommandLine "
-            "| ForEach-Object { Write-Output \\\"$($_.ProcessId)|$($_.CommandLine)\\\" }\""
+        # PowerShell 脚本——避免 shell=True 的嵌套引号转义问题
+        ps_script = (
+            "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+            "Select-Object ProcessId, CommandLine | "
+            "ForEach-Object { Write-Output \"$($_.ProcessId)|$($_.CommandLine)\" }"
         )
         out = subprocess.check_output(
-            ps_cmd, shell=True, text=True, timeout=15,
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            text=True, timeout=15,
             stderr=subprocess.DEVNULL,
         )
         repo_name = project_root.name.lower()
+        import re
+
         for line in out.splitlines():
             line = line.strip()
             if not line or "|" not in line:
@@ -375,11 +390,28 @@ def _find_uvicorn_workers(project_root: Path) -> list[int]:
                 pid_str, cmdline = line.split("|", 1)
                 pid = int(pid_str.strip())
                 cmd_lower = cmdline.lower()
-                # 匹配 uvicorn worker 或本项目的 Python 进程
+                # 阶段 1：匹配 uvicorn reloader/server 进程
                 if "uvicorn" in cmd_lower and (
                     repo_name in cmd_lower or "tianshu" in cmd_lower
                 ):
                     worker_pids.append(pid)
+                    continue
+
+                # 阶段 2：检测孤儿 multiprocessing.spawn worker
+                # 命令行格式示例：
+                # python.exe -c "from multiprocessing.spawn import spawn_main;
+                #   spawn_main(parent_pid=23832, pipe_handle=412)" --multiprocessing-fork
+                if "multiprocessing.spawn" in cmd_lower and "spawn_main" in cmd_lower:
+                    match = re.search(r"parent_pid=(\d+)", cmdline)
+                    if match:
+                        parent_pid = int(match.group(1))
+                        # 安全检查：仅当 parent_pid 关联到本项目端口时才处理
+                        # 避免误杀其他应用的 multiprocessing worker
+                        if known_parent_pids and parent_pid not in known_parent_pids:
+                            continue
+                        if not _process_exists(parent_pid):
+                            # 父进程已死 → 孤儿 worker → 加入清理列表
+                            worker_pids.append(pid)
             except (ValueError, IndexError):
                 continue
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError):
@@ -390,10 +422,11 @@ def _find_uvicorn_workers(project_root: Path) -> list[int]:
 def stop_service(port: int, project_root: Path) -> tuple[int, list[str]]:
     """停止指定端口上的本项目 dev 进程。
 
-    三层清理策略（解决 Windows 上 uvicorn worker 不随 reloader 退出的问题）：
+    四层清理策略（解决 Windows 上 uvicorn worker 不随 reloader 退出的问题）：
     1. netstat LISTENING → 存活校验 → 白名单检查 → taskkill
-    2. 扫描所有 Python 进程命令行 → 匹配 uvicorn + 项目名 → taskkill
-    3. 等待后再次 netstat 确认——仍有存活 PID 则再次 taskkill
+    2. 扫描 multiprocessing.spawn 孤儿 worker（parent_pid 关联到本端口）
+    3. 二次验证——等待后重新检查端口 + 孤儿 worker
+    4. 兜底——再次扫描孤儿 worker（解决 reloader 被杀前瞬间 spawn 的竞态）
 
     Args:
         port: 目标端口
@@ -408,7 +441,8 @@ def stop_service(port: int, project_root: Path) -> tuple[int, list[str]]:
     # ════ 第 1 层：netstat 端口监听进程 ════
     # 启用存活校验——过滤掉 Windows netstat 的僵死 TCP 表项
     pids = parse_netstat_listeners(port, validate_liveness=True)
-    zombies = set(parse_netstat_listeners(port, validate_liveness=False)) - set(pids)
+    all_port_pids = set(parse_netstat_listeners(port, validate_liveness=False))
+    zombies = all_port_pids - set(pids)
     if zombies:
         print(f"  [检测] 端口 {port} 发现僵死 PID {sorted(zombies)}（netstat 残留，已自动忽略）")
 
@@ -422,10 +456,12 @@ def stop_service(port: int, project_root: Path) -> tuple[int, list[str]]:
         else:
             errors.append(f"终止 PID {pid} 失败（taskkill 返回非零）")
 
-    # ════ 第 2 层：扫描 uvicorn worker 进程 ════
-    # uvicorn reloader 的 worker 子进程可能不直接出现在 netstat 中
-    # 但它们的命令行包含 "uvicorn" 和项目名
-    worker_pids = _find_uvicorn_workers(project_root)
+    # ════ 第 2 层：扫描 orphan worker 进程 ════
+    # uvicorn reloader 的 worker 子进程通过 multiprocessing.spawn 启动，
+    # 不绑定端口、命令行不含项目名。通过 parent_pid 关联到本端口的 PID 来识别。
+    # all_port_pids 包含僵尸 PID——即使 reloader 已死，其孤儿 worker 的 parent_pid
+    # 仍在 all_port_pids 中，确保能被匹配到。
+    worker_pids = _find_uvicorn_workers(project_root, known_parent_pids=all_port_pids)
     for pid in worker_pids:
         if pid in pids:
             continue  # 已处理过
@@ -434,9 +470,10 @@ def stop_service(port: int, project_root: Path) -> tuple[int, list[str]]:
         else:
             errors.append(f"终止 worker PID {pid} 失败（taskkill 返回非零）")
 
-    # ════ 第 3 层：二次验证——等待后重新检查端口 ════
+    # ════ 第 3 层：二次验证——等待后重新检查 ════
     if killed > 0:
         time.sleep(1.0)
+        # 3a. 重新检查端口监听进程
         remaining = parse_netstat_listeners(port, validate_liveness=True)
         for pid in remaining:
             allowed, reason = check_whitelist(pid, port, project_root)
@@ -447,6 +484,19 @@ def stop_service(port: int, project_root: Path) -> tuple[int, list[str]]:
                 killed += 1
             else:
                 errors.append(f"终止残留 PID {pid} 失败（taskkill 返回非零）")
+
+    # ════ 第 4 层：兜底——再次扫描孤儿 worker ════
+    # 解决竞态：reloader 在被杀前瞬间 spawn 了新的 worker
+    # 此时新 worker 的 parent_pid 可能在第 2 层时仍存活（reloader 尚未被完全杀死），
+    # 需要等 reloader 确认死亡后重新扫描
+    orphan_pids = _find_uvicorn_workers(project_root, known_parent_pids=all_port_pids)
+    for pid in orphan_pids:
+        if pid in pids or pid in worker_pids:
+            continue  # 已处理过
+        if kill_process(pid):
+            killed += 1
+        else:
+            errors.append(f"终止孤儿 worker PID {pid} 失败（taskkill 返回非零）")
 
     return killed, errors
 
