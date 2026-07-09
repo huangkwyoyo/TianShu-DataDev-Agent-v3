@@ -110,6 +110,19 @@ def _auto_table_mapping(spec: ParsedDeveloperSpec) -> dict[str, str]:
     return mapping
 
 
+def _aliases_from_table_mapping(table_mapping: dict[str, str] | None) -> dict[str, str]:
+    """把 {别名: 物理表名} 反转为 {物理表名: 别名}。
+
+    供 SnapshotBuilder.build() 的 table_aliases 参数使用，
+    让快照 source_name（_inputs_index.json 的 key）与 PySpark 代码中的别名对齐。
+
+    多别名映射到同一物理表时后者覆盖前者（正常 1:1，不预期冲突）。
+    """
+    if not table_mapping:
+        return {}
+    return {physical: alias for alias, physical in table_mapping.items()}
+
+
 # ════════════════════════════════════════════
 # Phase 9A1: PipelineArtifactBundle——中间产物导出模型
 # ════════════════════════════════════════════
@@ -1306,6 +1319,7 @@ class Pipeline:
                                 contract_hash=contract_hash,
                                 source_tables=source_tables,
                                 provider=self._snapshot_provider,
+                                table_aliases=_aliases_from_table_mapping(table_mapping),
                             )
                             logger.info(
                                 "Snapshot 构建成功——snapshot_id=%s，文件数=%d",
@@ -1577,6 +1591,7 @@ class Pipeline:
                             contract_hash=contract_hash,
                             source_tables=source_tables,
                             provider=self._snapshot_provider,
+                            table_aliases=_aliases_from_table_mapping(table_mapping),
                         )
                         logger.info(
                             "Snapshot 构建成功——snapshot_id=%s，文件数=%d",

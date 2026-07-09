@@ -679,6 +679,22 @@ class TestSnapshotManifest:
 
 
 # ════════════════════════════════════════════
+# 反转辅助测试（Task 3）
+# ════════════════════════════════════════════
+
+
+def test_reverse_table_mapping_to_aliases():
+    """{别名: 物理} 反转为 {物理: 别名}——纯函数测试。"""
+    from tianshu_datadev.api.pipeline import _aliases_from_table_mapping
+    assert _aliases_from_table_mapping({"ft": "fact_trips_sample", "tz": "dim_taxi_zone"}) == {
+        "fact_trips_sample": "ft",
+        "dim_taxi_zone": "tz",
+    }
+    assert _aliases_from_table_mapping(None) == {}
+    assert _aliases_from_table_mapping({}) == {}
+
+
+# ════════════════════════════════════════════
 # SnapshotBuilder 别名 + 侧车索引测试（Task 1）
 # ════════════════════════════════════════════
 
