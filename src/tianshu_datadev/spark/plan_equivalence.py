@@ -606,8 +606,9 @@ def compare_window_steps(
     """对比 SQL WindowStep 与 Spark WindowStep 的结构等价性。
 
     等价条件：
-    1. 数量相同（通常为 1）
-    2. 每个窗口表达式的 (function, alias, partition_by, order_by) 等价
+    1. 数量相同
+    2. 每个窗口表达式的 (function, alias, input_column, partition_by, order_by, frame) 等价
+    3. order_by 保持顺序（ORDER BY a,b != ORDER BY b,a）
 
     Args:
         sql_windows: SQL 侧 WindowStep 的 model_dump 列表
@@ -645,10 +646,12 @@ def compare_window_steps(
             partition = tuple(sorted([
                 normalize_field_name(p) for p in (expr.get("partition_by", []) or [])
             ]))
-            order = tuple(sorted([
+            order = tuple([
                 normalize_field_name(o) for o in (expr.get("order_by", []) or [])
-            ]))
-            sql_exprs.add((func, alias, partition, order))
+            ])
+            frame = normalize_field_name(expr.get("frame", ""))
+            input_val = normalize_field_name(str(expr.get("input_column", "") or ""))
+            sql_exprs.add((func, alias, partition, order, frame, input_val))
 
     spark_exprs: set[tuple[str, ...]] = set()
     for w in spark_windows:
@@ -658,10 +661,12 @@ def compare_window_steps(
             partition = tuple(sorted([
                 normalize_field_name(p) for p in (expr.get("partition_by", []) or [])
             ]))
-            order = tuple(sorted([
+            order = tuple([
                 normalize_field_name(o) for o in (expr.get("order_by", []) or [])
-            ]))
-            spark_exprs.add((func, alias, partition, order))
+            ])
+            frame = normalize_field_name(expr.get("frame", ""))
+            input_val = normalize_field_name(str(expr.get("input_column", "") or ""))
+            spark_exprs.add((func, alias, partition, order, frame, input_val))
 
     if sql_exprs != spark_exprs:
         return StepEquivalenceResult(

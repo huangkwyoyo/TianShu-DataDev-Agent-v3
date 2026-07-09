@@ -703,7 +703,9 @@ class PlanComparator:
             return PlanComparator._flatten_aggregate_step(step_dict)
         if step_type == "case_when":
             return PlanComparator._flatten_case_when_step(step_dict)
-        # scan / sort / limit / window 的对比字段已在顶层，无需额外扁平化
+        if step_type == "window":
+            return PlanComparator._flatten_window_step(step_dict)
+        # scan / sort / limit 的对比字段已在顶层，无需额外扁平化
         return step_dict
 
     # ── 嵌套谓词支持（缺陷 2） ──
@@ -1147,6 +1149,146 @@ class PlanComparator:
                 # IS_NULL/IS_NOT_NULL：统一 right 为 <NULL> 占位符
                 # SQL 侧 right=None（flatten 后为 ""），Spark 侧可能为任意值
                 s["right"] = "<NULL>"
+
+    @staticmethod
+    def _render_frame_boundary(boundary: dict) -> str:
+        """渲染 FrameBoundary dict 为规范边界字符串。
+
+        例如：
+        {"kind": "UNBOUNDED_PRECEDING"} → "UNBOUNDED_PRECEDING"
+        {"kind": "CURRENT_ROW"} → "CURRENT_ROW"
+        {"kind": "N_PRECEDING", "offset": 3} → "3 PRECEDING"
+        """
+        if not boundary:
+            return "UNBOUNDED_PRECEDING"
+        kind = str(boundary.get("kind", "UNBOUNDED_PRECEDING")).upper()
+        offset = boundary.get("offset")
+        if kind == "N_PRECEDING" and offset is not None:
+            return f"{offset} PRECEDING"
+        if kind == "N_FOLLOWING" and offset is not None:
+            return f"{offset} FOLLOWING"
+        return kind
+
+    @staticmethod
+    def _render_sort_spec(spec) -> str:
+        """将 SortSpec dict 或字符串渲染为规范化排序字符串。
+
+        处理两种输入：
+        1. SortSpec dict: {"column": "salary", "direction": "ASC", "null_order": "LAST"}
+           → "salary ASC LAST"
+        2. 字符串: "salary ASC LAST"（已有 null_order）
+           或 "salary ASC"（无 null_order，按 SortSpec 默认值补）→ "salary ASC LAST"
+        """
+        if isinstance(spec, str):
+            spec_str = spec.strip()
+            upper_part = spec_str.upper()
+            # 检查是否已包含 null_order 信息
+            if upper_part.endswith(" FIRST") or upper_part.endswith(" LAST"):
+                return normalize_field_name(spec_str)
+            # 无 null_order，按 SortSpec 默认 NullOrder.LAST 补全
+            return normalize_field_name(f"{spec_str} LAST")
+        # SortSpec dict
+        column = spec.get("column", "")
+        direction = str(spec.get("direction", "ASC")).upper()
+        null_order = str(spec.get("null_order", "LAST")).upper()
+        return normalize_field_name(f"{column} {direction} {null_order}")
+
+    @staticmethod
+    def _flatten_expr_frame(expr: dict) -> None:
+        """统一窗口表达式中的 frame 字段为合并字符串格式 "type:start:end"。
+
+        处理两种格式：
+        1. Spark 分离格式：frame_type（字符串）+ frame_start（字符串）+ frame_end（字符串）
+        2. SQL WindowFrame dict 格式：frame 为 {"frame_type": ..., "start": {...}, "end": {...}}
+        """
+        # Spark 分离格式
+        frame_type = expr.pop("frame_type", None)
+        if frame_type is not None:
+            ft = str(frame_type).upper()
+            fs = str(expr.pop("frame_start", "unbounded_preceding")).upper()
+            fe = str(expr.pop("frame_end", "current_row")).upper()
+            expr["frame"] = f"{ft}:{fs}:{fe}"
+            return
+
+        # SQL WindowFrame dict 格式
+        frame = expr.pop("frame", None)
+        if isinstance(frame, dict):
+            ft = str(frame.get("frame_type", "RANGE")).upper()
+            fs = PlanComparator._render_frame_boundary(frame.get("start", {}))
+            fe = PlanComparator._render_frame_boundary(frame.get("end", {}))
+            expr["frame"] = f"{ft}:{fs}:{fe}"
+
+    @staticmethod
+    def _flatten_window_step(step_dict: dict[str, Any]) -> dict[str, Any]:
+        """扁平化 WindowStep——统一 window_exprs 和 expressions 两套字段格式。
+
+        SQL 侧（window_exprs）：
+        - partition_by: ColumnRef 列表 → 字符串列表
+        - order_by: SortSpec 列表 → 字符串列表（_render_sort_spec）
+        - input: ColumnRef dict → input_column 字符串
+        - frame: WindowFrame dict → "TYPE:START:END" 合并字符串
+
+        Spark 侧（expressions）：
+        - partition_by: 已是字符串列表 → normalize_field_name
+        - order_by: 已是字符串列表 → _render_sort_spec（补 null_order）
+        - input: dict → input_column 字符串
+        - frame_type/frame_start/frame_end → "TYPE:START:END" 合并字符串
+        """
+        result = dict(step_dict)
+
+        # Step 1: 处理 window_exprs（SQL 侧）
+        raw_exprs = result.get("window_exprs", []) or []
+        if raw_exprs:
+            flat_exprs = []
+            for expr in raw_exprs:
+                flat_expr = dict(expr) if isinstance(expr, dict) else expr
+                if isinstance(flat_expr, dict):
+                    # partition_by: ColumnRef dict 列表 → 字符串列表
+                    raw_p = flat_expr.pop("partition_by", []) or []
+                    flat_expr["partition_by"] = [
+                        normalize_field_name(str(p.get("normalized_name") or p.get("column_name", "")))
+                        for p in raw_p if isinstance(p, dict)
+                    ]
+                    # order_by: SortSpec dict 列表 → 字符串列表
+                    raw_o = flat_expr.pop("order_by", []) or []
+                    flat_expr["order_by"] = [PlanComparator._render_sort_spec(o) for o in raw_o if o]
+                    # input: ColumnRef dict → input_column 字符串
+                    raw_input = flat_expr.pop("input", None)
+                    if raw_input is not None and isinstance(raw_input, dict):
+                        name = raw_input.get("normalized_name", "") or raw_input.get("column_name", "")
+                        flat_expr["input_column"] = normalize_field_name(str(name))
+                    # frame: WindowFrame dict → 合并字符串
+                    PlanComparator._flatten_expr_frame(flat_expr)
+                flat_exprs.append(flat_expr)
+            result["window_exprs"] = flat_exprs
+
+        # Step 2: 处理 expressions（Spark 侧）
+        raw_exprs2 = result.get("expressions", []) or []
+        if raw_exprs2:
+            flat_exprs2 = []
+            for expr in raw_exprs2:
+                flat_expr = dict(expr) if isinstance(expr, dict) else expr
+                if isinstance(flat_expr, dict):
+                    # partition_by: 已是字符串列表 → normalize_field_name
+                    raw_p = flat_expr.pop("partition_by", []) or []
+                    flat_expr["partition_by"] = [normalize_field_name(str(p)) for p in raw_p if p]
+                    # order_by: 已是字符串列表 → _render_sort_spec
+                    raw_o = flat_expr.pop("order_by", []) or []
+                    flat_expr["order_by"] = [PlanComparator._render_sort_spec(o) for o in raw_o if o]
+                    # input_column 扁平化（Spark 侧 input_column 可能已为字符串）
+                    raw_input_expr = flat_expr.pop("input", None)
+                    if raw_input_expr is not None and isinstance(raw_input_expr, dict):
+                        name = raw_input_expr.get("normalized_name", "") or raw_input_expr.get("column_name", "")
+                        flat_expr["input_column"] = normalize_field_name(str(name))
+                    elif flat_expr.get("input_column") is not None:
+                        # 字符串格式的 input_column 无需进一步处理
+                        pass
+                    # frame: frame_type/frame_start/frame_end → 合并字符串
+                    PlanComparator._flatten_expr_frame(flat_expr)
+                flat_exprs2.append(flat_expr)
+            result["expressions"] = flat_exprs2
+
+        return result
 
     @staticmethod
     def _count_type(

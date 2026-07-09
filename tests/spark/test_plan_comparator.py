@@ -46,6 +46,7 @@ from tianshu_datadev.spark.models import (
     SparkSortSpec,
     SparkSortStep,
     SparkStepType,
+    SparkWindowStep,
 )
 from tianshu_datadev.spark.plan_comparator import (
     ComparisonStatus,
@@ -3033,3 +3034,445 @@ class TestExtractSparkStepData:
         assert steps[0]["left"] == "amount"
         assert steps[0]["operator"] == "GT"
         assert steps[0]["right"] == "threshold"
+
+
+# ════════════════════════════════════════════
+# C 类验收测试——Window frame 字段统一合并（Task 2）
+# ════════════════════════════════════════════
+
+
+class TestPlanComparatorWindowEquivalence:
+    """Window 逻辑等价性对比——全管道集成测试（真实模型）。
+
+    覆盖 frame 合并/input_column 扁平化/order_by 空值处理。
+    """
+
+    def test_window_frame_equivalent(self):
+        """SQL WindowFrame dict + Spark frame_type/frame_start/frame_end → frame 合并后等价。"""
+        from tianshu_datadev.planning.models import (
+            WindowExpr,
+            WindowFrame,
+            WindowFrameType,
+            FrameBoundary,
+            FrameBoundaryKind,
+            WindowFunction,
+            ColumnRef,
+            SortSpec,
+            SortDirection,
+        )
+        from tianshu_datadev.planning.sql_build_plan import WindowStep
+        from tianshu_datadev.spark.models import (
+            SparkWindowExpr,
+            SparkWindowFunction,
+        )
+
+        # SQL 侧：使用 WindowFrame dict
+        sql_window = WindowStep(
+            step_type="window", step_id="step_win_001",
+            window_exprs=[
+                WindowExpr(
+                    function=WindowFunction.SUM_OVER,
+                    alias="total",
+                    input=ColumnRef(
+                        table_ref="od", column_name="amount", normalized_name="amount",
+                    ),
+                    partition_by=[
+                        ColumnRef(
+                            table_ref="od", column_name="dept_id", normalized_name="dept_id",
+                        ),
+                    ],
+                    order_by=[SortSpec(column="salary", direction=SortDirection.ASC)],
+                    frame=WindowFrame(
+                        frame_type=WindowFrameType.ROWS,
+                        start=FrameBoundary(kind=FrameBoundaryKind.UNBOUNDED_PRECEDING),
+                        end=FrameBoundary(kind=FrameBoundaryKind.CURRENT_ROW),
+                    ),
+                ),
+            ],
+        )
+        sql_plan = _make_sql_plan([_make_sql_scan_step(), sql_window])
+
+        # Spark 侧：使用分离 frame 字符串字段
+        spark_window = _make_spark_window_step(
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.SUM_OVER,
+                    alias="total",
+                    input_column="amount",
+                    partition_by=["dept_id"],
+                    order_by=["salary ASC LAST"],
+                    frame_type="ROWS",
+                    frame_start="unbounded_preceding",
+                    frame_end="current_row",
+                ),
+            ],
+        )
+        spark_plan = _make_spark_plan([_make_spark_read_step(), spark_window])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+            f"相同 frame 应等价，实际 status={report.status}, "
+            f"results={[(r.step_type, r.verdict.value) for r in report.step_results]}"
+        )
+
+    def test_window_frame_diff_not_equivalent(self):
+        """SQL ROWS vs Spark RANGE → LOGIC_MISMATCH。"""
+        from tianshu_datadev.planning.models import (
+            WindowExpr,
+            WindowFrame,
+            WindowFrameType,
+            FrameBoundary,
+            FrameBoundaryKind,
+            WindowFunction,
+            ColumnRef,
+            SortSpec,
+            SortDirection,
+        )
+        from tianshu_datadev.planning.sql_build_plan import WindowStep
+        from tianshu_datadev.spark.models import (
+            SparkWindowExpr,
+            SparkWindowFunction,
+        )
+
+        sql_window = WindowStep(
+            step_type="window", step_id="step_win_001",
+            window_exprs=[
+                WindowExpr(
+                    function=WindowFunction.SUM_OVER,
+                    alias="total",
+                    input=ColumnRef(
+                        table_ref="od", column_name="amount", normalized_name="amount",
+                    ),
+                    partition_by=[
+                        ColumnRef(
+                            table_ref="od", column_name="dept_id", normalized_name="dept_id",
+                        ),
+                    ],
+                    order_by=[SortSpec(column="salary", direction=SortDirection.ASC)],
+                    frame=WindowFrame(
+                        frame_type=WindowFrameType.ROWS,
+                        start=FrameBoundary(kind=FrameBoundaryKind.UNBOUNDED_PRECEDING),
+                        end=FrameBoundary(kind=FrameBoundaryKind.CURRENT_ROW),
+                    ),
+                ),
+            ],
+        )
+        sql_plan = _make_sql_plan([_make_sql_scan_step(), sql_window])
+
+        # Spark 侧：使用 RANGE（与 SQL 的 ROWS 不同）
+        spark_window = _make_spark_window_step(
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.SUM_OVER,
+                    alias="total",
+                    input_column="amount",
+                    partition_by=["dept_id"],
+                    order_by=["salary ASC LAST"],
+                    frame_type="RANGE",
+                    frame_start="unbounded_preceding",
+                    frame_end="current_row",
+                ),
+            ],
+        )
+        spark_plan = _make_spark_plan([_make_spark_read_step(), spark_window])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_MISMATCH, (
+            f"ROWS vs RANGE 应不等价，实际 status={report.status}"
+        )
+
+    def test_window_order_reversed_not_equivalent(self):
+        """ORDER BY salary DESC, name ASC vs name ASC, salary DESC → LOGIC_MISMATCH。"""
+        from tianshu_datadev.planning.models import (
+            WindowExpr,
+            WindowFrame,
+            WindowFrameType,
+            FrameBoundary,
+            FrameBoundaryKind,
+            WindowFunction,
+            ColumnRef,
+            SortSpec,
+            SortDirection,
+        )
+        from tianshu_datadev.planning.sql_build_plan import WindowStep
+        from tianshu_datadev.spark.models import (
+            SparkWindowExpr,
+            SparkWindowFunction,
+        )
+
+        sql_window = WindowStep(
+            step_type="window", step_id="step_win_002",
+            window_exprs=[
+                WindowExpr(
+                    function=WindowFunction.SUM_OVER,
+                    alias="total",
+                    input=ColumnRef(
+                        table_ref="od", column_name="amount", normalized_name="amount",
+                    ),
+                    partition_by=[
+                        ColumnRef(
+                            table_ref="od", column_name="dept_id", normalized_name="dept_id",
+                        ),
+                    ],
+                    order_by=[
+                        SortSpec(column="salary", direction=SortDirection.DESC),
+                        SortSpec(column="name", direction=SortDirection.ASC),
+                    ],
+                    frame=WindowFrame(
+                        frame_type=WindowFrameType.ROWS,
+                        start=FrameBoundary(kind=FrameBoundaryKind.UNBOUNDED_PRECEDING),
+                        end=FrameBoundary(kind=FrameBoundaryKind.CURRENT_ROW),
+                    ),
+                ),
+            ],
+        )
+        sql_plan = _make_sql_plan([_make_sql_scan_step(), sql_window])
+
+        # Spark 侧：顺序相反
+        spark_window = _make_spark_window_step(
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.SUM_OVER,
+                    alias="total",
+                    input_column="amount",
+                    partition_by=["dept_id"],
+                    order_by=["name ASC LAST", "salary DESC LAST"],
+                    frame_type="ROWS",
+                    frame_start="unbounded_preceding",
+                    frame_end="current_row",
+                ),
+            ],
+        )
+        spark_plan = _make_spark_plan([_make_spark_read_step(), spark_window])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_MISMATCH, (
+            f"ORDER BY 顺序不同应不等价，实际 status={report.status}"
+        )
+
+    def test_window_input_column_diff_not_equivalent(self):
+        """SUM(amount) vs SUM(discount) → LOGIC_MISMATCH。"""
+        from tianshu_datadev.planning.models import (
+            WindowExpr,
+            WindowFrame,
+            WindowFrameType,
+            FrameBoundary,
+            FrameBoundaryKind,
+            WindowFunction,
+            ColumnRef,
+            SortSpec,
+            SortDirection,
+        )
+        from tianshu_datadev.planning.sql_build_plan import WindowStep
+        from tianshu_datadev.spark.models import (
+            SparkWindowExpr,
+            SparkWindowFunction,
+        )
+
+        sql_window = WindowStep(
+            step_type="window", step_id="step_win_003",
+            window_exprs=[
+                WindowExpr(
+                    function=WindowFunction.SUM_OVER,
+                    alias="total",
+                    input=ColumnRef(
+                        table_ref="od", column_name="amount", normalized_name="amount",
+                    ),
+                    partition_by=[
+                        ColumnRef(
+                            table_ref="od", column_name="dept_id", normalized_name="dept_id",
+                        ),
+                    ],
+                    order_by=[SortSpec(column="salary", direction=SortDirection.ASC)],
+                    frame=WindowFrame(
+                        frame_type=WindowFrameType.ROWS,
+                        start=FrameBoundary(kind=FrameBoundaryKind.UNBOUNDED_PRECEDING),
+                        end=FrameBoundary(kind=FrameBoundaryKind.CURRENT_ROW),
+                    ),
+                ),
+            ],
+        )
+        sql_plan = _make_sql_plan([_make_sql_scan_step(), sql_window])
+
+        # Spark 侧：input_column 为 "discount"（与 SQL 的 "amount" 不同）
+        spark_window = _make_spark_window_step(
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.SUM_OVER,
+                    alias="total",
+                    input_column="discount",
+                    partition_by=["dept_id"],
+                    order_by=["salary ASC LAST"],
+                    frame_type="ROWS",
+                    frame_start="unbounded_preceding",
+                    frame_end="current_row",
+                ),
+            ],
+        )
+        spark_plan = _make_spark_plan([_make_spark_read_step(), spark_window])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_MISMATCH, (
+            f"不同 input_column 应不等价，实际 status={report.status}"
+        )
+
+    def test_window_full_equivalent(self):
+        """完整 window（partition + order + frame + input）→ LOGIC_EQUIVALENT。"""
+        from tianshu_datadev.planning.models import (
+            WindowExpr,
+            WindowFrame,
+            WindowFrameType,
+            FrameBoundary,
+            FrameBoundaryKind,
+            WindowFunction,
+            ColumnRef,
+            SortSpec,
+            SortDirection,
+        )
+        from tianshu_datadev.planning.sql_build_plan import WindowStep
+        from tianshu_datadev.spark.models import (
+            SparkWindowExpr,
+            SparkWindowFunction,
+        )
+
+        # 完整的三个窗口表达式
+        sql_window = WindowStep(
+            step_type="window", step_id="step_win_full",
+            window_exprs=[
+                WindowExpr(
+                    function=WindowFunction.SUM_OVER,
+                    alias="total_amt",
+                    input=ColumnRef(
+                        table_ref="od", column_name="amount", normalized_name="amount",
+                    ),
+                    partition_by=[
+                        ColumnRef(
+                            table_ref="od", column_name="dept_id", normalized_name="dept_id",
+                        ),
+                    ],
+                    order_by=[SortSpec(column="salary", direction=SortDirection.ASC)],
+                    frame=WindowFrame(
+                        frame_type=WindowFrameType.ROWS,
+                        start=FrameBoundary(kind=FrameBoundaryKind.UNBOUNDED_PRECEDING),
+                        end=FrameBoundary(kind=FrameBoundaryKind.CURRENT_ROW),
+                    ),
+                ),
+                WindowExpr(
+                    function=WindowFunction.RANK,
+                    alias="rnk",
+                    partition_by=[
+                        ColumnRef(
+                            table_ref="od", column_name="dept_id", normalized_name="dept_id",
+                        ),
+                    ],
+                    order_by=[SortSpec(column="salary", direction=SortDirection.DESC)],
+                    frame=WindowFrame(
+                        frame_type=WindowFrameType.ROWS,
+                        start=FrameBoundary(kind=FrameBoundaryKind.UNBOUNDED_PRECEDING),
+                        end=FrameBoundary(kind=FrameBoundaryKind.CURRENT_ROW),
+                    ),
+                ),
+            ],
+        )
+        sql_plan = _make_sql_plan([_make_sql_scan_step(), sql_window])
+
+        spark_window = _make_spark_window_step(
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.SUM_OVER,
+                    alias="total_amt",
+                    input_column="amount",
+                    partition_by=["dept_id"],
+                    order_by=["salary ASC LAST"],
+                    frame_type="ROWS",
+                    frame_start="unbounded_preceding",
+                    frame_end="current_row",
+                ),
+                SparkWindowExpr(
+                    function=SparkWindowFunction.RANK,
+                    alias="rnk",
+                    partition_by=["dept_id"],
+                    order_by=["salary DESC LAST"],
+                ),
+            ],
+        )
+        spark_plan = _make_spark_plan([_make_spark_read_step(), spark_window])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+            f"完整 window 应等价，实际 status={report.status}, "
+            f"results={[(r.step_type, r.verdict.value) for r in report.step_results]}"
+        )
+
+    def test_window_no_frame_no_partition(self):
+        """无 partition 的 ROW_NUMBER 使用默认 frame → 不崩溃，等价。"""
+        from tianshu_datadev.planning.models import (
+            WindowExpr,
+            WindowFrame,
+            WindowFrameType,
+            FrameBoundary,
+            FrameBoundaryKind,
+            WindowFunction,
+        )
+        from tianshu_datadev.planning.sql_build_plan import WindowStep
+        from tianshu_datadev.spark.models import (
+            SparkWindowExpr,
+            SparkWindowFunction,
+        )
+
+        # SQL 侧：ROW_NUMBER 无 partition，使用默认 frame
+        sql_window = WindowStep(
+            step_type="window", step_id="step_win_no",
+            window_exprs=[
+                WindowExpr(
+                    function=WindowFunction.ROW_NUMBER,
+                    alias="rn",
+                    frame=WindowFrame(
+                        frame_type=WindowFrameType.ROWS,
+                        start=FrameBoundary(kind=FrameBoundaryKind.UNBOUNDED_PRECEDING),
+                        end=FrameBoundary(kind=FrameBoundaryKind.CURRENT_ROW),
+                    ),
+                ),
+            ],
+        )
+        sql_plan = _make_sql_plan([_make_sql_scan_step(), sql_window])
+
+        # Spark 侧：使用 frame 默认值
+        spark_window = _make_spark_window_step(
+            expressions=[
+                SparkWindowExpr(
+                    function=SparkWindowFunction.ROW_NUMBER,
+                    alias="rn",
+                    frame_type="ROWS",
+                    frame_start="unbounded_preceding",
+                    frame_end="current_row",
+                ),
+            ],
+        )
+        spark_plan = _make_spark_plan([_make_spark_read_step(), spark_window])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+            f"ROW_NUMBER 默认 frame 应等价，实际 status={report.status}"
+        )
+
+
+def _make_spark_window_step(expressions: list) -> SparkWindowStep:
+    """构造最小 SparkWindowStep。"""
+    return SparkWindowStep(
+        step_type=SparkStepType.WINDOW,
+        input_alias="od",
+        expressions=expressions,
+    )
