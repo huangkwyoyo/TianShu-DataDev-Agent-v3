@@ -372,3 +372,54 @@ class TestExecutorBehavior:
             f"注入顺序错误: rlimit={rlimit_pos}, inputs={inputs_pos}, "
             f"user={user_pos}, transform={transform_pos}"
         )
+
+    def test_prologue_reads_inputs_index_before_glob(self):
+        """prologue 优先读 _inputs_index.json，回退 glob——两条路径都在模板里。"""
+        from tianshu_datadev.spark.executor import _SPARK_PROLOGUE_TEMPLATE
+
+        tpl = _SPARK_PROLOGUE_TEMPLATE
+        # 索引优先分支
+        assert "_inputs_index.json" in tpl
+        # 回退分支保留
+        assert "*.parquet" in tpl
+        # 索引读取用 json
+        assert "json" in tpl
+
+
+# ════════════════════════════════════════════
+# 真实 PySpark 集成测试（有 pyspark 守卫）
+# ════════════════════════════════════════════
+
+
+def test_execute_loads_inputs_by_alias_from_index():
+    """真实子进程：写 parquet + _inputs_index.json，按别名装载 inputs['ft'] 可解析。"""
+    import pytest
+    pytest.importorskip("pyspark")
+    import json
+    import tempfile
+    from pathlib import Path
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from tianshu_datadev.spark.executor import LocalSparkExecutor
+
+    with tempfile.TemporaryDirectory(prefix="tianshu_test_snap_") as tmp_dir:
+        data_dir = Path(tmp_dir) / "snap"
+        data_dir.mkdir()
+        # 磁盘物理名 fact_trips_sample.parquet——与索引中的别名 ft 不同
+        pq.write_table(
+            pa.table({"amount": [1, 2, 3]}),
+            str(data_dir / "fact_trips_sample.parquet"),
+        )
+        # 索引把别名 ft 指向物理文件
+        (data_dir / "_inputs_index.json").write_text(
+            json.dumps({"ft": "fact_trips_sample.parquet"}), encoding="utf-8"
+        )
+
+        executor = LocalSparkExecutor()
+        # transform 函数接收 inputs 字典，用别名 ft 取数据——修复前会 KeyError
+        code = """
+def transform(inputs):
+    return inputs['ft']
+"""
+        result = executor.execute(code, data_dir=str(data_dir))
+        assert result.status.name == "SUCCESS", result.error_message

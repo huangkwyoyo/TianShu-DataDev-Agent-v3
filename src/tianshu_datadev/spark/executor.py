@@ -129,7 +129,7 @@ _ALLOWED_ENV_VARS: frozenset[str] = frozenset({
 # ── Spark 初始化注入代码——注入到子进程脚本开头，在资源限制之后执行 ──
 
 _SPARK_PROLOGUE_TEMPLATE = '''# ── Executor 注入：Spark 初始化 + 数据加载 ──
-import os as _tianshu_os, glob as _tianshu_glob
+import os as _tianshu_os, glob as _tianshu_glob, json as _tianshu_json
 from pyspark.sql import SparkSession as _TianShuSpark, functions as F
 _tianshu_builder = _TianShuSpark.builder
 _tianshu_builder = _tianshu_builder.appName("tianshu_executor")
@@ -137,14 +137,25 @@ _tianshu_builder = _tianshu_builder.master("local[1]")
 _tianshu_builder = _tianshu_builder.config("spark.ui.enabled", "false")
 _tianshu_builder = _tianshu_builder.config("spark.sql.adaptive.enabled", "false")
 _tianshu_spark = _tianshu_builder.getOrCreate()
-# 构造 inputs 字典——按快照文件名 stem 映射为 transform 的输入参数
+# 构造 inputs 字典——优先读快照侧车索引（key=别名），无索引时回退按文件名 stem
 inputs: dict = {}
 _data_dir = _tianshu_os.environ.get("SPARK_DATA_DIR", "")
 if _data_dir and _tianshu_os.path.isdir(_data_dir):
-    _files = sorted(_tianshu_glob.glob(_tianshu_os.path.join(_data_dir, "*.parquet")))
-    for _f in _files:
-        _name = _tianshu_os.path.splitext(_tianshu_os.path.basename(_f))[0]
-        inputs[_name] = _tianshu_spark.read.parquet(_f)
+    _index_path = _tianshu_os.path.join(_data_dir, "_inputs_index.json")
+    if _tianshu_os.path.isfile(_index_path):
+        # 索引路径：{别名: 物理文件名}——按别名装载，与 PySpark 代码 inputs[别名] 对齐
+        with open(_index_path, "r", encoding="utf-8") as _idx_f:
+            _index = _tianshu_json.load(_idx_f)
+        for _key, _fname in _index.items():
+            inputs[_key] = _tianshu_spark.read.parquet(
+                _tianshu_os.path.join(_data_dir, _fname)
+            )
+    else:
+        # 回退路径：无索引的旧快照——按文件名 stem 做 key（向后兼容）
+        _files = sorted(_tianshu_glob.glob(_tianshu_os.path.join(_data_dir, "*.parquet")))
+        for _f in _files:
+            _name = _tianshu_os.path.splitext(_tianshu_os.path.basename(_f))[0]
+            inputs[_name] = _tianshu_spark.read.parquet(_f)
 '''
 
 # ── 资源限制注入代码（Unix 路径——注入到子进程脚本开头） ──
