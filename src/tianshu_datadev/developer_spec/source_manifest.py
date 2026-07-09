@@ -204,13 +204,30 @@ class SourceManifestBuilder:
             # 提取主键（来自 key_columns 中标记 unique=True 的字段）
             primary_key = [c.column_name for c in input_t.key_columns if c.unique]
 
+            # 提取 key_column_names_normalized——所有 key_columns 列名的归一化形式
+            key_column_names_normalized = [
+                self._normalizer.normalize(c.column_name)
+                for c in input_t.key_columns
+            ]
+
+            # 合并 unique_keys ——调用模块级纯函数
+            pk_as_list = [primary_key] if primary_key else None
+            unique_keys = _merge_unique_keys_from_sources(
+                pk_as_list,              # 来源 1：primary_key
+                input_t.unique_keys,     # 来源 2：YAML 显式声明
+                normalizer=self._normalizer,
+            )
+
             tables.append(ManifestTable(
                 table_ref=input_t.table_alias,
                 source_table=input_t.source_table,
                 columns=columns,
                 primary_key=primary_key if primary_key else None,
                 foreign_keys=None,  # DeveloperSpec 不声明外键，由 SchemaRegistry 补充
+                unique_keys=unique_keys if unique_keys else None,
                 estimated_row_count=input_t.row_count,
+                role=input_t.role,                                  # ── V2 新增
+                key_column_names_normalized=key_column_names_normalized,  # ── V2 新增
             ))
 
         return tables
@@ -308,6 +325,23 @@ class SourceManifestBuilder:
                         enum_values=reg_col.get("enum_values"),
                         source=FieldSource.SCHEMA_REGISTRY,
                     ))
+
+            # 从 SchemaRegistry 补充 unique_keys（合并而非覆盖）—— V2：用模块级纯函数
+            reg_unique_keys = registry_meta.get("unique_keys")
+            reg_pk = registry_meta.get("primary_key")
+            reg_pk_as_list = [reg_pk] if reg_pk and isinstance(reg_pk, list) and len(reg_pk) > 0 else None
+
+            # 合并 registry 侧的 unique_keys + primary_key
+            reg_merged = _merge_unique_keys_from_sources(
+                reg_unique_keys, reg_pk_as_list, normalizer=self._normalizer,
+            )
+            if reg_merged:
+                existing = table.unique_keys or []
+                all_merged = _merge_unique_keys_from_sources(
+                    existing, reg_merged, normalizer=self._normalizer,
+                )
+                if all_merged:
+                    object.__setattr__(table, "unique_keys", all_merged)
 
         return conflicts, anomalies
 
@@ -509,12 +543,33 @@ def build_manifest_from_spec(spec: ParsedDeveloperSpec) -> SourceManifest:
             for s in spec.output_spec.sort:
                 _add(s.column)
 
+        # 提取主键（来自 key_columns 中标记 unique=True 的字段）
+        primary_key = [c.column_name for c in t.key_columns if c.unique]
+
+        # 提取 key_column_names_normalized
+        key_column_names_normalized = [
+            FieldNormalizer().normalize(c.column_name)
+            for c in t.key_columns
+        ]
+
+        # 合并 unique_keys ——调用模块级纯函数
+        pk_as_list = [primary_key] if primary_key else None
+        unique_keys = _merge_unique_keys_from_sources(
+            pk_as_list,
+            t.unique_keys,
+            normalizer=FieldNormalizer(),
+        )
+
         tables.append(
             ManifestTable(
                 table_ref=t.table_alias,
                 source_table=t.source_table,
                 columns=cols,
+                primary_key=primary_key if primary_key else None,
+                unique_keys=unique_keys if unique_keys else None,
                 estimated_row_count=t.row_count,
+                role=t.role,                                      # ── V2 新增
+                key_column_names_normalized=key_column_names_normalized,  # ── V2 新增
             )
         )
     return SourceManifest(
