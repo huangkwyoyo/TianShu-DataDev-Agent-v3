@@ -346,9 +346,21 @@ class TestSparkStageContextUnit:
         ctx = SparkStageContext()
         assert ctx.spark_plan is None
         assert ctx.compile_result is None
+        assert ctx.standalone_pyspark is None
+        assert ctx.sandbox_transform_code is None
         assert ctx.comparator_report is None
         assert ctx.stage_results == {}
         assert ctx.errors == []
+
+    def test_sandbox_transform_code_independent(self):
+        """验证 sandbox_transform_code 与 standalone_pyspark 独立。"""
+        ctx = SparkStageContext()
+        ctx.standalone_pyspark = "# standalone wrapper with spark.read.csv"
+        ctx.sandbox_transform_code = "def transform(inputs, params=None):\n    ..."
+        # 两个字段应独立存储
+        assert "spark.read.csv" in ctx.standalone_pyspark
+        assert "spark.read" not in ctx.sandbox_transform_code
+        assert "def transform" in ctx.sandbox_transform_code
 
     def test_mutable_stage_results(self):
         """验证 stage_results 是可变的且独立于实例。"""

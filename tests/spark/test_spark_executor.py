@@ -329,3 +329,46 @@ class TestExecutorBehavior:
         assert rlimit_pos < start_marker_pos, (
             "资源限制应在输出收集器之前注入"
         )
+
+    def test_prologue_creates_inputs_dict(self):
+        """验证 executor prologue 构造 inputs 字典而非 input_df。"""
+        from tianshu_datadev.spark.executor import _SPARK_PROLOGUE_TEMPLATE
+
+        # prologue 应包含 inputs 字典构造逻辑
+        assert "inputs: dict = {}" in _SPARK_PROLOGUE_TEMPLATE
+        assert "inputs[_name] = _tianshu_spark.read.parquet(_f)" in _SPARK_PROLOGUE_TEMPLATE
+        # 不应再使用旧的 input_df 变量名
+        assert "input_df" not in _SPARK_PROLOGUE_TEMPLATE
+
+    def test_output_collector_calls_transform(self):
+        """验证输出收集器调用 transform(inputs) 获取结果。"""
+        from tianshu_datadev.spark.executor import _OUTPUT_COLLECTOR_TEMPLATE
+
+        # 输出收集器应调用 transform(inputs) 并赋值给 result_df
+        assert "result_df = transform(inputs)" in _OUTPUT_COLLECTOR_TEMPLATE
+        # 不应再有 {output_var} 占位符——transform 调用已固定
+        assert "{output_var}" not in _OUTPUT_COLLECTOR_TEMPLATE
+
+    def test_instrumentation_order_correct(self):
+        """验证注入顺序——prologue（inputs）在用户代码之前，collector 在之后。"""
+        user_code = "tf = inputs['test_fact']\nresult = tf.filter(F.col('x') > 0)"
+        executor = LocalSparkExecutor()
+
+        # 按 execute() 方法的注入顺序
+        instrumented = _inject_output_collector(user_code)
+        instrumented = executor._inject_spark_prologue(instrumented)
+        instrumented = executor._inject_resource_limits(instrumented)
+
+        # 资源限制在最前
+        rlimit_pos = instrumented.index("RLIMIT_CPU")
+        # inputs dict 在资源限制之后
+        inputs_pos = instrumented.index("inputs: dict = {}")
+        # transform 调用在用户代码之后
+        transform_pos = instrumented.index("result_df = transform(inputs)")
+        # 用户代码在 inputs dict 和 transform 调用之间
+        user_pos = instrumented.index("tf = inputs['test_fact']")
+
+        assert rlimit_pos < inputs_pos < user_pos < transform_pos, (
+            f"注入顺序错误: rlimit={rlimit_pos}, inputs={inputs_pos}, "
+            f"user={user_pos}, transform={transform_pos}"
+        )

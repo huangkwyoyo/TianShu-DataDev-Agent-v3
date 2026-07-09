@@ -2752,7 +2752,7 @@ class Pipeline:
         wrapper_lines.append("    # ======================")
         wrapper_lines.append("    # 2. 执行转换")
         wrapper_lines.append("    # ======================")
-        wrapper_lines.append("    result = transform(inputs)")
+        wrapper_lines.append("    result = transform(inputs, params=None)")
         wrapper_lines.append("")
         # ── Phase 8B: 追加静态字段解读注释（仅注释块，不进可执行代码）──
         if context.annotation_result and context.annotation_result.annotations:
@@ -2772,6 +2772,8 @@ class Pipeline:
         wrapper_lines.append("    spark.stop()")
 
         context.standalone_pyspark = "\n".join(wrapper_lines)
+        # ── 存储沙箱可执行代码（纯 transform 函数，供 PhysicalVerifier 传入 executor）──
+        context.sandbox_transform_code = result.raw_pyspark
 
     def _do_spark_validate(self, context: SparkStageContext) -> None:
         """执行 VALIDATOR 阶段——PySpark DSL 安全校验。"""
@@ -2861,11 +2863,11 @@ class Pipeline:
             return
 
         # Step 2：检查必要产物
-        if context.standalone_pyspark is None:
-            context.stage_results["PHYSICAL_VERIFIER"] = "SKIPPED"
+        if context.sandbox_transform_code is None:
+            context.stage_results["PHYSICAL_VERIFIER"] = "FAILURE"
             context.errors.append(
-                "[PHYSICAL_VERIFIER] SKIPPED: 缺少 PySpark 编译产物（standalone_pyspark）——"
-                "请先执行 COMPILER 阶段"
+                "[PHYSICAL_VERIFIER] 错误: 缺少沙箱可执行 PySpark 编译产物（sandbox_transform_code）——"
+                "请先执行 COMPILER 阶段。不得 fallback 到 standalone_pyspark。"
             )
             return
 
@@ -2924,7 +2926,7 @@ class Pipeline:
             verifier = PhysicalVerifier()
             report = verifier.verify(
                 sql_query=sql_query,
-                pyspark_code=context.standalone_pyspark,
+                pyspark_code=context.sandbox_transform_code,
                 snapshot_dir=snapshot_dir,
                 contract_hash=contract_hash,
                 snapshot_id=snapshot_id,
@@ -3034,7 +3036,8 @@ class SparkStageContext:
     """
     spark_plan: "SparkPlan | None" = None
     compile_result: "SparkCompileResult | None" = None
-    standalone_pyspark: str | None = None  # 独立可执行 PySpark 脚本（含 SparkSession 引导）
+    standalone_pyspark: str | None = None  # 独立可执行 PySpark 脚本（含 SparkSession 引导，仅人审 artifact）
+    sandbox_transform_code: str | None = None  # 沙箱可执行 PySpark 代码（纯 transform 函数，不含 spark.read）
     comparator_report: "PlanComparisonReport | None" = None
     # ── Phase 8: DEVELOPER 阶段产物缓存 ──
     annotation_result: "AnnotatedSparkPlan | None" = None

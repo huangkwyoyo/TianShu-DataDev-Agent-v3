@@ -136,15 +136,14 @@ _tianshu_builder = _tianshu_builder.master("local[1]")
 _tianshu_builder = _tianshu_builder.config("spark.ui.enabled", "false")
 _tianshu_builder = _tianshu_builder.config("spark.sql.adaptive.enabled", "false")
 _tianshu_spark = _tianshu_builder.getOrCreate()
+# 构造 inputs 字典——按快照文件名 stem 映射为 transform 的输入参数
+inputs: dict = {}
 _data_dir = _tianshu_os.environ.get("SPARK_DATA_DIR", "")
 if _data_dir and _tianshu_os.path.isdir(_data_dir):
     _files = sorted(_tianshu_glob.glob(_tianshu_os.path.join(_data_dir, "*.parquet")))
-    if _files:
-        input_df = _tianshu_spark.read.parquet(*_files)
-    else:
-        input_df = _tianshu_spark.createDataFrame([], "id string")
-else:
-    input_df = _tianshu_spark.createDataFrame([], "id string")
+    for _f in _files:
+        _name = _tianshu_os.path.splitext(_tianshu_os.path.basename(_f))[0]
+        inputs[_name] = _tianshu_spark.read.parquet(_f)
 '''
 
 # ── 资源限制注入代码（Unix 路径——注入到子进程脚本开头） ──
@@ -194,8 +193,9 @@ _OUTPUT_COLLECTOR_TEMPLATE = """
 # ── Executor 注入：结果收集 ──
 import json, sys as _exec_sys
 
-_result_df = {output_var}
-_rows = _result_df.toJSON().collect()
+# 调用编译器产出的 transform 函数——传入 executor prologue 构造的 inputs 字典
+result_df = transform(inputs)
+_rows = result_df.toJSON().collect()
 _exec_sys.stdout.write("{start_marker}\\n")
 for _row_json in _rows:
     _exec_sys.stdout.write(_row_json + "\\n")
@@ -205,17 +205,16 @@ _exec_sys.stdout.flush()
 
 
 def _inject_output_collector(code: str, output_var: str = "result_df") -> str:
-    """在 PySpark 代码末尾注入输出收集器——将指定变量序列化为 JSON 行。
+    """在 PySpark 代码末尾注入输出收集器——调用 transform(inputs) 并序列化结果为 JSON 行。
 
     Args:
         code: 原始 PySpark 代码
-        output_var: 最终 DataFrame 变量名
+        output_var: 保留参数，向后兼容（新模板固定使用 result_df）
 
     Returns:
         注入后的代码
     """
     collector = _OUTPUT_COLLECTOR_TEMPLATE.format(
-        output_var=output_var,
         start_marker=_OUTPUT_START_MARKER,
         end_marker=_OUTPUT_END_MARKER,
     )
@@ -475,10 +474,10 @@ class LocalSparkExecutor:
         注入内容：
         - 创建 local[1] 模式的 SparkSession（关闭 UI 和自适应查询）
         - 导出 F（pyspark.sql.functions）供 DSL 代码使用
-        - 从 SPARK_DATA_DIR 环境变量读取 Parquet 快照为 input_df
+        - 从 SPARK_DATA_DIR 环境变量读取 Parquet 快照为 inputs 字典（key=文件名 stem）
 
         Args:
-            code: 原始 PySpark DSL 代码
+            code: 原始 PySpark DSL 代码（编译器产出的 transform 函数）
 
         Returns:
             注入 Spark prologue 后的代码
