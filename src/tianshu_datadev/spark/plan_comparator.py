@@ -918,9 +918,13 @@ class PlanComparator:
                         or right_col.get("column_name", "")
                     )
 
+        # ← 新增：Spark 侧键名兼容（仅 .get()，不 pop——compare_join_steps 仍读 left_alias/right_alias）
+        if "left_table_ref" not in result or not result.get("left_table_ref"):
+            result["left_table_ref"] = str(result.get("left_alias", ""))
+        if "right_table_ref" not in result or not result.get("right_table_ref"):
+            result["right_table_ref"] = str(result.get("right_alias", ""))
+
         # 防御性默认值——确保对比函数访问时不抛 KeyError
-        if "left_table_ref" not in result:
-            result["left_table_ref"] = ""
         if "left_key" not in result:
             result["left_key"] = ""
         if "right_key" not in result:
@@ -970,36 +974,52 @@ class PlanComparator:
 
     @staticmethod
     def _flatten_case_when_step(step_dict: dict[str, Any]) -> dict[str, Any]:
-        """扁平化 CaseWhenStep——cases → labels，else_value SqlLiteral → default_value 字符串。
+        """扁平化 CaseWhenStep——cases/branches → labels，else_value → default_value 字符串。
 
-        SQL CaseWhenStep 模型：
-        - cases: list[WhenBranch]，每个含 result: SqlLiteral → 提取 value 为 labels
-        - else_value: SqlLiteral | None → 提取 value 为 default_value
-        - alias: SafeIdentifier（对比函数不消费，保留不丢失）
+        兼容 SQL 侧（cases）和 Spark 侧（branches）两种模型结构：
+        - SQL CaseWhenStep：cases: list[WhenBranch]，每条含 result: SqlLiteral → labels
+        - Spark CaseWhenStep：branches: list[SparkCaseWhenBranch]，每条含 label: str → labels
+        对比函数分别从 SQL 侧读 labels、Spark 侧读 branches，
+        本函数确保两种来源都被正确提取且不破坏各侧所需字段。
         """
         result = dict(step_dict)
 
-        # cases → labels: 提取每个 WhenBranch 的 result.value
+        # 从 cases（SQL 侧）或 branches（Spark 侧）提取 labels
+        # SQL 侧：pop cases；Spark 侧：保留 branches（比较函数直接读取 branches）
         raw_cases = result.pop("cases", [])
         labels: list[str] = []
-        for c in raw_cases:
-            if isinstance(c, dict):
-                res = c.get("result", {})
-                if isinstance(res, dict):
-                    labels.append(str(res.get("value", "")))
+        if raw_cases:
+            # SQL 侧：提取每个 WhenBranch 的 result.value
+            for c in raw_cases:
+                if isinstance(c, dict):
+                    res = c.get("result", {})
+                    if isinstance(res, dict):
+                        labels.append(str(res.get("value", "")))
+                    else:
+                        labels.append(str(res))
+        else:
+            # Spark 侧：从 branches 提取 label（不 pop——comparison 仍读 branches）
+            for b in (result.get("branches") or []):
+                if isinstance(b, dict):
+                    labels.append(str(b.get("label", "")))
                 else:
-                    labels.append(str(res))
+                    labels.append(str(b))
         result["labels"] = labels
 
-        # else_value SqlLiteral → default_value 字符串
-        else_val = result.pop("else_value", None)
+        # else_value → default_value 字符串
+        # SQL 侧：else_value 为 SqlLiteral dict → pop 并提取 value
+        # Spark 侧：else_value 已是字符串 → 保留原字段（comparison 读取 else_value）
+        else_val = result.get("else_value")
         if else_val is not None:
             if isinstance(else_val, dict):
                 result["default_value"] = str(else_val.get("value", ""))
+                del result["else_value"]
             else:
                 result["default_value"] = str(else_val)
+                # Spark 侧保留 else_value——comparison 仍从该字段取值
         else:
             result["default_value"] = ""
+            result.setdefault("else_value", "")
 
         return result
 
@@ -1063,14 +1083,18 @@ class PlanComparator:
 
     @staticmethod
     def _extract_spark_step_data(spark_plan: SparkPlan) -> list[dict[str, Any]]:
-        """从 SparkPlan 提取结构化 step 数据。
+        """从 SparkPlan 提取结构化 step 数据并通过 _normalize_step_dict 扁平化。
 
-        使用 mode='json' 确保 SparkStepType 等枚举序列化为字符串值。
+        统一路径：Spark 侧与 SQL 侧均经过 _normalize_step_dict 扁平化，
+        确保两侧的 filter/project/join/aggregate/case_when/window 字段
+        在进入 compare_plans 前已归一化为相同格式。
         """
-        return [
-            step.model_dump(mode="json", exclude_none=True)
-            for step in spark_plan.steps
-        ]
+        steps: list[dict[str, Any]] = []
+        for step in spark_plan.steps:
+            step_dict = step.model_dump(mode="json", exclude_none=True)
+            step_dict = PlanComparator._normalize_step_dict(step_dict)  # 新增：统一扁平化
+            steps.append(step_dict)
+        return steps
 
     def _normalize_type(self, step_type: str) -> str:
         """将 step 类型名归一化（read → scan 等）。"""

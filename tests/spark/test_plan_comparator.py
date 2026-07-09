@@ -3010,3 +3010,26 @@ class TestComparatorStatusMapping:
         # 防御：传入不存在的枚举值 → HUMAN_REVIEW
         assert Pipeline._map_comparator_status("FUTURE_STATUS_XYZ") == "HUMAN_REVIEW"  # type: ignore[arg-type]
         assert Pipeline._map_comparator_status(None) == "HUMAN_REVIEW"  # type: ignore[arg-type]
+
+
+# ── _extract_spark_step_data 规范化单元测试 ──
+
+
+class TestExtractSparkStepData:
+    """Spark 侧 _extract_spark_step_data 经由 _normalize_step_dict 扁平化。"""
+
+    def test_spark_step_data_goes_through_normalize(self):
+        """Spark 侧 step 数据经过 _normalize_step_dict 扁平化。"""
+        spark_plan = _make_spark_plan([
+            SparkFilterStep(
+                step_type=SparkStepType.FILTER,
+                input_alias="od",
+                operator="GT", left="amount", right="threshold",
+            ),
+        ])
+        steps = PlanComparator._extract_spark_step_data(spark_plan)
+        # 验证 filter step 被扁平化（left/operator/right 在顶层）
+        assert len(steps) == 1
+        assert steps[0]["left"] == "amount"
+        assert steps[0]["operator"] == "GT"
+        assert steps[0]["right"] == "threshold"
