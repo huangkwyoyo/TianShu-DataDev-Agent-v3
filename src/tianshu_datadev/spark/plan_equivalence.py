@@ -591,6 +591,30 @@ def compare_case_when_steps(
                 ),
             )
 
+    # 检测 condition 是否存在（标记由 _flatten_case_when_step 写入）
+    for i, (sql_cw, spark_cw) in enumerate(zip(sql_case_whens, spark_case_whens)):
+        sql_has_cond = sql_cw.get("has_conditions", False)
+        spark_has_cond = spark_cw.get("has_conditions", False)
+
+        # 额外检测 Spark 侧 branches 中的 condition
+        if not spark_has_cond:
+            for b in (spark_cw.get("branches", []) or []):
+                if isinstance(b, dict) and b.get("condition") is not None:
+                    spark_has_cond = True
+                    break
+
+        if sql_has_cond or spark_has_cond:
+            return StepEquivalenceResult(
+                step_type="case_when",
+                verdict=EquivalenceVerdict.UNSUPPORTED_COMPARISON,
+                sql_count=sql_count,
+                spark_count=spark_count,
+                detail=(
+                    f"CASE WHEN[{i}] 存在 condition 但 compare_case_when_steps "
+                    f"暂不支持 condition 对比（仅比较 labels/default/alias），需人工审核"
+                ),
+            )
+
     return StepEquivalenceResult(
         step_type="case_when",
         verdict=EquivalenceVerdict.EQUIVALENT,
@@ -988,8 +1012,12 @@ def compare_plans(
         r for r in step_results
         if r.verdict == EquivalenceVerdict.NOT_EQUIVALENT
     ]
+    unsupported_results = [
+        r for r in step_results
+        if r.verdict == EquivalenceVerdict.UNSUPPORTED_COMPARISON
+    ]
 
-    if unsupported_types:
+    if unsupported_types or unsupported_results:
         overall = EquivalenceVerdict.UNSUPPORTED_COMPARISON
     elif not_equivalent or extra_sql_types or extra_spark_types:
         overall = EquivalenceVerdict.NOT_EQUIVALENT

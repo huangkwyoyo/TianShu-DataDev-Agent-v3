@@ -1418,7 +1418,7 @@ class TestPlanComparatorCaseWhenEquivalence:
         assert report.status == ComparisonStatus.LOGIC_MISMATCH
 
     def test_case_when_equivalent(self):
-        """SQL cases 与 Spark branches 标签一致 → LOGIC_EQUIVALENT。"""
+        """SQL cases 与 Spark branches 标签一致 → LOGIC_EQUIVALENT（无 condition，仅 labels）。"""
         from tianshu_datadev.planning.sql_build_plan import CaseWhenStep
         from tianshu_datadev.spark.models import (
             SparkCaseWhenBranch,
@@ -1433,15 +1433,6 @@ class TestPlanComparatorCaseWhenEquivalence:
                     step_id="step_cw_001",
                     cases=[
                         WhenBranch(
-                            condition=Predicate(
-                                left=ColumnRef(
-                                    table_ref="order_info",
-                                    column_name="status",
-                                    normalized_name="status",
-                                ),
-                                operator=PredicateOperator.EQ,
-                                right=SqlLiteral(value="paid"),
-                            ),
                             result=SqlLiteral(value="normal"),
                         ),
                     ],
@@ -1520,7 +1511,7 @@ class TestPlanComparatorCaseWhenEquivalence:
         assert report.status == ComparisonStatus.LOGIC_MISMATCH
 
     def test_case_when_alias_both_empty(self):
-        """两侧 alias/output_alias 均为空字符串 → LOGIC_EQUIVALENT（边界行为）。"""
+        """两侧 alias/output_alias 均为空字符串 → LOGIC_EQUIVALENT（边界行为，无 condition）。"""
         from tianshu_datadev.planning.sql_build_plan import CaseWhenStep
         from tianshu_datadev.spark.models import (
             SparkCaseWhenBranch,
@@ -1535,15 +1526,6 @@ class TestPlanComparatorCaseWhenEquivalence:
                     step_id="step_cw_001",
                     cases=[
                         WhenBranch(
-                            condition=Predicate(
-                                left=ColumnRef(
-                                    table_ref="order_info",
-                                    column_name="status",
-                                    normalized_name="status",
-                                ),
-                                operator=PredicateOperator.EQ,
-                                right=SqlLiteral(value="paid"),
-                            ),
                             result=SqlLiteral(value="normal"),
                         ),
                     ],
@@ -1570,10 +1552,93 @@ class TestPlanComparatorCaseWhenEquivalence:
 
         assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
 
+    def test_case_when_condition_triggers_unsupported(self):
+        """CASE WHEN 含 condition → LOGIC_UNSUPPORTED。"""
+        from tianshu_datadev.planning.sql_build_plan import CaseWhenStep
+        from tianshu_datadev.spark.models import (
+            SparkCaseWhenBranch,
+            SparkCaseWhenStep,
+        )
 
-# ════════════════════════════════════════════
-# PlanComparator——NOT_COVERED 标记测试（仅 window）
-# ════════════════════════════════════════════
+        cond = Predicate(
+            left=ColumnRef(table_ref="od", column_name="amount",
+                           normalized_name="amount"),
+            operator=PredicateOperator.GT,
+            right=SqlLiteral(value="100", is_sql_expr=False),
+        )
+        sql_cw = CaseWhenStep(
+            step_type="case_when", step_id="step_cw_001",
+            cases=[
+                WhenBranch(condition=cond, result=SqlLiteral(value="high", is_sql_expr=False)),
+            ],
+            else_value=SqlLiteral(value="low", is_sql_expr=False),
+            alias="level",
+        )
+        sql_plan = _make_sql_plan([_make_sql_scan_step(), sql_cw])
+
+        # Spark 侧：相等的 labels
+        spark_cw = SparkCaseWhenStep(
+            step_type=SparkStepType.CASE_WHEN,
+            input_alias="od", output_alias="level",
+            branches=[SparkCaseWhenBranch(label="high")],
+            else_value="low",
+        )
+        spark_plan = _make_spark_plan([_make_spark_read_step(), spark_cw])
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        # condition 虽存在但 labels 相同 → UNSUPPORTED_COMPARISON（非 EQUIVALENT）
+        cw_results = [r for r in report.step_results if r.step_type == "case_when"]
+        assert len(cw_results) > 0
+        assert cw_results[0].verdict == EquivalenceVerdict.UNSUPPORTED_COMPARISON
+        # 检查状态传播：step UNSUPPORTED_COMPARISON → report LOGIC_UNSUPPORTED
+        assert report.status == ComparisonStatus.LOGIC_UNSUPPORTED, (
+            f"CASE WHEN condition 应使 report.status=LOGIC_UNSUPPORTED，"
+            f"实际={report.status}"
+        )
+
+    def test_case_when_no_condition_still_equivalent(self):
+        """无 condition 的 CASE WHEN（仅 labels）→ 不变，仍为 EQUIVALENT。"""
+        from tianshu_datadev.planning.sql_build_plan import CaseWhenStep
+        from tianshu_datadev.spark.models import (
+            SparkCaseWhenBranch,
+            SparkCaseWhenStep,
+        )
+
+        sql_plan = _make_sql_plan(
+            [
+                _make_sql_scan_step(),
+                CaseWhenStep(
+                    step_type="case_when",
+                    step_id="step_cw_001",
+                    cases=[
+                        WhenBranch(
+                            result=SqlLiteral(value="high"),
+                        ),
+                    ],
+                    else_value=SqlLiteral(value="low"),
+                    alias="level",
+                ),
+            ]
+        )
+        spark_plan = _make_spark_plan(
+            [
+                _make_spark_read_step(),
+                SparkCaseWhenStep(
+                    step_type=SparkStepType.CASE_WHEN,
+                    input_alias="od",
+                    output_alias="level",
+                    branches=[SparkCaseWhenBranch(label="high")],
+                    else_value="low",
+                ),
+            ]
+        )
+
+        comparator = PlanComparator()
+        report = comparator.compare(sql_plan, spark_plan)
+
+        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT
 
 
 class TestPlanComparatorNotCovered:
@@ -2093,14 +2158,23 @@ class TestPlanComparatorCustomEnabledTypes:
         comparator = PlanComparator()
         report = comparator.compare(sql_plan, spark_plan)
 
-        # ── Step 5: 验证——8 种已启用类型全部等价 ──
+        # ── Step 5: 验证——8 种已启用类型全部等价──
         # Mapper 产出的 SparkPlan 含 read+filter+join+aggregate+case_when+project+sort+limit
         # SqlBuildPlan 含 scan+scan+filter+join+aggregate+case_when+project+sort+limit
-        # 全部在 Phase 7B 启用范围内
-        assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
-            f"预期 LOGIC_EQUIVALENT，实际 {report.status}，"
-            f"step_results={[(r.step_type, r.verdict.value) for r in report.step_results]}"
-        )
+        # 全部在 Phase 7B 启用范围内。
+        # CASE WHEN 带 condition（CaseWhenCondition）时，compare_case_when_steps 返回
+        # UNSUPPORTED_COMPARISON，导致整体 report.status 为 LOGIC_UNSUPPORTED。
+        case_when_results = [r for r in report.step_results if r.step_type == "case_when"]
+        if case_when_results and case_when_results[0].verdict == EquivalenceVerdict.UNSUPPORTED_COMPARISON:
+            # CASE WHEN 带 condition——当前暂不支持 condition 对比，预期 LOGIC_UNSUPPORTED
+            assert report.status == ComparisonStatus.LOGIC_UNSUPPORTED, (
+                f"CASE WHEN 带 condition 时应为 LOGIC_UNSUPPORTED，实际 {report.status}"
+            )
+        else:
+            assert report.status == ComparisonStatus.LOGIC_EQUIVALENT, (
+                f"预期 LOGIC_EQUIVALENT，实际 {report.status}，"
+                f"step_results={[(r.step_type, r.verdict.value) for r in report.step_results]}"
+            )
         assert len(report.uncovered_step_types) == 0, (
             f"不应有任何未覆盖类型，实际 {report.uncovered_step_types}"
         )

@@ -1008,6 +1008,20 @@ class PlanComparator:
                     labels.append(str(b))
         result["labels"] = labels
 
+        # 检测 condition 存在性（保留标记供 compare_case_when_steps 消费）
+        # WhenBranch 的 condition 为 Predicate | None，raw_condition 为 SqlRawExpression | None
+        has_conditions = False
+        if isinstance(raw_cases, list):
+            for c in raw_cases:
+                if isinstance(c, dict):
+                    cond = c.get("condition")      # Predicate dict | None
+                    raw_cond = c.get("raw_condition")  # SqlRawExpression dict | None
+                    if cond is not None or raw_cond is not None:
+                        has_conditions = True
+                        break
+        result["has_conditions"] = has_conditions
+        result["condition_comparison_supported"] = False
+
         # else_value → default_value 字符串
         # SQL 侧：else_value 为 SqlLiteral dict → pop 并提取 value
         # Spark 侧：else_value 已是字符串 → 保留原字段（comparison 读取 else_value）
