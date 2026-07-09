@@ -16,7 +16,7 @@ Phase 1 LEFT JOIN 安全门禁已实现。核心逻辑：LEFT JOIN 右表 join k
 2. **dim 表只改善文案**：role=dim + join_key ∈ key_column_names 时，阻断消息更具体、可操作
 3. **LLM 不碰门禁决策**：LLM 仅在 Phase 2+ 生成修复建议文案，不参与通过/阻断判断
 4. **统一归一化**：所有列名比较统一经过 `FieldNormalizer.normalize()`。Builder 侧归一化后写入 `unique_keys` 和 `key_column_names`；Validator 侧接收已归一化的 `right_join_key_normalized`，不再自行 lower()
-5. **公共合并函数**：unique_keys 的合并/去重逻辑集中在 `SourceManifestBuilder` 实例方法中，复用 `self._normalizer`
+5. **公共合并函数**：`_normalize_unique_keys_list` 和 `_merge_unique_keys_from_sources` 为模块级纯函数，显式接收 `normalizer` 参数；`SourceManifestBuilder` 和 `build_manifest_from_spec` 共用同一套实现，避免二选一
 6. **不破坏事实源顺序**：unique_keys 组内列名顺序保留原始声明顺序（第一组首次出现的顺序），仅归一化大小写。去重用 `tuple(normalized_names)` 做 set key，返回值还原为原始顺序的归一化列表
 
 ## 第一节：ManifestTable 模型扩展
@@ -55,13 +55,14 @@ class InputTableDecl(StrictModel):
 
 ## 第二节：SourceManifestBuilder 透传 + Registry 主键收口
 
-### 公共合并函数（新增，`SourceManifestBuilder` 实例方法）
+### 公共合并函数（新增，模块级纯函数）
 
-合并逻辑放在 `SourceManifestBuilder` 上以复用 `self._normalizer`，避免外部调用 `.lower()`。
+两个函数均为模块级纯函数，显式接收 `normalizer: FieldNormalizer` 参数。`SourceManifestBuilder` 实例方法和 `build_manifest_from_spec` 独立函数共用同一套实现，避免二选一。
 
 ```python
 def _normalize_unique_keys_list(
-    self, keys: list[list[str]] | None
+    keys: list[list[str]] | None,
+    normalizer: FieldNormalizer,
 ) -> list[list[str]]:
     """将 unique_keys 列表归一化：列名经 FieldNormalizer 处理、组间去重。
 
@@ -72,6 +73,7 @@ def _normalize_unique_keys_list(
 
     Args:
         keys: 原始 unique_keys 列表，None 等价于 []
+        normalizer: FieldNormalizer 实例，由调用方传入
 
     Returns:
         归一化后的唯一键组列表，组间无重复，组内顺序保留首次声明。
@@ -83,7 +85,7 @@ def _normalize_unique_keys_list(
     for kg in keys:
         if not kg:
             continue
-        normalized = [self._normalizer.normalize(k) for k in kg]
+        normalized = [normalizer.normalize(k) for k in kg]
         key_tuple = tuple(normalized)
         if key_tuple not in seen:
             seen.add(key_tuple)
@@ -92,7 +94,8 @@ def _normalize_unique_keys_list(
 
 
 def _merge_unique_keys_from_sources(
-    self, *sources: list[list[str]] | None,
+    *sources: list[list[str]] | None,
+    normalizer: FieldNormalizer,
 ) -> list[list[str]]:
     """合并多个来源的 unique_keys，经归一化去重后返回。
 
@@ -102,7 +105,23 @@ def _merge_unique_keys_from_sources(
     for src in sources:
         if src:
             all_keys.extend(src)
-    return self._normalize_unique_keys_list(all_keys) if all_keys else []
+    return _normalize_unique_keys_list(all_keys, normalizer) if all_keys else []
+```
+
+调用方示例：
+
+```python
+# SourceManifestBuilder 实例方法中
+unique_keys = _merge_unique_keys_from_sources(
+    pk_as_list, input_t.unique_keys,
+    normalizer=self._normalizer,
+)
+
+# build_manifest_from_spec 独立函数中
+unique_keys = _merge_unique_keys_from_sources(
+    pk_as_list, input_t.unique_keys,
+    normalizer=normalizer,
+)
 ```
 
 ### `_build_manifest_tables` 变更
@@ -122,11 +141,12 @@ def _build_manifest_tables(self, spec: ParsedDeveloperSpec) -> list[ManifestTabl
             for c in input_t.key_columns
         ]
 
-        # 合并 unique_keys ——三来源合并
+        # 合并 unique_keys ——调用模块级纯函数
         pk_as_list = [primary_key] if primary_key else None
-        unique_keys = self._merge_unique_keys_from_sources(
+        unique_keys = _merge_unique_keys_from_sources(
             pk_as_list,              # 来源 1：primary_key
             input_t.unique_keys,     # 来源 2：YAML 显式声明
+            normalizer=self._normalizer,
         )
 
         tables.append(ManifestTable(
@@ -150,18 +170,22 @@ reg_unique_keys = registry_meta.get("unique_keys")
 reg_pk = registry_meta.get("primary_key")
 reg_pk_as_list = [reg_pk] if reg_pk and isinstance(reg_pk, list) and len(reg_pk) > 0 else None
 
-# 合并到现有 unique_keys
-reg_merged = self._merge_unique_keys_from_sources(reg_unique_keys, reg_pk_as_list)
+# 合并到现有 unique_keys——调用模块级纯函数
+reg_merged = _merge_unique_keys_from_sources(
+    reg_unique_keys, reg_pk_as_list, normalizer=self._normalizer,
+)
 if reg_merged:
     existing = table.unique_keys or []
-    all_merged = self._merge_unique_keys_from_sources(existing, reg_merged)
+    all_merged = _merge_unique_keys_from_sources(
+        existing, reg_merged, normalizer=self._normalizer,
+    )
     if all_merged:
         object.__setattr__(table, "unique_keys", all_merged)
 ```
 
 ### `build_manifest_from_spec` 同步变更
 
-与 `_build_manifest_tables` 一致：透传 role/key_column_names_normalized，调用 `_merge_unique_keys_from_sources`。该函数是模块级函数，需要创建局部 `SourceManifestBuilder` 实例（或提取为独立函数接收 normalizer 参数）以复用归一化逻辑。
+与 `_build_manifest_tables` 一致：透传 role/key_column_names_normalized，直接调用模块级 `_merge_unique_keys_from_sources(..., normalizer=normalizer)`，无需创建 Builder 实例。
 
 ## 第三节：lookup 类型重命名 + 富结构
 
@@ -382,8 +406,9 @@ def _parse_input_tables(self, raw_tables: list[dict]) -> list[InputTableDecl]:
                             parse_warnings.append(ParseWarning(
                                 code="W006",
                                 message=f"表 '{alias}' 的 unique_keys[{i}] 引用了未知列："
-                                        f"{unknown}——保留但请核实",
+                                        f"{unknown}——已跳过，不保留为唯一性证据",
                             ))
+                            continue  # 跳过该组，不保留
                         validated.append(kg)
                 if validated:
                     unique_keys = validated
@@ -394,7 +419,7 @@ def _parse_input_tables(self, raw_tables: list[dict]) -> list[InputTableDecl]:
 校验规则：
 1. `unique_keys` 值必须是 `list`，否则 `W005` 警告 + 忽略
 2. 内层元素必须是非空 `list`，否则 `W005` 警告 + 跳过该组
-3. 引用的列名必须在 `key_columns` 或 `business_columns` 中存在，否则 `W006` 警告 + 保留（不静默丢弃）
+3. 引用的列名必须在 `key_columns` 或 `business_columns` 中存在，否则 `W006` 警告 + **跳过该组**（不保留为唯一性证据，防止误放行）
 
 ## 测试矩阵
 
@@ -418,7 +443,7 @@ def _parse_input_tables(self, raw_tables: list[dict]) -> list[InputTableDecl]:
 | 文件 | 变更类型 | 内容 |
 |------|----------|------|
 | `developer_spec/models.py` | 修改 | `ManifestTable` 加 `role` + `key_column_names_normalized`（`Field(default_factory=list)`）；`InputTableDecl` 加 `unique_keys` |
-| `developer_spec/source_manifest.py` | 修改 | 新增 `_normalize_unique_keys_list` + `_merge_unique_keys_from_sources`（均为 `SourceManifestBuilder` 实例方法）；`_build_manifest_tables` 透传 role/key_column_names_normalized + 合并 unique_keys；`_supplement_from_registry` 补 registry PK 链路；`build_manifest_from_spec` 同步 |
+| `developer_spec/source_manifest.py` | 修改 | 新增 `_normalize_unique_keys_list` + `_merge_unique_keys_from_sources`（模块级纯函数，显式接收 `normalizer` 参数）；`_build_manifest_tables` 透传 role/key_column_names_normalized + 调用合并函数；`_supplement_from_registry` 补 registry PK 链路并调用合并函数；`build_manifest_from_spec` 直接调用合并函数 |
 | `developer_spec/parser.py` | 修改 | `_parse_input_tables` 解析 `unique_keys` + FieldNormalizer 校验 W005/W006 |
 | `planning/relationship_validator.py` | 修改 | 新增 `JoinSafetyTableInfo` dataclass（`default_factory=list`）；`check_left_join_safety` 参数改为 `right_join_key_normalized` + `right_join_safety_info`；新增 `_build_unsafe_result_no_unique_keys` 分层文案 |
 | `planning/relationship_planner.py` | 修改 | `_build_unique_keys_lookup` 重命名为 `_build_join_safety_info`，返回 `dict[str, JoinSafetyTableInfo]`；`_check_left_join_safety_gate` 用 `FieldNormalizer` 归一化 join key 后传入 Validator；参数名从 `table_unique_keys` 统一为 `join_safety_info` |
