@@ -461,9 +461,12 @@ class TestReviewReady:
             )
         state.derive_overall_status()
 
-        # 无 comparator_report 但所有关键阶段通过 → 仍可通过
+        # 无 comparator_report → comparator_status 为空 → REVIEW_READY 阻断
+        # 即使所有关键阶段标记为 SUCCESS，没有实际对比报告不视为就绪
         pkg = builder.build(state)
-        assert pkg.review_ready is True
+        assert pkg.review_ready is False, (
+            "无 comparator_report 应阻断 REVIEW_READY，comparator_status 为空"
+        )
         assert pkg.comparator_status == ""
 
     def test_review_ready_package_id_includes_new_fields(self):

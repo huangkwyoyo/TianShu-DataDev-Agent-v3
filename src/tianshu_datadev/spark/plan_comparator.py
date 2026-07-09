@@ -534,31 +534,40 @@ class PlanComparator:
                     if set(gk) == target_set
                 }
             elif agg_groups:
-                # 无精确匹配——所有 aggregate 的 grain 都是 target_set 的子集
-                #（如 ["borough"] 和 ["violation_county"] 都是 {"borough","violation_county"} 的子集）。
-                # 此时合并所有 aggregate 为 1 个，与 Mapper 从 Contract 平铺
-                # aggregation/grouping_keys 生成 1 个 SparkAggregateStep 的行为对称。
-                all_group_keys: list[str] = []
-                seen_gk: set[str] = set()
-                all_metrics: list[dict[str, Any]] = []
-                seen_metric_aliases: set[str] = set()
-                for gk_tuple, agg_data in agg_groups.items():
-                    for gk in agg_data["group_keys"]:
-                        if gk not in seen_gk:
-                            seen_gk.add(gk)
-                            all_group_keys.append(gk)
-                    for m in agg_data["metrics"]:
-                        alias = m.get("alias", "")
-                        if alias not in seen_metric_aliases:
-                            seen_metric_aliases.add(alias)
-                            all_metrics.append(m)
-                agg_groups = {
-                    tuple(sorted(all_group_keys)): {
-                        "group_keys": all_group_keys,
-                        "metrics": all_metrics,
-                        "seen_aliases": seen_metric_aliases,
+                # 无精确匹配——验证所有 aggregate 的 grain 是否都是 target_set 的子集。
+                # 若有 group_key 不在 target_set 中，说明存在与 target_grain 无关的
+                # aggregate，合并它们会产生错误的 group_keys——跳过合并，保留原始分组。
+                all_keys_in_target = all(
+                    gk in target_set
+                    for gk_tuple in agg_groups
+                    for gk in gk_tuple
+                )
+                if all_keys_in_target:
+                    # 所有 aggregate 的 grain 都是 target_set 的子集
+                    #（如 ["borough"] 和 ["violation_county"] 都是 {"borough","violation_county"} 的子集）。
+                    # 此时合并所有 aggregate 为 1 个，与 Mapper 从 Contract 平铺
+                    # aggregation/grouping_keys 生成 1 个 SparkAggregateStep 的行为对称。
+                    all_group_keys: list[str] = []
+                    seen_gk: set[str] = set()
+                    all_metrics: list[dict[str, Any]] = []
+                    seen_metric_aliases: set[str] = set()
+                    for gk_tuple, agg_data in agg_groups.items():
+                        for gk in agg_data["group_keys"]:
+                            if gk not in seen_gk:
+                                seen_gk.add(gk)
+                                all_group_keys.append(gk)
+                        for m in agg_data["metrics"]:
+                            alias = m.get("alias", "")
+                            if alias not in seen_metric_aliases:
+                                seen_metric_aliases.add(alias)
+                                all_metrics.append(m)
+                    agg_groups = {
+                        tuple(sorted(all_group_keys)): {
+                            "group_keys": all_group_keys,
+                            "metrics": all_metrics,
+                            "seen_aliases": seen_metric_aliases,
+                        }
                     }
-                }
 
         # 将分组后的 aggregate 按原始出现顺序插入 result
         # 修复：多个 grain 组计算同一 insert_pos 时顺序反转的 bug
@@ -907,6 +916,11 @@ class PlanComparator:
         join_keys = step_dict.pop("join_keys", [])
         result = dict(step_dict)
 
+        # 多 join key 标记——compare_join_steps 检测到此标记时返回 UNSUPPORTED_COMPARISON
+        # 当前只实现了单 key 等价对比，多 key 场景不能证明等价 → 保守阻断
+        if len(join_keys) > 1:
+            result["_multi_join_key"] = True
+
         if join_keys and len(join_keys) > 0:
             first_key = join_keys[0]
             # join_keys 中的每个元素是 [left_col, right_col] 列表
@@ -1040,152 +1054,6 @@ class PlanComparator:
         else:
             result["default_value"] = ""
             result.setdefault("else_value", "")
-
-        return result
-
-    @staticmethod
-    def _render_frame_boundary(boundary: dict) -> str:
-        """将 FrameBoundary dict 渲染为规范字符串。
-
-        FrameBoundary 格式：{"kind": "UNBOUNDED_PRECEDING", "offset": None}
-        """
-        kind = str(boundary.get("kind", "")).upper()
-        offset = boundary.get("offset")
-        if offset is not None:
-            return f"{kind}({offset})"
-        return kind
-
-    @staticmethod
-    def _render_sort_spec(spec: dict) -> str:
-        """将 SortSpec dict 渲染为规范字符串。
-
-        SortSpec 格式：{"column": "amount", "direction": "ASC", "null_order": "LAST"}
-        输出： "amount ASC LAST"
-        """
-        col = normalize_field_name(str(spec.get("column", "")))
-        direction = str(spec.get("direction", "ASC")).upper()
-        null_order = str(spec.get("null_order", "LAST")).upper()
-        return f"{col} {direction} {null_order}"
-
-    @staticmethod
-    def _flatten_window_step(step_dict: dict[str, Any]) -> dict[str, Any]:
-        """扁平化 WindowStep——将 ColumnRef/SortSpec 归一化为字符串。
-
-        SQL 侧 WindowStep.model_dump() 后：
-        - partition_by: list[ColumnRef] → 每个 ColumnRef 有 normalized_name/column_name/table_ref
-        - order_by: list[SortSpec] → 每个 SortSpec 有 column/direction/null_order
-        - frame: WindowFrame | None
-
-        扁平化规则：
-        - partition_by: ColumnRef → normalized_name 字符串（经 normalize_field_name）
-        - order_by: SortSpec → "column direction null_order" 字符串（经 normalize_field_name），
-          保留 direction/null_order 顺序语义
-        - frame: WindowFrame dict → "frame_type:start:end" 规范字符串
-        """
-        result = dict(step_dict)
-
-        # 扁平化 partition_by
-        raw_partition = result.pop("partition_by", []) or []
-        flattened_partition = []
-        for p in raw_partition:
-            if isinstance(p, dict):
-                # ColumnRef dict → 提取 normalized_name
-                name = p.get("normalized_name", "") or p.get("column_name", "")
-                flattened_partition.append(normalize_field_name(str(name)))
-            else:
-                flattened_partition.append(normalize_field_name(str(p)))
-        result["partition_by"] = flattened_partition
-
-        # 扁平化 order_by
-        raw_order = result.pop("order_by", []) or []
-        flattened_order = []
-        for o in raw_order:
-            if isinstance(o, dict):
-                # SortSpec dict → "column direction null_order"
-                flattened_order.append(PlanComparator._render_sort_spec(o))
-            else:
-                flattened_order.append(normalize_field_name(str(o)))
-        result["order_by"] = flattened_order
-
-        # 扁平化 input_column（ColumnRef → 字符串）
-        raw_input = result.pop("input", None)
-        if raw_input and isinstance(raw_input, dict):
-            if "normalized_name" in raw_input or "column_name" in raw_input:
-                name = raw_input.get("normalized_name", "") or raw_input.get("column_name", "")
-                result["input_column"] = normalize_field_name(str(name))
-            elif "value" in raw_input:
-                # SqlLiteral → 直接取 value
-                result["input_column"] = str(raw_input["value"])
-
-        # 扁平化 frame
-        raw_frame = result.pop("frame", None)
-        if raw_frame and isinstance(raw_frame, dict):
-            frame_type = str(raw_frame.get("frame_type", "RANGE")).upper()
-            start = raw_frame.get("start", {})
-            end = raw_frame.get("end", {})
-            start_str = PlanComparator._render_frame_boundary(start)
-            end_str = PlanComparator._render_frame_boundary(end)
-            result["frame"] = f"{frame_type}:{start_str}:{end_str}"
-
-        # 保留原有 window_exprs 键（用于 _extract_sql_step_data 匹配）
-        # 但每个 expr 中的 partition_by/order_by 也需扁平化
-        raw_exprs = result.get("window_exprs", []) or []
-        if raw_exprs:
-            flat_exprs = []
-            for expr in raw_exprs:
-                flat_expr = dict(expr) if isinstance(expr, dict) else expr
-                if isinstance(flat_expr, dict):
-                    # 扁平化 partition_by
-                    raw_p = flat_expr.pop("partition_by", []) or []
-                    flat_expr["partition_by"] = [
-                        normalize_field_name(str(
-                            p.get("normalized_name", "") or p.get("column_name", "") or str(p)
-                        )) if isinstance(p, dict) else normalize_field_name(str(p))
-                        for p in raw_p
-                    ]
-                    # 扁平化 order_by
-                    raw_o = flat_expr.pop("order_by", []) or []
-                    flat_expr["order_by"] = [
-                        PlanComparator._render_sort_spec(o) if isinstance(o, dict) else normalize_field_name(str(o))
-                        for o in raw_o
-                    ]
-                    # 扁平化 input
-                    raw_input_expr = flat_expr.pop("input", None)
-                    if raw_input_expr and isinstance(raw_input_expr, dict):
-                        if "normalized_name" in raw_input_expr or "column_name" in raw_input_expr:
-                            name = raw_input_expr.get("normalized_name", "") or raw_input_expr.get("column_name", "")
-                            flat_expr["input_column"] = normalize_field_name(str(name))
-                        elif "value" in raw_input_expr:
-                            flat_expr["input_column"] = str(raw_input_expr["value"])
-                    # 扁平化 frame
-                    raw_frame_expr = flat_expr.pop("frame", None)
-                    if raw_frame_expr and isinstance(raw_frame_expr, dict):
-                        ft = str(raw_frame_expr.get("frame_type", "RANGE")).upper()
-                        st = PlanComparator._render_frame_boundary(raw_frame_expr.get("start", {}))
-                        et = PlanComparator._render_frame_boundary(raw_frame_expr.get("end", {}))
-                        flat_expr["frame"] = f"{ft}:{st}:{et}"
-                flat_exprs.append(flat_expr)
-            result["window_exprs"] = flat_exprs
-
-        # 同样扁平化 expressions（Spark 侧兼容）
-        raw_exprs2 = result.get("expressions", []) or []
-        if raw_exprs2:
-            flat_exprs2 = []
-            for expr in raw_exprs2:
-                flat_expr = dict(expr) if isinstance(expr, dict) else expr
-                if isinstance(flat_expr, dict):
-                    raw_p = flat_expr.pop("partition_by", []) or []
-                    flat_expr["partition_by"] = [
-                        normalize_field_name(str(p)) if isinstance(p, dict) else normalize_field_name(str(p))
-                        for p in raw_p
-                    ]
-                    raw_o = flat_expr.pop("order_by", []) or []
-                    flat_expr["order_by"] = [
-                        PlanComparator._render_sort_spec(o) if isinstance(o, dict) else normalize_field_name(str(o))
-                        for o in raw_o
-                    ]
-                flat_exprs2.append(flat_expr)
-            result["expressions"] = flat_exprs2
 
         return result
 

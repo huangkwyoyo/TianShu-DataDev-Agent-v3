@@ -2792,11 +2792,9 @@ class Pipeline:
             return
 
         context.comparator_report = report
-        # 根据 report.status 映射阶段结果——不再硬编码 SUCCESS
-        # 详细状态保留在 comparator_report.status 中，derive_overall_status 消费
-        context.stage_results["COMPARATOR"] = Pipeline._map_comparator_status(
-            report.status,
-        )
+        # 统一语义：COMPARATOR 阶段始终标记为 SUCCESS（与 Orchestrator 路径一致），
+        # 细粒度对比结果由 comparator_report.status 承载，derive_overall_status 消费
+        context.stage_results["COMPARATOR"] = "SUCCESS"
 
     def _do_spark_physical_verify(
         self, artifacts: PipelineArtifactBundle, context: SparkStageContext,

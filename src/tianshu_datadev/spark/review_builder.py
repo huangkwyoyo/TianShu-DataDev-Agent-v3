@@ -178,10 +178,12 @@ class SparkReviewBuilder:
         if not all_critical_ok:
             return False
 
-        # 条件 2：若有对比报告，必须 LOGIC_EQUIVALENT
-        if comparator_status and comparator_status not in (
+        # 条件 2：对比器必须已执行且结果可接受
+        # 空 comparator_status 表示对比器未运行——不允许绕过
+        if not comparator_status:
+            return False
+        if comparator_status not in (
             "LOGIC_EQUIVALENT",
-            "NOT_COVERED",  # 无可对比 step 类型时视为通过
         ):
             return False
 

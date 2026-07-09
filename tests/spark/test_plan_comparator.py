@@ -3784,6 +3784,160 @@ class TestFilterRightPredicateTreeAux:
         assert result["right"] == ""
 
 
+class TestNormalizeFilterRights:
+    """_normalize_filter_rights 单测——BETWEEN/IN/IS_NULL 右值规范化。
+
+    覆盖三种场景：
+    1. BETWEEN/IN/NOT_IN——列表/字符串 right 统一为 [v1,v2,...]
+    2. IS_NULL/IS_NOT_NULL——right 统一为 <NULL> 占位符
+    3. 非 filter step 或非特殊操作符——保持原样
+    """
+
+    # ── BETWEEN：列表 right（SQL 侧）─────────────────────────────
+
+    def test_between_list_right_normalized(self):
+        """BETWEEN + 列表 right → 提取 value 保序 [v1,v2]。
+        SQL 侧 SqlLiteral 列表序列化为 [{'value': '...'}, ...]。"""
+        steps = [
+            {"step_type": "filter", "operator": "BETWEEN",
+             "right": [{"value": "10"}, {"value": "20"}]},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "[10,20]"
+
+    def test_between_list_right_preserves_order(self):
+        """BETWEEN right 保序——[low, high] 不可交换。"""
+        steps = [
+            {"step_type": "filter", "operator": "BETWEEN",
+             "right": [{"value": "20"}, {"value": "10"}]},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "[20,10]", "BETWEEN 应保序"
+
+    # ── BETWEEN：字符串 right（Spark 侧）────────────────────────
+
+    def test_between_string_right_normalized(self):
+        """BETWEEN + Spark repr 字符串 right → 提取 value 为 [v1,v2]。"""
+        steps = [
+            {"step_type": "filter", "operator": "BETWEEN",
+             "right": "[SqlLiteral(value='100', ...), SqlLiteral(value='500', ...)]"},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "[100,500]"
+
+    def test_between_string_right_with_spaces(self):
+        """BETWEEN 字符串 right 值含空格（如 datetime）→ 完整提取。"""
+        steps = [
+            {"step_type": "filter", "operator": "BETWEEN",
+             "right": "[SqlLiteral(value='2026-01-01 00:00:00', ...), "
+                      "SqlLiteral(value='2026-12-31 23:59:59', ...)]"},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "[2026-01-01 00:00:00,2026-12-31 23:59:59]"
+
+    # ── IN：列表 right ─────────────────────────────────────────
+
+    def test_in_list_right_sorted(self):
+        """IN + 列表 right → 提取 value 并排序。"""
+        steps = [
+            {"step_type": "filter", "operator": "IN",
+             "right": [{"value": "c"}, {"value": "a"}, {"value": "b"}]},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "[a,b,c]"
+
+    def test_not_in_list_right_sorted(self):
+        """NOT_IN + 列表 right → 提取 value 并排序。"""
+        steps = [
+            {"step_type": "filter", "operator": "NOT_IN",
+             "right": [{"value": "z"}, {"value": "x"}, {"value": "y"}]},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "[x,y,z]"
+
+    # ── IN：字符串 right（Spark 侧）─────────────────────────────
+
+    def test_in_string_right_extracted_and_sorted(self):
+        """IN + 字符串 right（Spark repr）→ 提取后排序。"""
+        steps = [
+            {"step_type": "filter", "operator": "IN",
+             "right": "[SqlLiteral(value='b', ...), "
+                      "SqlLiteral(value='a', ...), SqlLiteral(value='c', ...)]"},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "[a,b,c]"
+
+    # ── IS_NULL / IS_NOT_NULL ──────────────────────────────────
+
+    def test_is_null_right_becomes_null_placeholder(self):
+        """IS_NULL → right 统一为 <NULL>。"""
+        steps = [
+            {"step_type": "filter", "operator": "IS_NULL", "right": ""},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "<NULL>"
+
+    def test_is_not_null_right_becomes_null_placeholder(self):
+        """IS_NOT_NULL → right 统一为 <NULL>（Spark 侧可能有任意值）。"""
+        steps = [
+            {"step_type": "filter", "operator": "IS_NOT_NULL",
+             "right": "whatever_spark_outputs"},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "<NULL>"
+
+    def test_is_null_none_right_becomes_null_placeholder(self):
+        """IS_NULL + right=None（SQL 侧 flatten 后为 ""）→ <NULL>。"""
+        steps = [
+            {"step_type": "filter", "operator": "IS_NULL", "right": None},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "<NULL>"
+
+    # ── 非 filter step / 非特殊操作符 ──────────────────────────
+
+    def test_non_filter_step_untouched(self):
+        """非 filter step 不修改。"""
+        steps = [
+            {"step_type": "scan", "right": "original"},
+            {"step_type": "project", "right": "original"},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "original"
+        assert steps[1]["right"] == "original"
+
+    def test_unknown_operator_untouched(self):
+        """未知操作符（如 EQ/GT/LIKE）不修改 right。"""
+        steps = [
+            {"step_type": "filter", "operator": "EQ", "right": "100"},
+            {"step_type": "filter", "operator": "LIKE", "right": "%test%"},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "100"
+        assert steps[1]["right"] == "%test%"
+
+    def test_empty_steps_list(self):
+        """空列表不抛异常。"""
+        steps: list = []
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps == []
+
+    def test_mixed_steps(self):
+        """混合 step 类型：仅 filter 被处理。"""
+        steps = [
+            {"step_type": "scan"},
+            {"step_type": "filter", "operator": "BETWEEN",
+             "right": [{"value": "1"}, {"value": "5"}]},
+            {"step_type": "filter", "operator": "IS_NULL", "right": ""},
+            {"step_type": "sort"},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0].get("right") is None  # scan 未修改
+        assert steps[1]["right"] == "[1,5]"
+        assert steps[2]["right"] == "<NULL>"
+        assert steps[3].get("right") is None  # sort 未修改
+
+
 def _make_spark_window_step(expressions: list) -> SparkWindowStep:
     """构造最小 SparkWindowStep。"""
     return SparkWindowStep(

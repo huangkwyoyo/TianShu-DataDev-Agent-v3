@@ -289,6 +289,17 @@ def compare_join_steps(
             detail=f"Join 数量不一致：SQL 侧 {sql_count} 个，Spark 侧 {spark_count} 个",
         )
 
+    # 多 join key 保守阻断——当前只实现了单 key 对比，不能证明等价
+    for j in sql_joins + spark_joins:
+        if j.get("_multi_join_key"):
+            return StepEquivalenceResult(
+                step_type="join",
+                verdict=EquivalenceVerdict.UNSUPPORTED_COMPARISON,
+                sql_count=sql_count,
+                spark_count=spark_count,
+                detail="多 join key 对比暂不支持——单 key 对比无法证明复合 join 等价",
+            )
+
     # 归一化并排序
     sql_normalized = sorted([
         (
@@ -765,11 +776,13 @@ def compare_sort_steps(
     spark_keys: list[tuple[str, str, str]] = []
     for s in spark_sorts:
         for item in s.get("order_by", []) or []:
-            # Spark 编译器只生成 F.asc()/F.desc()，未显式指定 null_order。
-            # Spark SQL ORDER BY 默认：ASC → NULLS FIRST，DESC → NULLS LAST。
-            # 此处按 direction 派生出实际默认 null_order，而非固定 "LAST"。
             direction = (item.get("direction", "asc") or "asc").upper()
-            spark_null_order = "FIRST" if direction == "ASC" else "LAST"
+            # 防御性读取：若 SparkSortSpec 已包含 null_order 字段则直接使用，
+            # 否则按 Spark SQL 默认行为派生（ASC→FIRST, DESC→LAST）
+            if "null_order" in item:
+                spark_null_order = (item.get("null_order") or "LAST").upper()
+            else:
+                spark_null_order = "FIRST" if direction == "ASC" else "LAST"
             spark_keys.append((
                 normalize_field_name(item.get("column", "")),
                 direction,
@@ -819,7 +832,19 @@ def compare_limit_steps(
             spark_count=0,
         )
 
-    # SQL 侧可能有多个 LimitStep（多语句），取最终语句的
+    # 多 limit step 不支持对比——静默取最后一个会掩盖中间层 bug
+    if sql_count > 1 or spark_count > 1:
+        return StepEquivalenceResult(
+            step_type="limit",
+            verdict=EquivalenceVerdict.UNSUPPORTED_COMPARISON,
+            sql_count=sql_count,
+            spark_count=spark_count,
+            detail=(
+                f"多 limit 步对比暂不支持：SQL 侧 {sql_count} 个，"
+                f"Spark 侧 {spark_count} 个"
+            ),
+        )
+
     sql_limit_val = sql_limits[-1].get("limit", 0) if sql_limits else None
     spark_limit_val = spark_limits[-1].get("limit", 0) if spark_limits else None
 
