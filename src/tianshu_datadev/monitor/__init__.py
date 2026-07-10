@@ -20,6 +20,7 @@ from tianshu_datadev.monitor.models import (
     ResourceSample,
     StageEvent,
 )
+from tianshu_datadev.monitor.renderer import LogRenderer
 from tianshu_datadev.monitor.rotation import cleanup
 from tianshu_datadev.monitor.sanitizer import Sanitizer
 
@@ -35,5 +36,6 @@ __all__ = [
     "RunLogCollector",
     "Sanitizer",
     "StageContext",
+    "LogRenderer",
     "StageEvent",
 ]

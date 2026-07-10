@@ -22,6 +22,7 @@ from tianshu_datadev.monitor.models import (
     ResourceSample,
     StageEvent,
 )
+from tianshu_datadev.monitor.renderer import LogRenderer
 from tianshu_datadev.monitor.sanitizer import Sanitizer
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,10 @@ class RunLogCollector:
         file_path = self._log_dir / f"tianshu_run_{run_id}_events.jsonl"
         self._file: TextIO = open(file_path, "w", encoding="utf-8")
 
+        # 同时打开文本日志文件供人类可读
+        log_path = self._log_dir / f"tianshu_run_{run_id}_events.log"
+        self._text_file: TextIO = open(log_path, "w", encoding="utf-8")
+
         # 启动 writer 消费者线程
         self._writer_thread = threading.Thread(
             target=self._writer_loop, daemon=True, name=f"monitor-writer-{run_id}"
@@ -87,13 +92,20 @@ class RunLogCollector:
         self._writer_thread.start()
 
     def _writer_loop(self) -> None:
-        """消费者线程主循环——从队列取事件写入 JSONL 文件。"""
+        """消费者线程主循环——从队列取事件，先写 JSONL 再写文本日志。"""
         while self._running or not self._queue.empty():
             try:
                 event = self._queue.get(timeout=0.5)
-                line = event.model_dump_json() + "\n"
-                self._file.write(line)
+                # JSONL 写入（不变）
+                json_line = event.model_dump_json() + "\n"
+                self._file.write(json_line)
                 self._file.flush()
+                # 文本日志写入（新增）
+                event_dict = json.loads(event.model_dump_json())
+                text_output = LogRenderer.format_event(event_dict)
+                if text_output:
+                    self._text_file.write(text_output + "\n")
+                    self._text_file.flush()
             except queue.Empty:
                 continue
             except Exception as exc:
@@ -152,6 +164,7 @@ class RunLogCollector:
         self._running = False
         self._writer_thread.join(timeout=5.0)
         self._file.close()
+        self._text_file.close()
         self.run_complete = True
 
         # 原子输出状态文件
