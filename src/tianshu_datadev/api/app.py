@@ -187,17 +187,8 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
         # 自动发现 NYC 数据仓库 DuckDB 文件
         db_path = _discover_nyc_duckdb()
         _e2e_val = os.environ.get("TIANSHU_E2E_MODE")
-        _dp = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.dirname(os.path.abspath(__file__))))), "logs", "dev", "diag_snapshot.txt")
-        with open(_dp, "a") as _df:
-            _df.write(
-                f"DIAG create_app: TIANSHU_E2E_MODE={_e2e_val!r}, "
-                f"pipeline_is_None=True, db_path={db_path!r}\\n"
-            )
         if _e2e_val == "true":
             fixture_paths = _discover_csv_fixtures()
-            with open(_dp, "a") as _df:
-                _df.write(f"DIAG create_app: E2E branch taken, fixture keys={list(fixture_paths.keys())}\\n")
             pipeline = Pipeline(
                 default_table_paths=fixture_paths,
                 duckdb_path=db_path,
@@ -207,8 +198,6 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
             # 白名单仅来自显式发现的 CSV fixture 文件，禁止自动扫描目录全量加入
             _inject_snapshot_deps(pipeline, fixture_paths)
         else:
-            with open(_dp, "a") as _df:
-                _df.write("DIAG create_app: ELSE (web UI) branch taken\\n")
             pipeline = Pipeline(
                 duckdb_path=db_path,
                 developer_service=spark_developer_service,

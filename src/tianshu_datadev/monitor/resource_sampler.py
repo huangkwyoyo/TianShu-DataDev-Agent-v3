@@ -283,8 +283,12 @@ class ResourceSampler:
 
     def _write_peak_sample(self) -> None:
         """写入峰值聚合样本到 collector。每个峰值指标作为独立 ProcessMetrics 条目。"""
+        # 在线程锁内读取共享状态快照——由 _sample() 后台线程写入
+        with self._lock:
+            peak_metrics = dict(self._peak_metrics)
+            observed_stages = set(self._observed_stages)
         peak_processes: list[ProcessMetrics] = []
-        for key, value in self._peak_metrics.items():
+        for key, value in peak_metrics.items():
             metrics_kwargs: dict = {"pid": 0, "name": key}
             if key == "peak_observed_cpu_percent":
                 metrics_kwargs.update(
@@ -311,11 +315,11 @@ class ResourceSampler:
         self._collector.log_resource_sample(sample)
         logger.info(
             "峰值样本已写入: active_stage_count=%d, cpu=%.1f%%, rss=%.1fMB, vms=%.1fMB, procs=%d",
-            len(self._observed_stages),
-            self._peak_metrics["peak_observed_cpu_percent"],
-            self._peak_metrics["peak_observed_rss_mb"],
-            self._peak_metrics["peak_observed_vms_mb"],
-            self._peak_metrics["peak_observed_num_processes"],
+            len(observed_stages),
+            peak_metrics["peak_observed_cpu_percent"],
+            peak_metrics["peak_observed_rss_mb"],
+            peak_metrics["peak_observed_vms_mb"],
+            peak_metrics["peak_observed_num_processes"],
         )
 
     # ── 辅助：命令行清理 ─────────────────────────────────────

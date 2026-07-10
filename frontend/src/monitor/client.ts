@@ -58,6 +58,23 @@ const _handlers: {
 
 // ── 内部工具函数 ──
 
+/** 生成带本地时区偏移的 ISO 8601 时间戳（如 2026-07-10T14:30:22.123+08:00） */
+function toLocalISOString(date: Date): string {
+  const offset = -date.getTimezoneOffset();
+  const sign = offset >= 0 ? '+' : '-';
+  const pad = (n: number) => String(Math.floor(Math.abs(n))).padStart(2, '0');
+  return (
+    date.getFullYear() + '-' +
+    pad(date.getMonth() + 1) + '-' +
+    pad(date.getDate()) + 'T' +
+    pad(date.getHours()) + ':' +
+    pad(date.getMinutes()) + ':' +
+    pad(date.getSeconds()) + '.' +
+    String(date.getMilliseconds()).padStart(3, '0') +
+    sign + pad(offset / 60) + ':' + pad(offset % 60)
+  );
+}
+
 /** 过滤 stack trace 中的无关帧（browser extension 和 node_modules） */
 function filterStackFrames(stack: string): string[] {
   if (!stack) return [];
@@ -151,7 +168,7 @@ function registerFetchWrapper(): void {
         if (config) {
           sendEvent({
             event_type: 'api_call',
-            timestamp: new Date().toISOString(),
+            timestamp: toLocalISOString(new Date()),
             run_id: config.run_id || '',
             monitor_token: config.monitor_token || '',
             api_path: path,
@@ -166,7 +183,7 @@ function registerFetchWrapper(): void {
         if (config) {
           sendEvent({
             event_type: 'api_call',
-            timestamp: new Date().toISOString(),
+            timestamp: toLocalISOString(new Date()),
             run_id: config.run_id || '',
             monitor_token: config.monitor_token || '',
             api_path: path,
@@ -196,7 +213,7 @@ function registerOnError(): void {
 
     sendEvent({
       event_type: 'js_error',
-      timestamp: new Date().toISOString(),
+      timestamp: toLocalISOString(new Date()),
       run_id: config.run_id || '',
       monitor_token: config.monitor_token || '',
       error_type: errObj?.constructor?.name || 'Error',
@@ -238,7 +255,7 @@ function registerOnUnhandledRejection(): void {
 
     sendEvent({
       event_type: 'promise_rejection',
-      timestamp: new Date().toISOString(),
+      timestamp: toLocalISOString(new Date()),
       run_id: config.run_id || '',
       monitor_token: config.monitor_token || '',
       error_type: errorType,
@@ -308,7 +325,7 @@ export function reportEvent(
 
   sendEvent({
     ...payload,
-    timestamp: new Date().toISOString(),
+    timestamp: toLocalISOString(new Date()),
     run_id: config.run_id || '',
     monitor_token: config.monitor_token || '',
   });

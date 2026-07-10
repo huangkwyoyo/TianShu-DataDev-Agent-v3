@@ -51,13 +51,15 @@ class TestIntegration:
     # ─── Test 1：完整运行产出所有日志文件 ───────────────────
 
     def test_full_run_generates_all_log_files(self, tmp_path):
-        """一次完整运行产出 5 个日志文件：
+        """一次完整运行产出 RunLogCollector 生成的日志文件：
 
-        - _events.jsonl
-        - _collector_status.json
-        - summary.json
+        - _events.jsonl（事件日志）
+        - _collector_status.json（收集器状态）
 
-        使用 RunLogCollector 直接模拟完整生命周期，不启动真实子进程。
+        不启动真实子进程（不会产生 _backend.log / _frontend.log），
+        summary.json 由外部写入，不在 RunLogCollector.close() 中生成，
+        因此仅验证 RunLogCollector 产出的 2 个文件。
+        完整 5 文件验证需启动真实子进程（另见 e2e 测试）。
         """
         log_dir = tmp_path / "logs" / "monitor"
         log_dir.mkdir(parents=True, exist_ok=True)

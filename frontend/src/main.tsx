@@ -3,12 +3,12 @@ import ReactDOM from 'react-dom/client';
 import App from './App';
 import { initMonitor } from './monitor/client';
 
-// 初始化前端监控（不阻塞 React 渲染——即使配置获取失败，页面仍正常显示）
-// 使用 .then() 而非 await，确保 initMonitor 内部的 catch 不会传播到渲染层
-initMonitor().then(() => {
-  ReactDOM.createRoot(document.getElementById('root')!).render(
-    <React.StrictMode>
-      <App />
-    </React.StrictMode>,
-  );
-});
+// 先渲染 React（不阻塞——即使监控初始化失败，页面仍正常显示）
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+);
+
+// 后台初始化监控（失败静默——不影响页面正常功能）
+initMonitor().catch(() => {});

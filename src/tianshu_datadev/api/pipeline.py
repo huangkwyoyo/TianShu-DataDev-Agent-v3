@@ -216,10 +216,6 @@ class Pipeline:
         self._snapshot_provider = snapshot_provider
         # ── Phase 9C-R16: table_paths 回退值 ──
         self._default_table_paths = default_table_paths or {}
-        # 诊断：记录初始化参数
-        with open("D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3/logs/dev/diag_snapshot.txt", "a") as _df:
-            _df.write(f"DIAG Pipeline.__init__: _default_table_paths keys={list(self._default_table_paths.keys())}\\n")
-            _df.write(f"  snapshot_builder={snapshot_builder is not None}, duckdb_path={duckdb_path}\\n")
         # ── 外部 DuckDB 数据库路径 ──
         self._duckdb_path = duckdb_path
         # ── Phase 8: SparkDeveloperService 注入 ──
@@ -251,18 +247,6 @@ class Pipeline:
 
     def _store_result(self, request_id: str, data: dict) -> None:
         """缓存中间结果并记录写入时间戳——供 TTL 过期清理使用。"""
-        _snap = data.get("snapshot_manifest")
-        if _snap is not None:
-            import traceback as _tb
-            with open("D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3/logs/dev/diag_snapshot.txt", "a") as _df:
-                _df.write(f"DIAG _store_result: snapshot_manifest 被存储！request_id={request_id}\\n")
-                _df.write(f"  snapshot_manifest type={type(_snap).__name__}\\n")
-                if hasattr(_snap, 'snapshot_dir'):
-                    _df.write(f"  snapshot_dir={_snap.snapshot_dir}\\n")
-                    _df.write(f"  files={[(f.source_name, f.file_path) for f in _snap.files]}\\n")
-                _df.write(f"  stack:\\n")
-                for _line in _tb.format_stack()[-6:-1]:
-                    _df.write(f"    {_line.strip()}\\n")
         self._results[request_id] = data
         self._timestamps[request_id] = time.monotonic()
 
@@ -1963,16 +1947,6 @@ class Pipeline:
         if data is None:
             return None
 
-        # 诊断：记录 _results 中 snapshot_manifest 的状态
-        _sm = data.get("snapshot_manifest")
-        with open("D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3/logs/dev/diag_snapshot.txt", "a") as _df:
-            _df.write(f"DIAG export_artifacts: request_id={request_id}, "
-                      f"snapshot_manifest_in_results={_sm is not None}\\n")
-            if _sm is not None:
-                _df.write(f"  snapshot_dir={getattr(_sm, 'snapshot_dir', 'N/A')}\\n")
-                _df.write(f"  files count={len(getattr(_sm, 'files', []))}\\n")
-            _df.write(f"  _results keys={list(data.keys())}\\n")
-
         # 提取 spec_hash——从 ParsedDeveloperSpec 获取
         spec_hash = ""
         parsed_spec = data.get("parsed_spec")
@@ -2479,10 +2453,6 @@ class Pipeline:
         # 从 table_paths 的 CSV 文件生成 Parquet 快照，
         # 使物理验证阶段能通过 _register_parquet_views 注册为 DuckDB 视图
         snapshot_manifest = None
-        # 诊断：记录 table_paths 和 _default_table_paths 的真实值
-        with open("D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3/logs/dev/diag_snapshot.txt", "a") as _df:
-            _df.write(f"DIAG execute_rich snapshot: table_paths={table_paths!r}\\n")
-            _df.write(f"  _default_table_paths keys={list(self._default_table_paths.keys())}\\n")
         resolved_paths = self._resolve_table_paths(table_paths)
         if resolved_paths:
             with collector.stage("snapshot_builder", request_id) as ctx:
@@ -2939,18 +2909,6 @@ class Pipeline:
         context.compile_result = result
         context.stage_results["COMPILER"] = "SUCCESS"
 
-        # ── 诊断：输出 SparkPlan 步骤 + 编译器输出 ──
-        try:
-            _dp = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-                os.path.dirname(os.path.abspath(__file__))))), "logs", "dev", "diag_compiler.txt")
-            with open(_dp, "w", encoding="utf-8") as _df:
-                _df.write(f"=== SparkPlan steps ({len(context.spark_plan.steps)}) ===\n")
-                for _i, _s in enumerate(context.spark_plan.steps):
-                    _df.write(f"  [{_i}] {type(_s).__name__}: {_s.model_dump(exclude_none=True)}\n")
-                _df.write(f"\n=== raw_pyspark ===\n{result.raw_pyspark}\n")
-        except Exception:
-            pass
-
         # ── 生成独立可执行脚本（wrapper 格式，含 SparkSession 引导）──
         # ── Phase 8B: 使用 annotated_pyspark（含 LLM 业务注释）──
         annotated_pyspark = result.annotated_pyspark
@@ -3104,11 +3062,6 @@ class Pipeline:
         Returns:
             SnapshotManifest——成功构建的快照清单；None 表示失败（context 已写入错误）
         """
-        # 诊断：写文件确保可见
-        with open("D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3/logs/dev/diag_snapshot.txt", "a") as _df:
-            _df.write(f"DIAG: _try_build_snapshot entry - sb={self._snapshot_builder is not None} "
-                      f"sp={self._snapshot_provider is not None} "
-                      f"duckdb={self._duckdb_path is not None}\\n")
         # ── 路径 1：SnapshotBuilder 注入 → 走既有 CSV fixture 快照流程 ──
         if self._snapshot_builder is not None and self._snapshot_provider is not None:
             # 获取 table_paths——优先从 _results 读取 execute_rich 持久化的 resolved_table_paths，
@@ -3210,9 +3163,6 @@ class Pipeline:
         - 使用 DuckDB 只读连接——不修改源数据库
         - 快照写入临时目录——会话结束后由 OS 回收
         """
-        # 诊断：写文件确保可见
-        with open("D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3/logs/dev/diag_snapshot.txt", "a") as _df:
-            _df.write("DIAG: _build_snapshot_from_duckdb 入口\\n")
         logger.warning("DuckDB快照入口——进入 _build_snapshot_from_duckdb")
         from tianshu_datadev.spark.snapshot import SnapshotFile
         from tianshu_datadev.spark.snapshot import SnapshotManifest as _SnapManifest
@@ -3252,14 +3202,6 @@ class Pipeline:
             _physical = _results_table_mapping.get(t.source_table, t.source_table)
             if _physical not in _alias_map:
                 _alias_map[_physical] = t.table_ref
-        # 诊断：写入详细信息到文件
-        with open("D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3/logs/dev/diag_snapshot.txt", "a") as _df:
-            _df.write(f"source_tables={source_tables}\\n")
-            _df.write(f"_results_table_mapping={_results_table_mapping}\\n")
-            _df.write(f"_alias_map={_alias_map}\\n")
-            _df.write(f"input_tables_count={len(contract.input_tables)}\\n")
-            for _i, _t in enumerate(contract.input_tables):
-                _df.write(f"  input_table[{_i}]: table_ref={_t.table_ref!r}, source_table={_t.source_table!r}\\n")
         logger.info(
             "DuckDB快照诊断——source_tables=%s, _alias_map=%s, "
             "input_tables_count=%d",
@@ -3370,17 +3312,6 @@ class Pipeline:
         # 写入 _inputs_index.json——executor prologue 据此将别名映射到 Parquet 文件
         from tianshu_datadev.spark.snapshot import SnapshotBuilder
         SnapshotBuilder._write_inputs_index(snap_dir, files)
-        # 诊断：回读确认写入内容
-        import json as _json_diag
-        _idx_path = _os.path.join(snap_dir, "_inputs_index.json")
-        with open(_idx_path, "r", encoding="utf-8") as _ixf:
-            _idx_content = _json_diag.load(_ixf)
-        with open("D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3/logs/dev/diag_snapshot.txt", "a") as _df:
-            _df.write(f"DIAG: _inputs_index.json content={_idx_content}\\n")
-            _df.write(f"DIAG: snap_dir={snap_dir}\\n")
-            for _f in files:
-                _df.write(f"  file: source_name={_f.source_name!r} path={_f.file_path!r}\\n")
-
         # 回写 artifacts——供后续代码引用
         artifacts.snapshot_manifest = manifest
         logger.info(
@@ -3430,11 +3361,6 @@ class Pipeline:
         # Step 3：确定快照目录
         snapshot_dir: str | None = None
         snapshot_id: str = ""
-        with open("D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3/logs/dev/diag_snapshot.txt", "a") as _df:
-            _df.write(f"DIAG: _do_spark_physical_verify - snapshot_manifest={artifacts.snapshot_manifest is not None}\\n")
-            if artifacts.snapshot_manifest is not None:
-                _df.write(f"  snapshot_dir={artifacts.snapshot_manifest.snapshot_dir}\\n")
-                _df.write(f"  files={[(f.source_name, f.file_path) for f in artifacts.snapshot_manifest.files]}\\n")
         if artifacts.snapshot_manifest is not None:
             snapshot_dir = artifacts.snapshot_manifest.snapshot_dir
             snapshot_id = artifacts.snapshot_manifest.snapshot_id
@@ -3492,34 +3418,6 @@ class Pipeline:
                 uncovered_step_types=uncovered_types if uncovered_types else None,
                 duckdb_path=self._duckdb_path,
             )
-
-            # ── 诊断：输出双引擎对比详情 ──
-            try:
-                _dp = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-                    os.path.dirname(os.path.abspath(__file__))))), "logs", "dev", "diag_verify.txt")
-                with open(_dp, "w", encoding="utf-8") as _df:
-                    _df.write(f"=== SQL 查询 ===\n{sql_query}\n\n")
-                    _df.write(f"=== PySpark 代码 ===\n{context.sandbox_transform_code}\n\n")
-                    _df.write(f"=== DuckDB 结果（前 10 行）===\n")
-                    _df.write(f"行数: {report.duckdb_result.raw_row_count}\n")
-                    for _ri, _r in enumerate((report.duckdb_result.sample_rows or [])[:10]):
-                        _df.write(f"  [{_ri}] {_r}\n")
-                    _df.write(f"\n=== Spark 结果（前 10 行）===\n")
-                    _df.write(f"行数: {report.spark_result.raw_row_count}\n")
-                    for _ri, _r in enumerate((report.spark_result.sample_rows or [])[:10]):
-                        _df.write(f"  [{_ri}] {_r}\n")
-                    _df.write(f"\n=== 差异列表（共 {len(report.diffs)} 条）===\n")
-                    for _di, _d in enumerate(report.diffs):
-                        _df.write(f"  [{_di}] row={_d.row_index}, col={_d.column}\n")
-                        _df.write(f"       duckdb={_d.duckdb_value}\n")
-                        _df.write(f"       spark ={_d.spark_value}\n")
-                        _df.write(f"       desc  ={_d.description}\n")
-                    _df.write(f"\n=== 元信息 ===\n")
-                    _df.write(f"row_count_match={report.row_count_match}\n")
-                    _df.write(f"schema_match={report.schema_match}\n")
-                    _df.write(f"status={report.status.value}\n")
-            except Exception:
-                pass
 
             # Step 7：判定结果
             from tianshu_datadev.spark.physical_verifier import PhysicalVerificationStatus
