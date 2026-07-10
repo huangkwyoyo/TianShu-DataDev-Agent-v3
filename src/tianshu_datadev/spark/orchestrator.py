@@ -232,6 +232,7 @@ class SparkOrchestrator:
         sql_plan: "SqlBuildPlan | SqlProgram | None" = None,
         stage_failures: dict[str, str] | None = None,
         retry_count: int = 0,
+        collector=None,
     ) -> SparkPipelineState:
         """执行全链路 Pipeline。
 
@@ -249,10 +250,17 @@ class SparkOrchestrator:
             stage_failures: 阶段失败注入（测试用）——key 为阶段名，value 为错误信息。
                             None 时走真实执行或默认成功。
             retry_count: 当前返工轮次（0 表示首次执行）
+            collector: 监控采集器实例。None 时使用 NullCollector。
 
         Returns:
             SparkPipelineState——含每阶段结果、错误列表、全局状态
         """
+        # 默认 NullCollector——确保向后兼容
+        if collector is None:
+            from tianshu_datadev.monitor import NullCollector
+
+            collector = NullCollector()
+
         # 每次 run() 都是独立执行上下文——重置所有缓存，防止上一轮残留泄漏
         self._cached_plan = None
         self._cached_compile_result = None
@@ -269,23 +277,28 @@ class SparkOrchestrator:
             retry_count=retry_count,
         )
 
-        # 返工上限提前检查——最高优先级
-        if retry_count >= self.MAX_RETRY:
+        # 父阶段包裹整个 Pipeline——包括返工上限检查
+        with collector.stage("spark_verify", state.contract_hash) as verify_ctx:
+            # 返工上限提前检查——最高优先级
+            if retry_count >= self.MAX_RETRY:
+                for stage in SparkPipelineStage:
+                    state.record_stage_result(stage, "HUMAN_REVIEW")
+                state.errors.append(
+                    f"返工次数已达上限（{self.MAX_RETRY} 轮），"
+                    f"当前 retry_count={retry_count}，强制 HUMAN_REVIEW"
+                )
+                state.derive_overall_status()
+                return state
+
+            # 按顺序执行各阶段
             for stage in SparkPipelineStage:
-                state.record_stage_result(stage, "HUMAN_REVIEW")
-            state.errors.append(
-                f"返工次数已达上限（{self.MAX_RETRY} 轮），"
-                f"当前 retry_count={retry_count}，强制 HUMAN_REVIEW"
-            )
+                self._execute_stage(
+                    stage, state, contract, failures,
+                    collector, verify_ctx.stage_run_id,
+                )
+
             state.derive_overall_status()
             return state
-
-        # 按顺序执行各阶段
-        for stage in SparkPipelineStage:
-            self._execute_stage(stage, state, contract, failures)
-
-        state.derive_overall_status()
-        return state
 
     def _execute_stage(
         self,
@@ -293,6 +306,8 @@ class SparkOrchestrator:
         state: SparkPipelineState,
         contract: "DataTransformContractV1 | None",
         failures: dict[str, str],
+        collector=None,
+        parent_stage_run_id: str | None = None,
     ) -> None:
         """执行单个 Pipeline 阶段。
 
@@ -306,31 +321,71 @@ class SparkOrchestrator:
             state: Pipeline 状态（会被原地修改）
             contract: Contract 实例（可为 None）
             failures: 阶段失败注入字典
+            collector: 监控采集器实例
+            parent_stage_run_id: 父阶段 stage_run_id
         """
-        # ── 测试注入优先 ──
+        # ── 测试注入优先（包装在 stage 上下文中）──
         if stage.value in failures:
-            state.record_stage_result(stage, "FAILURE")
-            state.errors.append(f"[{stage.value}] {failures[stage.value]}")
+            stage_node = f"spark_{stage.value.lower()}"
+            try:
+                with collector.stage(
+                    stage_node, state.contract_hash,
+                    parent_stage_run_id=parent_stage_run_id,
+                ):
+                    state.record_stage_result(stage, "FAILURE")
+                    state.errors.append(f"[{stage.value}] {failures[stage.value]}")
+                    # 抛出异常让 StageContext.__exit__ 记录 failed
+                    raise RuntimeError(failures[stage.value])
+            except RuntimeError:
+                pass
             return
 
         # ── MAPPER ──
         if stage == SparkPipelineStage.MAPPER:
-            self._run_mapper(stage, state, contract)
+            with collector.stage(
+                "spark_mapper", state.contract_hash,
+                parent_stage_run_id=parent_stage_run_id,
+            ) as ctx:
+                self._run_mapper(stage, state, contract)
+                if state.stage_results["MAPPER"] == "SUCCESS" and self._cached_plan:
+                    ctx.set_result(artifact_path=f"spark_plan/{state.spark_plan_hash}")
         # ── DEVELOPER ──
         elif stage == SparkPipelineStage.DEVELOPER:
-            self._run_developer(stage, state)
+            with collector.stage(
+                "spark_developer", state.contract_hash,
+                parent_stage_run_id=parent_stage_run_id,
+            ):
+                self._run_developer(stage, state)
         # ── COMPILER ──
         elif stage == SparkPipelineStage.COMPILER:
-            self._run_compiler(stage, state)
+            with collector.stage(
+                "spark_compiler", state.contract_hash,
+                parent_stage_run_id=parent_stage_run_id,
+            ) as ctx:
+                self._run_compiler(stage, state)
+                if state.stage_results["COMPILER"] == "SUCCESS":
+                    ctx.set_result(artifact_path=f"compiled/{state.compiled_code_sha256}")
         # ── VALIDATOR ──
         elif stage == SparkPipelineStage.VALIDATOR:
-            self._run_validator(stage, state)
+            with collector.stage(
+                "spark_validator", state.contract_hash,
+                parent_stage_run_id=parent_stage_run_id,
+            ):
+                self._run_validator(stage, state)
         # ── COMPARATOR ──
         elif stage == SparkPipelineStage.COMPARATOR:
-            self._run_comparator(stage, state)
+            with collector.stage(
+                "spark_comparator", state.contract_hash,
+                parent_stage_run_id=parent_stage_run_id,
+            ):
+                self._run_comparator(stage, state)
         # ── PHYSICAL_VERIFIER ──
         elif stage == SparkPipelineStage.PHYSICAL_VERIFIER:
-            self._run_physical_verifier(stage, state)
+            with collector.stage(
+                "spark_physical_verifier", state.contract_hash,
+                parent_stage_run_id=parent_stage_run_id,
+            ):
+                self._run_physical_verifier(stage, state)
 
     # ── 各阶段实现 ──
 

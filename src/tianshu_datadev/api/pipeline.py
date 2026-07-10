@@ -2717,20 +2717,23 @@ class Pipeline:
         # Step 3: 依赖门禁
         self._check_stage_dependencies(stage, context, artifacts)
 
-        # Step 4: 执行阶段
+        # Step 4: 执行阶段（包装在监控 stage 上下文中）
+        stage_node = f"spark_{stage_val.lower()}"
+        collector = get_collector()
         try:
-            if stage == SparkPipelineStage.MAPPER:
-                self._do_spark_map(artifacts, context)
-            elif stage == SparkPipelineStage.DEVELOPER:
-                self._do_spark_develop(context)
-            elif stage == SparkPipelineStage.COMPILER:
-                self._do_spark_compile(context)
-            elif stage == SparkPipelineStage.VALIDATOR:
-                self._do_spark_validate(context)
-            elif stage == SparkPipelineStage.COMPARATOR:
-                self._do_spark_compare(artifacts, context)
-            elif stage == SparkPipelineStage.PHYSICAL_VERIFIER:
-                self._do_spark_physical_verify(artifacts, context)
+            with collector.stage(stage_node, request_id):
+                if stage == SparkPipelineStage.MAPPER:
+                    self._do_spark_map(artifacts, context)
+                elif stage == SparkPipelineStage.DEVELOPER:
+                    self._do_spark_develop(context)
+                elif stage == SparkPipelineStage.COMPILER:
+                    self._do_spark_compile(context)
+                elif stage == SparkPipelineStage.VALIDATOR:
+                    self._do_spark_validate(context)
+                elif stage == SparkPipelineStage.COMPARATOR:
+                    self._do_spark_compare(artifacts, context)
+                elif stage == SparkPipelineStage.PHYSICAL_VERIFIER:
+                    self._do_spark_physical_verify(artifacts, context)
         except Exception as e:
             context.stage_results[stage_val] = "FAILURE"
             context.errors.append(f"[{stage_val}] 异常：{e}")
