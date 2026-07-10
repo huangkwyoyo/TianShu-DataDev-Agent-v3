@@ -2,11 +2,9 @@
 
 用法:
     python scripts/monitor_dev_run.py          # 全量启动（监控模式）
-    python scripts/monitor_dev_run.py --backend-only   # 仅后端
-    python scripts/monitor_dev_run.py --frontend-only  # 仅前端
 
 行为序列（严格按顺序）:
-    1. 生成 run_id = YYYYMMDD_HHMMSS
+    1. 生成 run_id = YYYYMMDD-HHMMSS
     2. 生成 monitor_token = secrets.token_hex(16)
     3. 创建 logs/monitor/ 目录
     4. 设置环境变量 TIANSHU_RUN_ID 和 TIANSHU_MONITOR_TOKEN
@@ -62,7 +60,7 @@ logger = logging.getLogger(__name__)
 
 
 def _generate_run_id() -> str:
-    """生成 run_id = YYYYMMDD_HHMMSS，碰撞时追加 _{random_hex_4}。
+    """生成 run_id = YYYYMMDD-HHMMSS，碰撞时追加 _{random_hex_4}。
 
     碰撞检测：检查 logs/monitor/ 下是否存在同名文件前缀。
     这是线程安全的——同一台机器上几乎不可能在 1 秒内启动两次。
@@ -71,7 +69,7 @@ def _generate_run_id() -> str:
         唯一且可排序的 run_id 字符串。
     """
     now = datetime.now()
-    base = now.strftime("%Y%m%d_%H%M%S")
+    base = now.strftime("%Y%m%d-%H%M%S")
     run_id = base
 
     # 碰撞检测——检查是否有同前缀的日志文件
@@ -271,9 +269,11 @@ def _check_ports_available() -> list[str]:
             req = urllib_req.Request(url)
             with urllib_req.urlopen(req, timeout=1):
                 busy.append(f"{name} 端口 {port}")
+        except urllib_err.HTTPError:
+            busy.append(f"{name} 端口 {port}")  # HTTP响应=端口已占用
         except urllib_err.URLError:
             pass  # 端口空闲（连接被拒绝）
-        except (urllib_err.HTTPError, OSError):
+        except OSError:
             busy.append(f"{name} 端口 {port}")
         except Exception:
             pass  # 超时或无响应——端口可能被占用也可能未就绪
