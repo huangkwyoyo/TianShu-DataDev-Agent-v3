@@ -47,6 +47,15 @@ let config: MonitorConfig | null = null;
 /** 保存原始 fetch 引用，避免包装后的 fetch 造成递归 */
 const nativeFetch = window.fetch;
 
+/**
+ * 保存 event listener 引用，以便将来可能的 removeEventListener。
+ * 使用 addEventListener 而非属性赋值，避免覆盖页面上已有的错误处理程序。
+ */
+const _handlers: {
+  onerror?: (event: ErrorEvent) => void;
+  onrejection?: (event: PromiseRejectionEvent) => void;
+} = {};
+
 // ── 内部工具函数 ──
 
 /** 过滤 stack trace 中的无关帧（browser extension 和 node_modules） */
@@ -171,23 +180,18 @@ function registerFetchWrapper(): void {
   };
 }
 
-/** 注册 window.onerror——捕获运行时异常 */
+/**
+ * 注册 error 事件监听器——捕获运行时异常。
+ * 使用 addEventListener 而非 window.onerror 属性赋值，
+ * 避免覆盖页面上已有的错误处理程序（如其他监控库、React error boundary 全局回退等）。
+ */
 function registerOnError(): void {
-  window.onerror = function (
-    message: Event | string,
-    source?: string,
-    lineno?: number,
-    colno?: number,
-    error?: Error,
-  ): void {
+  _handlers.onerror = (event: ErrorEvent) => {
     if (!config) return;
 
-    // 兼容 Event 和 string 两种 overload
-    const msg = typeof message === 'string'
-      ? message
-      : (message as ErrorEvent).message || String(message);
-    const errObj: Error | undefined = error ||
-      (typeof message === 'object' ? (message as ErrorEvent).error : undefined);
+    // ErrorEvent 属性：.message、.filename、.lineno、.colno、.error
+    const msg = event.message || String(event);
+    const errObj: Error | undefined = event.error;
     const frames = errObj?.stack ? filterStackFrames(errObj.stack) : [];
 
     sendEvent({
@@ -202,11 +206,16 @@ function registerOnError(): void {
 
     // 不调用 preventDefault——让浏览器默认错误处理也运行
   };
+  window.addEventListener('error', _handlers.onerror);
 }
 
-/** 注册 window.onunhandledrejection——捕获未处理 Promise 拒绝 */
+/**
+ * 注册 unhandledrejection 事件监听器——捕获未处理 Promise 拒绝。
+ * 使用 addEventListener 而非 window.onunhandledrejection 属性赋值，
+ * 避免覆盖页面上已有的处理程序。
+ */
 function registerOnUnhandledRejection(): void {
-  window.onunhandledrejection = function (event: PromiseRejectionEvent): void {
+  _handlers.onrejection = (event: PromiseRejectionEvent) => {
     if (!config) return;
 
     const reason = event.reason;
@@ -239,6 +248,7 @@ function registerOnUnhandledRejection(): void {
 
     // 不调用 preventDefault——让浏览器默认处理也运行
   };
+  window.addEventListener('unhandledrejection', _handlers.onrejection);
 }
 
 // ── 公开 API ──
@@ -251,8 +261,8 @@ function registerOnUnhandledRejection(): void {
  * 2. 若 enabled=false → 直接返回（零开销——不注册任何全局监听器）
  * 3. 若 enabled=true → 保存 config，注册三个全局采集器：
  *    a. fetch 包装——拦截所有 /api/* 请求（排除 /api/monitor/*）
- *    b. window.onerror——捕获运行时异常
- *    c. window.onunhandledrejection——捕获未处理 Promise 拒绝
+ *    b. error 事件监听——捕获运行时异常（使用 addEventListener，不覆盖已有处理程序）
+ *    c. unhandledrejection 事件监听——捕获未处理 Promise 拒绝（使用 addEventListener）
  * 4. 所有上报请求携带 monitor_token 用于后端校验
  *
  * 安全：initMonitor 可被多次调用，仅首次生效。
