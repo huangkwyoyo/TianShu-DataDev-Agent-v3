@@ -199,11 +199,12 @@ class TestSqlPipelineMonitoring:
         expected = [
             "sql_parser", "sql_enricher", "sql_builder",
             "sql_validator", "sql_compiler", "sql_executor",
+            "snapshot_builder",
         ]
         for n in expected:
             assert n in nodes, f"缺少节点 {n}，实际节点：{nodes}"
-        assert len(nodes) >= len(expected), (
-            f"应至少有 {len(expected)} 个节点，实际 {len(nodes)}：{nodes}"
+        assert len(nodes) == len(expected), (
+            f"应有 {len(expected)} 个节点，实际 {len(nodes)}：{nodes}"
         )
 
     # ─── parse_only ───────────────────────────────────────
@@ -236,8 +237,8 @@ class TestSqlPipelineMonitoring:
         expected = ["sql_parser", "sql_enricher", "sql_builder", "sql_validator"]
         for n in expected:
             assert n in nodes, f"缺少节点 {n}，实际节点：{nodes}"
-        assert len(nodes) >= len(expected), (
-            f"应至少有 {len(expected)} 个节点，实际 {len(nodes)}：{nodes}"
+        assert len(nodes) == len(expected), (
+            f"应有 {len(expected)} 个节点，实际 {len(nodes)}：{nodes}"
         )
 
     # ─── run_all ──────────────────────────────────────────
@@ -245,7 +246,7 @@ class TestSqlPipelineMonitoring:
     def test_run_all_records_extra_stages(
         self, pipeline, golden_spec_passing, mock_collector,
     ):
-        """run_all 应记录 8 个节点（6 基础 + contract_extractor + packager）。"""
+        """run_all 应记录 9 个节点（6 基础 + contract_extractor + snapshot_builder + packager）。"""
         try:
             import duckdb  # noqa: F401
         except ImportError:
@@ -256,6 +257,21 @@ class TestSqlPipelineMonitoring:
             )
         )
         mock_collector.stages.clear()
+
+        # 注入 mock SnapshotBuilder + SnapshotProvider——使 snapshot_builder 阶段可执行
+        mock_snap_builder = MagicMock()
+        mock_snap_manifest = MagicMock()
+        mock_snap_manifest.snapshot_id = "snap_test"
+        mock_snap_manifest.files = [MagicMock()]
+        mock_snap_manifest.model_dump.return_value = {
+            "snapshot_id": "snap_test", "files": [],
+            "snapshot_dir": "/tmp/test", "contract_hash": "abc123",
+            "source_type": "local_fixture",
+        }
+        mock_snap_builder.build.return_value = mock_snap_manifest
+        mock_snap_provider = MagicMock()
+        mock_snap_provider.allowlisted_tables = ["test_fact"]
+        pipeline.inject_snapshot_deps(mock_snap_builder, mock_snap_provider)
 
         result = pipeline.run_all(
             golden_spec_passing,
@@ -270,12 +286,12 @@ class TestSqlPipelineMonitoring:
         expected = [
             "sql_parser", "sql_enricher", "sql_builder",
             "sql_validator", "sql_compiler", "sql_executor",
-            "contract_extractor", "packager",
+            "contract_extractor", "snapshot_builder", "packager",
         ]
         for n in expected:
             assert n in nodes, f"缺少节点 {n}，实际节点：{nodes}"
-        assert len(nodes) >= len(expected), (
-            f"应至少有 {len(expected)} 个节点，实际 {len(nodes)}：{nodes}"
+        assert len(nodes) == len(expected), (
+            f"应有 {len(expected)} 个节点，实际 {len(nodes)}：{nodes}"
         )
 
     # ─── parse_rich 不重复 ────────────────────────────────
@@ -362,7 +378,6 @@ class TestSqlPipelineMonitoring:
 
         # 注入一个会抛出异常的 compiler（使用通过验证的 golden_spec_passing）
         import tianshu_datadev.api.pipeline as pipeline_mod
-        original_compiler = pipeline_mod.DuckDbSqlCompiler
 
         class FailingCompiler:
             def __init__(self, *args, **kwargs):
@@ -371,15 +386,12 @@ class TestSqlPipelineMonitoring:
             def compile(self, plan):
                 raise ValueError("模拟编译失败")
 
-        pipeline_mod.DuckDbSqlCompiler = FailingCompiler
-        try:
+        with patch.object(pipeline_mod, 'DuckDbSqlCompiler', FailingCompiler):
             result = pipeline.execute(
                 golden_spec_passing,
                 table_mapping={"tf": "test_fact"},
                 table_paths={"test_fact": csv_path},
             )
-        finally:
-            pipeline_mod.DuckDbSqlCompiler = original_compiler
 
         # 应该有 pipeline_error
         assert "pipeline_error" in result

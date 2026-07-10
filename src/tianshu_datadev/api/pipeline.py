@@ -1399,40 +1399,45 @@ class Pipeline:
                 # 必须在 contract 提取之后——依赖 contract 的 hash
                 snapshot_manifest = None
                 if self._snapshot_builder is not None and self._snapshot_provider is not None:
-                    try:
-                        # 计算 contract_hash——使用 Contract 模型的静态方法
-                        from tianshu_datadev.artifacts.models import (
-                            DataTransformContractLite as _Lite,
-                        )
-                        from tianshu_datadev.artifacts.models import (
-                            DataTransformContractV1 as _V1,  # noqa: N814
-                        )
-                        if isinstance(contract, _V1):
-                            contract_hash = _V1.compute_contract_hash(contract)
-                        else:
-                            contract_hash = _Lite.compute_contract_hash(contract)
-
-                        # 从 table_paths 推导 source_tables——与 provider 白名单交集
-                        source_tables = list(table_paths.keys()) if table_paths else []
-                        allowlisted = set(self._snapshot_provider.allowlisted_tables)
-                        source_tables = [t for t in source_tables if t in allowlisted]
-
-                        if source_tables:
-                            snapshot_manifest = self._snapshot_builder.build(
-                                contract_hash=contract_hash,
-                                source_tables=source_tables,
-                                provider=self._snapshot_provider,
-                                table_aliases=_aliases_from_table_mapping(table_mapping),
+                    with collector.stage("snapshot_builder", request_id) as ctx:
+                        try:
+                            # 计算 contract_hash——使用 Contract 模型的静态方法
+                            from tianshu_datadev.artifacts.models import (
+                                DataTransformContractLite as _Lite,
                             )
-                            logger.info(
-                                "Snapshot 构建成功——snapshot_id=%s，文件数=%d",
-                                snapshot_manifest.snapshot_id,
-                                len(snapshot_manifest.files),
+                            from tianshu_datadev.artifacts.models import (
+                                DataTransformContractV1 as _V1,  # noqa: N814
                             )
-                    except Exception as snap_err:
-                        # Snapshot 失败不阻断主流程——记录日志，继续 Package
-                        logger.warning("Snapshot 构建失败（非阻断）：%s", snap_err)
-                        snapshot_manifest = None
+                            if isinstance(contract, _V1):
+                                contract_hash = _V1.compute_contract_hash(contract)
+                            else:
+                                contract_hash = _Lite.compute_contract_hash(contract)
+
+                            # 从 table_paths 推导 source_tables——与 provider 白名单交集
+                            source_tables = list(table_paths.keys()) if table_paths else []
+                            allowlisted = set(self._snapshot_provider.allowlisted_tables)
+                            source_tables = [t for t in source_tables if t in allowlisted]
+
+                            if source_tables:
+                                snapshot_manifest = self._snapshot_builder.build(
+                                    contract_hash=contract_hash,
+                                    source_tables=source_tables,
+                                    provider=self._snapshot_provider,
+                                    table_aliases=_aliases_from_table_mapping(table_mapping),
+                                )
+                                ctx.set_result(
+                                    artifact_path=f"snapshot/{snapshot_manifest.snapshot_id}",
+                                    row_count=len(snapshot_manifest.files),
+                                )
+                                logger.info(
+                                    "Snapshot 构建成功——snapshot_id=%s，文件数=%d",
+                                    snapshot_manifest.snapshot_id,
+                                    len(snapshot_manifest.files),
+                                )
+                        except Exception as snap_err:
+                            # Snapshot 失败不阻断主流程——记录日志，继续 Package
+                            logger.warning("Snapshot 构建失败（非阻断）：%s", snap_err)
+                            snapshot_manifest = None
 
                 stage = "package"
                 request_id = self._gen_request_id(spec)
@@ -1697,40 +1702,45 @@ class Pipeline:
             # 必须在 contract 提取之后——依赖 contract 的 hash
             snapshot_manifest = None
             if self._snapshot_builder is not None and self._snapshot_provider is not None:
-                try:
-                    # 计算 contract_hash——使用 Contract 模型的静态方法
-                    from tianshu_datadev.artifacts.models import (
-                        DataTransformContractLite as _Lite,
-                    )
-                    from tianshu_datadev.artifacts.models import (
-                        DataTransformContractV1 as _V1,  # noqa: N814
-                    )
-                    if isinstance(contract, _V1):
-                        contract_hash = _V1.compute_contract_hash(contract)
-                    else:
-                        contract_hash = _Lite.compute_contract_hash(contract)
-
-                    # 从 table_paths 推导 source_tables——与 provider 白名单交集
-                    source_tables = list(table_paths.keys()) if table_paths else []
-                    allowlisted = set(self._snapshot_provider.allowlisted_tables)
-                    source_tables = [t for t in source_tables if t in allowlisted]
-
-                    if source_tables:
-                        snapshot_manifest = self._snapshot_builder.build(
-                            contract_hash=contract_hash,
-                            source_tables=source_tables,
-                            provider=self._snapshot_provider,
-                            table_aliases=_aliases_from_table_mapping(table_mapping),
+                with collector.stage("snapshot_builder", request_id) as ctx:
+                    try:
+                        # 计算 contract_hash——使用 Contract 模型的静态方法
+                        from tianshu_datadev.artifacts.models import (
+                            DataTransformContractLite as _Lite,
                         )
-                        logger.info(
-                            "Snapshot 构建成功——snapshot_id=%s，文件数=%d",
-                            snapshot_manifest.snapshot_id,
-                            len(snapshot_manifest.files),
+                        from tianshu_datadev.artifacts.models import (
+                            DataTransformContractV1 as _V1,  # noqa: N814
                         )
-                except Exception as snap_err:
-                    # Snapshot 失败不阻断主流程——记录日志，继续 Package
-                    logger.warning("Snapshot 构建失败（非阻断）：%s", snap_err)
-                    snapshot_manifest = None
+                        if isinstance(contract, _V1):
+                            contract_hash = _V1.compute_contract_hash(contract)
+                        else:
+                            contract_hash = _Lite.compute_contract_hash(contract)
+
+                        # 从 table_paths 推导 source_tables——与 provider 白名单交集
+                        source_tables = list(table_paths.keys()) if table_paths else []
+                        allowlisted = set(self._snapshot_provider.allowlisted_tables)
+                        source_tables = [t for t in source_tables if t in allowlisted]
+
+                        if source_tables:
+                            snapshot_manifest = self._snapshot_builder.build(
+                                contract_hash=contract_hash,
+                                source_tables=source_tables,
+                                provider=self._snapshot_provider,
+                                table_aliases=_aliases_from_table_mapping(table_mapping),
+                            )
+                            ctx.set_result(
+                                artifact_path=f"snapshot/{snapshot_manifest.snapshot_id}",
+                                row_count=len(snapshot_manifest.files),
+                            )
+                            logger.info(
+                                "Snapshot 构建成功——snapshot_id=%s，文件数=%d",
+                                snapshot_manifest.snapshot_id,
+                                len(snapshot_manifest.files),
+                            )
+                    except Exception as snap_err:
+                        # Snapshot 失败不阻断主流程——记录日志，继续 Package
+                        logger.warning("Snapshot 构建失败（非阻断）：%s", snap_err)
+                        snapshot_manifest = None
 
             stage = "package"
             request_id = self._gen_request_id(spec)
@@ -2475,100 +2485,102 @@ class Pipeline:
             _df.write(f"  _default_table_paths keys={list(self._default_table_paths.keys())}\\n")
         resolved_paths = self._resolve_table_paths(table_paths)
         if resolved_paths:
-            try:
-                import os as _os
-                import tempfile as _tempfile
+            with collector.stage("snapshot_builder", request_id) as ctx:
+                try:
+                    import os as _os
+                    import tempfile as _tempfile
 
-                from tianshu_datadev.spark.snapshot import SnapshotFile
-                from tianshu_datadev.spark.snapshot import SnapshotManifest as _SnapManifest
+                    from tianshu_datadev.spark.snapshot import SnapshotFile
+                    from tianshu_datadev.spark.snapshot import SnapshotManifest as _SnapManifest
 
-                # 计算 contract_hash——用于快照溯源
-                contract_hash = ""
-                if contract is not None:
-                    from tianshu_datadev.artifacts.models import (
-                        DataTransformContractLite as _Lite,
-                    )
-                    from tianshu_datadev.artifacts.models import (
-                        DataTransformContractV1 as _V1,  # noqa: N814
-                    )
-                    if isinstance(contract, _V1):
-                        contract_hash = _V1.compute_contract_hash(contract)
-                    elif isinstance(contract, _Lite):
-                        contract_hash = _Lite.compute_contract_hash(contract)
-
-                # 创建快照输出目录
-                snap_dir = _tempfile.mkdtemp(prefix="tianshu_snap_")
-
-                import pyarrow.csv as _pacsv
-                import pyarrow.parquet as _pq
-
-                # 构建逆向映射：物理表名 → alias（供 source_name 使用）
-                _reverse_mapping = _aliases_from_table_mapping(table_mapping)
-                logger.info(
-                    "快照诊断——table_mapping=%s, _reverse_mapping=%s, "
-                    "resolved_paths_keys=%s",
-                    table_mapping, _reverse_mapping,
-                    list(resolved_paths.keys()) if resolved_paths else [],
-                )
-
-                files: list[SnapshotFile] = []
-                for table_name, csv_path in sorted(resolved_paths.items()):
-                    if not _os.path.isfile(csv_path):
-                        logger.warning("快照跳过——CSV 文件不存在：%s", csv_path)
-                        continue
-                    try:
-                        # 读取 CSV → PyArrow Table → 写入 Parquet
-                        table = _pacsv.read_csv(
-                            csv_path,
-                            read_options=_pacsv.ReadOptions(),
-                            parse_options=_pacsv.ParseOptions(),
+                    # 计算 contract_hash——用于快照溯源
+                    contract_hash = ""
+                    if contract is not None:
+                        from tianshu_datadev.artifacts.models import (
+                            DataTransformContractLite as _Lite,
                         )
-                        # 文件名保留 schema 前缀（如 gold.fact_trips.parquet）
-                        parquet_path = _os.path.join(snap_dir, f"{table_name}.parquet")
-                        _pq.write_table(table, parquet_path)
-
-                        # 计算行数和文件 hash
-                        row_count = int(table.num_rows)
-                        file_sha256 = hashlib.sha256()
-                        with open(parquet_path, "rb") as _fh:
-                            for _chunk in iter(lambda: _fh.read(8192), b""):
-                                file_sha256.update(_chunk)
-
-                        # source_name 用 alias（与 PySpark transform 中 inputs[alias] 对齐）
-                        # 无 alias 时回退物理表名（向后兼容单表无 mapping 场景）
-                        _source = _reverse_mapping.get(table_name, table_name)
-                        files.append(SnapshotFile(
-                            source_name=_source,
-                            file_path=parquet_path,
-                            format="parquet",
-                            row_count=row_count,
-                            file_sha256=file_sha256.hexdigest(),
-                        ))
-                    except Exception as _csv_err:
-                        logger.warning(
-                            "快照创建失败（表 %s）：%s", table_name, _csv_err,
+                        from tianshu_datadev.artifacts.models import (
+                            DataTransformContractV1 as _V1,  # noqa: N814
                         )
-                        continue
+                        if isinstance(contract, _V1):
+                            contract_hash = _V1.compute_contract_hash(contract)
+                        elif isinstance(contract, _Lite):
+                            contract_hash = _Lite.compute_contract_hash(contract)
 
-                if files:
-                    # 写 _inputs_index.json 侧车——executor prologue 按别名装载
-                    from tianshu_datadev.spark.snapshot import SnapshotBuilder
-                    SnapshotBuilder._write_inputs_index(snap_dir, files)
-                    # 生成确定性 snapshot_id
-                    snap_id = f"snap_{contract_hash[:16] if contract_hash else 'adhoc'}"
-                    snapshot_manifest = _SnapManifest(
-                        snapshot_id=snap_id,
-                        contract_hash=contract_hash,
-                        snapshot_dir=snap_dir,
-                        files=files,
-                        source_type="local_fixture",
-                    )
+                    # 创建快照输出目录
+                    snap_dir = _tempfile.mkdtemp(prefix="tianshu_snap_")
+
+                    import pyarrow.csv as _pacsv
+                    import pyarrow.parquet as _pq
+
+                    # 构建逆向映射：物理表名 → alias（供 source_name 使用）
+                    _reverse_mapping = _aliases_from_table_mapping(table_mapping)
                     logger.info(
-                        "快照创建成功——snapshot_id=%s，文件数=%d",
-                        snap_id, len(files),
+                        "快照诊断——table_mapping=%s, _reverse_mapping=%s, "
+                        "resolved_paths_keys=%s",
+                        table_mapping, _reverse_mapping,
+                        list(resolved_paths.keys()) if resolved_paths else [],
                     )
-            except Exception as snap_err:
-                logger.warning("快照创建失败（非阻断）：%s", snap_err)
+
+                    files: list[SnapshotFile] = []
+                    for table_name, csv_path in sorted(resolved_paths.items()):
+                        if not _os.path.isfile(csv_path):
+                            logger.warning("快照跳过——CSV 文件不存在：%s", csv_path)
+                            continue
+                        try:
+                            # 读取 CSV → PyArrow Table → 写入 Parquet
+                            table = _pacsv.read_csv(
+                                csv_path,
+                                read_options=_pacsv.ReadOptions(),
+                                parse_options=_pacsv.ParseOptions(),
+                            )
+                            # 文件名保留 schema 前缀（如 gold.fact_trips.parquet）
+                            parquet_path = _os.path.join(snap_dir, f"{table_name}.parquet")
+                            _pq.write_table(table, parquet_path)
+
+                            # 计算行数和文件 hash
+                            row_count = int(table.num_rows)
+                            file_sha256 = hashlib.sha256()
+                            with open(parquet_path, "rb") as _fh:
+                                for _chunk in iter(lambda: _fh.read(8192), b""):
+                                    file_sha256.update(_chunk)
+
+                            # source_name 用 alias（与 PySpark transform 中 inputs[alias] 对齐）
+                            # 无 alias 时回退物理表名（向后兼容单表无 mapping 场景）
+                            _source = _reverse_mapping.get(table_name, table_name)
+                            files.append(SnapshotFile(
+                                source_name=_source,
+                                file_path=parquet_path,
+                                format="parquet",
+                                row_count=row_count,
+                                file_sha256=file_sha256.hexdigest(),
+                            ))
+                        except Exception as _csv_err:
+                            logger.warning(
+                                "快照创建失败（表 %s）：%s", table_name, _csv_err,
+                            )
+                            continue
+
+                    if files:
+                        # 写 _inputs_index.json 侧车——executor prologue 按别名装载
+                        from tianshu_datadev.spark.snapshot import SnapshotBuilder
+                        SnapshotBuilder._write_inputs_index(snap_dir, files)
+                        # 生成确定性 snapshot_id
+                        snap_id = f"snap_{contract_hash[:16] if contract_hash else 'adhoc'}"
+                        snapshot_manifest = _SnapManifest(
+                            snapshot_id=snap_id,
+                            contract_hash=contract_hash,
+                            snapshot_dir=snap_dir,
+                            files=files,
+                            source_type="local_fixture",
+                        )
+                        ctx.set_result(artifact_path=f"snapshot/{snap_id}", row_count=len(files))
+                        logger.info(
+                            "快照创建成功——snapshot_id=%s，文件数=%d",
+                            snap_id, len(files),
+                        )
+                except Exception as snap_err:
+                    logger.warning("快照创建失败（非阻断）：%s", snap_err)
 
         self._store_result(request_id, {
             "parsed_spec": spec, "manifest": manifest, "plan": plan,
