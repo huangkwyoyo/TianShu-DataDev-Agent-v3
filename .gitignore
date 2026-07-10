@@ -41,3 +41,6 @@ llm_reports/
 # dev-reload 启动日志——忽略目录下所有内容，但保留 .gitkeep
 logs/dev/*
 !logs/dev/.gitkeep
+
+# 全流程运行监控系统日志
+logs/monitor/

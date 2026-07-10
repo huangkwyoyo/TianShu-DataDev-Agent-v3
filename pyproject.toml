@@ -40,8 +40,10 @@ langgraph = ["langgraph>=0.2.0"]
 spark = ["pyspark>=3.5.0"]
 # Anthropic SDK——Phase 4A DeepSeek/Anthropic LLM 调用
 anthropic = ["anthropic>=0.30.0"]
+# 全流程运行监控系统——Batch 1
+monitor = ["psutil>=5.9.0"]
 # 开发工具
-dev = ["pytest>=8.0", "pytest-cov>=4.0", "ruff>=0.3.0"]
+dev = ["pytest>=8.0", "pytest-cov>=4.0", "ruff>=0.3.0", "pytest-timeout>=2.0"]
 # 前端——Phase 5 开始激活（fastapi/uvicorn 已移入核心依赖）
 
 [tool.setuptools.packages.find]
