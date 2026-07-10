@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -23,6 +24,7 @@ from tianshu_datadev.developer_spec.models import (
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
 from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
 from tianshu_datadev.llm.models import LlmResponse, LlmTraceNode
+from tianshu_datadev.monitor import get_collector
 from tianshu_datadev.planning.cross_validator import cross_validate
 from tianshu_datadev.planning.program_factory import (
     build_sql_program,
@@ -214,6 +216,10 @@ class Pipeline:
         self._snapshot_provider = snapshot_provider
         # ── Phase 9C-R16: table_paths 回退值 ──
         self._default_table_paths = default_table_paths or {}
+        # 诊断：记录初始化参数
+        with open("D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3/logs/dev/diag_snapshot.txt", "a") as _df:
+            _df.write(f"DIAG Pipeline.__init__: _default_table_paths keys={list(self._default_table_paths.keys())}\\n")
+            _df.write(f"  snapshot_builder={snapshot_builder is not None}, duckdb_path={duckdb_path}\\n")
         # ── 外部 DuckDB 数据库路径 ──
         self._duckdb_path = duckdb_path
         # ── Phase 8: SparkDeveloperService 注入 ──
@@ -245,6 +251,18 @@ class Pipeline:
 
     def _store_result(self, request_id: str, data: dict) -> None:
         """缓存中间结果并记录写入时间戳——供 TTL 过期清理使用。"""
+        _snap = data.get("snapshot_manifest")
+        if _snap is not None:
+            import traceback as _tb
+            with open("D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3/logs/dev/diag_snapshot.txt", "a") as _df:
+                _df.write(f"DIAG _store_result: snapshot_manifest 被存储！request_id={request_id}\\n")
+                _df.write(f"  snapshot_manifest type={type(_snap).__name__}\\n")
+                if hasattr(_snap, 'snapshot_dir'):
+                    _df.write(f"  snapshot_dir={_snap.snapshot_dir}\\n")
+                    _df.write(f"  files={[(f.source_name, f.file_path) for f in _snap.files]}\\n")
+                _df.write(f"  stack:\\n")
+                for _line in _tb.format_stack()[-6:-1]:
+                    _df.write(f"    {_line.strip()}\\n")
         self._results[request_id] = data
         self._timestamps[request_id] = time.monotonic()
 
@@ -407,6 +425,7 @@ class Pipeline:
         table_mapping: dict | None = None,
         *,
         pipeline_stages: list[str] | None = None,
+        collector=None,
     ) -> dict:
         """Stage 1+2 统一入口：Parser + Enrich/Plan。
 
@@ -424,10 +443,14 @@ class Pipeline:
                       "extra_questions": ..., "table_mapping": ...}
             失败时：{"ok": False, "error_response": {...}}
         """
+        if collector is None:
+            collector = get_collector()
         # ── Stage 1: Parser ──
         try:
             parser = DeveloperSpecParser()
-            spec = parser.parse(markdown_text)
+            with collector.stage("sql_parser", "") as ctx:
+                spec = parser.parse(markdown_text)
+                ctx.set_result(artifact_path=f"spec/{spec.spec_hash[:12]}")
             manifest = build_manifest_from_spec(spec)
         except Exception as e:
             self._log_stage_failure(method, "parser", e)
@@ -444,13 +467,15 @@ class Pipeline:
             }
 
         # ── Stage 2: Enrich + Plan ──
+        request_id = self._gen_request_id(spec)
         try:
-            spec, hypothesis, extra_questions, table_mapping = self._enrich_and_plan(
-                spec, manifest, table_mapping,
-            )
+            with collector.stage("sql_enricher", request_id) as ctx:
+                spec, hypothesis, extra_questions, table_mapping = self._enrich_and_plan(
+                    spec, manifest, table_mapping,
+                )
+                ctx.set_result(artifact_path=f"spec/{spec.spec_hash[:12]}/enriched")
         except Exception as e:
             self._log_stage_failure(method, "enrich", e)
-            request_id = self._gen_request_id(spec)
             self._store_result(request_id, {"parsed_spec": spec, "manifest": manifest})
             error_info = self._capture_error("enrich", e)
             return {
@@ -658,10 +683,13 @@ class Pipeline:
             符合 SpecParseResponse 或 SpecRichResponse 结构的 dict
         """
         self._purge_expired()
+        collector = get_collector()
         # ── Stage: parser ──
         try:
             parser = DeveloperSpecParser()
-            spec = parser.parse(markdown_text)
+            with collector.stage("sql_parser", "") as ctx:
+                spec = parser.parse(markdown_text)
+                ctx.set_result(artifact_path=f"spec/{spec.spec_hash[:12]}")
         except Exception as e:
             self._log_stage_failure("parse_only", "parser", e)
             error_info = self._capture_error("parser", e)
@@ -753,8 +781,12 @@ class Pipeline:
             符合 PlanResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
         """
         self._purge_expired()
+        collector = get_collector()
         # ── Stage 1-2: Parser + Enrich ──
-        parsed = self._parse_and_enrich("build_plan", markdown_text, table_mapping)
+        parsed = self._parse_and_enrich(
+            "build_plan", markdown_text, table_mapping,
+            collector=collector,
+        )
         if not parsed["ok"]:
             return parsed["error_response"]
         spec = parsed["spec"]
@@ -762,6 +794,7 @@ class Pipeline:
         hypothesis = parsed["hypothesis"]
         extra_questions = parsed["extra_questions"]
         table_mapping = parsed["table_mapping"]
+        request_id = self._gen_request_id(spec)
 
         # ── Stage 3: Build + Validate ──
         plan = None
@@ -771,7 +804,10 @@ class Pipeline:
 
             if spec.compute_steps and len(spec.compute_steps) > 0:
                 # ── ComputeSteps 路径：每步独立聚合 Plan，_temp 串联 ──
-                plans = builder.build_from_steps(spec, hypothesis)
+                with collector.stage("sql_builder", request_id) as ctx:
+                    plans = builder.build_from_steps(spec, hypothesis)
+                    plan_snap = plans[-1]
+                    ctx.set_result(artifact_path=f"plan/{plan_snap.plan_id}")
                 chain_id = hashlib.md5(
                     "|".join(s.step_name for s in spec.compute_steps).encode()
                 ).hexdigest()[:8]
@@ -779,12 +815,16 @@ class Pipeline:
                     plans, spec, chain_id
                 )
                 validator = SqlBuildPlanValidator()
-                passed, val_questions = validator.validate_multi_hop_chain(sql_program)
+                with collector.stage("sql_validator", request_id):
+                    passed, val_questions = validator.validate_multi_hop_chain(sql_program)
                 plan = plans[-1]
                 plan_questions = []
             elif hypothesis and len(hypothesis.candidates) > 1:
                 # ── 多跳链路径：每对候选独立 Plan，_temp 串联 ──
-                plans = builder.build_multi(spec, hypothesis)
+                with collector.stage("sql_builder", request_id) as ctx:
+                    plans = builder.build_multi(spec, hypothesis)
+                    plan_snap = plans[-1]
+                    ctx.set_result(artifact_path=f"plan/{plan_snap.plan_id}")
                 chain_id = hashlib.md5(
                     "|".join(c.candidate_id for c in hypothesis.candidates).encode()
                 ).hexdigest()[:8]
@@ -792,13 +832,17 @@ class Pipeline:
                     plans, spec.spec_hash, chain_id
                 )
                 validator = SqlBuildPlanValidator()
-                passed, val_questions = validator.validate_multi_hop_chain(sql_program)
+                with collector.stage("sql_validator", request_id):
+                    passed, val_questions = validator.validate_multi_hop_chain(sql_program)
                 plan = plans[-1]
                 plan_questions = []
             else:
-                plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
+                with collector.stage("sql_builder", request_id) as ctx:
+                    plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
+                    ctx.set_result(artifact_path=f"plan/{plan.plan_id}")
                 validator = SqlBuildPlanValidator()
-                passed, val_questions = validator.validate(plan, manifest)
+                with collector.stage("sql_validator", request_id):
+                    passed, val_questions = validator.validate(plan, manifest)
                 sql_program = build_sql_program(plan, spec.spec_hash)
 
         except Exception as e:
@@ -856,8 +900,12 @@ class Pipeline:
             符合 ExecuteResponse 结构的 dict，失败时额外含 pipeline_error + pipeline_stages
         """
         self._purge_expired()
+        collector = get_collector()
         # ── Stage 1-2: Parser + Enrich ──
-        parsed = self._parse_and_enrich("execute", markdown_text, table_mapping)
+        parsed = self._parse_and_enrich(
+            "execute", markdown_text, table_mapping,
+            collector=collector,
+        )
         if not parsed["ok"]:
             return parsed["error_response"]
         spec = parsed["spec"]
@@ -865,6 +913,7 @@ class Pipeline:
         hypothesis = parsed["hypothesis"]
         extra_questions = parsed["extra_questions"]
         table_mapping = parsed["table_mapping"]
+        request_id = self._gen_request_id(spec)
 
         # ── Stage 3-5: Build → Compile → Execute（按分支） ──
         # 跨阶段变量——初始化为 None，按阶段赋值
@@ -880,7 +929,10 @@ class Pipeline:
 
             if spec.compute_steps and len(spec.compute_steps) > 0:
                 # ── ComputeSteps 路径 ──
-                plans = builder.build_from_steps(spec, hypothesis)
+                with collector.stage("sql_builder", request_id) as ctx:
+                    plans = builder.build_from_steps(spec, hypothesis)
+                    plan_snap = plans[-1]
+                    ctx.set_result(artifact_path=f"plan/{plan_snap.plan_id}")
                 chain_id = hashlib.md5(
                     "|".join(s.step_name for s in spec.compute_steps).encode()
                 ).hexdigest()[:8]
@@ -888,7 +940,8 @@ class Pipeline:
                     plans, spec, chain_id
                 )
                 validator = SqlBuildPlanValidator()
-                _chain_passed, val_questions = validator.validate_multi_hop_chain(sql_program)
+                with collector.stage("sql_validator", request_id):
+                    _chain_passed, val_questions = validator.validate_multi_hop_chain(sql_program)
                 validation_passed = _chain_passed
                 plan = plans[-1]
                 plan_questions: list = []
@@ -909,16 +962,25 @@ class Pipeline:
 
                 stage = "compile"
                 compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
-                program_artifact = compiler.compile_program(sql_program)
+                with collector.stage("sql_compiler", request_id) as ctx:
+                    program_artifact = compiler.compile_program(sql_program)
+                    ctx.set_result(
+                        artifact_path=f"compiled/{hashlib.sha256(str(sql_program).encode()).hexdigest()[:12]}"
+                    )
 
                 stage = "execute"
                 execute_executor = DuckDBExecutor(
                     table_paths=self._resolve_table_paths(table_paths),
                     duckdb_path=self._duckdb_path,
                 )
-                program_result = execute_executor.execute_program(
-                    program_artifact.compiled
-                )
+                with collector.stage("sql_executor", request_id) as ctx:
+                    program_result = execute_executor.execute_program(
+                        program_artifact.compiled
+                    )
+                    if program_result and program_result.results:
+                        last_trace = program_result.results[-1].trace
+                        if last_trace:
+                            ctx.set_result(row_count=last_trace.row_count)
                 last_result = (
                     program_result.results[-1]
                     if program_result.results else None
@@ -928,7 +990,10 @@ class Pipeline:
                 compiled = program_artifact.compiled.statements[-1]
             elif hypothesis and len(hypothesis.candidates) > 1:
                 # ── 多跳链路径 ──
-                plans = builder.build_multi(spec, hypothesis)
+                with collector.stage("sql_builder", request_id) as ctx:
+                    plans = builder.build_multi(spec, hypothesis)
+                    plan_snap = plans[-1]
+                    ctx.set_result(artifact_path=f"plan/{plan_snap.plan_id}")
                 chain_id = hashlib.md5(
                     "|".join(c.candidate_id for c in hypothesis.candidates).encode()
                 ).hexdigest()[:8]
@@ -936,7 +1001,8 @@ class Pipeline:
                     plans, spec.spec_hash, chain_id
                 )
                 validator = SqlBuildPlanValidator()
-                _chain_passed, val_questions = validator.validate_multi_hop_chain(sql_program)
+                with collector.stage("sql_validator", request_id):
+                    _chain_passed, val_questions = validator.validate_multi_hop_chain(sql_program)
                 validation_passed = _chain_passed
                 plan = plans[-1]
                 plan_questions: list = []
@@ -957,16 +1023,25 @@ class Pipeline:
 
                 stage = "compile"
                 compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
-                program_artifact = compiler.compile_program(sql_program)
+                with collector.stage("sql_compiler", request_id) as ctx:
+                    program_artifact = compiler.compile_program(sql_program)
+                    ctx.set_result(
+                        artifact_path=f"compiled/{hashlib.sha256(str(sql_program).encode()).hexdigest()[:12]}"
+                    )
 
                 stage = "execute"
                 execute_executor = DuckDBExecutor(
                     table_paths=self._resolve_table_paths(table_paths),
                     duckdb_path=self._duckdb_path,
                 )
-                program_result = execute_executor.execute_program(
-                    program_artifact.compiled
-                )
+                with collector.stage("sql_executor", request_id) as ctx:
+                    program_result = execute_executor.execute_program(
+                        program_artifact.compiled
+                    )
+                    if program_result and program_result.results:
+                        last_trace = program_result.results[-1].trace
+                        if last_trace:
+                            ctx.set_result(row_count=last_trace.row_count)
                 last_result = (
                     program_result.results[-1]
                     if program_result.results else None
@@ -975,11 +1050,14 @@ class Pipeline:
                 summary = last_result.summary if last_result is not None else None
                 compiled = program_artifact.compiled.statements[-1]
             else:
-                plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
+                with collector.stage("sql_builder", request_id) as ctx:
+                    plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
+                    ctx.set_result(artifact_path=f"plan/{plan.plan_id}")
 
                 # Validator 验证——blocking 问题阻断编译，非 blocking 记录供排查
                 validator = SqlBuildPlanValidator()
-                _passed, val_questions = validator.validate(plan, manifest)
+                with collector.stage("sql_validator", request_id):
+                    _passed, val_questions = validator.validate(plan, manifest)
                 validation_passed = _passed
                 all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
 
@@ -998,14 +1076,19 @@ class Pipeline:
 
                 stage = "compile"
                 compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
-                compiled = compiler.compile(plan)
+                with collector.stage("sql_compiler", request_id) as ctx:
+                    compiled = compiler.compile(plan)
+                    ctx.set_result(artifact_path=f"compiled/{compiled.sql_sha256[:12]}")
 
                 stage = "execute"
                 execute_executor = DuckDBExecutor(
                     table_paths=self._resolve_table_paths(table_paths),
                     duckdb_path=self._duckdb_path,
                 )
-                trace, summary = execute_executor.execute(compiled)
+                with collector.stage("sql_executor", request_id) as ctx:
+                    trace, summary = execute_executor.execute(compiled)
+                    if trace:
+                        ctx.set_result(row_count=trace.row_count)
 
             # ── 执行状态检查——RUNTIME_FAIL 阻断，不进入成功路径 ──
             if isinstance(trace.status, ExecutionStatus) and trace.status == ExecutionStatus.RUNTIME_FAIL:
@@ -1156,6 +1239,7 @@ class Pipeline:
             符合 RunAllResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
         """
         self._purge_expired()
+        collector = get_collector()
         _run_all_stages = [
             "parser", "enrich", "build", "validate",
             "compile", "execute", "contract", "package",
@@ -1165,6 +1249,7 @@ class Pipeline:
         parsed = self._parse_and_enrich(
             "run_all", markdown_text, table_mapping,
             pipeline_stages=_run_all_stages,
+            collector=collector,
         )
         if not parsed["ok"]:
             return parsed["error_response"]
@@ -1173,6 +1258,7 @@ class Pipeline:
         hypothesis = parsed["hypothesis"]
         extra_questions = parsed["extra_questions"]
         table_mapping = parsed["table_mapping"]
+        request_id = self._gen_request_id(spec)
 
         # ── Stage 3-7: Build → Compile → Execute → Contract → Package ──
         plan = None
@@ -1197,7 +1283,10 @@ class Pipeline:
 
             if spec.compute_steps and len(spec.compute_steps) > 0:
                 # ── ComputeSteps 路径 ──
-                plans = builder.build_from_steps(spec, hypothesis)
+                with collector.stage("sql_builder", request_id) as ctx:
+                    plans = builder.build_from_steps(spec, hypothesis)
+                    plan_snap = plans[-1]
+                    ctx.set_result(artifact_path=f"plan/{plan_snap.plan_id}")
                 chain_id = hashlib.md5(
                     "|".join(s.step_name for s in spec.compute_steps).encode()
                 ).hexdigest()[:8]
@@ -1208,7 +1297,8 @@ class Pipeline:
                 plan_questions = []
 
                 validator = SqlBuildPlanValidator()
-                passed, val_questions = validator.validate_multi_hop_chain(sql_program)
+                with collector.stage("sql_validator", request_id):
+                    passed, val_questions = validator.validate_multi_hop_chain(sql_program)
 
                 if not passed:
                     all_qs = list(plan_questions) + list(val_questions) + list(extra_questions)
@@ -1225,7 +1315,11 @@ class Pipeline:
 
                 stage = "compile"
                 compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
-                program_artifact = compiler.compile_program(sql_program)
+                with collector.stage("sql_compiler", request_id) as ctx:
+                    program_artifact = compiler.compile_program(sql_program)
+                    ctx.set_result(
+                        artifact_path=f"compiled/{hashlib.sha256(str(sql_program).encode()).hexdigest()[:12]}"
+                    )
                 compiled_sql = program_artifact.compiled.statements[-1]
 
                 stage = "execute"
@@ -1233,9 +1327,14 @@ class Pipeline:
                     table_paths=self._resolve_table_paths(table_paths),
                     duckdb_path=self._duckdb_path,
                 )
-                program_result = executor.execute_program(
-                    program_artifact.compiled
-                )
+                with collector.stage("sql_executor", request_id) as ctx:
+                    program_result = executor.execute_program(
+                        program_artifact.compiled
+                    )
+                    if program_result and program_result.results:
+                        last_trace = program_result.results[-1].trace
+                        if last_trace:
+                            ctx.set_result(row_count=last_trace.row_count)
                 execution_trace = program_result.results[-1].trace if program_result.results else None
                 execution_summary = (
                     program_result.results[-1].summary
@@ -1247,7 +1346,11 @@ class Pipeline:
 
                 # ── Contract 提取（执行状态检查之前——contract 不依赖执行结果）──
                 extractor = DataTransformContractExtractor()
-                contract = extractor.extract_v1(sql_program)
+                with collector.stage("contract_extractor", request_id) as ctx:
+                    contract = extractor.extract_v1(sql_program)
+                    if contract:
+                        ctx.set_result(artifact_path=f"contract/{contract.contract_id[:12]}")
+
 
                 # ── 执行状态检查——RUNTIME_FAIL 阻断 ──
                 if execution_trace is not None \
@@ -1363,7 +1466,9 @@ class Pipeline:
                     snapshot_manifest=snapshot_manifest.model_dump() if snapshot_manifest else None,
                 )
                 packager = ReviewPackageBuilder()
-                package_manifest = packager.build(package_inputs)
+                with collector.stage("packager", request_id) as ctx:
+                    package_manifest = packager.build(package_inputs)
+                    ctx.set_result(artifact_path=f"package/{package_manifest.package_id}")
                 self._store_result(request_id, {
                     "package": package_manifest,
                     "sql_artifact": SqlArtifact(
@@ -1432,7 +1537,10 @@ class Pipeline:
 
             elif hypothesis and len(hypothesis.candidates) > 1:
                 # ── 多跳链路径 ──
-                plans = builder.build_multi(spec, hypothesis)
+                with collector.stage("sql_builder", request_id) as ctx:
+                    plans = builder.build_multi(spec, hypothesis)
+                    plan_snap = plans[-1]
+                    ctx.set_result(artifact_path=f"plan/{plan_snap.plan_id}")
                 chain_id = hashlib.md5(
                     "|".join(c.candidate_id for c in hypothesis.candidates).encode()
                 ).hexdigest()[:8]
@@ -1443,7 +1551,8 @@ class Pipeline:
                 plan_questions = []
 
                 validator = SqlBuildPlanValidator()
-                passed, val_questions = validator.validate_multi_hop_chain(sql_program)
+                with collector.stage("sql_validator", request_id):
+                    passed, val_questions = validator.validate_multi_hop_chain(sql_program)
 
                 if not passed:
                     all_qs = list(plan_questions) + list(val_questions) + list(extra_questions)
@@ -1460,7 +1569,11 @@ class Pipeline:
 
                 stage = "compile"
                 compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
-                program_artifact = compiler.compile_program(sql_program)
+                with collector.stage("sql_compiler", request_id) as ctx:
+                    program_artifact = compiler.compile_program(sql_program)
+                    ctx.set_result(
+                        artifact_path=f"compiled/{hashlib.sha256(str(sql_program).encode()).hexdigest()[:12]}"
+                    )
                 compiled_sql = program_artifact.compiled.statements[-1]
 
                 stage = "execute"
@@ -1468,9 +1581,14 @@ class Pipeline:
                     table_paths=self._resolve_table_paths(table_paths),
                     duckdb_path=self._duckdb_path,
                 )
-                program_result = execute_executor.execute_program(
-                    program_artifact.compiled
-                )
+                with collector.stage("sql_executor", request_id) as ctx:
+                    program_result = execute_executor.execute_program(
+                        program_artifact.compiled
+                    )
+                    if program_result and program_result.results:
+                        last_trace = program_result.results[-1].trace
+                        if last_trace:
+                            ctx.set_result(row_count=last_trace.row_count)
                 trace = (
                     program_result.results[-1].trace
                     if program_result.results else None
@@ -1483,10 +1601,13 @@ class Pipeline:
                 program_cleanup_status = program_result.cleanup_status if program_result else None
                 program_cleanup_error = program_result.cleanup_error if program_result else None
             else:
-                plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
+                with collector.stage("sql_builder", request_id) as ctx:
+                    plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
+                    ctx.set_result(artifact_path=f"plan/{plan.plan_id}")
 
                 validator = SqlBuildPlanValidator()
-                passed, val_questions = validator.validate(plan, manifest)
+                with collector.stage("sql_validator", request_id):
+                    passed, val_questions = validator.validate(plan, manifest)
 
                 if not passed:
                     all_qs = list(plan_questions) + list(val_questions) + list(extra_questions)
@@ -1503,15 +1624,20 @@ class Pipeline:
 
                 stage = "compile"
                 compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
-                artifact = compiler.compile_to_artifact(plan, spec.spec_hash)
-                compiled_sql = artifact.compiled_sql
+                with collector.stage("sql_compiler", request_id) as ctx:
+                    artifact = compiler.compile_to_artifact(plan, spec.spec_hash)
+                    compiled_sql = artifact.compiled_sql
+                    ctx.set_result(artifact_path=f"compiled/{compiled_sql.sql_sha256[:12]}")
 
                 stage = "execute"
                 execute_executor = DuckDBExecutor(
                     table_paths=self._resolve_table_paths(table_paths),
                     duckdb_path=self._duckdb_path,
                 )
-                trace, summary = execute_executor.execute(compiled_sql)
+                with collector.stage("sql_executor", request_id) as ctx:
+                    trace, summary = execute_executor.execute(compiled_sql)
+                    if trace:
+                        ctx.set_result(row_count=trace.row_count)
 
                 sql_program = build_sql_program(plan, spec.spec_hash)
 
@@ -1559,10 +1685,13 @@ class Pipeline:
             # ── 公共阶段：Contract + Package（所有路径——ComputeSteps 和非 ComputeSteps）──
             stage = "contract"
             contract_extractor = DataTransformContractExtractor()
-            if len(sql_program.statements) > 1:
-                contract = contract_extractor.extract_v1(sql_program)
-            else:
-                contract = contract_extractor.extract(plan)
+            with collector.stage("contract_extractor", request_id) as ctx:
+                if len(sql_program.statements) > 1:
+                    contract = contract_extractor.extract_v1(sql_program)
+                else:
+                    contract = contract_extractor.extract(plan)
+                if contract:
+                    ctx.set_result(artifact_path=f"contract/{contract.contract_id[:12]}")
 
             # ── Phase 9B-P0: Snapshot 阶段（可选——仅当注入 SnapshotBuilder + Provider 时执行）──
             # 必须在 contract 提取之后——依赖 contract 的 hash
@@ -1637,7 +1766,9 @@ class Pipeline:
                 snapshot_manifest=snapshot_manifest.model_dump() if snapshot_manifest else None,
                 # 编译产物元数据（单表路径为 None）
             )
-            package_manifest = packager.build(package_inputs)
+            with collector.stage("packager", request_id) as ctx:
+                package_manifest = packager.build(package_inputs)
+                ctx.set_result(artifact_path=f"package/{package_manifest.package_id}")
 
         except Exception as e:
             request_id = self._gen_request_id(spec)
@@ -1821,6 +1952,16 @@ class Pipeline:
         data = self._results.get(request_id)
         if data is None:
             return None
+
+        # 诊断：记录 _results 中 snapshot_manifest 的状态
+        _sm = data.get("snapshot_manifest")
+        with open("D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3/logs/dev/diag_snapshot.txt", "a") as _df:
+            _df.write(f"DIAG export_artifacts: request_id={request_id}, "
+                      f"snapshot_manifest_in_results={_sm is not None}\\n")
+            if _sm is not None:
+                _df.write(f"  snapshot_dir={getattr(_sm, 'snapshot_dir', 'N/A')}\\n")
+                _df.write(f"  files count={len(getattr(_sm, 'files', []))}\\n")
+            _df.write(f"  _results keys={list(data.keys())}\\n")
 
         # 提取 spec_hash——从 ParsedDeveloperSpec 获取
         spec_hash = ""
@@ -2074,8 +2215,12 @@ class Pipeline:
             符合 PlanRichResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
         """
         self._purge_expired()
+        collector = get_collector()
         # ── Stage 1-2: Parser + Enrich ──
-        parsed = self._parse_and_enrich("build_plan_rich", markdown_text, table_mapping)
+        parsed = self._parse_and_enrich(
+            "build_plan_rich", markdown_text, table_mapping,
+            collector=collector,
+        )
         if not parsed["ok"]:
             return parsed["error_response"]
         spec = parsed["spec"]
@@ -2083,15 +2228,19 @@ class Pipeline:
         hypothesis = parsed["hypothesis"]
         extra_questions = parsed["extra_questions"]
         table_mapping = parsed["table_mapping"]
+        request_id = self._gen_request_id(spec)
 
         # ── Stage 3: Build + Validate ──
         plan = None
         try:
             builder = SqlBuildPlanBuilder()
-            plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
+            with collector.stage("sql_builder", request_id) as ctx:
+                plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
+                ctx.set_result(artifact_path=f"plan/{plan.plan_id}")
 
             validator = SqlBuildPlanValidator()
-            passed, val_questions = validator.validate(plan, manifest)
+            with collector.stage("sql_validator", request_id):
+                passed, val_questions = validator.validate(plan, manifest)
         except Exception as e:
             self._log_stage_failure("build_plan_rich", "build", e)
             request_id = self._gen_request_id(spec)
@@ -2153,8 +2302,12 @@ class Pipeline:
             符合 ExecuteRichResponse 结构的 dict，失败时含 pipeline_error + pipeline_stages
         """
         self._purge_expired()
+        collector = get_collector()
         # ── Stage 1-2: Parser + Enrich ──
-        parsed = self._parse_and_enrich("execute_rich", markdown_text, table_mapping)
+        parsed = self._parse_and_enrich(
+            "execute_rich", markdown_text, table_mapping,
+            collector=collector,
+        )
         if not parsed["ok"]:
             return parsed["error_response"]
         spec = parsed["spec"]
@@ -2184,14 +2337,17 @@ class Pipeline:
         try:
             _build_start = time.time()
             builder = SqlBuildPlanBuilder()
-            plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
+            with collector.stage("sql_builder", request_id) as ctx:
+                plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
+                ctx.set_result(artifact_path=f"plan/{plan.plan_id}")
             self._record_trace(
                 request_id, "sql_build_planner",
                 status="skipped", latency_ms=int((time.time() - _build_start) * 1000),
             )
 
             validator = SqlBuildPlanValidator()
-            _passed, val_questions = validator.validate(plan, manifest)
+            with collector.stage("sql_validator", request_id):
+                _passed, val_questions = validator.validate(plan, manifest)
             all_questions = list(plan_questions) + list(val_questions) + list(extra_questions)
 
             if not _passed:
@@ -2212,7 +2368,9 @@ class Pipeline:
             stage = "compile"
             _compile_start = time.time()
             compiler = DuckDbSqlCompiler(table_mapping=table_mapping or {})
-            compiled = compiler.compile(plan)
+            with collector.stage("sql_compiler", request_id) as ctx:
+                compiled = compiler.compile(plan)
+                ctx.set_result(artifact_path=f"compiled/{compiled.sql_sha256[:12]}")
             self._record_trace(
                 request_id, "sql_program_planner",
                 status="skipped", latency_ms=int((time.time() - _compile_start) * 1000),
@@ -2223,7 +2381,10 @@ class Pipeline:
                 table_paths=self._resolve_table_paths(table_paths),
                 duckdb_path=self._duckdb_path,
             )
-            trace, summary = executor.execute(compiled)
+            with collector.stage("sql_executor", request_id) as ctx:
+                trace, summary = executor.execute(compiled)
+                if trace:
+                    ctx.set_result(row_count=trace.row_count)
 
             # ── 执行状态检查——RUNTIME_FAIL 阻断，不进入成功路径 ──
             if isinstance(trace.status, ExecutionStatus) and trace.status == ExecutionStatus.RUNTIME_FAIL:
@@ -2308,6 +2469,10 @@ class Pipeline:
         # 从 table_paths 的 CSV 文件生成 Parquet 快照，
         # 使物理验证阶段能通过 _register_parquet_views 注册为 DuckDB 视图
         snapshot_manifest = None
+        # 诊断：记录 table_paths 和 _default_table_paths 的真实值
+        with open("D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3/logs/dev/diag_snapshot.txt", "a") as _df:
+            _df.write(f"DIAG execute_rich snapshot: table_paths={table_paths!r}\\n")
+            _df.write(f"  _default_table_paths keys={list(self._default_table_paths.keys())}\\n")
         resolved_paths = self._resolve_table_paths(table_paths)
         if resolved_paths:
             try:
@@ -2337,6 +2502,15 @@ class Pipeline:
                 import pyarrow.csv as _pacsv
                 import pyarrow.parquet as _pq
 
+                # 构建逆向映射：物理表名 → alias（供 source_name 使用）
+                _reverse_mapping = _aliases_from_table_mapping(table_mapping)
+                logger.info(
+                    "快照诊断——table_mapping=%s, _reverse_mapping=%s, "
+                    "resolved_paths_keys=%s",
+                    table_mapping, _reverse_mapping,
+                    list(resolved_paths.keys()) if resolved_paths else [],
+                )
+
                 files: list[SnapshotFile] = []
                 for table_name, csv_path in sorted(resolved_paths.items()):
                     if not _os.path.isfile(csv_path):
@@ -2360,8 +2534,11 @@ class Pipeline:
                             for _chunk in iter(lambda: _fh.read(8192), b""):
                                 file_sha256.update(_chunk)
 
+                        # source_name 用 alias（与 PySpark transform 中 inputs[alias] 对齐）
+                        # 无 alias 时回退物理表名（向后兼容单表无 mapping 场景）
+                        _source = _reverse_mapping.get(table_name, table_name)
                         files.append(SnapshotFile(
-                            source_name=table_name,
+                            source_name=_source,
                             file_path=parquet_path,
                             format="parquet",
                             row_count=row_count,
@@ -2374,6 +2551,9 @@ class Pipeline:
                         continue
 
                 if files:
+                    # 写 _inputs_index.json 侧车——executor prologue 按别名装载
+                    from tianshu_datadev.spark.snapshot import SnapshotBuilder
+                    SnapshotBuilder._write_inputs_index(snap_dir, files)
                     # 生成确定性 snapshot_id
                     snap_id = f"snap_{contract_hash[:16] if contract_hash else 'adhoc'}"
                     snapshot_manifest = _SnapManifest(
@@ -2744,6 +2924,18 @@ class Pipeline:
         context.compile_result = result
         context.stage_results["COMPILER"] = "SUCCESS"
 
+        # ── 诊断：输出 SparkPlan 步骤 + 编译器输出 ──
+        try:
+            _dp = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))))), "logs", "dev", "diag_compiler.txt")
+            with open(_dp, "w", encoding="utf-8") as _df:
+                _df.write(f"=== SparkPlan steps ({len(context.spark_plan.steps)}) ===\n")
+                for _i, _s in enumerate(context.spark_plan.steps):
+                    _df.write(f"  [{_i}] {type(_s).__name__}: {_s.model_dump(exclude_none=True)}\n")
+                _df.write(f"\n=== raw_pyspark ===\n{result.raw_pyspark}\n")
+        except Exception:
+            pass
+
         # ── 生成独立可执行脚本（wrapper 格式，含 SparkSession 引导）──
         # ── Phase 8B: 使用 annotated_pyspark（含 LLM 业务注释）──
         annotated_pyspark = result.annotated_pyspark
@@ -2897,6 +3089,11 @@ class Pipeline:
         Returns:
             SnapshotManifest——成功构建的快照清单；None 表示失败（context 已写入错误）
         """
+        # 诊断：写文件确保可见
+        with open("D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3/logs/dev/diag_snapshot.txt", "a") as _df:
+            _df.write(f"DIAG: _try_build_snapshot entry - sb={self._snapshot_builder is not None} "
+                      f"sp={self._snapshot_provider is not None} "
+                      f"duckdb={self._duckdb_path is not None}\\n")
         # ── 路径 1：SnapshotBuilder 注入 → 走既有 CSV fixture 快照流程 ──
         if self._snapshot_builder is not None and self._snapshot_provider is not None:
             # 获取 table_paths——优先从 _results 读取 execute_rich 持久化的 resolved_table_paths，
@@ -2941,12 +3138,16 @@ class Pipeline:
                 )
                 return None
 
+            # 从 _results 读取 table_mapping，反转为 {物理名: 别名}——供 SnapshotBuilder 使用
+            _table_mapping = results_data.get("table_mapping") or {}
+
             # 通过 SnapshotBuilder.build() 创建快照（不手写 PyArrow）
             try:
                 snapshot_manifest = self._snapshot_builder.build(
                     contract_hash=contract_hash,
                     source_tables=source_tables,
                     provider=self._snapshot_provider,
+                    table_aliases=_aliases_from_table_mapping(_table_mapping),
                 )
                 # 回写 artifacts——供后续代码引用（PipelineArtifactBundle 非 frozen）
                 artifacts.snapshot_manifest = snapshot_manifest
@@ -2994,6 +3195,10 @@ class Pipeline:
         - 使用 DuckDB 只读连接——不修改源数据库
         - 快照写入临时目录——会话结束后由 OS 回收
         """
+        # 诊断：写文件确保可见
+        with open("D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3/logs/dev/diag_snapshot.txt", "a") as _df:
+            _df.write("DIAG: _build_snapshot_from_duckdb 入口\\n")
+        logger.warning("DuckDB快照入口——进入 _build_snapshot_from_duckdb")
         from tianshu_datadev.spark.snapshot import SnapshotFile
         from tianshu_datadev.spark.snapshot import SnapshotManifest as _SnapManifest
 
@@ -3007,10 +3212,44 @@ class Pipeline:
             )
             return None
 
+        # 从 _results 获取正确的 别名→物理表名 映射
+        # Contract._extract_scan() 会把 source_table 设为别名（step.table_ref），
+        # 但 DeveloperSpec 和 _auto_table_mapping() 持有正确的物理表名；
+        # 此处从 _results[request_id]["table_mapping"] 取得正确映射作为补丁。
+        _results_data = self._results.get(artifacts.request_id, {})
+        _results_table_mapping: dict[str, str] = _results_data.get("table_mapping") or {}
+
         # 去重收集源表物理名（同一物理表可能被多个别名引用）
-        source_tables: list[str] = list(dict.fromkeys(
+        # 优先用 _results 中的 table_mapping 解析物理表名（Web UI / DuckDB 路径），
+        # 回退到 contract.source_table（E2E CSV 路径——source_table 即 CSV 文件名）
+        _contract_sources: list[str] = list(dict.fromkeys(
             t.source_table for t in contract.input_tables
         ))
+        source_tables: list[str] = []
+        for _src in _contract_sources:
+            _physical = _results_table_mapping.get(_src, _src)
+            source_tables.append(_physical)
+
+        # 构建物理表名→别名映射——用于 SnapshotFile.source_name 和 _inputs_index.json
+        # 若同一物理表有多个别名，取第一个（其余别名不会被 executor prologue 装载）
+        _alias_map: dict[str, str] = {}
+        for t in contract.input_tables:
+            _physical = _results_table_mapping.get(t.source_table, t.source_table)
+            if _physical not in _alias_map:
+                _alias_map[_physical] = t.table_ref
+        # 诊断：写入详细信息到文件
+        with open("D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3/logs/dev/diag_snapshot.txt", "a") as _df:
+            _df.write(f"source_tables={source_tables}\\n")
+            _df.write(f"_results_table_mapping={_results_table_mapping}\\n")
+            _df.write(f"_alias_map={_alias_map}\\n")
+            _df.write(f"input_tables_count={len(contract.input_tables)}\\n")
+            for _i, _t in enumerate(contract.input_tables):
+                _df.write(f"  input_table[{_i}]: table_ref={_t.table_ref!r}, source_table={_t.source_table!r}\\n")
+        logger.info(
+            "DuckDB快照诊断——source_tables=%s, _alias_map=%s, "
+            "input_tables_count=%d",
+            source_tables, _alias_map, len(contract.input_tables),
+        )
 
         import os as _os
         import tempfile as _tempfile
@@ -3050,9 +3289,12 @@ class Pipeline:
             for table_name in source_tables:
                 try:
                     # 查询全表 → PyArrow Table → 写入 Parquet
+                    # 使用 to_arrow_table() 而非 .arrow()——
+                    # DuckDB ≥1.0 中 .arrow() 返回 RecordBatchReader（流式），
+                    # pyarrow.parquet.write_table() 要求 Table 类型。
                     arrow_table = con.execute(
                         f"SELECT * FROM {table_name}"
-                    ).arrow()
+                    ).to_arrow_table()
                     parquet_path = _os.path.join(
                         snap_dir, f"{table_name}.parquet",
                     )
@@ -3065,8 +3307,10 @@ class Pipeline:
                         for _chunk in iter(lambda: _fh.read(8192), b""):
                             file_sha256.update(_chunk)
 
+                    # 使用别名作为 source_name——executor prologue 按此 key 装载 inputs dict
+                    _source = _alias_map.get(table_name, table_name)
                     files.append(SnapshotFile(
-                        source_name=table_name,
+                        source_name=_source,
                         file_path=parquet_path,
                         format="parquet",
                         row_count=row_count,
@@ -3107,6 +3351,20 @@ class Pipeline:
             files=files,
             source_type="dev_warehouse",
         )
+
+        # 写入 _inputs_index.json——executor prologue 据此将别名映射到 Parquet 文件
+        from tianshu_datadev.spark.snapshot import SnapshotBuilder
+        SnapshotBuilder._write_inputs_index(snap_dir, files)
+        # 诊断：回读确认写入内容
+        import json as _json_diag
+        _idx_path = _os.path.join(snap_dir, "_inputs_index.json")
+        with open(_idx_path, "r", encoding="utf-8") as _ixf:
+            _idx_content = _json_diag.load(_ixf)
+        with open("D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3/logs/dev/diag_snapshot.txt", "a") as _df:
+            _df.write(f"DIAG: _inputs_index.json content={_idx_content}\\n")
+            _df.write(f"DIAG: snap_dir={snap_dir}\\n")
+            for _f in files:
+                _df.write(f"  file: source_name={_f.source_name!r} path={_f.file_path!r}\\n")
 
         # 回写 artifacts——供后续代码引用
         artifacts.snapshot_manifest = manifest
@@ -3157,6 +3415,11 @@ class Pipeline:
         # Step 3：确定快照目录
         snapshot_dir: str | None = None
         snapshot_id: str = ""
+        with open("D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3/logs/dev/diag_snapshot.txt", "a") as _df:
+            _df.write(f"DIAG: _do_spark_physical_verify - snapshot_manifest={artifacts.snapshot_manifest is not None}\\n")
+            if artifacts.snapshot_manifest is not None:
+                _df.write(f"  snapshot_dir={artifacts.snapshot_manifest.snapshot_dir}\\n")
+                _df.write(f"  files={[(f.source_name, f.file_path) for f in artifacts.snapshot_manifest.files]}\\n")
         if artifacts.snapshot_manifest is not None:
             snapshot_dir = artifacts.snapshot_manifest.snapshot_dir
             snapshot_id = artifacts.snapshot_manifest.snapshot_id
@@ -3214,6 +3477,34 @@ class Pipeline:
                 uncovered_step_types=uncovered_types if uncovered_types else None,
                 duckdb_path=self._duckdb_path,
             )
+
+            # ── 诊断：输出双引擎对比详情 ──
+            try:
+                _dp = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.dirname(os.path.abspath(__file__))))), "logs", "dev", "diag_verify.txt")
+                with open(_dp, "w", encoding="utf-8") as _df:
+                    _df.write(f"=== SQL 查询 ===\n{sql_query}\n\n")
+                    _df.write(f"=== PySpark 代码 ===\n{context.sandbox_transform_code}\n\n")
+                    _df.write(f"=== DuckDB 结果（前 10 行）===\n")
+                    _df.write(f"行数: {report.duckdb_result.raw_row_count}\n")
+                    for _ri, _r in enumerate((report.duckdb_result.sample_rows or [])[:10]):
+                        _df.write(f"  [{_ri}] {_r}\n")
+                    _df.write(f"\n=== Spark 结果（前 10 行）===\n")
+                    _df.write(f"行数: {report.spark_result.raw_row_count}\n")
+                    for _ri, _r in enumerate((report.spark_result.sample_rows or [])[:10]):
+                        _df.write(f"  [{_ri}] {_r}\n")
+                    _df.write(f"\n=== 差异列表（共 {len(report.diffs)} 条）===\n")
+                    for _di, _d in enumerate(report.diffs):
+                        _df.write(f"  [{_di}] row={_d.row_index}, col={_d.column}\n")
+                        _df.write(f"       duckdb={_d.duckdb_value}\n")
+                        _df.write(f"       spark ={_d.spark_value}\n")
+                        _df.write(f"       desc  ={_d.description}\n")
+                    _df.write(f"\n=== 元信息 ===\n")
+                    _df.write(f"row_count_match={report.row_count_match}\n")
+                    _df.write(f"schema_match={report.schema_match}\n")
+                    _df.write(f"status={report.status.value}\n")
+            except Exception:
+                pass
 
             # Step 7：判定结果
             from tianshu_datadev.spark.physical_verifier import PhysicalVerificationStatus
