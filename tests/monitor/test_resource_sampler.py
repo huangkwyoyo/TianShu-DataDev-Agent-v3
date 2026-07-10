@@ -130,23 +130,29 @@ class TestResourceSampler:
 
     # ── Test 2：活跃阶段设置 ──────────────────────────────
 
-    def test_sample_has_active_stage_run_ids(self):
-        """采样时活跃阶段被记录（mock collector 验证）。"""
+    def test_set_active_stages_updates_internal_state(self):
+        """验证 set_active_stages 正确更新采样器内部活跃阶段状态。"""
         collector = MockCollector()
         sampler = self._make_sampler(collector=collector)
 
         # 设置活跃阶段
         sampler.set_active_stages({"stage_1", "stage_2"})
 
-        # 采样并通过 collector 记录
-        sample = sampler._sample()
-        collector.log_resource_sample(sample)
+        # 验证采样器内部状态已更新
+        with sampler._lock:
+            assert sampler._active_stage_run_ids == {"stage_1", "stage_2"}
+            assert sampler._observed_stages == {"stage_1", "stage_2"}
 
-        # 验证 collector 收到了采样
-        assert len(collector.samples) == 1
-        assert collector.samples[0] is sample
-        assert isinstance(collector.samples[0], ResourceSample)
-        assert len(collector.samples[0].processes) > 0
+        # 第二次设置应正确替换并累积
+        sampler.set_active_stages({"stage_3", "stage_4"})
+        with sampler._lock:
+            assert sampler._active_stage_run_ids == {"stage_3", "stage_4"}
+            assert sampler._observed_stages == {"stage_1", "stage_2", "stage_3", "stage_4"}
+
+        # 验证 _sample() 可以读取活跃阶段（不崩溃）
+        sample = sampler._sample()
+        assert isinstance(sample, ResourceSample)
+        assert len(sample.processes) > 0
 
     # ── Test 3：命令行截断 ────────────────────────────────
 
@@ -268,8 +274,10 @@ class TestResourceSampler:
         assert sampler._peak_metrics["peak_observed_num_processes"] == 1
 
         # 第二轮：高指标（应保留峰值）
+        # 注：使用不同 PID 绕过 _proc_cache——缓存会复用首轮的 mock Process 对象，
+        # 导致 cpu_percent 返回缓存的旧值而非新 mock 的值
         high_proc = self._make_fake_process(
-            pid=1001, name="python.exe",
+            pid=2001, name="python.exe",
             cpu=50.0, rss_bytes=300 * 1024 * 1024, vms_bytes=500 * 1024 * 1024,
             num_threads=8,
         )
@@ -293,7 +301,7 @@ class TestResourceSampler:
 
         # 第三轮：低指标（峰值不应降低）
         low_proc2 = self._make_fake_process(
-            pid=1001, name="python.exe",
+            pid=3001, name="python.exe",
             cpu=5.0, rss_bytes=50 * 1024 * 1024, vms_bytes=100 * 1024 * 1024,
             num_threads=2,
         )

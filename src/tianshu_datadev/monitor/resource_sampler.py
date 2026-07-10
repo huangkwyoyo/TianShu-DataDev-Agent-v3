@@ -48,9 +48,14 @@ class ResourceSampler:
 
         # 内部状态
         self._active_stage_run_ids: set[str] = set()
+        self._observed_stages: set[str] = set()  # 整个 run 中观察到的所有阶段 ID
+        self._stop_called = False  # 防止重复 stop()
         self._running = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+
+        # 进程对象缓存——避免每次采样新建 Process 导致 cpu_percent 首次调用返回 0.0
+        self._proc_cache: dict[int, psutil.Process] = {}
 
         # 整个 run 的峰值聚合
         self._peak_metrics: dict[str, float | int] = {
@@ -68,6 +73,7 @@ class ResourceSampler:
             logger.warning("ResourceSampler 线程已在运行")
             return
         self._running.set()
+        self._stop_called = False  # 重置 stop 标志，允许新周期正常停止
         self._thread = threading.Thread(
             target=self._run_loop,
             daemon=True,
@@ -77,7 +83,15 @@ class ResourceSampler:
         logger.info("ResourceSampler 已启动，间隔 %.1f 秒", self._interval)
 
     def stop(self) -> None:
-        """停止后台线程并等待 join(timeout=10)。"""
+        """停止后台线程并等待 join(timeout=10) 后写入峰值样本。
+
+        重复调用安全：第一次调用后 _stop_called 置 True，后续调用直接返回，
+        避免重复写入峰值样本。
+        """
+        if self._stop_called:
+            logger.debug("ResourceSampler 已停止，忽略重复 stop()")
+            return
+        self._stop_called = True
         self._running.clear()
         if self._thread is not None:
             self._thread.join(timeout=10.0)
@@ -86,20 +100,14 @@ class ResourceSampler:
             self._thread = None
         # 写入最终峰值样本
         self._write_peak_sample()
-        logger.info(
-            "ResourceSampler 峰值摘要: cpu=%.1f%%, rss=%.1fMB, vms=%.1fMB, procs=%d",
-            self._peak_metrics["peak_observed_cpu_percent"],
-            self._peak_metrics["peak_observed_rss_mb"],
-            self._peak_metrics["peak_observed_vms_mb"],
-            self._peak_metrics["peak_observed_num_processes"],
-        )
 
     # ── 线程安全接口 ─────────────────────────────────────────
 
     def set_active_stages(self, stage_run_ids: set[str]) -> None:
-        """更新活跃阶段列表——线程安全。"""
+        """更新活跃阶段列表——线程安全。同时累积到 _observed_stages 中。"""
         with self._lock:
             self._active_stage_run_ids = set(stage_run_ids)
+            self._observed_stages.update(stage_run_ids)
 
     # ── 内部：后台线程主循环 ─────────────────────────────────
 
@@ -208,6 +216,15 @@ class ResourceSampler:
             self._peak_metrics["peak_observed_num_processes"], num_processes  # type: ignore[arg-type]
         )
 
+        # 活跃阶段信息记录（读快照，不阻塞收集器）
+        with self._lock:
+            active_count = len(self._active_stage_run_ids)
+        logger.debug("当前活跃阶段数量: %d", active_count)
+
+        # 首轮采样说明——CPU 值需两轮后才准确
+        if not self._proc_cache:
+            logger.debug("首轮采样：CPU 值为参考值，需两轮后才准确")
+
         return ResourceSample(
             run_id=self.run_id,
             processes=process_metrics,
@@ -218,13 +235,23 @@ class ResourceSampler:
     def _collect_process_metrics(self, proc: psutil.Process) -> ProcessMetrics | None:
         """采集单个进程的指标。
 
+        使用进程对象缓存：避免每次采样新建 Process 导致 cpu_percent 首次调用返回 0.0。
+        缓存中的进程对象保留了 CPU 时间基线，第二次调用时才能计算差值。
+
         Args:
             proc: psutil.Process 实例。
 
         Returns:
             ProcessMetrics 实例；采集失败（权限不足、进程已退出）时返回 None。
         """
+        pid = proc.pid
         try:
+            # 优先使用缓存的 Process 对象（保留 CPU 时间历史基线）
+            if pid in self._proc_cache:
+                proc = self._proc_cache[pid]
+            else:
+                self._proc_cache[pid] = proc
+
             cpu = proc.cpu_percent(interval=None)
             mem = proc.memory_info()
             p_name = proc.name() or ""
@@ -247,7 +274,9 @@ class ResourceSampler:
                 num_threads=num_threads,
             )
         except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
-            logger.warning("无法采集进程 pid=%d 指标: %s", proc.pid, exc)
+            logger.warning("无法采集进程 pid=%d 指标: %s", pid, exc)
+            # 进程已退出时从缓存中移除
+            self._proc_cache.pop(pid, None)
             return None
 
     # ── 辅助：峰值样本写入 ───────────────────────────────────
@@ -280,6 +309,14 @@ class ResourceSampler:
             processes=peak_processes,
         )
         self._collector.log_resource_sample(sample)
+        logger.info(
+            "峰值样本已写入: active_stage_count=%d, cpu=%.1f%%, rss=%.1fMB, vms=%.1fMB, procs=%d",
+            len(self._observed_stages),
+            self._peak_metrics["peak_observed_cpu_percent"],
+            self._peak_metrics["peak_observed_rss_mb"],
+            self._peak_metrics["peak_observed_vms_mb"],
+            self._peak_metrics["peak_observed_num_processes"],
+        )
 
     # ── 辅助：命令行清理 ─────────────────────────────────────
 
