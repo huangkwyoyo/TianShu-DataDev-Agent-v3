@@ -54,6 +54,7 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 markers = [
     "slow: 需要真实 PySpark 子进程执行的慢速集成测试",
+    "integration: 需要实际启动前后端的端到端集成测试",
 ]
 
 [tool.ruff]
