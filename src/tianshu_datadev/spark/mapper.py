@@ -750,6 +750,12 @@ def _chain_input_aliases(steps: list) -> None:
     prev_output: str | None = None
     used_aliases: set[str] = set()
 
+    # 追踪别名解析——与 compiler 的 state.latest_alias 保持一致，
+    # 确保 JoinStep 的输出别名使用解析后的左右表名（而非原始表别名）。
+    # 否则 Filter→Join→Aggregate 链路中，mapper 预测 Join 输出为 "ft_with_tz"，
+    # compiler 实际生成 "ft_filtered_with_tz"，下游 Aggregate 断链 → NameError。
+    latest_alias: dict[str, str] = {}
+
     # 预计算最后一个 ProjectStep 索引 + 预注册 Read 别名
     last_project_idx = -1
     for j, s in enumerate(steps):
@@ -757,6 +763,7 @@ def _chain_input_aliases(steps: list) -> None:
             last_project_idx = j
         if isinstance(s, SparkReadStep):
             used_aliases.add(s.alias)
+            latest_alias[s.alias] = s.alias
 
     for i, step in enumerate(steps):
         # 预填 input_alias——在生成输出别名之前，确保生成器能看到正确的输入
@@ -767,16 +774,38 @@ def _chain_input_aliases(steps: list) -> None:
 
         # 生成输出别名（与 compiler.py 共享逻辑）
         is_last = isinstance(step, SparkProjectStep) and i == last_project_idx
-        cur_output = _get_step_output_alias(step, used_aliases, is_last)
 
-        # ReadStep 为数据源——无输入依赖，仅记录输出供后续步骤引用
-        if isinstance(step, SparkReadStep):
-            prev_output = cur_output
-            continue
-
-        # JoinStep 使用 left_alias/right_alias——跳过 input_alias 填充
         if isinstance(step, SparkJoinStep):
+            # 使用解析后的别名——与 compiler 的 resolved_left/resolved_right 对齐
+            resolved_left = latest_alias.get(step.left_alias, step.left_alias)
+            resolved_right = latest_alias.get(step.right_alias, step.right_alias)
+            cur_output = generate_step_alias(
+                step, left_alias=resolved_left, right_alias=resolved_right,
+                used_aliases=used_aliases,
+            )
+        else:
+            cur_output = _get_step_output_alias(step, used_aliases, is_last)
+
+        # 更新 latest_alias 追踪——与 compiler 的别名更新逻辑一致
+        if isinstance(step, SparkReadStep):
+            if not cur_output.startswith("#"):
+                latest_alias[step.alias] = cur_output
             prev_output = cur_output
             continue
+
+        if isinstance(step, SparkJoinStep):
+            if not cur_output.startswith("#"):
+                # 与 compiler 一致：key 为 left_alias（原始左表别名）
+                latest_alias[step.left_alias] = cur_output
+            prev_output = cur_output
+            continue
+
+        # 单输入步骤（Filter/Project/Sort/Limit/Aggregate/CaseWhen/Window）
+        if isinstance(step, (SparkFilterStep, SparkProjectStep, SparkSortStep,
+                             SparkLimitStep, SparkAggregateStep, SparkCaseWhenStep,
+                             SparkWindowStep)):
+            input_key = getattr(step, "input_alias", "")
+            if not cur_output.startswith("#") and input_key:
+                latest_alias[input_key] = cur_output
 
         prev_output = cur_output

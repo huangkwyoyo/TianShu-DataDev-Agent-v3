@@ -632,6 +632,54 @@ class TestSparkPlanMapper:
                 f"R3 依赖链填充未覆盖此步骤类型"
             )
 
+    def test_filter_join_alias_chain_resolved_correctly(self):
+        """Filter→Join→Aggregate 链路中，mapper 的 Join 输出别名必须与 compiler 一致。
+
+        回归：mapper 用原始 left_alias 算 Join 输出 → "od_with_ri"，
+        compiler 用解析后别名 → "od_filtered_with_ri"。
+        当 AggregateStep.input_alias 由 _chain_input_aliases 填充时（聚合列无表前缀），
+        此不一致导致下游 NameError。
+        """
+        contract = _make_minimal_contract()
+        # 关键：所有聚合列去掉表前缀，使 _infer_input_alias_from_aggregations
+        # 返回 "" → _chain_input_aliases 填充 AggregateStep.input_alias
+        contract.aggregations = [
+            ContractAggregation(function="COUNT", input_column=None, alias="order_count"),
+            ContractAggregation(function="COUNT_DISTINCT", input_column="user_id", alias="active_users"),
+            ContractAggregation(function="SUM", input_column="order_amount", alias="total_amount"),
+        ]
+        result = map_contract_to_spark_plan(contract)
+        assert result.success is True, f"映射应成功：{result.gaps}"
+        plan = result.spark_plan
+        assert plan is not None
+
+        # 找到 AggregateStep
+        agg_step = None
+        for step in plan.steps:
+            if isinstance(step, SparkAggregateStep):
+                agg_step = step
+                break
+        assert agg_step is not None, "Contract 应产生 AggregateStep"
+
+        # 核心断言：AggregateStep 的 input_alias 应含 "_filtered"
+        # （因为 FilterStep 在 JoinStep 之前过滤了 od 表）
+        assert "_filtered" in agg_step.input_alias, (
+            f"AggregateStep.input_alias 应含 '_filtered'（Filter→Join→Aggregate 链路"
+            f"中 _chain_input_aliases 应使用 resolved 别名填充），"
+            f"实际为 {agg_step.input_alias!r}"
+        )
+
+        # 编译器验证：编译生成的代码中 Aggregate 步骤应引用正确的变量
+        from tianshu_datadev.spark.compiler import SparkCompiler
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+        code = result.raw_pyspark
+        # 生成的代码应引用含 _filtered 的 Join 输出变量
+        assert "_filtered_with" in code, (
+            f"编译后代码应引用 resolved Join 输出（含 '_filtered_with'），"
+            f"实际代码片段：{code[:500]}"
+        )
+
 
 # ════════════════════════════════════════════
 # PlanEquivalence 测试
