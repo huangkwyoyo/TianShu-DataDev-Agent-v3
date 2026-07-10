@@ -333,3 +333,92 @@ class TestRunLogCollector:
         with patch.dict(os.environ, {"TIANSHU_RUN_ID": "  "}):
             collector = get_collector()
             assert isinstance(collector, NullCollector)
+
+
+class TestRunLogCollectorTextLog:
+    """RunLogCollector 人类可读文本日志集成测试。"""
+
+    def test_writes_both_jsonl_and_log(self):
+        """RunLogCollector 同时写出 .jsonl 和 .log 两个文件。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp)
+            with patch.dict(os.environ, {"TIANSHU_RUN_ID": "test-log-001"}):
+                collector = RunLogCollector(log_dir, "test-log-001")
+                # emit 一个 stage started 事件
+                event = StageEvent(
+                    run_id="test-log-001",
+                    stage_run_id="stage_test_abc",
+                    node="test_node",
+                    status="started",
+                )
+                collector.emit(event)
+                collector.flush(timeout=2.0)
+                collector.close()
+
+            # 验证两个文件都存在且非空
+            jsonl_path = log_dir / "tianshu_run_test-log-001_events.jsonl"
+            log_path = log_dir / "tianshu_run_test-log-001_events.log"
+            assert jsonl_path.exists()
+            assert log_path.exists()
+            # JSONL 含事件
+            jsonl_content = jsonl_path.read_text(encoding="utf-8")
+            assert "test_node" in jsonl_content
+            # 文本日志含格式化行
+            log_content = log_path.read_text(encoding="utf-8")
+            assert "test_node" in log_content
+            assert "STARTED" in log_content
+
+    def test_null_collector_does_not_create_log(self):
+        """NullCollector 不创建 .log 文件。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp)
+            with patch.dict(os.environ, {}, clear=True):
+                collector = get_collector(log_dir)
+                assert isinstance(collector, NullCollector)
+                # emit 不应创建任何文件
+                event = StageEvent(
+                    run_id="",
+                    stage_run_id="stage_test",
+                    node="test",
+                    status="started",
+                )
+                collector.emit(event)
+                collector.close()
+
+            # 验证没有任何文件被创建
+            log_files = list(log_dir.glob("*"))
+            assert len(log_files) == 0
+
+    def test_text_log_flushed_on_each_event(self):
+        """每个事件写入后立即 flush——支持 tail -f 实时查看。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp)
+            with patch.dict(os.environ, {"TIANSHU_RUN_ID": "test-flush-001"}):
+                collector = RunLogCollector(log_dir, "test-flush-001")
+                log_path = log_dir / "tianshu_run_test-flush-001_events.log"
+
+                # 写入第一个事件
+                collector.emit(StageEvent(
+                    run_id="test-flush-001",
+                    stage_run_id="stage_1",
+                    node="node_1",
+                    status="started",
+                ))
+                collector.flush(timeout=2.0)
+                content_1 = log_path.read_text(encoding="utf-8")
+                assert "node_1" in content_1
+
+                # 写入第二个事件
+                collector.emit(StageEvent(
+                    run_id="test-flush-001",
+                    stage_run_id="stage_2",
+                    node="node_2",
+                    status="completed",
+                    duration_ms=100,
+                ))
+                collector.flush(timeout=2.0)
+                content_2 = log_path.read_text(encoding="utf-8")
+                assert "node_2" in content_2
+                assert "DONE" in content_2
+
+                collector.close()
