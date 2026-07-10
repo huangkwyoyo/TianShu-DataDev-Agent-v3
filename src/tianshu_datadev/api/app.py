@@ -15,6 +15,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from tianshu_datadev.monitor.lifespan import monitor_lifespan
+from tianshu_datadev.monitor.middleware import MonitorMiddleware
+
 from .error_handlers import register_error_handlers
 from .pipeline import Pipeline
 from .routes import api_router
@@ -128,9 +131,9 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
     import logging
 
     from tianshu_datadev.config import load_dotenv
-    from tianshu_datadev.spark.developer import SparkDeveloperService
-    from tianshu_datadev.prompts.manager import PromptManager
     from tianshu_datadev.llm.adapters.anthropic_adapter import AnthropicAdapter
+    from tianshu_datadev.prompts.manager import PromptManager
+    from tianshu_datadev.spark.developer import SparkDeveloperService
 
     logger = logging.getLogger(__name__)
 
@@ -163,6 +166,7 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
         title="TianShu DataDev Agent API",
         version="0.1.0",
         description="内部交互验证口——不对外暴露，不做生产执行。",
+        lifespan=monitor_lifespan,
     )
 
     # CORS 中间件——允许本地开发
@@ -174,13 +178,26 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
+    # HTTP 监控中间件——记录请求事件，异常时 bare raise
+    app.add_middleware(MonitorMiddleware)
+
     # 注入流水线——未显式传入时仅在 E2E 测试模式下自动发现 CSV fixture 文件
     # 生产路径不扫描 tests/fixtures/，避免测试数据泄漏到生产环境
     if pipeline is None:
         # 自动发现 NYC 数据仓库 DuckDB 文件
         db_path = _discover_nyc_duckdb()
-        if os.environ.get("TIANSHU_E2E_MODE") == "true":
+        _e2e_val = os.environ.get("TIANSHU_E2E_MODE")
+        _dp = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))))), "logs", "dev", "diag_snapshot.txt")
+        with open(_dp, "a") as _df:
+            _df.write(
+                f"DIAG create_app: TIANSHU_E2E_MODE={_e2e_val!r}, "
+                f"pipeline_is_None=True, db_path={db_path!r}\\n"
+            )
+        if _e2e_val == "true":
             fixture_paths = _discover_csv_fixtures()
+            with open(_dp, "a") as _df:
+                _df.write(f"DIAG create_app: E2E branch taken, fixture keys={list(fixture_paths.keys())}\\n")
             pipeline = Pipeline(
                 default_table_paths=fixture_paths,
                 duckdb_path=db_path,
@@ -190,6 +207,8 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
             # 白名单仅来自显式发现的 CSV fixture 文件，禁止自动扫描目录全量加入
             _inject_snapshot_deps(pipeline, fixture_paths)
         else:
+            with open(_dp, "a") as _df:
+                _df.write("DIAG create_app: ELSE (web UI) branch taken\\n")
             pipeline = Pipeline(
                 duckdb_path=db_path,
                 developer_service=spark_developer_service,

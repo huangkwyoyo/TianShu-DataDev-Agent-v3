@@ -15,14 +15,22 @@ Phase 4.5B 新增前端 SPA 专用端点：
   POST /api/plan-rich        — 富 Plan（含步骤详情+Join 证据）
   POST /api/execute-rich     — 富 Execute（含 SQL 文本）
   GET  /api/package-rich/{id}— 富 Package（含文件树）
+
+Batch 3 — 监控端点：
+  GET  /api/monitor/config   — 前端查询监控状态
+  POST /api/monitor/browser-event — 浏览器安全上报
 """
 
 from __future__ import annotations
 
+import json
+import os
+import time
+from collections import defaultdict
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
 
 if TYPE_CHECKING:
     from tianshu_datadev.spark.orchestrator import SparkPipelineStage
@@ -431,3 +439,100 @@ async def spark_physical_verify(request: Request, body: SparkStageRequest):
     """Spark PHYSICAL_VERIFIER 阶段——双引擎物理结果对比。"""
     from tianshu_datadev.spark.orchestrator import SparkPipelineStage
     return _handle_spark_stage(request, body.request_id, SparkPipelineStage.PHYSICAL_VERIFIER)
+
+
+# ════════════════════════════════════════════
+# Batch 3 — 监控端点
+# ════════════════════════════════════════════
+
+# 速率限制状态（按 run_id）
+_rate_limit_state: dict[str, list[float]] = defaultdict(list)
+_total_count_state: dict[str, int] = defaultdict(int)
+
+
+@api_router.get("/monitor/config")
+def monitor_config(request: Request):
+    """前端查询监控状态——返回 enabled、run_id、monitor_token、限流阈值。
+
+    监控未启用时返回 {"enabled": False}，前端据此隐藏监控面板。
+    """
+    collector = getattr(request.app.state, "monitor_collector", None)
+    if collector is None or not getattr(collector, "enabled", True):
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "run_id": collector.run_id,
+        "monitor_token": os.environ.get("TIANSHU_MONITOR_TOKEN", ""),
+        "rate_limit_per_minute": 20,
+        "max_total_events": 200,
+    }
+
+
+@api_router.post("/monitor/browser-event", status_code=204)
+async def browser_event(payload: dict, request: Request):
+    """浏览器安全上报——6 层安全校验链后写入浏览器事件。
+
+    安全校验链（任一失败返回 403/404）：
+    1. 监控未启用 → 404
+    2. Origin 白名单（127.0.0.1:5173, localhost:5173）→ 403
+    3. monitor_token 缺失或不匹配 → 403
+    4. run_id 与 TIANSHU_RUN_ID 不匹配 → 403
+    5. 速率限制（每分钟 20 条）→ 429
+    6. 总量限制（总共 200 条）→ 429
+    7. 请求体 > 4KB → 413
+    """
+    collector = getattr(request.app.state, "monitor_collector", None)
+    if collector is None or not getattr(collector, "enabled", True):
+        raise HTTPException(status_code=404)  # 不暴露原因
+
+    # ── 1. Origin 白名单 ──
+    origin = request.headers.get("Origin", "")
+    if origin not in ("http://127.0.0.1:5173", "http://localhost:5173"):
+        raise HTTPException(status_code=403)
+
+    # ── 2. Token 校验 ──
+    token = payload.get("monitor_token", "")
+    if not token or token != os.environ.get("TIANSHU_MONITOR_TOKEN", ""):
+        raise HTTPException(status_code=403)
+
+    # ── 3. Run ID 校验 ──
+    run_id = payload.get("run_id", "")
+    if run_id != os.environ.get("TIANSHU_RUN_ID", ""):
+        raise HTTPException(status_code=403)
+
+    # ── 4. 请求体大小限制 ──
+    body_str = json.dumps(payload)
+    if len(body_str.encode()) > 4096:
+        raise HTTPException(status_code=413)
+
+    # ── 5. 速率限制——每分钟 20 条 ──
+    now = time.time()
+    window = [t for t in _rate_limit_state[run_id] if now - t < 60]
+    if len(window) >= 20:
+        raise HTTPException(status_code=429)
+    window.append(now)
+    _rate_limit_state[run_id] = window
+
+    # ── 6. 总量限制——200 条 ──
+    if _total_count_state[run_id] >= 200:
+        raise HTTPException(status_code=429)
+    _total_count_state[run_id] += 1
+
+    # ── 7. 黑名单检查（对原始 payload 检查，禁止上报敏感字段）──
+    forbidden = {"request_body", "response_body", "headers", "authorization", "cookie"}
+    for key in forbidden:
+        if key in payload:
+            raise HTTPException(status_code=400)
+
+    # ── 8. 白名单字段过滤（移除未在允许列表中的字段）──
+    allowed = {
+        "event_type", "timestamp", "run_id", "monitor_token",
+        "api_path", "api_status", "api_duration_ms",
+        "error_type", "error_message", "stack_frames", "url",
+    }
+    for key in list(payload.keys()):
+        if key not in allowed:
+            del payload[key]
+
+    collector.log_browser_event(payload)
+    return Response(status_code=204)
