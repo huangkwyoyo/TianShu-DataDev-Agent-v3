@@ -162,6 +162,13 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
             "SparkDeveloperService 跳过，DEVELOPER 阶段将标记 SKIPPED"
         )
 
+    # 监控系统自动启用——仅当 TIANSHU_RUN_ID 未设置时自动生成
+    # 环境变量存在但为空字符串 → 显式禁用（get_collector 返回 NullCollector）
+    # 环境变量不存在 → 自动生成 run_id（默认启用）
+    if "TIANSHU_RUN_ID" not in os.environ:
+        from datetime import datetime
+        os.environ["TIANSHU_RUN_ID"] = datetime.now().strftime("%Y%m%d-%H%M%S")
+
     app = FastAPI(
         title="TianShu DataDev Agent API",
         version="0.1.0",

@@ -3,10 +3,7 @@
 import os
 from unittest.mock import patch
 
-import pytest
-
-# 目标函数尚不存在——测试先行，预期 ImportError
-from tianshu_datadev.monitor.renderer import LogRenderer  # noqa: E402
+from tianshu_datadev.monitor.renderer import LogRenderer
 
 
 class TestFormatStageStarted:
@@ -188,7 +185,7 @@ class TestFormatStageFailed:
         assert "286" in result
         # 验证缩进标记存在——两条 stack frame 行
         lines = result.split("\n")
-        stack_lines = [l for l in lines if "parser.py" in l or "pipeline.py" in l]
+        stack_lines = [ln for ln in lines if "parser.py" in ln or "pipeline.py" in ln]
         assert len(stack_lines) == 2
 
 
@@ -301,7 +298,10 @@ class TestFormatResource:
             "run_id": "20260710-120000",
             "timestamp": "2026-07-10T12:00:05.000000+00:00",
             "processes": [
-                {"pid": 12345, "name": "python", "cpu_percent": 45.2, "rss_mb": 256.8, "vms_mb": 1024.0, "num_threads": 8},
+                {
+                    "pid": 12345, "name": "python", "cpu_percent": 45.2,
+                    "rss_mb": 256.8, "vms_mb": 1024.0, "num_threads": 8,
+                },
             ],
         }
         with patch.dict(os.environ, {}, clear=True):
@@ -315,7 +315,10 @@ class TestFormatResource:
             "run_id": "20260710-120000",
             "timestamp": "2026-07-10T12:00:05.000000+00:00",
             "processes": [
-                {"pid": 12345, "name": "python", "cpu_percent": 45.2, "rss_mb": 256.8, "vms_mb": 1024.0, "num_threads": 8},
+                {
+                    "pid": 12345, "name": "python", "cpu_percent": 45.2,
+                    "rss_mb": 256.8, "vms_mb": 1024.0, "num_threads": 8,
+                },
             ],
         }
         with patch.dict(os.environ, {"TIANSHU_LOG_RESOURCE": "1"}):

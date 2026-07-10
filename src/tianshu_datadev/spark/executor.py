@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import platform
 import re
@@ -714,13 +715,31 @@ class LocalSparkExecutor:
                 },
             )
         if return_code != 0:
+            # stderr 摘要写入后端日志——上限 5000 字符，超出时附加截断标记
+            _stderr_total = len(stderr)
+            _stderr_log_limit = 5000
+            if _stderr_total > _stderr_log_limit:
+                _stderr_summary = stderr[:_stderr_log_limit] + (
+                    f"\n... [stderr truncated: {_stderr_log_limit}/{_stderr_total} chars]"
+                )
+            else:
+                _stderr_summary = stderr
+            logging.getLogger(__name__).error(
+                "PySpark 执行失败（退出码 %d）：\n%s",
+                return_code, _stderr_summary,
+            )
+            # error_message 返回前端——截断 2000 字符，避免 UI 过长
+            _msg_limit = 2000
+            _error_msg = stderr[:_msg_limit]
+            if _stderr_total > _msg_limit:
+                _error_msg += f"\n... [stderr truncated: {_msg_limit}/{_stderr_total} chars]"
             return SparkExecutionResult(
                 status=SparkExecutionStatus.RUNTIME_ERROR,
                 stdout=cleaned_stdout,
                 stderr=stderr,
                 return_code=return_code,
                 execution_time_ms=elapsed_ms,
-                error_message=f"PySpark 执行失败（退出码 {return_code}）：{stderr[:500]}",
+                error_message=f"PySpark 执行失败（退出码 {return_code}）：{_error_msg}",
                 resource_usage={
                     "stdout_bytes": stdout_bytes,
                     "stderr_bytes": stderr_bytes,

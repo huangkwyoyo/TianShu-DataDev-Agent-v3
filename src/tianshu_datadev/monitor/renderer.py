@@ -4,7 +4,7 @@
 """
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 
 
 class LogRenderer:
