@@ -44,3 +44,4 @@ logs/dev/*
 
 # 全流程运行监控系统日志
 logs/monitor/
+logs/monitor-text/

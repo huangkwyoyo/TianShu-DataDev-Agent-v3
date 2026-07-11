@@ -3,13 +3,10 @@
 import os
 from unittest.mock import patch
 
-import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from tianshu_datadev.api.routes import api_router, _rate_limit_state, _total_count_state
-from tianshu_datadev.monitor.collector import RunLogCollector
-from tianshu_datadev.monitor.middleware import MonitorMiddleware
+from tianshu_datadev.api.routes import _rate_limit_state, _total_count_state, api_router
 
 
 class _CollectingBrowserCollector:

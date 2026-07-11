@@ -517,14 +517,14 @@ def _make_e2e_spark_plan():
                 right="100",
             ),
             SparkProjectStep(
-                input_alias="_f0",
+                input_alias="od",
                 columns=[
                     SparkProjectColumn(column_name="order_id", alias="order_id"),
                     SparkProjectColumn(column_name="amount", alias="amount"),
                 ],
             ),
             SparkSortStep(
-                input_alias="_p2",
+                input_alias="od",
                 order_by=[
                     SparkSortSpec(column="amount", direction=SparkSortDirection.DESC),
                 ],

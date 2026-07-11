@@ -5,13 +5,9 @@ Batch 4 — SQL 管线埋点。
 """
 
 import os
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
-
-from tianshu_datadev.monitor import NullCollector, StageContext
-from tianshu_datadev.monitor.collector import get_collector
-
 
 # ═══════════════════════════════════════════════════════════
 # 辅助：MockCollector——轻量替代 RunLogCollector，避免文件 IO
@@ -107,8 +103,9 @@ def mock_collector():
 @pytest.fixture
 def pipeline(mock_collector):
     """创建真实 Pipeline 实例——由 mock_collector fixture 自动注入 mock collector。"""
-    from tianshu_datadev.api.pipeline import Pipeline
     import tempfile
+
+    from tianshu_datadev.api.pipeline import Pipeline
     tmpdir = tempfile.mkdtemp()
     yield Pipeline(base_output_dir=tmpdir)
     import shutil
@@ -421,8 +418,9 @@ class TestSqlPipelineMonitoring:
         """NullCollector 时管线行为不变（不崩溃、返回正常结果）。"""
         # 确保 TIANSHU_RUN_ID 未设置 → NullCollector
         # 只需要调用 pipeline 方法，不应崩溃
-        from tianshu_datadev.api.pipeline import Pipeline
         import tempfile
+
+        from tianshu_datadev.api.pipeline import Pipeline
 
         tmpdir = tempfile.mkdtemp()
         try:

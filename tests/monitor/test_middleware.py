@@ -1,7 +1,5 @@
 """测试 MonitorMiddleware——HTTP 监控中间件。"""
 
-import os
-from unittest.mock import patch
 
 import pytest
 from fastapi import FastAPI

@@ -2,9 +2,7 @@
 
 import json
 import os
-import queue
 import tempfile
-import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -14,7 +12,6 @@ import pytest
 from tianshu_datadev.monitor import (
     NullCollector,
     RunLogCollector,
-    StageContext,
     get_collector,
 )
 from tianshu_datadev.monitor.models import StageEvent
@@ -421,4 +418,89 @@ class TestRunLogCollectorTextLog:
                 assert "node_2" in content_2
                 assert "DONE" in content_2
 
+                collector.close()
+
+
+class TestRunLogCollectorSeparateTextDir:
+    """文本日志写入独立目录——logs/monitor-text 与 logs/monitor 分离。"""
+
+    def test_log_written_to_text_log_dir(self):
+        """指定 text_log_dir 时，.log 文件写入该目录而非 log_dir。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp) / "monitor"
+            text_log_dir = Path(tmp) / "monitor-text"
+            with patch.dict(os.environ, {"TIANSHU_RUN_ID": "test-sep-001"}):
+                collector = RunLogCollector(
+                    log_dir, "test-sep-001", text_log_dir=text_log_dir,
+                )
+                event = StageEvent(
+                    run_id="test-sep-001",
+                    stage_run_id="stage_test",
+                    node="separate_dir_node",
+                    status="started",
+                )
+                collector.emit(event)
+                collector.flush(timeout=2.0)
+                collector.close()
+
+            # .log 文件应在 text_log_dir 中
+            log_path = text_log_dir / "tianshu_run_test-sep-001_events.log"
+            assert log_path.exists(), f".log 应在 {text_log_dir} 中"
+            content = log_path.read_text(encoding="utf-8")
+            assert "separate_dir_node" in content
+
+    def test_jsonl_stays_in_log_dir_when_text_separate(self):
+        """text_log_dir 分离时，JSONL 仍写入 log_dir。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp) / "monitor"
+            text_log_dir = Path(tmp) / "monitor-text"
+            with patch.dict(os.environ, {"TIANSHU_RUN_ID": "test-sep-002"}):
+                collector = RunLogCollector(
+                    log_dir, "test-sep-002", text_log_dir=text_log_dir,
+                )
+                event = StageEvent(
+                    run_id="test-sep-002",
+                    stage_run_id="stage_jsonl",
+                    node="jsonl_node",
+                    status="started",
+                )
+                collector.emit(event)
+                collector.flush(timeout=2.0)
+                collector.close()
+
+            # JSONL 文件仍在 log_dir 中
+            jsonl_path = log_dir / "tianshu_run_test-sep-002_events.jsonl"
+            assert jsonl_path.exists(), f"JSONL 应在 {log_dir} 中"
+            content = jsonl_path.read_text(encoding="utf-8")
+            assert "jsonl_node" in content
+
+    def test_text_log_dir_defaults_to_log_dir(self):
+        """未指定 text_log_dir 时，.log 与 JSONL 在同一目录（向后兼容）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp)
+            with patch.dict(os.environ, {"TIANSHU_RUN_ID": "test-default-001"}):
+                collector = RunLogCollector(log_dir, "test-default-001")
+                event = StageEvent(
+                    run_id="test-default-001",
+                    stage_run_id="stage_default",
+                    node="default_node",
+                    status="started",
+                )
+                collector.emit(event)
+                collector.flush(timeout=2.0)
+                collector.close()
+
+            # .log 和 JSONL 都在 log_dir 中
+            assert (log_dir / "tianshu_run_test-default-001_events.jsonl").exists()
+            assert (log_dir / "tianshu_run_test-default-001_events.log").exists()
+
+    def test_get_collector_passes_text_log_dir(self):
+        """get_collector 工厂正确传递 text_log_dir 参数。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp) / "monitor"
+            text_log_dir = Path(tmp) / "monitor-text"
+            with patch.dict(os.environ, {"TIANSHU_RUN_ID": "test-factory-001"}):
+                collector = get_collector(log_dir, text_log_dir=text_log_dir)
+                assert isinstance(collector, RunLogCollector)
+                assert collector._text_log_dir == text_log_dir
                 collector.close()

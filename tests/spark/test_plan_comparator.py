@@ -3257,15 +3257,15 @@ class TestPlanComparatorWindowEquivalence:
     def test_window_frame_equivalent(self):
         """SQL WindowFrame dict + Spark frame_type/frame_start/frame_end → frame 合并后等价。"""
         from tianshu_datadev.planning.models import (
+            ColumnRef,
+            FrameBoundary,
+            FrameBoundaryKind,
+            SortDirection,
+            SortSpec,
             WindowExpr,
             WindowFrame,
             WindowFrameType,
-            FrameBoundary,
-            FrameBoundaryKind,
             WindowFunction,
-            ColumnRef,
-            SortSpec,
-            SortDirection,
         )
         from tianshu_datadev.planning.sql_build_plan import WindowStep
         from tianshu_datadev.spark.models import (
@@ -3327,15 +3327,15 @@ class TestPlanComparatorWindowEquivalence:
     def test_window_frame_diff_not_equivalent(self):
         """SQL ROWS vs Spark RANGE → LOGIC_MISMATCH。"""
         from tianshu_datadev.planning.models import (
+            ColumnRef,
+            FrameBoundary,
+            FrameBoundaryKind,
+            SortDirection,
+            SortSpec,
             WindowExpr,
             WindowFrame,
             WindowFrameType,
-            FrameBoundary,
-            FrameBoundaryKind,
             WindowFunction,
-            ColumnRef,
-            SortSpec,
-            SortDirection,
         )
         from tianshu_datadev.planning.sql_build_plan import WindowStep
         from tianshu_datadev.spark.models import (
@@ -3395,15 +3395,15 @@ class TestPlanComparatorWindowEquivalence:
     def test_window_order_reversed_not_equivalent(self):
         """ORDER BY salary DESC, name ASC vs name ASC, salary DESC → LOGIC_MISMATCH。"""
         from tianshu_datadev.planning.models import (
+            ColumnRef,
+            FrameBoundary,
+            FrameBoundaryKind,
+            SortDirection,
+            SortSpec,
             WindowExpr,
             WindowFrame,
             WindowFrameType,
-            FrameBoundary,
-            FrameBoundaryKind,
             WindowFunction,
-            ColumnRef,
-            SortSpec,
-            SortDirection,
         )
         from tianshu_datadev.planning.sql_build_plan import WindowStep
         from tianshu_datadev.spark.models import (
@@ -3466,15 +3466,15 @@ class TestPlanComparatorWindowEquivalence:
     def test_window_input_column_diff_not_equivalent(self):
         """SUM(amount) vs SUM(discount) → LOGIC_MISMATCH。"""
         from tianshu_datadev.planning.models import (
+            ColumnRef,
+            FrameBoundary,
+            FrameBoundaryKind,
+            SortDirection,
+            SortSpec,
             WindowExpr,
             WindowFrame,
             WindowFrameType,
-            FrameBoundary,
-            FrameBoundaryKind,
             WindowFunction,
-            ColumnRef,
-            SortSpec,
-            SortDirection,
         )
         from tianshu_datadev.planning.sql_build_plan import WindowStep
         from tianshu_datadev.spark.models import (
@@ -3534,15 +3534,15 @@ class TestPlanComparatorWindowEquivalence:
     def test_window_full_equivalent(self):
         """完整 window（partition + order + frame + input）→ LOGIC_EQUIVALENT。"""
         from tianshu_datadev.planning.models import (
+            ColumnRef,
+            FrameBoundary,
+            FrameBoundaryKind,
+            SortDirection,
+            SortSpec,
             WindowExpr,
             WindowFrame,
             WindowFrameType,
-            FrameBoundary,
-            FrameBoundaryKind,
             WindowFunction,
-            ColumnRef,
-            SortSpec,
-            SortDirection,
         )
         from tianshu_datadev.planning.sql_build_plan import WindowStep
         from tianshu_datadev.spark.models import (
@@ -3624,11 +3624,11 @@ class TestPlanComparatorWindowEquivalence:
     def test_window_no_frame_no_partition(self):
         """无 partition 的 ROW_NUMBER 使用默认 frame → 不崩溃，等价。"""
         from tianshu_datadev.planning.models import (
+            FrameBoundary,
+            FrameBoundaryKind,
             WindowExpr,
             WindowFrame,
             WindowFrameType,
-            FrameBoundary,
-            FrameBoundaryKind,
             WindowFunction,
         )
         from tianshu_datadev.planning.sql_build_plan import WindowStep

@@ -29,7 +29,6 @@ from tianshu_datadev.artifacts.models import (
     WindowSpecSummary,
 )
 
-from ._alias_generator import generate_step_alias
 from .models import (
     ContractGap,
     SparkAggFunction,
@@ -546,10 +545,9 @@ def _map_windows(
         )
         return unsupported[-1]
 
-    # 从第一个 window_spec 推断 input_alias
+    # input_alias 由 _chain_input_aliases 统一补全——不留 statement_id
+    # statement_id 是 Contract 层的标识符，不是数据流别名
     input_alias = ""
-    if window_specs and window_specs[0].statement_id:
-        input_alias = window_specs[0].statement_id
 
     expressions = [
         SparkWindowExpr(
@@ -697,115 +695,37 @@ def _infer_input_alias_from_columns(
 # ════════════════════════════════════════════
 
 
-def _get_step_output_alias(
-    step, used_aliases: set[str], is_last_project: bool = False,
-) -> str:
-    """返回编译器将赋予该步骤的输出别名——委托 alias generator 确保一致。
-
-    Args:
-        step: SparkPlan 步骤实例
-        used_aliases: 已用别名集合（会被原地修改）
-        is_last_project: 是否为管线中最后一个 ProjectStep
-
-    Returns:
-        编译器将赋予该步骤的输出变量名
-    """
-    if isinstance(step, SparkReadStep):
-        alias = step.alias
-        used_aliases.add(alias)
-        return alias
-    if isinstance(step, SparkJoinStep):
-        return generate_step_alias(
-            step, left_alias=step.left_alias, right_alias=step.right_alias,
-            used_aliases=used_aliases,
-        )
-    if isinstance(step, SparkProjectStep):
-        input_alias = getattr(step, "input_alias", "")
-        return generate_step_alias(
-            step, input_alias=input_alias, used_aliases=used_aliases,
-            is_last_project=is_last_project,
-        )
-    # 单输入步骤：Filter / Sort / Limit / Aggregate / CaseWhen / Window
-    input_alias = getattr(step, "input_alias", "")
-    return generate_step_alias(
-        step, input_alias=input_alias, used_aliases=used_aliases,
-    )
-
-
 def _chain_input_aliases(steps: list) -> None:
-    """填充步骤间的线性依赖链——每个步骤的 input_alias 指向前一步骤的输出别名。
+    """填充步骤间的线性依赖链——仅补全空的 input_alias 字段。
 
-    在 map_contract_to_spark_plan() 组装步骤列表后、构造 SparkPlan 前调用。
-    仅填充当前为空字符串的 input_alias——已由映射函数显式设置的字段不受影响。
+    不生成代码变量名（tN/fN 由 _alias_resolver 统一分配）。
+    不预测编译器输出——仅确保 DAG 依赖链完整。
 
-    不处理的步骤类型：
-    - SparkReadStep：数据源，无输入依赖，仅记录其输出供后续步骤引用
-    - SparkJoinStep：使用 left_alias/right_alias 指定输入，不使用 input_alias
-
-    Phase 9B：使用数据流式别名——与 compiler.py 共享 _alias_generator 确保一致。
+    规则：
+    - ReadStep：设置 prev_key = step.alias，下游步骤通过该 key 引用
+    - JoinStep：使用 left_alias/right_alias，设置 prev_key = left_alias
+    - 单输入步骤：空 input_alias → 用 prev_key 填充；设置 prev_key = input_alias
 
     Args:
         steps: 已排序的步骤列表（会被原地修改）
     """
-    prev_output: str | None = None
-    used_aliases: set[str] = set()
+    prev_key: str | None = None
 
-    # 追踪别名解析——与 compiler 的 state.latest_alias 保持一致，
-    # 确保 JoinStep 的输出别名使用解析后的左右表名（而非原始表别名）。
-    # 否则 Filter→Join→Aggregate 链路中，mapper 预测 Join 输出为 "ft_with_tz"，
-    # compiler 实际生成 "ft_filtered_with_tz"，下游 Aggregate 断链 → NameError。
-    latest_alias: dict[str, str] = {}
-
-    # 预计算最后一个 ProjectStep 索引 + 预注册 Read 别名
-    last_project_idx = -1
-    for j, s in enumerate(steps):
-        if isinstance(s, SparkProjectStep):
-            last_project_idx = j
-        if isinstance(s, SparkReadStep):
-            used_aliases.add(s.alias)
-            latest_alias[s.alias] = s.alias
-
-    for i, step in enumerate(steps):
-        # 预填 input_alias——在生成输出别名之前，确保生成器能看到正确的输入
-        if not isinstance(step, (SparkReadStep, SparkJoinStep)):
-            if hasattr(step, "input_alias") and getattr(step, "input_alias", None) == "":
-                if prev_output is not None:
-                    step.input_alias = prev_output
-
-        # 生成输出别名（与 compiler.py 共享逻辑）
-        is_last = isinstance(step, SparkProjectStep) and i == last_project_idx
-
-        if isinstance(step, SparkJoinStep):
-            # 使用解析后的别名——与 compiler 的 resolved_left/resolved_right 对齐
-            resolved_left = latest_alias.get(step.left_alias, step.left_alias)
-            resolved_right = latest_alias.get(step.right_alias, step.right_alias)
-            cur_output = generate_step_alias(
-                step, left_alias=resolved_left, right_alias=resolved_right,
-                used_aliases=used_aliases,
-            )
-        else:
-            cur_output = _get_step_output_alias(step, used_aliases, is_last)
-
-        # 更新 latest_alias 追踪——与 compiler 的别名更新逻辑一致
+    for step in steps:
         if isinstance(step, SparkReadStep):
-            if not cur_output.startswith("#"):
-                latest_alias[step.alias] = cur_output
-            prev_output = cur_output
+            prev_key = step.alias
             continue
 
         if isinstance(step, SparkJoinStep):
-            if not cur_output.startswith("#"):
-                # 与 compiler 一致：key 为 left_alias（原始左表别名）
-                latest_alias[step.left_alias] = cur_output
-            prev_output = cur_output
+            prev_key = step.left_alias
             continue
 
-        # 单输入步骤（Filter/Project/Sort/Limit/Aggregate/CaseWhen/Window）
-        if isinstance(step, (SparkFilterStep, SparkProjectStep, SparkSortStep,
-                             SparkLimitStep, SparkAggregateStep, SparkCaseWhenStep,
-                             SparkWindowStep)):
-            input_key = getattr(step, "input_alias", "")
-            if not cur_output.startswith("#") and input_key:
-                latest_alias[input_key] = cur_output
+        # 单输入步骤——空 input_alias 用前一步的 key 填充
+        if hasattr(step, "input_alias") and getattr(step, "input_alias", None) == "":
+            if prev_key is not None:
+                step.input_alias = prev_key
 
-        prev_output = cur_output
+        # 更新 prev_key 为当前步骤的标识——不预测输出变量名
+        cur_key = getattr(step, "input_alias", "")
+        if cur_key:
+            prev_key = cur_key

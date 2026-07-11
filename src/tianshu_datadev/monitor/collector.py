@@ -67,8 +67,13 @@ class RunLogCollector:
     close() 原子输出 *_collector_status.json。
     """
 
-    def __init__(self, log_dir: Path, run_id: str, max_queue: int = 10000):
+    def __init__(
+        self, log_dir: Path, run_id: str,
+        text_log_dir: Path | None = None,
+        max_queue: int = 10000,
+    ):
         self._log_dir = log_dir
+        self._text_log_dir = text_log_dir if text_log_dir is not None else log_dir
         self.run_id = run_id
         self._queue: queue.Queue = queue.Queue(maxsize=max_queue)
         self.dropped_event_count: int = 0
@@ -76,13 +81,14 @@ class RunLogCollector:
         self.run_complete: bool = False
         self._running: bool = True
 
-        # 创建日志目录并打开文件
+        # 创建 JSONL 日志目录并打开文件
         self._log_dir.mkdir(parents=True, exist_ok=True)
         file_path = self._log_dir / f"tianshu_run_{run_id}_events.jsonl"
         self._file: TextIO = open(file_path, "w", encoding="utf-8")
 
-        # 同时打开文本日志文件供人类可读
-        log_path = self._log_dir / f"tianshu_run_{run_id}_events.log"
+        # 人类可读文本日志——写入独立目录
+        self._text_log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = self._text_log_dir / f"tianshu_run_{run_id}_events.log"
         self._text_file: TextIO = open(log_path, "w", encoding="utf-8")
 
         # 启动 writer 消费者线程
@@ -247,11 +253,21 @@ class StageContext:
         return False  # 关键——不吞异常
 
 
-def get_collector(log_dir: Path | None = None) -> "RunLogCollector | NullCollector":
-    """工厂——根据 TIANSHU_RUN_ID 环境变量返回对应采集器。"""
+def get_collector(
+    log_dir: Path | None = None,
+    text_log_dir: Path | None = None,
+) -> "RunLogCollector | NullCollector":
+    """工厂——根据 TIANSHU_RUN_ID 环境变量返回对应采集器。
+
+    Args:
+        log_dir: JSONL 日志目录，默认 logs/monitor。
+        text_log_dir: 人类可读文本日志目录，默认与 log_dir 相同。
+    """
     run_id = os.environ.get("TIANSHU_RUN_ID", "").strip()
     if not run_id:
         return NullCollector()
     if log_dir is None:
         log_dir = Path("logs/monitor")
-    return RunLogCollector(log_dir, run_id)
+    if text_log_dir is None:
+        text_log_dir = log_dir
+    return RunLogCollector(log_dir, run_id, text_log_dir=text_log_dir)

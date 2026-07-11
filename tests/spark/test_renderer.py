@@ -522,7 +522,11 @@ class TestMaliciousInputPhase6B:
             compiler.compile(plan)
 
     def test_join_malicious_left_alias_rejected(self):
-        """join left_alias 含恶意字符——编译时抛出 RenderError。"""
+        """join left_alias 含恶意字符——解析时抛出 AliasResolutionError。
+
+        恶意 left_alias 无法在 latest 中解析，resolver 在编译前拦截。
+        """
+        from tianshu_datadev.spark._alias_resolver import AliasResolutionError
         from tianshu_datadev.spark.compiler import SparkCompiler
         from tianshu_datadev.spark.models import (
             SparkJoinStep,
@@ -540,7 +544,7 @@ class TestMaliciousInputPhase6B:
                 SparkReadStep(alias="od", source_name="t", input_key="t"),
                 SparkReadStep(alias="up", source_name="t2", input_key="t2"),
                 SparkJoinStep(
-                    left_alias="od; import os",  # 恶意 alias
+                    left_alias="od; import os",  # 恶意 alias——不在 latest 中
                     right_alias="up",
                     left_key="user_id",
                     right_key="user_id",
@@ -549,7 +553,7 @@ class TestMaliciousInputPhase6B:
             ],
         )
         compiler = SparkCompiler()
-        with pytest.raises(RenderError, match="非法标识符"):
+        with pytest.raises(AliasResolutionError, match="未解析"):
             compiler.compile(plan)
 
     def test_join_malicious_key_rejected(self):

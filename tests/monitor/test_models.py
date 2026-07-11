@@ -6,7 +6,6 @@ from pydantic import ValidationError
 from tianshu_datadev.monitor.models import (
     BrowserEvent,
     HttpEvent,
-    MonitorEvent,
     ProcessMetrics,
     ResourceSample,
     StageEvent,

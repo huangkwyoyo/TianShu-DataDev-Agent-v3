@@ -210,20 +210,20 @@ def _make_e2e_plan() -> SparkPlan:
                 right="100",
             ),
             SparkProjectStep(
-                input_alias="_f0",
+                input_alias="od",
                 columns=[
                     SparkProjectColumn(column_name="order_id", alias="order_id"),
                     SparkProjectColumn(column_name="amount", alias="amount"),
                 ],
             ),
             SparkSortStep(
-                input_alias="_p2",
+                input_alias="od",
                 order_by=[
                     SparkSortSpec(column="amount", direction=SparkSortDirection.DESC),
                 ],
             ),
             SparkLimitStep(
-                input_alias="_s3",
+                input_alias="od",
                 limit=10,
             ),
         ],
@@ -528,7 +528,7 @@ class TestC4D2CompilationDeterminism:
                 SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="order_detail"),
                 SparkFilterStep(input_alias="od", operator="GT", left="od.amount", right="100"),
                 SparkProjectStep(
-                    input_alias="_f0",
+                    input_alias="od",
                     columns=[
                         SparkProjectColumn(column_name="order_id", alias="order_id"),
                     ],
@@ -724,7 +724,7 @@ class TestC4D5PhysicalPrecondition:
                 SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="order_detail"),
                 SparkFilterStep(input_alias="od", operator="GT", left="od.amount", right="0"),
                 SparkAggregateStep(
-                    input_alias="_f0",
+                    input_alias="od",
                     group_keys=["region"],
                     metrics=[
                         SparkAggregateSpec(
@@ -734,7 +734,7 @@ class TestC4D5PhysicalPrecondition:
                     ],
                 ),
                 SparkCaseWhenStep(
-                    input_alias="_a2",
+                    input_alias="od",
                     output_alias="level",
                     branches=[
                         SparkCaseWhenBranch(
@@ -747,7 +747,7 @@ class TestC4D5PhysicalPrecondition:
                     else_value="low",
                 ),
                 SparkProjectStep(
-                    input_alias="_cw3",
+                    input_alias="od",
                     columns=[
                         SparkProjectColumn(column_name="region", alias="region"),
                         SparkProjectColumn(column_name="total_amt", alias="total_amt"),
@@ -755,10 +755,10 @@ class TestC4D5PhysicalPrecondition:
                     ],
                 ),
                 SparkSortStep(
-                    input_alias="_p4",
+                    input_alias="od",
                     order_by=[SparkSortSpec(column="total_amt", direction=SparkSortDirection.DESC)],
                 ),
-                SparkLimitStep(input_alias="_s5", limit=10),
+                SparkLimitStep(input_alias="od", limit=10),
             ],
         )
 

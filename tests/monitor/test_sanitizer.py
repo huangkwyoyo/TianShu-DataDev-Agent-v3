@@ -3,8 +3,6 @@
 import pytest
 
 from tianshu_datadev.monitor.models import (
-    BrowserEvent,
-    HttpEvent,
     MonitorEvent,
     StageEvent,
 )
@@ -88,7 +86,6 @@ class TestValidateEvent:
 
     def test_validate_event_rejects_request_body(self):
         """含 request_body 字段的事件被拒绝。"""
-        from pydantic import BaseModel, ConfigDict
 
         # 创建一个包含 request_body 的恶意事件（模拟攻击）
         class BadEvent(MonitorEvent):
@@ -104,7 +101,6 @@ class TestValidateEvent:
 
     def test_validate_event_rejects_authorization_header(self):
         """含 authorization 字段的事件被拒绝。"""
-        from pydantic import BaseModel, ConfigDict
 
         class BadEvent(MonitorEvent):
             event_type: str = "http"

@@ -31,13 +31,24 @@ from tianshu_datadev.spark.renderer import RenderError
 
 
 def _make_plan(*steps) -> SparkPlan:
-    """构建测试用 SparkPlan。"""
+    """构建测试用 SparkPlan——无 Read 时自动前置默认 ReadStep。
+
+    保证所有步骤的 input_alias 都能在 latest 中解析。
+    使用 alias="df" 与多数 Window 测试的参数名一致。
+    """
+    steps_list = list(steps)
+    has_read = any(isinstance(s, SparkReadStep) for s in steps_list)
+    if not has_read:
+        steps_list.insert(
+            0,
+            SparkReadStep(alias="df", source_name="default_table", input_key="default"),
+        )
     return SparkPlan(
         plan_id="test_plan",
         version="v1",
         source_phase="phase-6",
         source_contract_hash="test_hash",
-        steps=list(steps),
+        steps=steps_list,
     )
 
 
@@ -58,12 +69,12 @@ class TestCompileRead:
         compiler = SparkCompiler()
         result = compiler.compile(plan)
 
-        assert 'od = inputs["dwd.order_detail"]' in result.raw_pyspark
+        assert 't1 = inputs["dwd.order_detail"]' in result.raw_pyspark
         assert "def transform(" in result.raw_pyspark
         assert len(result.step_ids) == 1
 
     def test_multiple_reads(self):
-        """多个 ReadStep 编译。"""
+        """多个 ReadStep 编译——tN 按 input_key 字典序分配。"""
         steps = [
             SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
             SparkReadStep(alias="ri", source_name="dim.region_info", input_key="ri"),
@@ -72,8 +83,9 @@ class TestCompileRead:
         compiler = SparkCompiler()
         result = compiler.compile(plan)
 
-        assert 'od = inputs["dwd.order_detail"]' in result.raw_pyspark
-        assert 'ri = inputs["dim.region_info"]' in result.raw_pyspark
+        # t1/t2 按 input_key 字典序——"od" < "ri"
+        assert 't1 = inputs["dwd.order_detail"]' in result.raw_pyspark
+        assert 't2 = inputs["dim.region_info"]' in result.raw_pyspark
         assert len(result.step_ids) == 2
 
     def test_read_no_spark_read(self):
@@ -101,7 +113,7 @@ class TestCompileFilter:
         compiler = SparkCompiler()
         result = compiler.compile(plan)
 
-        assert "od = inputs[" in result.raw_pyspark
+        assert "t1 = inputs[" in result.raw_pyspark
         assert ".filter(" in result.raw_pyspark
         # F.col() 只接受纯列名，filter 上下文剥离了表前缀 "od."
         assert 'F.col("order_status")' in result.raw_pyspark
@@ -120,11 +132,11 @@ class TestCompileFilter:
         assert ">" in result.raw_pyspark
 
     def test_filter_chaining(self):
-        """多个 FilterStep 链式编译。"""
+        """多个 FilterStep 链式编译——resolver 通过 latest 映射串联。"""
         plan = _make_plan(
             SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
             SparkFilterStep(input_alias="od", operator="EQ", left="od.status", right="'paid'"),
-            SparkFilterStep(input_alias="_f1", operator="GT", left="od.amount", right="0"),
+            SparkFilterStep(input_alias="od", operator="GT", left="od.amount", right="0"),
         )
         compiler = SparkCompiler()
         result = compiler.compile(plan)
@@ -250,7 +262,7 @@ class TestCompileLimit:
                     SparkSortSpec(column="total_amount", direction=SparkSortDirection.DESC),
                 ],
             ),
-            SparkLimitStep(input_alias="_s1", limit=10),
+            SparkLimitStep(input_alias="od", limit=10),
         )
         compiler = SparkCompiler()
         result = compiler.compile(plan)
@@ -791,8 +803,8 @@ class TestCompileJoin:
         result = compiler.compile(plan)
 
         assert ".join(" in result.raw_pyspark
-        assert 'od["user_id"]' in result.raw_pyspark
-        assert 'up["user_id"]' in result.raw_pyspark
+        assert 't1["user_id"]' in result.raw_pyspark
+        assert 't2["user_id"]' in result.raw_pyspark
         assert 'how="inner"' in result.raw_pyspark
 
     def test_left_join(self):
@@ -829,17 +841,17 @@ class TestCompileJoin:
         compiler = SparkCompiler()
         result = compiler.compile(plan)
 
-        assert 'od["region_code"]' in result.raw_pyspark
-        assert 'ri["code"]' in result.raw_pyspark
+        assert 't1["region_code"]' in result.raw_pyspark
+        assert 't2["code"]' in result.raw_pyspark
 
     def test_join_after_filter(self):
-        """Filter 后 Join——链式编译。"""
+        """Filter 后 Join——resolver 通过 latest 映射串联。"""
         plan = _make_plan(
             SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
             SparkFilterStep(input_alias="od", operator="GT", left="od.amount", right="0"),
             SparkReadStep(alias="up", source_name="dim.user_profile", input_key="up"),
             SparkJoinStep(
-                left_alias="_f1",
+                left_alias="od",
                 right_alias="up",
                 left_key="user_id",
                 right_key="user_id",
@@ -1297,7 +1309,7 @@ class TestCompileWindow:
         from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
 
         step = SparkWindowStep(
-            input_alias="input_df",
+            input_alias="df",
             expressions=[
                 SparkWindowExpr(
                     function=SparkWindowFunction.ROW_NUMBER,
@@ -1320,7 +1332,7 @@ class TestCompileWindow:
         from tianshu_datadev.spark.models import SparkWindowExpr, SparkWindowFunction, SparkWindowStep
 
         step = SparkWindowStep(
-            input_alias="input_df",
+            input_alias="df",
             expressions=[
                 SparkWindowExpr(
                     function=SparkWindowFunction.RANK,
@@ -1642,8 +1654,8 @@ class TestCompileWindow:
         plan = _make_plan(step)
         result = SparkCompiler().compile(plan)
 
-        # 空表达式应生成直通赋值 df_windowed = df，不含裸注释行
-        assert "df_windowed = df" in result.raw_pyspark
+        # 空表达式应生成直通赋值 f1 = t1（Read 前置 → t1）
+        assert "f1 = t1" in result.raw_pyspark
         assert "# WINDOW" not in result.raw_pyspark
         assert "# Step:" in result.annotated_pyspark
 
@@ -1743,14 +1755,14 @@ class TestCommentNoSQL:
             SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
             SparkFilterStep(input_alias="od", operator="EQ", left="od.status", right="'paid'"),
             SparkProjectStep(
-                input_alias="_f1",
+                input_alias="od",
                 columns=[SparkProjectColumn(column_name="amount", alias="amount")],
             ),
             SparkSortStep(
-                input_alias="_p2",
+                input_alias="od",
                 order_by=[SparkSortSpec(column="amount", direction=SparkSortDirection.DESC)],
             ),
-            SparkLimitStep(input_alias="_s3", limit=100),
+            SparkLimitStep(input_alias="od", limit=100),
         )
         compiler = SparkCompiler()
         result = compiler.compile(plan)
@@ -1784,7 +1796,7 @@ class TestAnnotationsRemovable:
             SparkReadStep(alias="od", source_name="dwd.order_detail", input_key="od"),
             SparkFilterStep(input_alias="od", operator="EQ", left="od.status", right="'paid'"),
             SparkProjectStep(
-                input_alias="_f1",
+                input_alias="od",
                 columns=[SparkProjectColumn(column_name="status", alias="status")],
             ),
         )

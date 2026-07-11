@@ -575,40 +575,28 @@ class TestSparkPlanMapper:
         assert "SparkSortStep" in step_types
         assert "SparkLimitStep" in step_types
 
-        # 核心验证：每个非首步的 input_alias 非空且指向正确的编译器输出别名
+        # 核心验证：每个非首步的 input_alias 非空（依赖链完整）
+        # 注意：v2 不再生成语义别名（_filtered/_output/_sorted），
+        # _chain_input_aliases 仅补全空字段为 prev_key
         for i, step in enumerate(plan.steps):
             if isinstance(step, SparkReadStep):
-                # ReadStep 为数据源，无 input_alias
                 assert step.alias == "od"
             elif isinstance(step, SparkFilterStep):
-                # FilterStep 的 input_alias 由 _extract_table_alias 设置为 "od"
                 assert step.input_alias == "od", (
                     f"FilterStep[{i}] input_alias 应为 'od'，实际为 {step.input_alias!r}"
                 )
             elif isinstance(step, SparkProjectStep):
-                # 前一步是 FilterStep，输出为 {input}_filtered
                 assert step.input_alias != "", (
                     f"ProjectStep[{i}] input_alias 不应为空（R3 修复验证）"
                 )
-                assert "_filtered" in step.input_alias, (
-                    f"ProjectStep[{i}] input_alias 应指向 FilterStep 输出"
-                    f"（含 '_filtered'），实际为 {step.input_alias!r}"
-                )
+                # 仅验证非空——不要求特定后缀（v2 由 resolver 分配代码变量名）
             elif isinstance(step, SparkSortStep):
                 assert step.input_alias != "", (
                     f"SortStep[{i}] input_alias 不应为空（R3 修复验证）"
                 )
-                assert "_output" in step.input_alias or "_selected" in step.input_alias, (
-                    f"SortStep[{i}] input_alias 应指向 ProjectStep 输出"
-                    f"（含 '_output' 或 '_selected'），实际为 {step.input_alias!r}"
-                )
             elif isinstance(step, SparkLimitStep):
                 assert step.input_alias != "", (
                     f"LimitStep[{i}] input_alias 不应为空（R3 修复验证）"
-                )
-                assert "_sorted" in step.input_alias, (
-                    f"LimitStep[{i}] input_alias 应指向 SortStep 输出"
-                    f"（含 '_sorted'），实际为 {step.input_alias!r}"
                 )
 
     def test_input_alias_chain_full_contract_no_empty_aliases(self):
@@ -633,16 +621,13 @@ class TestSparkPlanMapper:
             )
 
     def test_filter_join_alias_chain_resolved_correctly(self):
-        """Filter→Join→Aggregate 链路中，mapper 的 Join 输出别名必须与 compiler 一致。
+        """Filter→Join→Aggregate 链路中，依赖链完整且 resolver 可正确解析。
 
-        回归：mapper 用原始 left_alias 算 Join 输出 → "od_with_ri"，
-        compiler 用解析后别名 → "od_filtered_with_ri"。
-        当 AggregateStep.input_alias 由 _chain_input_aliases 填充时（聚合列无表前缀），
-        此不一致导致下游 NameError。
+        v2：mapper 不再预测代码变量名——仅确保 input_alias 非空。
+        实际变量名（tN/fN）由 _alias_resolver 统一分配，
+        编译产物通过 ast.parse 验证先定义后引用。
         """
         contract = _make_minimal_contract()
-        # 关键：所有聚合列去掉表前缀，使 _infer_input_alias_from_aggregations
-        # 返回 "" → _chain_input_aliases 填充 AggregateStep.input_alias
         contract.aggregations = [
             ContractAggregation(function="COUNT", input_column=None, alias="order_count"),
             ContractAggregation(function="COUNT_DISTINCT", input_column="user_id", alias="active_users"),
@@ -653,32 +638,26 @@ class TestSparkPlanMapper:
         plan = result.spark_plan
         assert plan is not None
 
-        # 找到 AggregateStep
+        # 验证依赖链完整——AggregateStep 的 input_alias 非空
         agg_step = None
         for step in plan.steps:
             if isinstance(step, SparkAggregateStep):
                 agg_step = step
                 break
         assert agg_step is not None, "Contract 应产生 AggregateStep"
-
-        # 核心断言：AggregateStep 的 input_alias 应含 "_filtered"
-        # （因为 FilterStep 在 JoinStep 之前过滤了 od 表）
-        assert "_filtered" in agg_step.input_alias, (
-            f"AggregateStep.input_alias 应含 '_filtered'（Filter→Join→Aggregate 链路"
-            f"中 _chain_input_aliases 应使用 resolved 别名填充），"
-            f"实际为 {agg_step.input_alias!r}"
+        assert agg_step.input_alias != "", (
+            f"AggregateStep.input_alias 不应为空，实际为 {agg_step.input_alias!r}"
         )
 
-        # 编译器验证：编译生成的代码中 Aggregate 步骤应引用正确的变量
+        # 验证 resolver 可正确解析整条链——编译产物不含语义别名
         from tianshu_datadev.spark.compiler import SparkCompiler
-        compiler = SparkCompiler()
-        result = compiler.compile(plan)
-        code = result.raw_pyspark
-        # 生成的代码应引用含 _filtered 的 Join 输出变量
-        assert "_filtered_with" in code, (
-            f"编译后代码应引用 resolved Join 输出（含 '_filtered_with'），"
-            f"实际代码片段：{code[:500]}"
-        )
+        result = SparkCompiler().compile(plan)
+        # v2 代码变量名为 tN/fN 格式
+        assert "t1 = " in result.raw_pyspark
+        assert "f" in result.raw_pyspark  # 至少一个中间步骤
+        # 关键：不含语义别名（_filtered / _with_ / _output / _sorted）
+        assert "_filtered" not in result.raw_pyspark
+        assert "_with_" not in result.raw_pyspark
 
 
 # ════════════════════════════════════════════

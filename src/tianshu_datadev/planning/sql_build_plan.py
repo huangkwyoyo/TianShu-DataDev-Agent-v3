@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from datetime import date, timedelta
 from typing import Annotated, Literal, Union
 
 from pydantic import Field
@@ -196,6 +198,36 @@ StepNode = Annotated[
     ],
     Field(discriminator="step_type"),
 ]
+
+
+# ── 日期辅助函数：半开区间日期计算 ──
+
+_YYYYMMDD_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _is_date_only(s: str) -> bool:
+    """判断字符串是否为 YYYY-MM-DD 格式（仅日期，无时间组件）。"""
+    return bool(_YYYYMMDD_RE.match(s))
+
+
+def _add_one_day(date_str: str) -> str:
+    """对 YYYY-MM-DD 格式日期加一天，返回 ISO 格式字符串。
+
+    在 SqlBuildPlan 构建阶段确定性计算 end_plus_one_day，
+    Compiler/Mapper 只渲染 IR，不做边界修正。
+
+    Args:
+        date_str: YYYY-MM-DD 格式的日期字符串
+
+    Returns:
+        end_plus_one_day 的 ISO 格式字符串（如 "2026-04-01"）
+
+    Raises:
+        ValueError: date_str 不是合法的 YYYY-MM-DD 日期
+    """
+    d = date.fromisoformat(date_str)
+    next_day = d + timedelta(days=1)
+    return next_day.isoformat()
 
 
 # ════════════════════════════════════════════
@@ -1414,10 +1446,9 @@ class SqlBuildPlanBuilder:
             filter_step = self._build_filter_step(f, table.table_alias)
             steps.append(filter_step)
 
-        # 2b. 时间范围过滤——TimeRangeDecl → FilterStep（Phase 5 业务日历）
-        tr_filter = self._build_time_range_filter(spec, table.table_alias)
-        if tr_filter:
-            steps.append(tr_filter)
+        # 2b. 时间范围过滤——TimeRangeDecl → FilterStep 列表（Phase 5 业务日历，半开区间）
+        tr_filters = self._build_time_range_filter(spec, table.table_alias)
+        steps.extend(tr_filters)
 
         # 3. AggregateStep——如果有指标
         if spec.metrics:
@@ -1527,10 +1558,9 @@ class SqlBuildPlanBuilder:
         for f in right_table.filters:
             steps.append(self._build_filter_step(f, right_alias))
 
-        # 3b. 时间范围过滤——在 Join 之前下推到左表（Phase 5 业务日历）
-        tr_filter = self._build_time_range_filter(spec, left_alias)
-        if tr_filter:
-            steps.append(tr_filter)
+        # 3b. 时间范围过滤——在 Join 之前下推到左表（Phase 5 业务日历，半开区间）
+        tr_filters = self._build_time_range_filter(spec, left_alias)
+        steps.extend(tr_filters)
 
         # 4. JoinStep——基于 JoinCandidate（自引用时使用生成别名）
         join_step = JoinStep(
@@ -1845,28 +1875,34 @@ class SqlBuildPlanBuilder:
 
     def _build_time_range_filter(
         self, spec: ParsedDeveloperSpec, table_alias: str,
-    ) -> FilterStep | None:
-        """从 TimeRangeDecl 构建时间范围 FilterStep——支持财年、相对日期和固定起止。
+    ) -> list[FilterStep]:
+        """从 TimeRangeDecl 构建时间范围 FilterStep 列表——支持财年、相对日期和固定起止。
 
         三种模式（优先级递减）：
-        1. relative_range: "last_7d" → col >= CURRENT_DATE - INTERVAL 7 DAY（SQL 表达式）
-        2. calendar_type: "fiscal_jul"/"fiscal_apr" + fiscal_year → col BETWEEN start AND end
-        3. start + end（默认）→ col BETWEEN start AND end
+        1. relative_range: "last_7d" → [col >= CURRENT_DATE - INTERVAL 7 DAY]（SQL 表达式）
+        2. calendar_type: "fiscal_jul"/"fiscal_apr" + fiscal_year
+           → [col >= start, col < end+1day]（半开区间）
+        3. start + end（默认）
+           → YYYY-MM-DD 格式：[col >= start, col < end+1day]（半开区间）
+           → 非 YYYY-MM-DD：[col BETWEEN start AND end]（保留原有行为）
 
         relative_range 与 start/end 互斥——relative_range 优先。
 
         column_ref 解析优先级：tr.column_ref > 对应 InputTableDecl.time_field。
+
+        半开区间 end+1day 在构建阶段用 date.fromisoformat() + timedelta(days=1)
+        确定性计算，Compiler/Mapper 只渲染 IR，不做边界修正。
 
         Args:
             spec: 已解析的 DeveloperSpec
             table_alias: 表别名（用于 ColumnRef.table_ref）
 
         Returns:
-            FilterStep 或 None（spec.time_range 为 None 或无有效配置时）
+            FilterStep 列表（无有效配置时为空列表）
         """
         tr = spec.time_range
         if tr is None:
-            return None
+            return []
 
         # 解析时间列名：优先用 time_range.column_ref，为空时回退到表声明的 time_field
         column_ref = tr.column_ref
@@ -1879,9 +1915,17 @@ class SqlBuildPlanBuilder:
 
         if not column_ref:
             # 无法确定时间列——无法构建过滤条件
-            return None
+            return []
 
         normalized = self._normalizer.normalize(column_ref)
+
+        def _col_ref() -> ColumnRef:
+            """构建当前上下文的 ColumnRef。"""
+            return ColumnRef(
+                table_ref=table_alias,
+                column_name=column_ref,
+                normalized_name=normalized,
+            )
 
         # ── 模式 1：相对日期范围（relative_range 优先）──
         if tr.relative_range:
@@ -1894,7 +1938,7 @@ class SqlBuildPlanBuilder:
                     value=f"CURRENT_DATE - INTERVAL {days} DAY",
                     is_sql_expr=True,
                 )
-                return FilterStep(
+                return [FilterStep(
                     step_id=SqlBuildPlan.generate_step_id("filter", {
                         "table": table_alias,
                         "col": column_ref,
@@ -1902,21 +1946,17 @@ class SqlBuildPlanBuilder:
                         "relative_range": tr.relative_range,
                     }),
                     predicate=Predicate(
-                        left=ColumnRef(
-                            table_ref=table_alias,
-                            column_name=column_ref,
-                            normalized_name=normalized,
-                        ),
+                        left=_col_ref(),
                         operator=PredicateOperator.GTE,
                         right=right_expr,
                     ),
-                )
+                )]
             elif tr.relative_range == "mtd":
                 right_expr = SqlLiteral(
                     value="DATE_TRUNC('month', CURRENT_DATE)",
                     is_sql_expr=True,
                 )
-                return FilterStep(
+                return [FilterStep(
                     step_id=SqlBuildPlan.generate_step_id("filter", {
                         "table": table_alias,
                         "col": column_ref,
@@ -1924,21 +1964,17 @@ class SqlBuildPlanBuilder:
                         "relative_range": "mtd",
                     }),
                     predicate=Predicate(
-                        left=ColumnRef(
-                            table_ref=table_alias,
-                            column_name=column_ref,
-                            normalized_name=normalized,
-                        ),
+                        left=_col_ref(),
                         operator=PredicateOperator.GTE,
                         right=right_expr,
                     ),
-                )
+                )]
             elif tr.relative_range == "ytd":
                 right_expr = SqlLiteral(
                     value="DATE_TRUNC('year', CURRENT_DATE)",
                     is_sql_expr=True,
                 )
-                return FilterStep(
+                return [FilterStep(
                     step_id=SqlBuildPlan.generate_step_id("filter", {
                         "table": table_alias,
                         "col": column_ref,
@@ -1946,17 +1982,13 @@ class SqlBuildPlanBuilder:
                         "relative_range": "ytd",
                     }),
                     predicate=Predicate(
-                        left=ColumnRef(
-                            table_ref=table_alias,
-                            column_name=column_ref,
-                            normalized_name=normalized,
-                        ),
+                        left=_col_ref(),
                         operator=PredicateOperator.GTE,
                         right=right_expr,
                     ),
-                )
+                )]
 
-        # ── 模式 2：财年日期计算 ──
+        # ── 模式 2：财年日期计算（半开区间：>= start AND < end+1day）──
         if tr.calendar_type != "calendar" and tr.fiscal_year is not None:
             fy = tr.fiscal_year
             if tr.calendar_type == "fiscal_jul":
@@ -1966,53 +1998,90 @@ class SqlBuildPlanBuilder:
                 start_date = f"{fy}-04-01"
                 end_date = f"{fy + 1}-03-31"
             else:
-                return None
+                return []
 
-            return FilterStep(
-                step_id=SqlBuildPlan.generate_step_id("filter", {
-                    "table": table_alias,
-                    "col": column_ref,
-                    "op": "BETWEEN",
-                    "calendar_type": tr.calendar_type,
-                    "fiscal_year": tr.fiscal_year,
-                }),
-                predicate=Predicate(
-                    left=ColumnRef(
-                        table_ref=table_alias,
-                        column_name=column_ref,
-                        normalized_name=normalized,
+            # 财年日期始终是 YYYY-MM-DD 格式，确定性计算 end+1day
+            end_plus_one = _add_one_day(end_date)
+            return [
+                FilterStep(
+                    step_id=SqlBuildPlan.generate_step_id("filter", {
+                        "table": table_alias,
+                        "col": column_ref,
+                        "op": "GTE",
+                        "calendar_type": tr.calendar_type,
+                        "fiscal_year": tr.fiscal_year,
+                    }),
+                    predicate=Predicate(
+                        left=_col_ref(),
+                        operator=PredicateOperator.GTE,
+                        right=SqlLiteral(value=start_date),
                     ),
-                    operator=PredicateOperator.BETWEEN,
-                    right=[
-                        SqlLiteral(value=start_date),
-                        SqlLiteral(value=end_date),
-                    ],
                 ),
-            )
+                FilterStep(
+                    step_id=SqlBuildPlan.generate_step_id("filter", {
+                        "table": table_alias,
+                        "col": column_ref,
+                        "op": "LT",
+                        "calendar_type": tr.calendar_type,
+                        "fiscal_year": tr.fiscal_year,
+                    }),
+                    predicate=Predicate(
+                        left=_col_ref(),
+                        operator=PredicateOperator.LT,
+                        right=SqlLiteral(value=end_plus_one),
+                    ),
+                ),
+            ]
 
-        # ── 模式 3：固定起止日期（原有逻辑）──
+        # ── 模式 3：固定起止日期 ──
         if tr.start and tr.end:
-            return FilterStep(
+            # YYYY-MM-DD 格式 → 半开区间 col >= start AND col < end+1day
+            if _is_date_only(tr.start) and _is_date_only(tr.end):
+                end_plus_one = _add_one_day(tr.end)
+                return [
+                    FilterStep(
+                        step_id=SqlBuildPlan.generate_step_id("filter", {
+                            "table": table_alias,
+                            "col": column_ref,
+                            "op": "GTE",
+                        }),
+                        predicate=Predicate(
+                            left=_col_ref(),
+                            operator=PredicateOperator.GTE,
+                            right=SqlLiteral(value=tr.start),
+                        ),
+                    ),
+                    FilterStep(
+                        step_id=SqlBuildPlan.generate_step_id("filter", {
+                            "table": table_alias,
+                            "col": column_ref,
+                            "op": "LT",
+                        }),
+                        predicate=Predicate(
+                            left=_col_ref(),
+                            operator=PredicateOperator.LT,
+                            right=SqlLiteral(value=end_plus_one),
+                        ),
+                    ),
+                ]
+            # 非 YYYY-MM-DD 格式（含时间组件）→ 保留 BETWEEN 语义
+            return [FilterStep(
                 step_id=SqlBuildPlan.generate_step_id("filter", {
                     "table": table_alias,
                     "col": column_ref,
                     "op": "BETWEEN",
                 }),
                 predicate=Predicate(
-                    left=ColumnRef(
-                        table_ref=table_alias,
-                        column_name=column_ref,
-                        normalized_name=normalized,
-                    ),
+                    left=_col_ref(),
                     operator=PredicateOperator.BETWEEN,
                     right=[
                         SqlLiteral(value=tr.start),
                         SqlLiteral(value=tr.end),
                     ],
                 ),
-            )
+            )]
 
-        return None
+        return []
 
     def _build_required_columns(
         self, table_alias: str, spec: ParsedDeveloperSpec

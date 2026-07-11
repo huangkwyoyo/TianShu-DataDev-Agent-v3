@@ -55,7 +55,7 @@ def _make_simple_plan() -> SparkPlan:
                 right="'paid'",
             ),
             SparkProjectStep(
-                input_alias="_f0",
+                input_alias="od",
                 columns=[
                     SparkProjectColumn(column_name="order_id", alias="order_id"),
                     SparkProjectColumn(column_name="amount", alias="amount"),

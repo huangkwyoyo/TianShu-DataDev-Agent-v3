@@ -1251,7 +1251,7 @@ class TestBusinessCalendar:
         )
 
     def test_fixed_date_range_between(self):
-        """固定起止 → >= start AND <= end（BETWEEN 规范化展开后保持包含语义）。"""
+        """固定起止 YYYY-MM-DD → 半开区间 >= start AND < end+1day（构建阶段计算）。"""
         spec = self._build_time_range_spec({
             "column_ref": "order_time",
             "start": "2025-01-01",
@@ -1266,13 +1266,14 @@ class TestBusinessCalendar:
 
         sql = compiled.sql
         assert ">=" in sql
-        assert "<=" in sql
+        assert "<" in sql
         assert "'2025-01-01'" in sql
-        assert "'2025-06-30'" in sql
+        # end+1day：2025-06-30 + 1 = 2025-07-01
+        assert "'2025-07-01'" in sql
         assert "WHERE" in sql
 
     def test_fiscal_july_date_range(self):
-        """财年 7 月起 FY2026 → >= '2026-07-01' AND <= '2027-06-30'。"""
+        """财年 7 月起 FY2026 → >= '2026-07-01' AND < '2027-07-01'（半开区间）。"""
         spec = self._build_time_range_spec({
             "column_ref": "order_time",
             "calendar_type": "fiscal_jul",
@@ -1287,11 +1288,12 @@ class TestBusinessCalendar:
 
         sql = compiled.sql
         assert "'2026-07-01'" in sql, f"财年 7 月应含起始日期:\n{sql}"
-        assert "'2027-06-30'" in sql, f"财年 7 月应含结束日期:\n{sql}"
-        assert "<=" in sql  # 包含上界
+        # end+1day：2027-06-30 + 1 = 2027-07-01
+        assert "'2027-07-01'" in sql, f"财年 7 月应含结束+1天日期:\n{sql}"
+        assert "<" in sql  # 半开区间——不含上界
 
     def test_fiscal_april_date_range(self):
-        """财年 4 月起 FY2026 → >= '2026-04-01' AND <= '2027-03-31'。"""
+        """财年 4 月起 FY2026 → >= '2026-04-01' AND < '2028-04-01'（半开区间）。"""
         spec = self._build_time_range_spec({
             "column_ref": "order_time",
             "calendar_type": "fiscal_apr",
@@ -1306,7 +1308,8 @@ class TestBusinessCalendar:
 
         sql = compiled.sql
         assert "'2026-04-01'" in sql, f"财年 4 月应含起始日期:\n{sql}"
-        assert "'2027-03-31'" in sql, f"财年 4 月应含结束日期:\n{sql}"
+        # end+1day：2027-03-31 + 1 = 2027-04-01
+        assert "'2027-04-01'" in sql, f"财年 4 月应含结束+1天日期:\n{sql}"
 
     def test_relative_range_last_30d(self):
         """相对日期 last_30d → CURRENT_DATE - INTERVAL 30 DAY。"""
@@ -1470,6 +1473,295 @@ class TestBusinessCalendar:
             assert len(result) == 3, (
                 f"预期 3 行（最近 30 天），实际 {len(result)}: {result}"
             )
+        finally:
+            con.close()
+
+
+# ════════════════════════════════════════════
+# 半开区间日期范围——辅助函数 + 集成 + 边界测试
+# ════════════════════════════════════════════
+
+
+class TestHalfOpenDateHelpers:
+    """_add_one_day / _is_date_only 单元测试。"""
+
+    def test_is_date_only_standard(self):
+        """标准 YYYY-MM-DD 格式识别。"""
+        from tianshu_datadev.planning.sql_build_plan import _is_date_only
+
+        assert _is_date_only("2026-01-01") is True
+        assert _is_date_only("2026-12-31") is True
+        assert _is_date_only("2024-02-29") is True  # 闰日
+
+    def test_is_date_only_rejects_non_date(self):
+        """非 YYYY-MM-DD 格式拒绝。"""
+        from tianshu_datadev.planning.sql_build_plan import _is_date_only
+
+        assert _is_date_only("2026-01-01 00:00:00") is False  # 含时间
+        assert _is_date_only("2026-1-1") is False  # 无前导零
+        assert _is_date_only("2026/01/01") is False  # 斜杠分隔
+        assert _is_date_only("") is False
+        assert _is_date_only("not-a-date") is False
+        assert _is_date_only("2026-01") is False  # 缺日
+
+    def test_add_one_day_normal(self):
+        """普通日期加一天。"""
+        from tianshu_datadev.planning.sql_build_plan import _add_one_day
+
+        assert _add_one_day("2026-01-01") == "2026-01-02"
+
+    def test_add_one_day_month_end(self):
+        """月末跨月——2026-03-31 + 1 = 2026-04-01。"""
+        from tianshu_datadev.planning.sql_build_plan import _add_one_day
+
+        assert _add_one_day("2026-03-31") == "2026-04-01"
+        assert _add_one_day("2026-01-31") == "2026-02-01"
+
+    def test_add_one_day_year_end(self):
+        """年末跨年——2026-12-31 + 1 = 2027-01-01。"""
+        from tianshu_datadev.planning.sql_build_plan import _add_one_day
+
+        assert _add_one_day("2026-12-31") == "2027-01-01"
+
+    def test_add_one_day_leap_day(self):
+        """闰日——2024-02-29 + 1 = 2024-03-01。"""
+        from tianshu_datadev.planning.sql_build_plan import _add_one_day
+
+        assert _add_one_day("2024-02-29") == "2024-03-01"
+
+    def test_add_one_day_non_leap_year_feb28(self):
+        """非闰年 2 月 28 日——+1 = 3 月 1 日。"""
+        from tianshu_datadev.planning.sql_build_plan import _add_one_day
+
+        assert _add_one_day("2025-02-28") == "2025-03-01"
+
+    def test_add_one_day_invalid_raises(self):
+        """非法日期抛出 ValueError。"""
+        import pytest
+
+        from tianshu_datadev.planning.sql_build_plan import _add_one_day
+        with pytest.raises(ValueError):
+            _add_one_day("not-a-date")
+        with pytest.raises(ValueError):
+            _add_one_day("2026-13-01")  # 非法月份
+
+
+class TestHalfOpenDateRangeSQL:
+    """SQL 编译器——半开区间集成测试。"""
+
+    @staticmethod
+    def _build_time_range_spec(time_range_cfg: dict):
+        """构造含 time_range 的单表 Spec（复用 TestBusinessCalendar 的模式）。"""
+        from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer
+        from tianshu_datadev.developer_spec.models import (
+            AggregationType,
+            ColumnDecl,
+            DimensionDecl,
+            InputTableDecl,
+            MetricDecl,
+            OutputColumnDecl,
+            OutputSpecDecl,
+            ParsedDeveloperSpec,
+            TimeRangeDecl,
+        )
+
+        normalizer = FieldNormalizer()
+
+        def _col(name: str, dtype: str = "bigint") -> ColumnDecl:
+            return ColumnDecl(
+                column_name=name, normalized_name=normalizer.normalize(name),
+                data_type=dtype,
+            )
+
+        tr = TimeRangeDecl(**time_range_cfg)
+
+        return ParsedDeveloperSpec(
+            spec_id="test_half_open",
+            spec_hash="test_half_open_hash",
+            title="半开区间测试",
+            description="验证半开区间时间范围过滤",
+            input_tables=[
+                InputTableDecl(
+                    table_alias="t",
+                    source_table="test.orders",  # type: ignore[arg-type]
+                    role="fact",
+                    key_columns=[_col("id")],
+                    business_columns=[_col("amount"), _col("order_time", "timestamp")],
+                ),
+            ],
+            metrics=[
+                MetricDecl(
+                    metric_name="total",
+                    aggregation=AggregationType.SUM,
+                    input_column="amount",
+                    alias="total_amount",
+                ),
+            ],
+            dimensions=[
+                DimensionDecl(dimension_name="order_time", column_ref="order_time"),
+            ],
+            output_spec=OutputSpecDecl(
+                columns=[
+                    OutputColumnDecl(name="order_time", type="timestamp"),
+                    OutputColumnDecl(name="total_amount", type="decimal"),
+                ],
+                grain=["order_time"],
+            ),
+            time_range=tr,
+        )
+
+    def test_month_end_half_open(self):
+        """月末日期——end+1day 正确跨月。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+        from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
+
+        spec = self._build_time_range_spec({
+            "column_ref": "order_time",
+            "start": "2026-01-01",
+            "end": "2026-03-31",
+        })
+
+        builder = SqlBuildPlanBuilder()
+        plan, _ = builder.build(spec)
+
+        compiler = DuckDbSqlCompiler({"t": "test.orders"})
+        compiled = compiler.compile(plan)
+
+        sql = compiled.sql
+        assert ">=" in sql
+        assert "<" in sql
+        # 三月末：end=2026-03-31 → end+1=2026-04-01
+        assert "'2026-04-01'" in sql
+
+    def test_year_end_half_open(self):
+        """年末日期——end+1day 正确跨年。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+        from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
+
+        spec = self._build_time_range_spec({
+            "column_ref": "order_time",
+            "start": "2026-10-01",
+            "end": "2026-12-31",
+        })
+
+        builder = SqlBuildPlanBuilder()
+        plan, _ = builder.build(spec)
+
+        compiler = DuckDbSqlCompiler({"t": "test.orders"})
+        compiled = compiler.compile(plan)
+
+        sql = compiled.sql
+        # end=2026-12-31 → end+1=2027-01-01
+        assert "'2027-01-01'" in sql
+
+    def test_leap_day_half_open(self):
+        """闰年 2 月——end+1day 正确处理闰日。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+        from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
+
+        spec = self._build_time_range_spec({
+            "column_ref": "order_time",
+            "start": "2024-02-01",
+            "end": "2024-02-29",
+        })
+
+        builder = SqlBuildPlanBuilder()
+        plan, _ = builder.build(spec)
+
+        compiler = DuckDbSqlCompiler({"t": "test.orders"})
+        compiled = compiler.compile(plan)
+
+        sql = compiled.sql
+        # end=2024-02-29 → end+1=2024-03-01
+        assert "'2024-03-01'" in sql
+
+    def test_no_between_in_half_open(self):
+        """半开区间不产生 BETWEEN 关键字。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+        from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
+
+        spec = self._build_time_range_spec({
+            "column_ref": "order_time",
+            "start": "2026-01-01",
+            "end": "2026-06-30",
+        })
+
+        builder = SqlBuildPlanBuilder()
+        plan, _ = builder.build(spec)
+
+        compiler = DuckDbSqlCompiler({"t": "test.orders"})
+        compiled = compiler.compile(plan)
+
+        sql = compiled.sql
+        assert "BETWEEN" not in sql, f"半开区间不应有 BETWEEN:\n{sql}"
+
+    def test_non_date_format_keeps_between(self):
+        """含时间组件的日期保留闭合区间语义（>= AND <=）。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+        from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
+
+        spec = self._build_time_range_spec({
+            "column_ref": "order_time",
+            "start": "2026-01-01 00:00:00",
+            "end": "2026-03-31 23:59:59",
+        })
+
+        builder = SqlBuildPlanBuilder()
+        plan, _ = builder.build(spec)
+
+        compiler = DuckDbSqlCompiler({"t": "test.orders"})
+        compiled = compiler.compile(plan)
+
+        sql = compiled.sql
+        # 非 YYYY-MM-DD 格式保留闭合区间——>= AND <=（BETWEEN 规范化展开）
+        assert ">=" in sql, f"含时间组件应有 >= :\n{sql}"
+        assert "'2026-01-01 00:00:00'" in sql
+        assert "'2026-03-31 23:59:59'" in sql
+        # 不应用半开区间——不应有 end+1day
+        assert "2026-04-01" not in sql
+
+    def test_boundary_inclusivity_duckdb(self):
+        """边界包含性——最后一天的全天数据都在结果中。"""
+        import duckdb
+
+        spec = self._build_time_range_spec({
+            "column_ref": "order_time",
+            "start": "2025-06-01",
+            "end": "2025-06-15",
+        })
+
+        builder = SqlBuildPlanBuilder()
+        plan, _ = builder.build(spec)
+
+        compiler = DuckDbSqlCompiler({"t": "orders"})
+        compiled = compiler.compile(plan)
+
+        con = duckdb.connect(":memory:")
+        try:
+            # 使用 TIMESTAMP 类型——真实场景是时间戳列
+            con.execute("""
+                CREATE TABLE orders AS
+                SELECT * FROM (VALUES
+                    (1, 100, CAST('2025-05-31 23:59:59' AS TIMESTAMP)),
+                    (2, 200, CAST('2025-06-01 00:00:00' AS TIMESTAMP)),
+                    (3, 300, CAST('2025-06-15 12:30:00' AS TIMESTAMP)),
+                    (4, 400, CAST('2025-06-15 23:59:59' AS TIMESTAMP)),
+                    (5, 500, CAST('2025-06-16 00:00:00' AS TIMESTAMP))
+                ) AS t(id, amount, order_time)
+            """)
+
+            result = con.execute(compiled.sql).fetchall()
+            # 应包含 3 行——6/1 00:00:00 ~ 6/15 23:59:59 的数据
+            assert len(result) == 3, (
+                f"预期 3 行（6/1~6/15 全天），实际 {len(result)}: {result}"
+            )
+            # 验证边界值：6/1 00:00:00 在结果中，6/16 00:00:00 不在
+            timestamps = {row[0] for row in result}
+            import datetime
+            assert datetime.datetime(2025, 6, 1, 0, 0) in timestamps
+            assert datetime.datetime(2025, 6, 15, 12, 30) in timestamps
+            assert datetime.datetime(2025, 6, 15, 23, 59, 59) in timestamps
+            assert datetime.datetime(2025, 6, 16, 0, 0) not in timestamps
         finally:
             con.close()
 

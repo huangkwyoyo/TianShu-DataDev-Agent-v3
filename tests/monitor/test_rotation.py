@@ -1,11 +1,7 @@
 """测试日志轮转 cleanup——分组保留、保护当前 run_id、边界情况。"""
 
-import os
-import random
 import tempfile
 from pathlib import Path
-
-import pytest
 
 from tianshu_datadev.monitor.rotation import cleanup
 
