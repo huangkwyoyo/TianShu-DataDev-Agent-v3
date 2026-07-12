@@ -69,8 +69,6 @@ class TestDuckDBExecutor:
         try:
             trace, summary = executor.execute(compiled)
         except Exception as e:
-            if "DuckDB" in str(e) or "duckdb" in str(e).lower():
-                pytest.skip("DuckDB 未安装")
             raise
 
         # 验证 ExecutionTrace
@@ -107,8 +105,6 @@ class TestDuckDBExecutor:
         try:
             trace, summary = executor.execute(compiled)
         except Exception as e:
-            if "DuckDB" in str(e) or "duckdb" in str(e).lower():
-                pytest.skip("DuckDB 未安装")
             raise
 
         # ExecutionTrace 完整性检查

@@ -756,10 +756,6 @@ class TestOrchestratorSkeletonE2E:
         与 9A2 版本的关键区别：不再手工构造 DataTransformContractV1 绕过
         export_artifacts() 导出的 contract——而是使用确定性适配层升级 Lite → V1。
         """
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
 
         import os
         import tempfile

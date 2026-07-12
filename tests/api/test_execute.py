@@ -19,8 +19,6 @@ class TestExecute:
             "table_mapping": {"tf": "test_fact"},
             "table_paths": {"test_fact": _CSV_PATH},
         })
-        if resp.status_code == 500 and "DuckDB" in resp.text:
-            pytest.skip("DuckDB 未安装")
         assert resp.status_code == 200, f"期望 200，实际 {resp.status_code}: {resp.text}"
         data = resp.json()
         if "pipeline_error" in data:
@@ -39,8 +37,6 @@ class TestExecute:
     def test_execute_no_table_paths(self, client, golden_spec_passing):
         """不传 table_paths → 执行可能失败但不崩溃（表不存在）"""
         resp = client.post("/api/execute", json={"markdown_text": golden_spec_passing})
-        if resp.status_code == 500 and "DuckDB" in resp.text:
-            pytest.skip("DuckDB 未安装")
         # 即使表不存在，API 仍应返回 200（执行状态在 trace 中体现）
         assert resp.status_code == 200
         data = resp.json()
@@ -67,8 +63,6 @@ class TestExecute:
             "table_mapping": {"tf": "test_fact"},
             "table_paths": {"test_fact": _CSV_PATH},
         })
-        if resp.status_code == 500 and "DuckDB" in resp.text:
-            pytest.skip("DuckDB 未安装")
         assert resp.status_code == 200
         data = resp.json()
         assert "pipeline_error" not in data
@@ -84,8 +78,6 @@ class TestExecute:
             "table_mapping": {"tf": "test_fact"},
             "table_paths": {"test_fact": _CSV_PATH},
         })
-        if resp.status_code == 500 and "DuckDB" in resp.text:
-            pytest.skip("DuckDB 未安装")
         assert resp.status_code == 200
         data = resp.json()
         assert "pipeline_error" not in data

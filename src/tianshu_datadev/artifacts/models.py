@@ -11,6 +11,8 @@ import hashlib
 import json
 from typing import Literal
 
+from pydantic import Field
+
 from tianshu_datadev.developer_spec.models import StrictModel
 
 # ── ReviewFeedback 路由 target 字面量类型 ──
@@ -54,7 +56,7 @@ class ContractJoin(StrictModel):
     left_key: str  # 左键原始字段名
     right_key: str  # 右键原始字段名
     join_type: str  # INNER / LEFT / RIGHT / FULL
-    evidence_chain: dict = {}  # 完整证据链（来自 RelationshipEvidence 序列化）
+    evidence_chain: dict = Field(default_factory=dict)  # 完整证据链（来自 RelationshipEvidence 序列化）
     level: str  # STRONG / MEDIUM（WEAK/NONE 不进入 Contract）
 
 

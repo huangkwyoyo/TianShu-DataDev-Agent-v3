@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import re as _re
+
 from tianshu_datadev.artifacts.models import (
     CaseWhenLabelSpec,
     ContractAggregation,
@@ -204,6 +206,27 @@ def map_contract_to_spark_plan(
 
     # 填充步骤间的线性依赖链——确保每个步骤的 input_alias 正确指向前驱步骤的输出
     _chain_input_aliases(steps)
+
+    # ── 校验别名合法性——禁止旧式语义别名和 tN/fN 代码变量名进入 SparkPlan ──
+    read_aliases = {s.alias for s in read_steps}
+    alias_errors = _validate_step_aliases(steps, read_aliases)
+    if alias_errors:
+        # 无法确定依赖时返回结构化 gap，不得猜测
+        gaps.append(
+            ContractGap(
+                gap_id="gap_alias_validation",
+                contract_field="steps[*].input_alias",
+                missing_info=f"别名校验失败——存在旧式语义别名或无法解析的依赖：{'；'.join(alias_errors)}",
+                severity="BLOCKING",
+            )
+        )
+        return SparkPlanMappingResult(
+            success=False,
+            spark_plan=None,
+            unsupported=unsupported,
+            gaps=gaps,
+            warnings=warnings,
+        )
 
     spark_plan = SparkPlan(
         plan_id=plan_id,
@@ -406,8 +429,10 @@ def _map_aggregations(
             )
         )
 
-    # 推断 input_alias——从第一个聚合的 input_column 中提取
-    input_alias = _infer_input_alias_from_aggregations(aggregations)
+    # input_alias 不从此处推断——由 _chain_input_aliases 统一填充
+    # 禁止从 Contract 列名前缀（如 "ft_filtered.some_col"）提取旧式派生别名，
+    # 否则会导致新 _alias_resolver 无法解析（它只追踪 Read alias + 稳定 lineage key）
+    input_alias = ""
 
     metrics = [
         SparkAggregateSpec(
@@ -452,8 +477,9 @@ def _map_output_columns(
         gaps.append(gap)
         return gap
 
-    # 推断 input_alias——所有输出列的来源表取并集
-    input_alias = _infer_input_alias_from_columns(output_columns)
+    # input_alias 不从此处推断——由 _chain_input_aliases 统一填充
+    # 禁止从 Contract 输出列的 column_name 前缀提取旧式派生别名
+    input_alias = ""
 
     columns = [
         SparkProjectColumn(
@@ -652,42 +678,106 @@ def _extract_table_alias(operand_str: str) -> str:
     return ""
 
 
-def _infer_input_alias_from_aggregations(
-    aggregations: list[ContractAggregation],
-) -> str:
-    """从聚合列表中推断 input_alias。
+# ════════════════════════════════════════════
+# 别名合法性校验
+# ════════════════════════════════════════════
 
-    取第一个非空的 input_column 的表别名部分。
-
-    Args:
-        aggregations: ContractAggregation 列表
-
-    Returns:
-        表别名，或空字符串
-    """
-    for a in aggregations:
-        if a.input_column and "." in a.input_column:
-            return a.input_column.split(".")[0]
-    return ""
+# tN/fN 代码变量名正则——不得出现在 SparkPlan 的 alias 字段中
+_TNFN_ALIAS_RE = _re.compile(r"^[tf]\d+$")
 
 
-def _infer_input_alias_from_columns(
-    columns: list[ContractOutputColumn],
-) -> str:
-    """从输出列列表中推断 input_alias。
+def _is_valid_lineage_alias(alias: str, valid_aliases: set[str]) -> bool:
+    """检查单个 alias 是否为合法的 lineage key。
 
-    取第一个含表别名的 column_name。
+    合法 lineage key 的唯一事实源是已声明的 Read alias 集合。
+    如果 alias 属于 read_aliases，即使名称含下划线也必须合法。
+
+    合法条件：
+    - 在已知 Read alias 集合中，或
+    - 为空字符串（将由 _chain_input_aliases 填充）
 
     Args:
-        columns: ContractOutputColumn 列表
+        alias: 待检查的别名
+        valid_aliases: 已知的合法 Read alias 集合
 
     Returns:
-        表别名，或空字符串
+        True 如果别名合法
     """
-    for oc in columns:
-        if "." in oc.column_name:
-            return oc.column_name.split(".")[0]
-    return ""
+    if alias == "":
+        return True
+    if alias in valid_aliases:
+        return True
+    return False
+
+
+def _contains_forbidden_pattern(alias: str) -> str | None:
+    """检查 alias 是否为 tN/fN 代码变量名——此类变量不得进入 SparkPlan 依赖字段。
+
+    Args:
+        alias: 待检查的别名
+
+    Returns:
+        匹配到的禁止模式字符串，或 None
+    """
+    if not alias:
+        return None
+    if _TNFN_ALIAS_RE.match(alias):
+        return f"tN/fN 代码变量名: {alias!r}"
+    return None
+
+
+def _validate_step_aliases(
+    steps: list,
+    valid_aliases: set[str],
+) -> list[str]:
+    """校验所有步骤的依赖别名合法性——仅允许 Read alias 或空字符串。
+
+    合法 lineage key 的唯一事实源是已声明的 Read alias 集合。
+    tN/fN 代码变量名不得进入 SparkPlan 依赖字段。
+    禁止解析、拆分或兼容旧式派生别名。
+
+    _chain_input_aliases 之后调用——别名若不为空且不在 valid_aliases 中即阻断。
+
+    Args:
+        steps: SparkPlan.steps 列表（chain 填充前）
+        valid_aliases: 合法的 Read alias 集合
+
+    Returns:
+        错误信息列表——空列表表示全部合法
+    """
+    errors: list[str] = []
+    for i, step in enumerate(steps):
+        # 检查 input_alias（单输入步骤）
+        if hasattr(step, "input_alias"):
+            alias = getattr(step, "input_alias", "")
+            # 禁止模式检查
+            forbidden = _contains_forbidden_pattern(alias)
+            if forbidden:
+                errors.append(
+                    f"步骤 {i} {type(step).__name__} 的 input_alias 含禁止模式——{forbidden}"
+                )
+            # 合法性检查
+            if not _is_valid_lineage_alias(alias, valid_aliases):
+                errors.append(
+                    f"步骤 {i} {type(step).__name__} 的 input_alias={alias!r} "
+                    f"不是已知的 Read alias——有效值: {sorted(valid_aliases)}"
+                )
+
+        # 检查 left_alias / right_alias（Join 步骤）
+        if hasattr(step, "left_alias"):
+            for side, field in [("左", step.left_alias), ("右", step.right_alias)]:
+                forbidden = _contains_forbidden_pattern(field)
+                if forbidden:
+                    errors.append(
+                        f"步骤 {i} {type(step).__name__} 的 {side}表别名含禁止模式——{forbidden}"
+                    )
+                if not _is_valid_lineage_alias(field, valid_aliases):
+                    errors.append(
+                        f"步骤 {i} {type(step).__name__} 的 {side}表别名={field!r} "
+                        f"不是已知的 Read alias——有效值: {sorted(valid_aliases)}"
+                    )
+
+    return errors
 
 
 # ════════════════════════════════════════════

@@ -129,7 +129,7 @@ class SparkJoinStep(StrictModel):
     left_key: str  # 左 Join 键（原始字段名）
     right_key: str  # 右 Join 键（原始字段名）
     join_type: SparkJoinType  # INNER / LEFT / RIGHT / FULL
-    evidence_chain: dict = {}  # 完整证据链（从 ContractJoin 直传）
+    evidence_chain: dict = Field(default_factory=dict)  # 完整证据链（从 ContractJoin 直传）
 
 
 class SparkAggregateStep(StrictModel):

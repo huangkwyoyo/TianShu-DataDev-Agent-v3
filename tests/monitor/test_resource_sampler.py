@@ -8,11 +8,14 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import psutil
 import pytest
 
-from tianshu_datadev.monitor.models import ResourceSample
-from tianshu_datadev.monitor.resource_sampler import ResourceSampler
+# psutil 是 monitor 可选依赖（pyproject.toml [project.optional-dependencies] monitor）
+# 若未安装，整个测试模块静默跳过——ResourceSampler 当前不提供无 psutil 降级路径
+psutil = pytest.importorskip("psutil", reason="psutil 未安装——执行 `pip install .[monitor]` 启用资源采样测试")
+
+from tianshu_datadev.monitor.models import ResourceSample  # noqa: E402
+from tianshu_datadev.monitor.resource_sampler import ResourceSampler  # noqa: E402
 
 # ═══════════════════════════════════════════════════════════
 # 辅助：MockCollector——轻量替代 RunLogCollector

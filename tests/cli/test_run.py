@@ -17,8 +17,6 @@ class TestCliRun:
              "--table-path", f"test_fact={test_fact_csv_path}"],
             capture_output=True, text=True, timeout=30,
         )
-        if result.returncode != 0 and "DuckDB" in result.stderr:
-            pytest.skip("DuckDB 未安装")
         assert result.returncode == 0, f"stderr: {result.stderr}"
         data = json.loads(result.stdout)
         assert data["status"] == "success"

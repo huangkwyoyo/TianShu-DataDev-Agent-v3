@@ -354,6 +354,7 @@ class DataTransformContractExtractor:
         self,
         sql_program: SqlProgram,
         write_plan: FinalWritePlan | None = None,
+        evidence_map: dict[str, RelationshipEvidence] | None = None,
     ) -> DataTransformContractV1:
         """从 SqlProgram 确定性抽取 DataTransformContract v1。
 
@@ -363,6 +364,9 @@ class DataTransformContractExtractor:
         Args:
             sql_program: 经过 DAG 校验的 SqlProgram
             write_plan: 可选的 FinalWritePlan——若提供则写入 write_spec 字段
+            evidence_map: Join candidate_id → RelationshipEvidence 的映射，
+                         用于填充 join_relationships 中的 evidence_chain。
+                         若为 None，Join 的 evidence_chain 为空。
 
         Returns:
             DataTransformContractV1——不包含 SQL 代码字段
@@ -372,6 +376,8 @@ class DataTransformContractExtractor:
         """
         if not sql_program.statements:
             raise ValueError("SqlProgram 不含任何 statement，无法抽取 Contract v1")
+
+        evidence_map = evidence_map or {}
 
         program_id = sql_program.program_id
 
@@ -423,7 +429,7 @@ class DataTransformContractExtractor:
                         for k in step.join_keys
                     ):
                         continue
-                    join_rel = self._extract_join(step, {})
+                    join_rel = self._extract_join(step, evidence_map)
                     if join_rel:
                         join_relationships.append(join_rel)
                 elif isinstance(step, AggregateStep):

@@ -5,6 +5,7 @@ __pycache__/
 
 # pytest 缓存
 .pytest_cache/
+.pytest_tmp/
 .coverage
 
 # 虚拟环境

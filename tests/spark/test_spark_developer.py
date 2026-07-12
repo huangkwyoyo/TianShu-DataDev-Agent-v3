@@ -428,3 +428,370 @@ class TestProviderAdapterIntegration:
 
         # 非 AdapterError 只调用 1 次——不浪费重试次数
         assert call_count[0] == 1
+
+
+# ════════════════════════════════════════════
+# TestProvenanceOverride——plan_id 和 hash 由 Python 确定性覆盖
+# ════════════════════════════════════════════
+
+
+class TestProvenanceOverride:
+    """Provenance 边界——plan_id / baseline_plan_hash 不由 LLM 决定。"""
+
+    def test_llm_returns_empty_hash_overwritten(self):
+        """LLM 返回空 baseline_plan_hash → 被确定性覆盖为正确值。"""
+        plan = _make_simple_plan()
+        expected_hash = SparkPlan.compute_plan_hash(plan)
+
+        def _empty_hash_llm(spark_plan: SparkPlan) -> AnnotatedSparkPlan:
+            ann = _mock_llm_annotate(spark_plan)
+            return ann.model_copy(update={"baseline_plan_hash": ""})
+
+        svc = SparkDeveloperService(llm_call=_empty_hash_llm)
+        result = svc.annotate(plan)
+
+        assert result.baseline_plan_hash == expected_hash
+        assert result.baseline_plan_hash != ""
+
+    def test_llm_returns_wrong_hash_overwritten(self):
+        """LLM 返回错误 hash → 被确定性覆盖为正确值。"""
+        plan = _make_simple_plan()
+        expected_hash = SparkPlan.compute_plan_hash(plan)
+        wrong_hash = "deadbeef" * 8
+
+        def _wrong_hash_llm(spark_plan: SparkPlan) -> AnnotatedSparkPlan:
+            ann = _mock_llm_annotate(spark_plan)
+            return ann.model_copy(update={"baseline_plan_hash": wrong_hash})
+
+        svc = SparkDeveloperService(llm_call=_wrong_hash_llm)
+        result = svc.annotate(plan)
+
+        assert result.baseline_plan_hash == expected_hash
+        assert result.baseline_plan_hash != wrong_hash
+
+    def test_llm_returns_wrong_plan_id_overwritten(self):
+        """LLM 返回错误 plan_id → 被确定性覆盖为正确值。"""
+        plan = _make_simple_plan()
+
+        def _wrong_plan_id_llm(spark_plan: SparkPlan) -> AnnotatedSparkPlan:
+            ann = _mock_llm_annotate(spark_plan)
+            return ann.model_copy(update={"plan_id": "fake_plan_id"})
+
+        svc = SparkDeveloperService(llm_call=_wrong_plan_id_llm)
+        result = svc.annotate(plan)
+
+        assert result.plan_id == plan.plan_id
+        assert result.plan_id != "fake_plan_id"
+
+    def test_injected_llm_call_and_adapter_path_both_override(self):
+        """注入式 llm_call 和 adapter 包装路径——两种路径均确定性覆盖。"""
+        from tianshu_datadev.prompts.manager import PromptManager
+
+        plan = _make_simple_plan()
+        expected_hash = SparkPlan.compute_plan_hash(plan)
+        expected_plan_id = plan.plan_id
+
+        # 路径 1：注入式 llm_call（mock 路径）
+        svc_injected = SparkDeveloperService(llm_call=_mock_llm_annotate)
+        result_injected = svc_injected.annotate(plan)
+        assert result_injected.plan_id == expected_plan_id
+        assert result_injected.baseline_plan_hash == expected_hash
+
+        # 路径 2：adapter 包装路径——通过 from_provider_adapter 创建
+        class PathAdapter:
+            """适配器——返回错误 provenance 的 mock 数据。"""
+
+            def invoke(
+                self, system_message: str, user_message: str,
+                json_schema: dict, model: str, temperature: float,
+            ) -> dict:
+                # 返回错误 provenance——验证会被代码覆盖
+                data = _mock_llm_annotate(plan).model_dump(mode="json")
+                data["plan_id"] = "adapter_wrong_id"
+                data["baseline_plan_hash"] = ""
+                return data
+
+            def provider_name(self) -> str:
+                return "path_test"
+
+        adapter = PathAdapter()
+        pm = PromptManager()
+        svc_adapter = SparkDeveloperService.from_provider_adapter(adapter, pm)
+        result_adapter = svc_adapter.annotate(plan)
+
+        assert result_adapter.plan_id == expected_plan_id
+        assert result_adapter.baseline_plan_hash == expected_hash
+
+
+# ════════════════════════════════════════════
+# TestWarningContract——category 封闭 + 确定性过滤
+# ════════════════════════════════════════════
+
+
+class TestWarningContract:
+    """Warning contract——仅 4 种合法 category，其他被确定性过滤。"""
+
+    def test_unknown_category_warnings_filtered(self):
+        """LLM 返回未知 category → 被确定性过滤，不影响合法 warning。"""
+        from tianshu_datadev.spark.annotations import AnnotationWarning
+
+        plan = _make_simple_plan()
+
+        def _unknown_category_llm(spark_plan: SparkPlan) -> AnnotatedSparkPlan:
+            ann = _mock_llm_annotate(spark_plan)
+            return ann.model_copy(update={
+                "warnings": [
+                    AnnotationWarning(
+                        warning_id="w001",
+                        severity="WARN",
+                        category="step_count_anomaly",  # 合法
+                        description="合法 warning——应保留",
+                    ),
+                    AnnotationWarning(
+                        warning_id="w002",
+                        severity="REVIEW",
+                        category="missing_evidence_chain",  # 未知 category
+                        description="非法 warning——应被过滤",
+                    ),
+                    AnnotationWarning(
+                        warning_id="w003",
+                        severity="INFO",
+                        category="baseline_hash_missing",  # 未知 category
+                        description="非法 warning——应被过滤",
+                    ),
+                ],
+            })
+
+        svc = SparkDeveloperService(llm_call=_unknown_category_llm)
+        result = svc.annotate(plan)
+
+        # 只有合法 category 的 warning 保留
+        categories = [w.category for w in result.warnings]
+        assert "step_count_anomaly" in categories
+        assert "missing_evidence_chain" not in categories
+        assert "baseline_hash_missing" not in categories
+        assert len(result.warnings) == 1
+
+    def test_baseline_hash_warning_filtered(self):
+        """LLM 返回 baseline_plan_hash 缺失的 warning → 被过滤。"""
+        from tianshu_datadev.spark.annotations import AnnotationWarning
+
+        plan = _make_simple_plan()
+
+        def _hash_warning_llm(spark_plan: SparkPlan) -> AnnotatedSparkPlan:
+            ann = _mock_llm_annotate(spark_plan)
+            return ann.model_copy(update={
+                "warnings": [
+                    AnnotationWarning(
+                        warning_id="w_hash",
+                        severity="INFO",
+                        category="baseline_hash_missing",
+                        description="输入中未提供 baseline_plan_hash",
+                    ),
+                ],
+            })
+
+        svc = SparkDeveloperService(llm_call=_hash_warning_llm)
+        result = svc.annotate(plan)
+
+        assert len(result.warnings) == 0
+
+    def test_evidence_chain_warning_filtered(self):
+        """LLM 返回 evidence_chain 为空的 warning → 被过滤。"""
+        from tianshu_datadev.spark.annotations import AnnotationWarning
+
+        plan = _make_simple_plan()
+
+        def _evidence_warning_llm(spark_plan: SparkPlan) -> AnnotatedSparkPlan:
+            ann = _mock_llm_annotate(spark_plan)
+            return ann.model_copy(update={
+                "warnings": [
+                    AnnotationWarning(
+                        warning_id="w_ev",
+                        severity="REVIEW",
+                        category="missing_evidence_chain",
+                        description="join步骤缺少 evidence_chain 元数据",
+                    ),
+                ],
+            })
+
+        svc = SparkDeveloperService(llm_call=_evidence_warning_llm)
+        result = svc.annotate(plan)
+
+        assert len(result.warnings) == 0
+
+    def test_unknown_review_does_not_trigger_human_review(self):
+        """未知 REVIEW warning 被过滤 → 不触发 human_review_suggested。"""
+        from tianshu_datadev.spark.annotations import AnnotationWarning
+
+        plan = _make_simple_plan()
+
+        def _unknown_review_llm(spark_plan: SparkPlan) -> AnnotatedSparkPlan:
+            ann = _mock_llm_annotate(spark_plan)
+            return ann.model_copy(update={
+                "warnings": [
+                    AnnotationWarning(
+                        warning_id="w_review",
+                        severity="REVIEW",
+                        category="unknown_freetext_review",  # 未知
+                        description="自由审查意见——应被过滤",
+                    ),
+                ],
+            })
+
+        svc = SparkDeveloperService(llm_call=_unknown_review_llm)
+        result = svc.annotate(plan)
+
+        # warning 被过滤，也不触发 human_review_suggested
+        assert len(result.warnings) == 0
+
+        # 通过 Validator 再次确认
+        from tianshu_datadev.spark.annotations import AnnotationValidator
+        validator = AnnotationValidator()
+        valid_step_ids = {f"{type(s).__name__}_{i}" for i, s in enumerate(plan.steps)}
+        validation = validator.validate(
+            annotated=result,
+            expected_step_count=len(plan.steps),
+            valid_step_ids=valid_step_ids,
+        )
+        assert validation.is_valid
+        assert not validation.human_review_suggested
+
+    def test_valid_warnings_preserved(self):
+        """已知 category 的合法 warning → 全部保留。"""
+        from tianshu_datadev.spark.annotations import (
+            ALLOWED_WARNING_CATEGORIES,
+            AnnotationWarning,
+        )
+
+        plan = _make_simple_plan()
+        # 为所有 4 种合法 category 各构造一个 warning
+        expected_categories = sorted(ALLOWED_WARNING_CATEGORIES)
+
+        def _all_valid_llm(spark_plan: SparkPlan) -> AnnotatedSparkPlan:
+            ann = _mock_llm_annotate(spark_plan)
+            return ann.model_copy(update={
+                "warnings": [
+                    AnnotationWarning(
+                        warning_id=f"w_{cat}",
+                        severity="WARN",
+                        category=cat,
+                        description=f"合法 warning: {cat}",
+                    )
+                    for cat in expected_categories
+                ],
+            })
+
+        svc = SparkDeveloperService(llm_call=_all_valid_llm)
+        result = svc.annotate(plan)
+
+        result_categories = sorted([w.category for w in result.warnings])
+        assert result_categories == expected_categories
+        assert len(result.warnings) == len(expected_categories)
+
+    def test_warning_with_invalid_step_id_rejected(self):
+        """warning.step_id 不在 baseline 中 → 被确定性拒绝。"""
+        from tianshu_datadev.spark.annotations import AnnotationWarning
+
+        plan = _make_simple_plan()
+
+        def _invalid_step_id_llm(spark_plan: SparkPlan) -> AnnotatedSparkPlan:
+            ann = _mock_llm_annotate(spark_plan)
+            return ann.model_copy(update={
+                "warnings": [
+                    AnnotationWarning(
+                        warning_id="w_valid",
+                        severity="WARN",
+                        category="missing_cleaning_step",
+                        step_id="SparkReadStep_0",  # 存在
+                        description="合法 warning——step_id 有效",
+                    ),
+                    AnnotationWarning(
+                        warning_id="w_invalid",
+                        severity="WARN",
+                        category="step_count_anomaly",
+                        step_id="NotExistStep_99",  # 不存在
+                        description="非法 warning——step_id 无效",
+                    ),
+                ],
+            })
+
+        svc = SparkDeveloperService(llm_call=_invalid_step_id_llm)
+        result = svc.annotate(plan)
+
+        # 只有 step_id 有效的 warning 保留
+        assert len(result.warnings) == 1
+        assert result.warnings[0].warning_id == "w_valid"
+
+
+# ════════════════════════════════════════════
+# TestEvidenceChainTransmission——证据链传递
+# ════════════════════════════════════════════
+
+
+class TestEvidenceChainTransmission:
+    """evidence_chain 传递——有数据时完整传递，无数据时不伪造。"""
+
+    def test_evidence_chain_transmitted_when_present(self):
+        """evidence_chain 有数据时 → ContractJoin → mapper → SparkJoinStep 完整传递。"""
+        from tianshu_datadev.artifacts.models import ContractJoin
+        from tianshu_datadev.spark.mapper import _map_joins
+        from tianshu_datadev.spark.models import SparkJoinStep, UnsupportedPattern
+
+        # 构造含证据链的 ContractJoin
+        evidence = {
+            "evidence_id": "ev_001",
+            "level": "STRONG",
+            "action": "AUTO_ADOPT",
+            "left_field": {"raw": "user_id", "normalized": "user_id"},
+            "right_field": {"raw": "id", "normalized": "id"},
+            "evidence_checks": ["field_name_match: MATCH", "data_type_match: MATCH"],
+            "detail": "字段名和类型均匹配",
+        }
+        contract_join = ContractJoin(
+            join_id="ev_001",
+            left_table="od",
+            right_table="ud",
+            left_key="user_id",
+            right_key="id",
+            join_type="INNER",
+            evidence_chain=evidence,
+            level="STRONG",
+        )
+
+        unsupported: list[UnsupportedPattern] = []
+        spark_joins = _map_joins([contract_join], unsupported)
+
+        assert len(spark_joins) == 1
+        js = spark_joins[0]
+        assert isinstance(js, SparkJoinStep)
+        assert js.evidence_chain["evidence_id"] == "ev_001"
+        assert js.evidence_chain["level"] == "STRONG"
+        assert js.evidence_chain["left_field"]["raw"] == "user_id"
+        assert js.evidence_chain["right_field"]["normalized"] == "id"
+        assert "field_name_match: MATCH" in js.evidence_chain["evidence_checks"]
+        assert len(unsupported) == 0
+
+    def test_evidence_chain_empty_when_absent(self):
+        """无 evidence_chain 数据时 → 保持为空，不伪造。"""
+        from tianshu_datadev.artifacts.models import ContractJoin
+        from tianshu_datadev.spark.mapper import _map_joins
+        from tianshu_datadev.spark.models import UnsupportedPattern
+
+        contract_join = ContractJoin(
+            join_id="ev_empty",
+            left_table="od",
+            right_table="ud",
+            left_key="user_id",
+            right_key="id",
+            join_type="LEFT",
+            evidence_chain={},  # 空
+            level="MEDIUM",
+        )
+
+        unsupported: list[UnsupportedPattern] = []
+        spark_joins = _map_joins([contract_join], unsupported)
+
+        assert len(spark_joins) == 1
+        # 空字典，不伪造数据
+        assert spark_joins[0].evidence_chain == {}

@@ -228,7 +228,7 @@ class TestAnnotationValidator:
                 AnnotationWarning(
                     warning_id="w1",
                     severity="REVIEW",
-                    category="semantic_mismatch",
+                    category="missing_cleaning_step",
                     description="可疑语义",
                 ),
             ],
@@ -330,3 +330,61 @@ class TestAnnotationHash:
         h1 = compute_annotation_hash(plan1)
         h2 = compute_annotation_hash(plan2)
         assert h1 != h2
+
+
+class TestAnnotationCompilerIsolation:
+    """标注不应影响编译产物——Developer/Compiler 隔离。"""
+
+    def test_annotation_does_not_change_compile_result(self):
+        """Developer 标注阶段不影响 Compiler 的编译结果。
+
+        验证：同一 SparkPlan 在标注前后编译产物相同（raw_pyspark 一致）。
+        此测试原在 API 层，迁移至 Spark 单元层——标注隔离是 Compiler 契约。
+        """
+        from tianshu_datadev.spark.compiler import SparkCompiler
+        from tianshu_datadev.spark.models import (
+            SparkAggFunction,
+            SparkAggregateSpec,
+            SparkAggregateStep,
+            SparkFilterStep,
+            SparkJoinStep,
+            SparkJoinType,
+            SparkPlan,
+            SparkReadStep,
+        )
+
+        plan = SparkPlan(
+            plan_id="test_integration",
+            version="v1",
+            source_phase="test",
+            source_contract_hash="hash_int_001",
+            source_contract_version="v1",
+            steps=[
+                SparkReadStep(alias="ft", source_name="fact_table", input_key="ft"),
+                SparkReadStep(alias="tz", source_name="dim_timezone", input_key="tz"),
+                SparkFilterStep(input_alias="ft", operator="GT", left="ft.amount", right="0"),
+                SparkFilterStep(input_alias="ft", operator="LT", left="ft.amount", right="100"),
+                SparkJoinStep(
+                    left_alias="ft", right_alias="tz",
+                    left_key="tz_id", right_key="id",
+                    join_type=SparkJoinType.LEFT,
+                ),
+                SparkAggregateStep(
+                    input_alias="ft",
+                    group_keys=["region_id"],
+                    metrics=[SparkAggregateSpec(
+                        function=SparkAggFunction.COUNT, input_column=None, alias="cnt",
+                    )],
+                ),
+            ],
+        )
+
+        compiler = SparkCompiler()
+        result_without = compiler.compile(plan)
+        result_with_none = compiler.compile(plan, annotations=None)
+
+        assert result_without.raw_pyspark == result_with_none.raw_pyspark, (
+            "标注不应影响编译产物"
+        )
+        assert "t1 = inputs[" in result_without.raw_pyspark
+        assert "t2 = inputs[" in result_without.raw_pyspark

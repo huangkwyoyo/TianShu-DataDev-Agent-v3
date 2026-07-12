@@ -87,14 +87,11 @@ class TestTablePathsNoneVsEmptyDict:
 
     def test_none_falls_back_to_default(self, pipeline_with_default):
         """table_paths=None → 使用 default_table_paths，执行成功。"""
-        try:
-            result = pipeline_with_default.execute(
-                self._VALID_SPEC,
-                table_mapping={"tf": "test_fact"},
-                table_paths=None,  # 不传 → 应回退到 default_table_paths
-            )
-        except Exception:
-            pytest.skip("DuckDB 未安装或 CSV 不可读")
+        result = pipeline_with_default.execute(
+            self._VALID_SPEC,
+            table_mapping={"tf": "test_fact"},
+            table_paths=None,  # 不传 → 应回退到 default_table_paths
+        )
 
         # 回退到默认值 → CSV 可加载 → 执行成功（trace 存在）
         # 如果因 Validator 阻断失败，错误不应是"表不存在"
@@ -110,14 +107,11 @@ class TestTablePathsNoneVsEmptyDict:
 
     def test_empty_dict_does_not_fall_back(self, pipeline_with_default):
         """table_paths={} → 不回退到 default_table_paths，表找不到。"""
-        try:
-            result = pipeline_with_default.execute(
-                self._VALID_SPEC,
-                table_mapping={"tf": "test_fact"},
-                table_paths={},  # 显式传空 → 不得回退
-            )
-        except Exception:
-            pytest.skip("DuckDB 未安装或 CSV 不可读")
+        result = pipeline_with_default.execute(
+            self._VALID_SPEC,
+            table_mapping={"tf": "test_fact"},
+            table_paths={},  # 显式传空 → 不得回退
+        )
 
         # 显式传 {} → CSV 不加载 → DuckDB 中表不存在 → 执行失败
         if "pipeline_error" in result:

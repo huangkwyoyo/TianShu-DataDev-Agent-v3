@@ -54,6 +54,30 @@ def _make_plan(*steps: object) -> SparkPlan:
     )
 
 
+def _collect_df_assignments(code: str) -> list[str]:
+    """用 ast.parse 收集 transform 函数体中所有 DataFrame 赋值目标变量名。
+
+    仅收集顶层 ast.Assign 的目标 Name 节点——不深入嵌套表达式。
+    返回收集到的变量名列表，调用方断言非空以防测试空通过。
+    """
+    tree = ast.parse(code)
+    func_def = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "transform":
+            func_def = node
+            break
+    if func_def is None:
+        return []
+
+    df_vars: list[str] = []
+    for stmt in func_def.body:
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    df_vars.append(target.id)
+    return df_vars
+
+
 # ════════════════════════════════════════════
 # assign_source_aliases 测试
 # ════════════════════════════════════════════
@@ -292,6 +316,79 @@ class TestResolveCodegenAliases:
 
 
 # ════════════════════════════════════════════
+# 旧式别名拒绝——回归测试（B 类设计一致性修复）
+# ════════════════════════════════════════════
+
+
+class TestOldStyleAliasRejection:
+    """旧式语义别名必须在 resolver 层被严格拒绝——不得模糊回退。"""
+
+    def test_aggregate_with_old_style_alias_raises(self):
+        """真实失败形态：Aggregate 的 input_alias 为旧式派生名 → AliasResolutionError。
+
+        Read(ft) + Read(tz) → Filter → Filter → Join → Aggregate
+        Aggregate.input_alias='ft_filtered_filtered_with_tz' 无法在 latest 中解析。
+        """
+        plan = _make_plan(
+            SparkReadStep(alias="ft", source_name="fact_table", input_key="ft"),
+            SparkReadStep(alias="tz", source_name="timezone", input_key="tz"),
+            SparkFilterStep(input_alias="ft", operator="GT", left="ft.amount", right="0"),
+            SparkFilterStep(input_alias="ft", operator="LT", left="ft.amount", right="100"),
+            SparkJoinStep(
+                left_alias="ft", right_alias="tz",
+                left_key="tz_id", right_key="id",
+                join_type=SparkJoinType.LEFT,
+            ),
+            # 旧式语义别名——Mapper 从 Contract 列名前缀推断产生的错误值
+            SparkAggregateStep(
+                input_alias="ft_filtered_filtered_with_tz",
+                group_keys=["region_id"],
+                metrics=[SparkAggregateSpec(
+                    function=SparkAggFunction.COUNT, input_column=None, alias="cnt",
+                )],
+            ),
+        )
+        with pytest.raises(AliasResolutionError, match="input_alias='ft_filtered_filtered_with_tz' 未解析"):
+            resolve_codegen_aliases(plan)
+
+    def test_correct_alias_same_topology_compiles(self):
+        """相同拓扑但 Aggregate 使用正确的稳定 lineage key → 编译成功。
+
+        证明问题出在 input_alias 的值，而非拓扑结构。
+        """
+        plan = _make_plan(
+            SparkReadStep(alias="ft", source_name="fact_table", input_key="ft"),
+            SparkReadStep(alias="tz", source_name="timezone", input_key="tz"),
+            SparkFilterStep(input_alias="ft", operator="GT", left="ft.amount", right="0"),
+            SparkFilterStep(input_alias="ft", operator="LT", left="ft.amount", right="100"),
+            SparkJoinStep(
+                left_alias="ft", right_alias="tz",
+                left_key="tz_id", right_key="id",
+                join_type=SparkJoinType.LEFT,
+            ),
+            # 使用 Join 的左表别名作为 lineage key——正确的依赖标识
+            SparkAggregateStep(
+                input_alias="ft",
+                group_keys=["region_id"],
+                metrics=[SparkAggregateSpec(
+                    function=SparkAggFunction.COUNT, input_column=None, alias="cnt",
+                )],
+            ),
+        )
+        resolved = resolve_codegen_aliases(plan)
+        compiled = SparkCompiler().compile(plan)
+
+        # 编译成功，不含旧式别名
+        assert "_filtered" not in compiled.raw_pyspark
+        assert "filtered_filtered" not in compiled.raw_pyspark
+        # Aggregate 的输入来自 Join 的输出（f3），而非原始 Read（t1）
+        agg_step = resolved.steps[5]
+        assert agg_step.input_vars[0].startswith("f"), (
+            f"Aggregate 输入应为 Join 的输出 fN，实际为 {agg_step.input_vars[0]}"
+        )
+
+
+# ════════════════════════════════════════════
 # 集成测试——Mapper→resolver→Compiler
 # ════════════════════════════════════════════
 
@@ -377,6 +474,175 @@ class TestIntegrationMapperToCompiler:
         # 不含 filtered_filtered 模式
         assert "filtered_filtered" not in code
 
+    def test_contract_with_old_style_column_prefix_causes_resolver_failure(self):
+        """Contract 聚合列带旧式前缀 → Mapper 不再推断旧式 alias → 使用稳定 lineage key。
+
+        这是本次 B 类修复的精确复现：
+        Contract 的 input_column="ft_filtered.filtered_with_tz" 是 SqlBuildPlan
+        中间表派生名。修复前 Mapper 从列名前缀提取 "ft_filtered" 作为 input_alias，
+        导致新 resolver 无法解析。修复后 Mapper 不再从列名推断，由
+        _chain_input_aliases 用稳定 lineage key（如 "ft"）填充。
+        """
+        from tianshu_datadev.artifacts.models import (
+            ContractAggregation,
+            ContractInputTable,
+            ContractJoin,
+            ContractOutputColumn,
+            ContractPredicate,
+            DataTransformContractV1,
+        )
+
+        program_id = "prog_test_old_alias_001"
+        contract = DataTransformContractV1(
+            contract_id=DataTransformContractV1.generate_contract_id(program_id),
+            version="v1",
+            source_phase="phase-3",
+            source_sqlprogram_hash=program_id,
+            input_tables=[
+                ContractInputTable(table_ref="ft", source_table="fact_table"),
+                ContractInputTable(table_ref="tz", source_table="dim_timezone"),
+            ],
+            input_columns=[],
+            filters=[
+                ContractPredicate(operator="GT", left="ft.amount", right="0"),
+                ContractPredicate(operator="LT", left="ft.amount", right="100"),
+            ],
+            join_relationships=[
+                ContractJoin(
+                    join_id="join_1",
+                    left_table="ft", right_table="tz",
+                    left_key="tz_id", right_key="id",
+                    join_type="LEFT",
+                    level="STRONG",
+                ),
+            ],
+            aggregations=[
+                # 关键：input_column 携带 SqlBuildPlan 旧式派生表前缀
+                ContractAggregation(
+                    function="COUNT",
+                    input_column="ft_filtered.filtered_with_tz",
+                    alias="cnt",
+                ),
+            ],
+            grouping_keys=["region_id"],
+            output_columns=[
+                ContractOutputColumn(column_name="region_id", alias="region_id"),
+                ContractOutputColumn(column_name="cnt", alias="cnt"),
+            ],
+            output_grain=["region_id"],
+            sort_spec=[],
+            limit_spec=None,
+            case_when_labels=[],
+            window_specs=[],
+        )
+
+        result = map_contract_to_spark_plan(contract)
+        # 修复后：Aggregate 的 input_alias 不再从列名前缀推断，
+        # 而是由 _chain_input_aliases 用稳定 lineage key 填充（此处应为 "ft"）
+        assert result.success is True, f"映射失败：{result.gaps}"
+        plan = result.spark_plan
+        assert plan is not None
+
+        # 验证 Aggregate 使用稳定 lineage key 而非旧式派生别名
+        agg_steps = [s for s in plan.steps if isinstance(s, SparkAggregateStep)]
+        assert len(agg_steps) == 1
+        assert agg_steps[0].input_alias == "ft", (
+            f"Aggregate input_alias 应为稳定 lineage key 'ft'，"
+            f"实际为 {agg_steps[0].input_alias!r}"
+        )
+
+        # 编译应成功
+        compiler = SparkCompiler()
+        compiled = compiler.compile(plan)
+
+        # DataFrame 变量名只有 tN/fN——用 ast.parse 收集，确保非空
+        df_vars = _collect_df_assignments(compiled.raw_pyspark)
+        assert len(df_vars) >= 1, "应至少收集到 1 个 DataFrame 赋值变量"
+        for var in df_vars:
+            assert (var[0] in ("t", "f") and var[1:].isdigit()), (
+                f"DataFrame 变量应为 tN/fN，实际为 {var!r}"
+            )
+        # return 语句指向 fN
+        assert "return f" in compiled.raw_pyspark, (
+            f"return 应指向 fN，实际代码: {compiled.raw_pyspark[-80:]}"
+        )
+        # 关键：input_alias 不再包含 _filtered（验证旧式别名未进入依赖字段）
+        assert agg_steps[0].input_alias == "ft", (
+            f"Aggregate input_alias 应为 'ft'，实际为 {agg_steps[0].input_alias!r}"
+        )
+
+    def test_contract_with_filter_old_style_prefix_blocked(self):
+        """Contract Filter 的 left 带旧式前缀 → Mapper 别名校验阻断。
+
+        Filter 的 left="ft_filtered_filtered_with_tz.some_col" 提取出的
+        input_alias 不在已知 Read alias 集合中，应由 _validate_step_aliases
+        检测并以 BLOCKING gap 拒绝，不得猜测或自动修正。
+        """
+        from tianshu_datadev.artifacts.models import (
+            ContractAggregation,
+            ContractInputTable,
+            ContractJoin,
+            ContractOutputColumn,
+            ContractPredicate,
+            DataTransformContractV1,
+        )
+
+        program_id = "prog_test_old_alias_002"
+        contract = DataTransformContractV1(
+            contract_id=DataTransformContractV1.generate_contract_id(program_id),
+            version="v1",
+            source_phase="phase-3",
+            source_sqlprogram_hash=program_id,
+            input_tables=[
+                ContractInputTable(table_ref="ft", source_table="fact_table"),
+                ContractInputTable(table_ref="tz", source_table="dim_timezone"),
+            ],
+            input_columns=[],
+            filters=[
+                # Filter 的 left 带旧式前缀——_extract_table_alias 会错误提取
+                ContractPredicate(
+                    operator="GT",
+                    left="ft_filtered_filtered_with_tz.some_col",
+                    right="0",
+                ),
+            ],
+            join_relationships=[
+                ContractJoin(
+                    join_id="join_1",
+                    left_table="ft", right_table="tz",
+                    left_key="tz_id", right_key="id",
+                    join_type="LEFT",
+                    level="STRONG",
+                ),
+            ],
+            aggregations=[
+                ContractAggregation(
+                    function="COUNT", input_column=None, alias="cnt",
+                ),
+            ],
+            grouping_keys=["region_id"],
+            output_columns=[
+                ContractOutputColumn(column_name="region_id", alias="region_id"),
+            ],
+            output_grain=["region_id"],
+            sort_spec=[],
+            limit_spec=None,
+            case_when_labels=[],
+            window_specs=[],
+        )
+
+        result = map_contract_to_spark_plan(contract)
+        # 修复后：Mapper 应拒绝含旧式别名的 Contract，返回 BLOCKING gap
+        assert result.success is False, (
+            f"应拒绝含旧式前缀的 Filter alias，但 result.success={result.success}"
+        )
+        blocking_gaps = [g for g in result.gaps if g.severity == "BLOCKING"]
+        assert len(blocking_gaps) >= 1, f"应有 BLOCKING gap，实际 gaps: {result.gaps}"
+        assert any("ft_filtered_filtered_with_tz" in g.missing_info for g in blocking_gaps), (
+            f"gap 应提及无法解析的 alias 'ft_filtered_filtered_with_tz'，"
+            f"实际: {blocking_gaps[0].missing_info if blocking_gaps else 'N/A'}"
+        )
+
     def test_compiled_code_passes_ast_parse(self):
         """编译产物通过 ast.parse——所有变量先定义后引用。
 
@@ -449,4 +715,280 @@ class TestIntegrationMapperToCompiler:
         expected_return = f"return {resolved.output_var}"
         assert expected_return in compiled.raw_pyspark, (
             f"期望 return {resolved.output_var}，代码中未找到"
+        )
+
+    def test_project_window_sort_limit_all_use_current_lineage(self):
+        """Project/Window/Sort/Limit 统一使用当前 lineage——Mapper 产出可编译。
+
+        Read(od) → Filter → Window → Project → Sort → Limit
+        所有单输入步骤的 input_alias 均由 _chain_input_aliases 填充，
+        使用当前 lineage key（Read alias 或前驱步骤所追踪的 key）。
+        """
+        from tianshu_datadev.artifacts.models import (
+            ContractAggregation,
+            ContractInputTable,
+            ContractOutputColumn,
+            ContractSort,
+            DataTransformContractV1,
+            WindowSpecSummary,
+        )
+        from tianshu_datadev.artifacts.models import (
+            ContractLimit as ContractLimitModel,
+        )
+
+        program_id = "prog_test_lineage_001"
+        contract = DataTransformContractV1(
+            contract_id=DataTransformContractV1.generate_contract_id(program_id),
+            version="v1",
+            source_phase="phase-3",
+            source_sqlprogram_hash=program_id,
+            input_tables=[
+                ContractInputTable(table_ref="od", source_table="dwd.order_detail"),
+            ],
+            input_columns=[],
+            filters=[],
+            join_relationships=[],
+            aggregations=[
+                ContractAggregation(function="COUNT", input_column=None, alias="cnt"),
+            ],
+            grouping_keys=["name"],
+            output_columns=[
+                ContractOutputColumn(column_name="name", alias="name"),
+                ContractOutputColumn(column_name="cnt", alias="cnt"),
+            ],
+            output_grain=["name"],
+            sort_spec=[ContractSort(column="name", direction="ASC")],
+            limit_spec=ContractLimitModel(limit=100),
+            case_when_labels=[],
+            window_specs=[
+                WindowSpecSummary(
+                    statement_id="stmt_1",
+                    function="ROW_NUMBER",
+                    alias="rn",
+                    input_column=None,
+                    partition_by=["name"],
+                    order_by=["cnt"],
+                ),
+            ],
+        )
+
+        result = map_contract_to_spark_plan(contract)
+        assert result.success is True, f"映射失败：{result.gaps}"
+        plan = result.spark_plan
+
+        # 编译应成功
+        compiler = SparkCompiler()
+        compiled = compiler.compile(plan)
+        code = compiled.raw_pyspark
+
+        # DataFrame 变量名只有 tN/fN——用 ast.parse 收集，确保非空
+        df_vars = _collect_df_assignments(code)
+        assert len(df_vars) >= 1, "应至少收集到 1 个 DataFrame 赋值变量"
+        for var in df_vars:
+            assert (var[0] in ("t", "f") and var[1:].isdigit()), (
+                f"DataFrame 变量应为 tN/fN，实际为 {var!r}"
+            )
+        # 不含旧式别名作为左值
+        assert "_filtered =" not in code
+        assert "_with_" not in code
+
+    def test_tn_fn_code_var_in_alias_blocked(self):
+        """tN/fN 代码变量名出现在 input_alias 中 → 校验阻断。
+
+        确保 Mapper 不会将代码生成变量名泄漏到 SparkPlan 的依赖字段。
+        """
+        plan = _make_plan(
+            SparkReadStep(alias="od", source_name="orders", input_key="od"),
+            # t1 是代码变量名，不应出现在 input_alias 中
+            SparkFilterStep(input_alias="t1", operator="GT", left="od.amount", right="0"),
+        )
+        # 直接构造的 plan 绕过了 Mapper 校验，但 resolver 仍应能解析
+        # （因为 t1 恰好在 latest 中作为 od 的输出变量）
+        # 真正的防线在 Mapper 的 _validate_step_aliases
+        from tianshu_datadev.spark.mapper import _validate_step_aliases
+        errors = _validate_step_aliases(list(plan.steps), {"od"})
+        assert len(errors) >= 1, f"应检测到 t1 代码变量名，实际 errors: {errors}"
+        assert any("tN/fN" in e for e in errors), (
+            f"错误应提及 tN/fN 禁止模式，实际: {errors}"
+        )
+
+
+# ════════════════════════════════════════════
+# 业务别名回归测试——合法别名不得被误伤
+# ════════════════════════════════════════════
+
+
+class TestBusinessAliasRegression:
+    """合法业务别名（含下划线）必须正确映射和编译——不被旧式后缀检查误伤。"""
+
+    def test_read_alias_orders_filtered_compiles(self):
+        """Read alias='orders_filtered' 必须映射和编译成功。
+
+        合法 lineage key 的唯一事实源是已声明的 Read alias 集合——
+        如果 alias 属于 read_aliases，即使名称含 _filtered 也必须合法。
+        """
+        plan = _make_plan(
+            SparkReadStep(alias="orders_filtered", source_name="orders", input_key="orders_filtered"),
+            SparkFilterStep(
+                input_alias="orders_filtered", operator="GT",
+                left="orders_filtered.amount", right="0",
+            ),
+        )
+        resolved = resolve_codegen_aliases(plan)
+        compiled = SparkCompiler().compile(plan)
+
+        # 编译成功，DataFrame 变量为 tN/fN
+        df_vars = _collect_df_assignments(compiled.raw_pyspark)
+        assert len(df_vars) >= 1, "应至少收集到 1 个 DataFrame 赋值变量"
+        for var in df_vars:
+            assert (var[0] in ("t", "f") and var[1:].isdigit()), (
+                f"DataFrame 变量应为 tN/fN，实际为 {var!r}"
+            )
+        # input_vars 正确引用 t1
+        assert resolved.steps[1].input_vars == ("t1",)
+
+    def test_read_alias_fact_with_tax_compiles(self):
+        """Read alias='fact_with_tax' 必须映射和编译成功。
+
+        含 _with_ 的合法业务别名不得被误伤——唯一事实源是 Read alias 集合。
+        """
+        plan = _make_plan(
+            SparkReadStep(alias="fact_with_tax", source_name="fact_table", input_key="fact_with_tax"),
+            SparkFilterStep(
+                input_alias="fact_with_tax", operator="GT",
+                left="fact_with_tax.amount", right="0",
+            ),
+        )
+        resolved = resolve_codegen_aliases(plan)
+        compiled = SparkCompiler().compile(plan)
+
+        df_vars = _collect_df_assignments(compiled.raw_pyspark)
+        assert len(df_vars) >= 1, "应至少收集到 1 个 DataFrame 赋值变量"
+        for var in df_vars:
+            assert (var[0] in ("t", "f") and var[1:].isdigit()), (
+                f"DataFrame 变量应为 tN/fN，实际为 {var!r}"
+            )
+        assert resolved.steps[1].input_vars == ("t1",)
+
+    def test_input_alias_ft_filtered_not_in_read_aliases_blocked(self):
+        """input_alias='ft_filtered' 且它不属于 Read aliases 时必须被阻断。
+
+        ft_filtered 不在 read_aliases={ft, tz} 中 → 返回 BLOCKING gap。
+        不得尝试解析、拆分或兼容旧式派生别名。
+        """
+        plan = _make_plan(
+            SparkReadStep(alias="ft", source_name="fact_table", input_key="ft"),
+            SparkReadStep(alias="tz", source_name="timezone", input_key="tz"),
+            SparkFilterStep(
+                input_alias="ft_filtered", operator="GT",
+                left="ft.amount", right="0",
+            ),
+        )
+        from tianshu_datadev.spark.mapper import _validate_step_aliases
+        errors = _validate_step_aliases(list(plan.steps), {"ft", "tz"})
+        assert len(errors) >= 1, (
+            f"应检测到不在 Read alias 集合中的 'ft_filtered'，实际 errors: {errors}"
+        )
+        assert any("ft_filtered" in e for e in errors), (
+            f"错误应提及未知 alias 'ft_filtered'，实际: {errors}"
+        )
+
+    def test_input_alias_t1_and_f2_blocked(self):
+        """input_alias='t1' 和 'f2' 必须被阻断——tN/fN 不得进入 SparkPlan 依赖字段。
+
+        分别测试 t1（匹配 tN）和 f2（匹配 fN），确保两种模式均被覆盖。
+        """
+        from tianshu_datadev.spark.mapper import _validate_step_aliases
+
+        # 测试 t1
+        plan_t1 = _make_plan(
+            SparkReadStep(alias="od", source_name="orders", input_key="od"),
+            SparkFilterStep(input_alias="t1", operator="GT", left="od.amount", right="0"),
+        )
+        errors_t1 = _validate_step_aliases(list(plan_t1.steps), {"od"})
+        assert len(errors_t1) >= 1, f"t1 应被阻断，实际 errors: {errors_t1}"
+        assert any("tN/fN" in e for e in errors_t1), (
+            f"错误应提及 tN/fN 禁止模式，实际: {errors_t1}"
+        )
+
+        # 测试 f2
+        plan_f2 = _make_plan(
+            SparkReadStep(alias="od", source_name="orders", input_key="od"),
+            SparkFilterStep(input_alias="f2", operator="GT", left="od.amount", right="0"),
+        )
+        errors_f2 = _validate_step_aliases(list(plan_f2.steps), {"od"})
+        assert len(errors_f2) >= 1, f"f2 应被阻断，实际 errors: {errors_f2}"
+        assert any("tN/fN" in e for e in errors_f2), (
+            f"错误应提及 tN/fN 禁止模式，实际: {errors_f2}"
+        )
+
+    def test_ast_collects_real_variables_and_return(self):
+        """ast.parse 实际收集到 t1/t2/f1...，并验证最终 return 指向最后一个关系变量。
+
+        使用真实链路 Read(ft,tz) → Filter → Join → Aggregate，
+        确保收集结果非空且 return 指向 resolved.output_var。
+        """
+        plan = _make_plan(
+            SparkReadStep(alias="ft", source_name="fact_table", input_key="ft"),
+            SparkReadStep(alias="tz", source_name="timezone", input_key="tz"),
+            SparkFilterStep(input_alias="ft", operator="GT", left="ft.amount", right="0"),
+            SparkJoinStep(
+                left_alias="ft", right_alias="tz",
+                left_key="tz_id", right_key="id",
+                join_type=SparkJoinType.LEFT,
+            ),
+            SparkAggregateStep(
+                input_alias="ft",
+                group_keys=["tz_id"],
+                metrics=[SparkAggregateSpec(
+                    function=SparkAggFunction.COUNT, input_column=None, alias="cnt",
+                )],
+            ),
+        )
+        resolved = resolve_codegen_aliases(plan)
+        compiled = SparkCompiler().compile(plan)
+
+        df_vars = _collect_df_assignments(compiled.raw_pyspark)
+        # Read(ft,tz) → Filter → Join → Aggregate：至少 t1,t2,f1,f2,f3
+        assert len(df_vars) >= 4, (
+            f"应至少收集到 4 个 DataFrame 变量（t1,t2,f1,f2...），实际: {df_vars}"
+        )
+
+        # 所有变量为 tN/fN
+        for var in df_vars:
+            assert (var[0] in ("t", "f") and var[1:].isdigit()), (
+                f"DataFrame 变量应为 tN/fN，实际为 {var!r}"
+            )
+
+        # return 指向最后一个关系变量（resolved.output_var）
+        assert f"return {resolved.output_var}" in compiled.raw_pyspark, (
+            f"return 应指向 {resolved.output_var}，"
+            f"实际代码末段: {compiled.raw_pyspark[-100:]}"
+        )
+
+    def test_mapper_validates_orders_filtered_as_legal_alias(self):
+        """Mapper 别名校验——Read alias='orders_filtered' 通过 _validate_step_aliases。
+
+        直接验证：_validate_step_aliases 不拒绝属于 read_aliases 的合法业务别名，
+        即使其名称含旧式后缀子串。
+        """
+        plan = _make_plan(
+            SparkReadStep(alias="orders_filtered", source_name="orders", input_key="orders_filtered"),
+            SparkReadStep(alias="fact_with_tax", source_name="fact", input_key="fact_with_tax"),
+            SparkFilterStep(
+                input_alias="orders_filtered", operator="GT",
+                left="orders_filtered.amount", right="0",
+            ),
+            SparkJoinStep(
+                left_alias="orders_filtered", right_alias="fact_with_tax",
+                left_key="id", right_key="id",
+                join_type=SparkJoinType.INNER,
+            ),
+        )
+        from tianshu_datadev.spark.mapper import _validate_step_aliases
+        errors = _validate_step_aliases(
+            list(plan.steps), {"orders_filtered", "fact_with_tax"},
+        )
+        assert len(errors) == 0, (
+            f"合法业务别名不应被拒绝，实际 errors: {errors}"
         )

@@ -160,8 +160,6 @@ class TestPipelineE2E:
         try:
             trace, summary = executor.execute(compiled)
         except Exception as e:
-            if "DuckDB" in str(e) or "duckdb" in str(e).lower():
-                pytest.skip("DuckDB 未安装")
             raise
 
         # 8. 验证 ExecutionTrace + ResultSummary
@@ -276,8 +274,6 @@ class TestPipelineE2E:
         try:
             trace, summary = executor.execute(compiled)
         except Exception as e:
-            if "DuckDB" in str(e) or "duckdb" in str(e).lower():
-                pytest.skip("DuckDB 未安装")
             raise
 
         # ExecutionTrace 验证

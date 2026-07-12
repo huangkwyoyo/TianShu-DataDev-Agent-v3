@@ -1467,8 +1467,6 @@ spec:
                 table_paths={"test_fact": csv_path},
             )
         except Exception as e:
-            if "DuckDB" in str(e) or "duckdb" in str(type(e).__name__).lower():
-                pytest.skip("DuckDB 未安装")
             raise
 
         # 断言结构化输出
@@ -1583,8 +1581,6 @@ spec:
                 table_paths={"test_fact": csv_path},
             )
         except Exception as e:
-            if "DuckDB" in str(e) or "duckdb" in str(type(e).__name__).lower():
-                pytest.skip("DuckDB 未安装")
             raise
 
         # 容忍执行阶段阻断（_temp 表别名已知问题）

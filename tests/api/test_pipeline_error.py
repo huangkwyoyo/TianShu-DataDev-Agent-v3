@@ -84,10 +84,6 @@ class TestPipelineErrorHandling:
 
     def test_execute_success_path_complete(self, pipeline, golden_spec_passing):
         """execute() 成功路径——不含 pipeline_error/stages，产物完整。"""
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
         import os
         csv_path = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv")
@@ -457,10 +453,6 @@ class TestPipelineExportArtifacts:
 
     def test_export_after_run_all_returns_bundle(self, pipeline, golden_spec_passing):
         """run_all 成功后 export_artifacts 返回非空 PipelineArtifactBundle。"""
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
         import os
         csv_path = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv")
@@ -500,10 +492,6 @@ class TestPipelineExportArtifacts:
 
     def test_export_after_ttl_expiry_returns_none(self, pipeline, golden_spec_passing):
         """TTL 过期清理后 export_artifacts 返回 None。"""
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
         import os
         csv_path = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv")
@@ -523,10 +511,6 @@ class TestPipelineExportArtifacts:
 
     def test_export_after_execute_returns_bundle(self, pipeline, golden_spec_passing):
         """execute() 成功后 export_artifacts 同样可导出产物。"""
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
         import os
         csv_path = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv")
@@ -562,10 +546,6 @@ class TestPipelineExportArtifacts:
 
     def test_export_bundle_spec_hash_matches_parsed_spec(self, pipeline, golden_spec_passing):
         """bundle.spec_hash 与 _results 中 ParsedDeveloperSpec.spec_hash 一致。"""
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
         import os
         csv_path = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv")
@@ -585,10 +565,6 @@ class TestPipelineExportArtifacts:
 
     def test_export_bundle_plan_id_matches(self, pipeline, golden_spec_passing):
         """bundle.sql_build_plan.plan_id 与 run_all 返回的 plan_id 一致。"""
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
         import os
         csv_path = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv")

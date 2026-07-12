@@ -19,8 +19,6 @@ class TestRunAll:
             "table_mapping": {"tf": "test_fact"},
             "table_paths": {"test_fact": _CSV_PATH},
         })
-        if resp.status_code == 500 and "DuckDB" in resp.text:
-            pytest.skip("DuckDB 未安装")
         assert resp.status_code == 200, f"期望 200，实际 {resp.status_code}: {resp.text}"
         data = resp.json()
         assert data["package_id"].startswith("pkg_")
@@ -52,8 +50,6 @@ class TestRunAll:
             "table_mapping": {"tf": "test_fact"},
             "table_paths": {"test_fact": _CSV_PATH},
         })
-        if resp.status_code == 500 and "DuckDB" in resp.text:
-            pytest.skip("DuckDB 未安装")
         assert resp.status_code == 200
         data = resp.json()
         assert "pipeline_error" not in data

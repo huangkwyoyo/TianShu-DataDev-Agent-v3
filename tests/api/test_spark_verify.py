@@ -24,10 +24,6 @@ class TestSparkVerifySuccess:
 
     def test_spark_verify_full_chain_returns_200(self, client, golden_spec_passing):
         """run_all → spark/verify → 200 + 6 阶段 + review_ready=True。"""
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
 
         # ── Step 1: 先执行全流程 Run-All ──
         resp_run = client.post("/api/run-all", json={
@@ -128,10 +124,6 @@ class TestSparkVerifyErrors:
 
         通过替换 Pipeline._results 中的 contract 为 None 来模拟。
         """
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
 
         # ── Step 1: 正常 run-all ──
         resp_run = client.post("/api/run-all", json={

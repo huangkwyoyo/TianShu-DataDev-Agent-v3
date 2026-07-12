@@ -171,10 +171,6 @@ class TestSqlPipelineMonitoring:
         self, pipeline, golden_spec_passing, mock_collector,
     ):
         """execute_rich 应记录 6 个 SQL 管线节点事件。"""
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
         csv_path = os.path.abspath(
             os.path.join(
                 os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv",
@@ -244,10 +240,6 @@ class TestSqlPipelineMonitoring:
         self, pipeline, golden_spec_passing, mock_collector,
     ):
         """run_all 应记录 9 个节点（6 基础 + contract_extractor + snapshot_builder + packager）。"""
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
         csv_path = os.path.abspath(
             os.path.join(
                 os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv",
@@ -330,10 +322,6 @@ class TestSqlPipelineMonitoring:
         )
 
         # execute_rich 的后续阶段应有非空 artifact_request_id
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
         csv_path = os.path.abspath(
             os.path.join(
                 os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv",
@@ -362,10 +350,6 @@ class TestSqlPipelineMonitoring:
         self, pipeline, golden_spec_passing, mock_collector,
     ):
         """编译失败时 sql_compiler stage 记录 failed 状态 + error_type。"""
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
         csv_path = os.path.abspath(
             os.path.join(
                 os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv",

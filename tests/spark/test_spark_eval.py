@@ -1206,10 +1206,6 @@ class TestC4D4LogicEquivalence:
         与 9A2 版本的关键区别：不再手工构造 DataTransformContractV1 绕过
         export_artifacts() 导出的 contract——而是使用确定性适配层升级 Lite → V1。
         """
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
 
         import os
         import tempfile
@@ -1460,10 +1456,6 @@ class TestC4AutoDrive:
         单表 DeveloperSpec → Pipeline.run_all() → export_artifacts()
         → adapt_lite_to_v1() → Orchestrator.run() → 自动判定 passed。
         """
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
 
         import os
         import tempfile
@@ -1544,10 +1536,6 @@ class TestC4AutoDrive:
 
     def test_auto_drive_orchestrator_stages_recorded(self):
         """自动驱动器——Orchestrator 全部 6 阶段结果记录到 actual_result。"""
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
 
         import os
         import tempfile
@@ -1681,10 +1669,6 @@ class TestC4ReviewReady:
         → adapt_lite_to_v1() → Orchestrator.run(contract, sql_plan)
         → SparkReviewBuilder.build() → SparkReviewPackage.review_ready=True
         """
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
 
         import os
         import tempfile
@@ -1821,10 +1805,6 @@ class TestC4ReviewReady:
 
     def test_review_ready_package_deterministic(self):
         """同一 state → 同一 ReviewPackage（含 review_ready 判定确定性）。"""
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
 
         import os
         import tempfile
@@ -1903,10 +1883,6 @@ class TestC4ReviewReady:
 
     def test_review_ready_report_contains_all_provenance(self):
         """REVIEW_READY 通过的 ReviewPackage 包含完整溯源链。"""
-        try:
-            import duckdb  # noqa: F401
-        except ImportError:
-            pytest.skip("DuckDB 未安装")
 
         import os
         import tempfile

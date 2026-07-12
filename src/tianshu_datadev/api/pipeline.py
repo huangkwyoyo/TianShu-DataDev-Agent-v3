@@ -54,8 +54,8 @@ if TYPE_CHECKING:
     from tianshu_datadev.planning.sql_program import SqlProgram
     from tianshu_datadev.spark.annotations import AnnotatedSparkPlan
     from tianshu_datadev.spark.compiler import SparkCompileResult
-    from tianshu_datadev.spark.models import SparkPlan
-    from tianshu_datadev.spark.plan_comparator import PlanComparisonReport
+    from tianshu_datadev.spark.models import SparkPlan, SparkStep
+    from tianshu_datadev.spark.plan_comparator import ComparisonStatus, PlanComparisonReport
     from tianshu_datadev.spark.snapshot import SnapshotBuilder, SnapshotManifest, SnapshotSourceProvider
     from tianshu_datadev.sql.models import CompiledSql, ExecutionTrace, ResultSummary
 
@@ -1158,8 +1158,14 @@ class Pipeline:
         # 前提：plan 已通过 Validator 校验，compiled/trace/summary 已在当前作用域
         contract = None
         try:
+            # 构建 evidence_map——将 RelationshipPlanner 产出的证据链传入 Contract
+            evidence_map_sp = {}
+            if hypothesis:
+                for c in hypothesis.candidates:
+                    if c.evidence:
+                        evidence_map_sp[c.candidate_id] = c.evidence
             extractor = DataTransformContractExtractor()
-            contract = extractor.extract(plan)
+            contract = extractor.extract(plan, evidence_map_sp)
         except Exception as contract_err:
             logger.warning("Contract 抽取失败（非阻断）：%s", contract_err)
 
@@ -1672,12 +1678,18 @@ class Pipeline:
 
             # ── 公共阶段：Contract + Package（所有路径——ComputeSteps 和非 ComputeSteps）──
             stage = "contract"
+            # 构建 evidence_map——将 RelationshipPlanner 产出的证据链传入 Contract
+            evidence_map: dict = {}
+            if hypothesis:
+                for c in hypothesis.candidates:
+                    if c.evidence:
+                        evidence_map[c.candidate_id] = c.evidence
             contract_extractor = DataTransformContractExtractor()
             with collector.stage("contract_extractor", request_id) as ctx:
                 if len(sql_program.statements) > 1:
-                    contract = contract_extractor.extract_v1(sql_program)
+                    contract = contract_extractor.extract_v1(sql_program, evidence_map=evidence_map)
                 else:
-                    contract = contract_extractor.extract(plan)
+                    contract = contract_extractor.extract(plan, evidence_map)
                 if contract:
                     ctx.set_result(artifact_path=f"contract/{contract.contract_id[:12]}")
 
@@ -2443,8 +2455,14 @@ class Pipeline:
         # 前提：plan 已通过 Validator 校验，compiled/trace/summary 已在当前作用域
         contract = None
         try:
+            # 构建 evidence_map——将 RelationshipPlanner 产出的证据链传入 Contract
+            evidence_map_d: dict = {}
+            if hypothesis:
+                for c in hypothesis.candidates:
+                    if c.evidence:
+                        evidence_map_d[c.candidate_id] = c.evidence
             extractor = DataTransformContractExtractor()
-            contract = extractor.extract(plan)
+            contract = extractor.extract(plan, evidence_map_d)
         except Exception as contract_err:
             logger.warning("Contract 抽取失败（非阻断）：%s", contract_err)
 
@@ -2687,6 +2705,10 @@ class Pipeline:
         self._check_stage_dependencies(stage, context, artifacts)
 
         # Step 4: 执行阶段（包装在监控 stage 上下文中）
+        # 先清除该阶段的旧错误——同一 request_id 重复点击时不得累积重复错误
+        stage_error_prefix = f"[{stage_val}] "
+        context.errors = [e for e in context.errors if not e.startswith(stage_error_prefix)]
+
         stage_node = f"spark_{stage_val.lower()}"
         collector = get_collector()
         try:
@@ -2705,7 +2727,10 @@ class Pipeline:
                     self._do_spark_physical_verify(artifacts, context)
         except Exception as e:
             context.stage_results[stage_val] = "FAILURE"
-            context.errors.append(f"[{stage_val}] 异常：{e}")
+            # 去重：同一阶段同一异常不重复追加
+            new_error = f"[{stage_val}] 异常：{e}"
+            if new_error not in context.errors:
+                context.errors.append(new_error)
 
         # Step 5: 构建响应
         status_map = {
@@ -2733,7 +2758,11 @@ class Pipeline:
                     "type": "mapper",
                     "steps": [
                         {
-                            "step_type": s.step_type.value if hasattr(s.step_type, "value") else str(s.step_type),
+                            "step_type": (
+                                s.step_type.value
+                                if hasattr(s.step_type, "value")
+                                else str(s.step_type)
+                            ),
                             "description": _summarize_step(s),
                         }
                         for s in context.spark_plan.steps
@@ -2759,10 +2788,18 @@ class Pipeline:
                 report = context.comparator_report
                 result = {
                     "type": "comparator",
-                    "status": report.status.value if hasattr(report.status, "value") else str(report.status),
+                    "status": (
+                        report.status.value
+                        if hasattr(report.status, "value")
+                        else str(report.status)
+                    ),
                     "step_results": [
                         {
-                            "step_type": r.step_type.value if hasattr(r.step_type, "value") else str(r.step_type),
+                            "step_type": (
+                                r.step_type.value
+                                if hasattr(r.step_type, "value")
+                                else str(r.step_type)
+                            ),
                             "verdict": r.verdict,
                         }
                         for r in report.step_results
@@ -2866,7 +2903,9 @@ class Pipeline:
         else:
             context.stage_results["MAPPER"] = "FAILURE"
             gap_msgs = [g.message for g in result.gaps] if result.gaps else ["未知错误"]
-            context.errors.append(f"[MAPPER] 映射失败：{'; '.join(gap_msgs)}")
+            new_error = f"[MAPPER] 映射失败：{'; '.join(gap_msgs)}"
+            if new_error not in context.errors:
+                context.errors.append(new_error)
 
     def _do_spark_develop(self, context: SparkStageContext) -> None:
         """执行 DEVELOPER 阶段——LLM 语义标注。
@@ -2876,12 +2915,16 @@ class Pipeline:
         """
         if self._spark_developer_service is None:
             context.stage_results["DEVELOPER"] = "SKIPPED"
-            context.errors.append("[DEVELOPER] SKIPPED: 未注入 SparkDeveloperService")
+            err_msg = "[DEVELOPER] SKIPPED: 未注入 SparkDeveloperService"
+            if err_msg not in context.errors:
+                context.errors.append(err_msg)
             return
 
         if context.spark_plan is None:
             context.stage_results["DEVELOPER"] = "SKIPPED"
-            context.errors.append("[DEVELOPER] SKIPPED: 无 SparkPlan（MAPPER 未执行或失败）")
+            err_msg = "[DEVELOPER] SKIPPED: 无 SparkPlan（MAPPER 未执行或失败）"
+            if err_msg not in context.errors:
+                context.errors.append(err_msg)
             return
 
         try:
@@ -2890,7 +2933,9 @@ class Pipeline:
             context.stage_results["DEVELOPER"] = "SUCCESS"
         except Exception as e:
             context.stage_results["DEVELOPER"] = "FAILURE"
-            context.errors.append(f"[DEVELOPER] 标注异常：{e}")
+            new_error = f"[DEVELOPER] 标注异常：{e}"
+            if new_error not in context.errors:
+                context.errors.append(new_error)
 
     def _do_spark_compile(self, context: SparkStageContext) -> None:
         """执行 COMPILER 阶段——SparkPlan → PySpark DSL。"""
@@ -2986,7 +3031,7 @@ class Pipeline:
                 context.errors.append(f"[VALIDATOR] {e.error_code}: {e.detail}")
 
     @staticmethod
-    def _map_comparator_status(status: "ComparisonStatus") -> str:  # noqa: F821
+    def _map_comparator_status(status: ComparisonStatus) -> str:
         """将 COMPARATOR 的 ComparisonStatus 映射为 Pipeline 的阶段结果字符串。
 
         提取为独立方法方便测试——确保测试验证的是生产代码逻辑，而非测试内复制的局部映射表。
@@ -3405,7 +3450,11 @@ class Pipeline:
                         str(artifacts.data_transform_contract).encode()
                     ).hexdigest()
 
-            sql_query = artifacts.compiled_sql.sql if hasattr(artifacts.compiled_sql, "sql") else str(artifacts.compiled_sql)
+            sql_query = (
+                artifacts.compiled_sql.sql
+                if hasattr(artifacts.compiled_sql, "sql")
+                else str(artifacts.compiled_sql)
+            )
             verifier = PhysicalVerifier()
             report = verifier.verify(
                 sql_query=sql_query,
@@ -3461,7 +3510,7 @@ def _safe_enum_value(obj, attr: str) -> str:
 # ════════════════════════════════════════════
 
 
-def _summarize_step(step: "SparkStep") -> str:
+def _summarize_step(step: SparkStep) -> str:
     """生成 SparkPlan 步骤的人类可读摘要。
 
     用于前端 SparkStageResultPanel 展示每个步骤的简要描述。
@@ -3503,7 +3552,11 @@ def _summarize_step(step: "SparkStep") -> str:
             funcs += f"…(+{len(step.expressions) - 3})"
         return f"窗口 {step.input_alias}: {funcs}"
     elif isinstance(step, SparkSortStep):
-        orders = ", ".join(f"{s.column} {s.direction.value if hasattr(s.direction, 'value') else s.direction}" for s in step.order_by)
+        orders = ", ".join(
+            f"{s.column} "
+            f"{s.direction.value if hasattr(s.direction, 'value') else s.direction}"
+            for s in step.order_by
+        )
         return f"排序 {step.input_alias}: {orders}"
     elif isinstance(step, SparkLimitStep):
         return f"LIMIT {step.limit} on {step.input_alias}"

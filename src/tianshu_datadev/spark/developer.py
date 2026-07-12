@@ -109,12 +109,20 @@ class SparkDeveloperService:
 
             内部处理：
             1. Prompt 加载与渲染（PromptManager + SparkPlan JSON）
-            2. LLM 调用（adapter.invoke()）
-            3. Schema 校验（model_validate）
-            4. 重试逻辑（仅 AdapterError 可重试）
+            2. 注入确定性 provenance（plan_id / hash）——LLM 只读，不由其决定
+            3. LLM 调用（adapter.invoke()）
+            4. Schema 校验（model_validate）
+            5. 重试逻辑（仅 AdapterError 可重试）
+
+            注意：provenance 在 annotate() 中会再次被确定性覆盖——
+            此处注入仅为告知 LLM 这些值由系统管理，无需其填写或发出警告。
             """
             # 加载版本化 Prompt 模板
             template = prompt_manager.get_prompt("spark_annotator", "v001")
+
+            # 确定性 provenance——由 Python 计算，不由 LLM 决定
+            expected_plan_id = spark_plan.plan_id
+            expected_hash = SparkPlan.compute_plan_hash(spark_plan)
 
             # 渲染用户消息——将 SparkPlan 结构化为 JSON 注入模板
             spark_plan_json = json.dumps(
@@ -125,6 +133,19 @@ class SparkDeveloperService:
             user_message = template.user_message_template.replace(
                 "{spark_plan_json}", spark_plan_json
             )
+
+            # 注入确定性 provenance——LLM 只读，系统 metadata
+            provenance_lines = [
+                "",
+                "## 系统 Provenance（只读——以下值由系统确定性计算，不要修改或发出警告）",
+                "",
+                f"- plan_id: {expected_plan_id}",
+                f"- baseline_plan_hash: {expected_hash}",
+                "",
+                "重要：上述 plan_id 和 baseline_plan_hash 已经由系统确定。",
+                "输出时直接使用这些值，不要修改、不要置空、不要对其发出任何 warning。",
+            ]
+            user_message += "\n".join(provenance_lines)
 
             # 附加显式 step_id 指引——防止 LLM 从原始 JSON 推断错误 ID
             # （JSON 中 step_type 是枚举值 "read"，但 step_id 格式要求类名 "SparkReadStep_0"）
@@ -179,10 +200,15 @@ class SparkDeveloperService:
         """对 SparkPlan 做语义标注。
 
         流程：
-        1. 基于 SparkPlan 结构化字段构造 Prompt（不含 SQL 文本）
-        2. 调用 LLM 产出 AnnotatedSparkPlan
-        3. AnnotationValidator 校验产出
-        4. 返回通过校验的 AnnotatedSparkPlan
+        1. 计算确定性 provenance（plan_id / baseline_plan_hash）
+        2. 基于 SparkPlan 结构化字段构造 Prompt（不含 SQL 文本）
+        3. 调用 LLM（通过注入的 callable）产出 AnnotatedSparkPlan
+        4. 强制覆盖 LLM 返回的 plan_id 和 baseline_plan_hash
+        5. AnnotationValidator 校验产出（含 warning 过滤）
+        6. 返回通过校验的 AnnotatedSparkPlan
+
+        provenance 边界：plan_id 和 baseline_plan_hash 由 Python 确定性计算，
+        不由 LLM 决定。LLM 返回的值会被确定性覆盖。
 
         Args:
             spark_plan: mapper.py 产出的 SparkPlan
@@ -193,10 +219,22 @@ class SparkDeveloperService:
         Raises:
             ValueError: LLM 产出未通过 AnnotationValidator 校验
         """
+        # Step 0：计算确定性 provenance——plan_id 和 hash 由代码负责
+        expected_plan_id = spark_plan.plan_id
+        expected_hash = SparkPlan.compute_plan_hash(spark_plan)
+
         # Step 1：调用 LLM（生产：StructuredOutput，测试：mock）
         annotated = self._llm_call(spark_plan)
 
-        # Step 2：确定性校验
+        # Step 1.5：强制覆盖 provenance——LLM 返回的值不可信
+        annotated = annotated.model_copy(
+            update={
+                "plan_id": expected_plan_id,
+                "baseline_plan_hash": expected_hash,
+            }
+        )
+
+        # Step 2：确定性校验（含 warning 过滤）
         valid_step_ids = {
             f"{type(s).__name__}_{i}"
             for i, s in enumerate(spark_plan.steps)

@@ -2,18 +2,42 @@
 
 SparkDeveloper（LLM）只做语义标注，不增删改 SparkPlan step。
 所有标注经过 AnnotationValidator 确定性校验后才进入编译链路。
+
+Provenance 边界：
+- plan_id 和 baseline_plan_hash 由 Python 代码确定性计算——不由 LLM 填写
+- LLM 返回的 provenance 字段会被 annotate() 强制覆盖
+
+Warning contract：
+- 仅 4 种合法 category——超出范围的 warning 被确定性过滤并记录日志
+- warning 引用的 step_id 必须存在于 baseline 中
+- 未知 REVIEW 不会触发 human_review_suggested
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from enum import Enum
 from typing import Literal
 
 from pydantic import Field
 
 from tianshu_datadev.developer_spec.models import StrictModel
+
+logger = logging.getLogger(__name__)
+
+# ════════════════════════════════════════════
+# Warning category 封闭集合——仅此 4 种合法
+# ════════════════════════════════════════════
+
+# 合法 warning category——Prompt 模板必须与以下值保持同步
+ALLOWED_WARNING_CATEGORIES: frozenset[str] = frozenset({
+    "step_count_anomaly",     # step 数量异常（0 个或超过 20 个）
+    "missing_cleaning_step",  # 缺少常见清洗步骤（如无 Filter 直接 Project）
+    "window_missing_partition",  # 窗口函数缺少 PARTITION BY
+    "nonstandard_alias",      # 别名命名不规范
+})
 
 # ════════════════════════════════════════════
 # StepIntent 枚举——步骤意图分类
@@ -115,7 +139,9 @@ class AnnotationValidator:
     - annotation 数量 != steps 数量 → VALIDATION_ERROR（阻断编译）
     - step_id 不在 baseline 中 → VALIDATION_ERROR
     - step_id 重复 → VALIDATION_ERROR
-    - REVIEW 级别 warning → 标记 HumanReviewSuggested（不阻断）
+    - REVIEW 级别 warning（已知 category）→ 标记 HumanReviewSuggested（不阻断）
+    - 未知 category 的 warning → 确定性过滤 + 记录日志
+    - warning 引用的 step_id 不存在 → 移除该 warning + 记录日志
     """
 
     def validate(
@@ -155,7 +181,10 @@ class AnnotationValidator:
                 errors.append(f"step_id '{ann.step_id}' 重复")
             seen_ids.add(ann.step_id)
 
-        # 规则 4：REVIEW 级别 warning → HumanReviewSuggested
+        # 规则 4：确定性过滤 warning——未知 category、无效 step_id
+        self._validate_warnings(annotated, valid_step_ids)
+
+        # 规则 5：REVIEW 级别 warning（已知 category）→ HumanReviewSuggested
         for w in annotated.warnings:
             if w.severity == "REVIEW":
                 human_review_suggested = True
@@ -166,6 +195,46 @@ class AnnotationValidator:
             errors=errors,
             human_review_suggested=human_review_suggested,
         )
+
+    @staticmethod
+    def _validate_warnings(
+        annotated: AnnotatedSparkPlan,
+        valid_step_ids: set[str],
+    ) -> None:
+        """确定性过滤 warning——就地修改 annotated.warnings。
+
+        过滤规则：
+        1. 未知 category → 移除 + warning 日志（防止 LLM 越权告警）
+        2. step_id 非 None 但不在 valid_step_ids 中 → 移除 + warning 日志
+
+        这些是就地修改——LLM 输出的 warning 不是可执行指令，
+        过滤后不影响标注的正确性。
+        """
+        filtered: list = []
+        for w in annotated.warnings:
+            # 规则 1：未知 category → 过滤
+            if w.category not in ALLOWED_WARNING_CATEGORIES:
+                logger.warning(
+                    "AnnotationValidator: 过滤未知 warning category=%r "
+                    "（warning_id=%s, severity=%s）——不在合法集合 %s 中",
+                    w.category, w.warning_id, w.severity,
+                    sorted(ALLOWED_WARNING_CATEGORIES),
+                )
+                continue
+
+            # 规则 2：step_id 存在但在 baseline 中不存在 → 过滤
+            if w.step_id is not None and w.step_id not in valid_step_ids:
+                logger.warning(
+                    "AnnotationValidator: 过滤无效 step_id=%r 的 warning "
+                    "（warning_id=%s, category=%s）",
+                    w.step_id, w.warning_id, w.category,
+                )
+                continue
+
+            filtered.append(w)
+
+        # 就地替换——warnings 是非执行性提示，过滤不抛异常
+        annotated.warnings = filtered
 
 
 # ════════════════════════════════════════════
