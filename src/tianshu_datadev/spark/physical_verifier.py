@@ -239,27 +239,39 @@ class ResultCanonicalizer:
 
     @staticmethod
     def _normalize_value(value: Any) -> str:
-        """值归一化——统一 NULL/NaN/Decimal/datetime 表示。
+        """值归一化——统一 NULL/NaN/Decimal/datetime/float 表示。
 
-        DuckDB fetchall() 返回原生 Python datetime 对象，而 PySpark toJSON()
-        序列化后再经 json.loads() 还原的 datetime 变为 ISO 字符串（T 分隔）。
-        若不做归一化，两者 str() 结果不一致：
-        - DuckDB: datetime.datetime → str() → "2026-01-15 10:30:00"（空格分隔）
-        - PySpark: JSON ISO 字符串 → "2026-01-15T10:30:00"（T 分隔）
-        → 导致 PHYSICAL_VERIFIER 误报 RESULT_MISMATCH。
+        双引擎差异来源：
+        1. DuckDB (C++) vs PySpark (JVM) 浮点运算末位差异（~1e-15）
+           → round(value, 10) 消除
+        2. PySpark toJSON() 序列化 datetime → ISO 字符串（T 分隔）
+           → 检测并替换 T 为空格
+        3. DuckDB 返回原生 datetime 对象 vs PySpark 返回 ISO 字符串
+           → 统一格式化为 YYYY-MM-DD HH:MM:SS
+        4. DuckDB Decimal 类型 vs PySpark float/double 类型
+           → 统一转为字符串表示
         """
         import datetime as _dt
+        import math as _math
         import re as _re
 
         if value is None:
             return ""
         if isinstance(value, float):
-            import math
-            if math.isnan(value):
+            if _math.isnan(value):
                 return ""
-        # Decimal 归一化——转为字符串以避免精度差异
+            # 浮点精度归一化——DuckDB C++ 引擎与 PySpark JVM 引擎
+            # 对同一聚合运算（AVG/SUM）可能产生末位差异（~1e-15），
+            # 四舍五入到 10 位小数消除此差异。
+            # 例：DuckDB 3.9369690851405856 vs Spark 3.9369690851405883
+            #     → round(..., 10) → 3.9369690851（一致）
+            return str(round(value, 10))
+        # Decimal 归一化——转为 float 后再 round，与 PySpark float 路径对齐
+        # DuckDB DECIMAL(12,2) 的 str() 保留尾随零（如 '1266.70'），
+        # 而 PySpark double 的 str() 不保留（如 '1266.7'）——两者需统一。
+        # float 转换引入的精度损失与 PySpark JVM double 一致，round 后等价。
         if hasattr(value, "__class__") and value.__class__.__name__ == "Decimal":
-            return str(float(value))
+            return str(round(float(value), 10))
         # datetime.date → 规范化为 YYYY-MM-DD 格式
         if isinstance(value, _dt.date) and not isinstance(value, _dt.datetime):
             return value.isoformat()
@@ -337,6 +349,17 @@ class ResultCanonicalizer:
                 for key, val in row.items()
             }
             result.append(norm_row)
+
+        # Step 3.5：补齐缺失列——PySpark toJSON() 可能省略 null 字段的键
+        # 确保所有行的键集合一致，缺失键以空字符串填充（与 _normalize_value(None) 一致）
+        if result:
+            all_keys: set[str] = set()
+            for row in result:
+                all_keys.update(row.keys())
+            for row in result:
+                for key in all_keys:
+                    if key not in row:
+                        row[key] = ""
 
         # Step 4：去重（可选）
         if deduplicate:

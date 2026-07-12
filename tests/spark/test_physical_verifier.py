@@ -225,10 +225,93 @@ class TestResultCanonicalizer:
         # 不含 T 的日期字符串应原样保留
         assert result == "2026-01-15"
 
+    # ── 浮点精度归一化测试（双引擎 C++ vs JVM 末位差异修复）──
 
-# ════════════════════════════════════════════
-# DuckDB 真实执行测试（需要 duckdb + pyarrow）
-# ════════════════════════════════════════════
+    def test_float_precision_rounding(self):
+        """float 值四舍五入到 10 位小数——消除双引擎末位差异。"""
+        canonicalizer = ResultCanonicalizer()
+        result = canonicalizer._normalize_value(3.9369690851405856)
+        # round(3.9369690851405856, 10) = 3.9369690851
+        assert result == "3.9369690851"
+
+    def test_float_precision_dual_engine_equivalence(self):
+        """DuckDB 与 PySpark 浮点值归一化后一致。"""
+        canonicalizer = ResultCanonicalizer()
+        # 模拟 DuckDB C++ 引擎的浮点结果
+        duckdb_val = canonicalizer._normalize_value(3.9369690851405856)
+        # 模拟 PySpark JVM 引擎的浮点结果（末位不同）
+        spark_val = canonicalizer._normalize_value(3.9369690851405883)
+        assert duckdb_val == spark_val, (
+            f"双引擎浮点值归一化后应一致，"
+            f"duckdb={duckdb_val!r}, spark={spark_val!r}"
+        )
+
+    def test_float_nan_still_returns_empty(self):
+        """NaN 仍然返回空字符串（浮点精度修复不应影响 NaN 处理）。"""
+        canonicalizer = ResultCanonicalizer()
+        result = canonicalizer._normalize_value(float("nan"))
+        assert result == ""
+
+    def test_decimal_trailing_zero_normalization(self):
+        """Decimal 尾随零归一化——DuckDB DECIMAL(12,2) 的 '1266.70' 与 PySpark double 的 '1266.7' 对齐。"""
+        from decimal import Decimal
+        canonicalizer = ResultCanonicalizer()
+        duckdb_val = canonicalizer._normalize_value(Decimal("1266.70"))
+        spark_val = canonicalizer._normalize_value(1266.7)
+        assert duckdb_val == spark_val, (
+            f"Decimal 尾随零归一化后应与 float 一致，"
+            f"decimal={duckdb_val!r}, float={spark_val!r}"
+        )
+
+    def test_decimal_integer_value_normalization(self):
+        """Decimal 整数值（如 '0'）归一化后与 float 一致。"""
+        from decimal import Decimal
+        canonicalizer = ResultCanonicalizer()
+        assert canonicalizer._normalize_value(Decimal("0")) == "0.0"
+        assert canonicalizer._normalize_value(0.0) == "0.0"
+
+    def test_missing_column_filled_in_canonicalize(self):
+        """PySpark toJSON() 省略 null 字段——canonicalize 补齐缺失列。
+
+        真实场景：714 行中 712 行有 total_revenue 键，最后 2 行（NULL 值）缺失该键。
+        补齐依赖同结果集中其他行提供键名。
+        """
+        canonicalizer = ResultCanonicalizer()
+        # 模拟真实场景：前 712 行有 total_revenue，最后 2 行缺失
+        spark_rows = [
+            {"pickup_date_key": "2026-03-31", "borough": "Bronx",
+             "total_fare": "21.97", "total_revenue": "0"},
+            {"pickup_date_key": "2026-03-31", "borough": "Brooklyn",
+             "total_fare": "63.78"},  # 缺少 total_revenue
+        ]
+        spark_norm = canonicalizer.canonicalize(spark_rows, order_keys=["pickup_date_key", "borough"])
+
+        assert len(spark_norm) == 2
+        # 第二行应补齐 total_revenue 键
+        assert "total_revenue" in spark_norm[1], (
+            f"canonicalize 应补齐缺失的 total_revenue 列，"
+            f"实际键={sorted(spark_norm[1].keys())}"
+        )
+        # 补齐值应为空字符串（与 _normalize_value(None) 一致）
+        assert spark_norm[1]["total_revenue"] == "", (
+            f"缺失列补齐值应为空字符串，实际={spark_norm[1]['total_revenue']!r}"
+        )
+
+    def test_missing_column_filled_across_multiple_rows(self):
+        """补齐缺失列——多行场景，某些行有键、某些行无键。"""
+        canonicalizer = ResultCanonicalizer()
+        rows = [
+            {"a": "1", "b": "x"},
+            {"a": "2"},           # 缺少 b
+            {"a": "3", "b": "z"},
+        ]
+        result = canonicalizer.canonicalize(rows, order_keys=["a"])
+        assert len(result) == 3
+        for i, row in enumerate(result):
+            assert "b" in row, f"第 {i} 行应补齐 b 列，实际键={sorted(row.keys())}"
+        assert result[1]["b"] == ""  # 缺失的 b 应为空字符串
+        assert result[0]["b"] == "x"
+        assert result[2]["b"] == "z"
 
 
 @pytest.fixture
