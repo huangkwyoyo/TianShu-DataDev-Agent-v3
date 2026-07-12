@@ -239,7 +239,18 @@ class ResultCanonicalizer:
 
     @staticmethod
     def _normalize_value(value: Any) -> str:
-        """值归一化——统一 NULL/NaN/Decimal 表示。"""
+        """值归一化——统一 NULL/NaN/Decimal/datetime 表示。
+
+        DuckDB fetchall() 返回原生 Python datetime 对象，而 PySpark toJSON()
+        序列化后再经 json.loads() 还原的 datetime 变为 ISO 字符串（T 分隔）。
+        若不做归一化，两者 str() 结果不一致：
+        - DuckDB: datetime.datetime → str() → "2026-01-15 10:30:00"（空格分隔）
+        - PySpark: JSON ISO 字符串 → "2026-01-15T10:30:00"（T 分隔）
+        → 导致 PHYSICAL_VERIFIER 误报 RESULT_MISMATCH。
+        """
+        import datetime as _dt
+        import re as _re
+
         if value is None:
             return ""
         if isinstance(value, float):
@@ -249,6 +260,18 @@ class ResultCanonicalizer:
         # Decimal 归一化——转为字符串以避免精度差异
         if hasattr(value, "__class__") and value.__class__.__name__ == "Decimal":
             return str(float(value))
+        # datetime.date → 规范化为 YYYY-MM-DD 格式
+        if isinstance(value, _dt.date) and not isinstance(value, _dt.datetime):
+            return value.isoformat()
+        # datetime.datetime → 规范化为 YYYY-MM-DD HH:MM:SS 格式（空格分隔，与 DuckDB 一致）
+        if isinstance(value, _dt.datetime):
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        # 字符串：检测 ISO 8601 datetime 格式（T 分隔，如 "2026-01-15T10:30:00"）
+        # PySpark toJSON() 序列化产物——需归一化为空格分隔以与 DuckDB 原生 str() 对齐
+        if isinstance(value, str) and _re.match(
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?$", value,
+        ):
+            return value.replace("T", " ")
         return str(value)
 
     def canonicalize(

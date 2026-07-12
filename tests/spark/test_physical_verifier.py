@@ -163,6 +163,68 @@ class TestResultCanonicalizer:
         assert len(result) == 1
         assert result[0]["id"] == "1"
 
+    # ── datetime 归一化测试（双引擎 JSON 往返类型丢失修复）──
+
+    def test_datetime_date_normalization(self):
+        """datetime.date → ISO 格式字符串 YYYY-MM-DD。"""
+        import datetime as _dt
+        canonicalizer = ResultCanonicalizer()
+        result = canonicalizer._normalize_value(_dt.date(2026, 1, 15))
+        assert result == "2026-01-15"
+
+    def test_datetime_datetime_normalization(self):
+        """datetime.datetime → 空格分隔格式（与 DuckDB str() 对齐）。"""
+        import datetime as _dt
+        canonicalizer = ResultCanonicalizer()
+        result = canonicalizer._normalize_value(
+            _dt.datetime(2026, 1, 15, 10, 30, 0),
+        )
+        assert result == "2026-01-15 10:30:00"
+
+    def test_iso_t_string_normalization(self):
+        """ISO 8601 T 分隔字符串 → 空格分隔——PySpark toJSON() 产物归一化。"""
+        canonicalizer = ResultCanonicalizer()
+        result = canonicalizer._normalize_value("2026-01-15T10:30:00")
+        assert result == "2026-01-15 10:30:00"
+
+    def test_iso_t_microsecond_string_normalization(self):
+        """ISO 8601 含微秒的 T 分隔字符串 → 保留微秒的空格分隔。"""
+        canonicalizer = ResultCanonicalizer()
+        result = canonicalizer._normalize_value("2026-01-15T10:30:00.123456")
+        assert result == "2026-01-15 10:30:00.123456"
+
+    def test_duckdb_datetime_vs_spark_json_string_equivalence(self):
+        """DuckDB 原生 datetime 与 PySpark JSON 字符串归一化后等价。
+
+        这是 PHYSICAL_VERIFIER RESULT_MISMATCH 的根因修复验证——
+        DuckDB fetchall() 返回 datetime.datetime，PySpark toJSON() 产生
+        ISO T 分隔字符串，_normalize_value 必须将两者归一化为相同格式。
+        """
+        import datetime as _dt
+        canonicalizer = ResultCanonicalizer()
+        duckdb_val = canonicalizer._normalize_value(
+            _dt.datetime(2026, 1, 15, 10, 30, 0),
+        )
+        spark_val = canonicalizer._normalize_value("2026-01-15T10:30:00")
+        assert duckdb_val == spark_val, (
+            f"DuckDB datetime 与 PySpark JSON 归一化后应一致，"
+            f"实际 duckdb={duckdb_val!r}, spark={spark_val!r}"
+        )
+
+    def test_plain_string_not_affected(self):
+        """非 datetime 格式的普通字符串不受影响。"""
+        canonicalizer = ResultCanonicalizer()
+        assert canonicalizer._normalize_value("Manhattan") == "Manhattan"
+        assert canonicalizer._normalize_value("2026-01-15") == "2026-01-15"
+        assert canonicalizer._normalize_value(42) == "42"
+
+    def test_date_iso_string_not_mistaken_for_datetime(self):
+        """YYYY-MM-DD 格式的日期字符串不应被误当 datetime 处理（不含 T）。"""
+        canonicalizer = ResultCanonicalizer()
+        result = canonicalizer._normalize_value("2026-01-15")
+        # 不含 T 的日期字符串应原样保留
+        assert result == "2026-01-15"
+
 
 # ════════════════════════════════════════════
 # DuckDB 真实执行测试（需要 duckdb + pyarrow）
