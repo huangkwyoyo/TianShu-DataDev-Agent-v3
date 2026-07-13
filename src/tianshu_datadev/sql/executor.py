@@ -194,6 +194,72 @@ class DuckDBExecutor:
             )
             return trace, summary
 
+    # ── CDP digest 执行（Task 5） ──
+
+    def execute_with_cdp(
+        self,
+        compiled: CompiledSql,
+        spec,
+        snapshot_id: str,
+    ):
+        """执行 SQL 并在引擎内部计算 CDP digest——不将 output_rows 传回 Python。
+
+        Args:
+            compiled: CompiledSql 对象——Comiler 产物
+            spec: CreDigestSpec——CDP 摘要规范
+            snapshot_id: 快照 ID（用于溯源）
+
+        Returns:
+            DigestExecutionEnvelope——含 full_digest 和 row_count，不含 samples
+        """
+        from tianshu_datadev.spark.cdp_duckdb_builder import DuckdbCdpBuilder
+        from tianshu_datadev.spark.cdp_spec import (
+            DigestExecutionEnvelope,
+            EngineDigestSummary,
+            compute_digest_spec_hash,
+        )
+
+        builder = DuckdbCdpBuilder()
+        spec_hash_hex = compute_digest_spec_hash(spec).hex()
+        # spec_hash_hex 作为参数传入 build_query——仅通过 f-string 格式化
+        cdp_query = builder.build_query(
+            compiled.sql, spec, spec_hash_hex=spec_hash_hex
+        )
+
+        try:
+            import duckdb
+
+            con = duckdb.connect(":memory:")
+            # 与现有 execute() 一致——加载 CSV fixture 和外部数据库
+            self._load_tables(con)
+            self._attach_database(con)
+
+            result = con.execute(cdp_query).fetchone()
+            full_digest = str(result[0])
+            row_count = int(result[1])
+
+            return DigestExecutionEnvelope(
+                execution_status="SUCCESS",
+                snapshot_id=snapshot_id,
+                digest_spec_hash=spec_hash_hex,
+                protocol_version="cdp-v1",
+                engine_version="duckdb",
+                summary=EngineDigestSummary(
+                    row_count=row_count,
+                    full_digest=full_digest,
+                    samples=[],
+                ),
+            )
+        except Exception as e:
+            return DigestExecutionEnvelope(
+                execution_status="FAILED",
+                snapshot_id=snapshot_id,
+                digest_spec_hash=spec_hash_hex,
+                protocol_version="cdp-v1",
+                engine_version="duckdb",
+                error=str(e),
+            )
+
     # ── 多语句执行（Phase 3A） ──
 
     def execute_program(
