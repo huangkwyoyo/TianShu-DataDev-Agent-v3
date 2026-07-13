@@ -13,6 +13,9 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from tianshu_datadev.cre_models import CreShadowReport
+
 from tianshu_datadev.api.templates import TEMPLATES
 from tianshu_datadev.artifacts.contract_extractor import DataTransformContractExtractor
 from tianshu_datadev.artifacts.packager import PackageInputs, ReviewPackageBuilder
@@ -2725,6 +2728,37 @@ class Pipeline:
                     self._do_spark_compare(artifacts, context)
                 elif stage == SparkPipelineStage.PHYSICAL_VERIFIER:
                     self._do_spark_physical_verify(artifacts, context)
+                    # ── CRE shadow 最终硬化：物理验证后原子追加 CRE 报告到 Review Package ──
+                    # ReviewPackageFinalizer 验证已有 Manifest 全部 artifact 哈希后原子追加
+                    if context.cre_shadow_report is not None:
+                        from tianshu_datadev.artifacts.finalizer import (
+                            ReviewPackageFinalizer,
+                        )
+                        finalizer = ReviewPackageFinalizer(self._base_output_dir)
+                        cre_result = finalizer.finalize(
+                            request_id, context.cre_shadow_report,
+                        )
+                        if not cre_result.success:
+                            # ── Point 2：失败时 CRE 标记 diagnostic_available=False、
+                            #    audit_status=INCOMPLETE ──
+                            # 禁止只写 warning——必须在 API/阶段报告中可见
+                            context.cre_shadow_report.diagnostic_available = False
+                            cre_err_msg = (
+                                f"[CRE_FINALIZER] CRE shadow 写入 Review Package 失败："
+                                f"audit_status={cre_result.audit_status}，"
+                                f"错误={'; '.join(cre_result.errors)}"
+                            )
+                            context.errors.append(cre_err_msg)
+                            logger.error(cre_err_msg)
+                        else:
+                            logger.info(
+                                "CRE shadow 已写入 Review Package：request_id=%s, "
+                                "cre_hash=%s, artifacts: %d → %d",
+                                request_id,
+                                cre_result.cre_shadow_report_hash,
+                                cre_result.artifacts_before,
+                                cre_result.artifacts_after,
+                            )
         except Exception as e:
             context.stage_results[stage_val] = "FAILURE"
             # 去重：同一阶段同一异常不重复追加
@@ -3436,7 +3470,17 @@ class Pipeline:
 
         # Step 6：执行双引擎物理验证
         try:
-            from tianshu_datadev.spark.physical_verifier import PhysicalVerifier
+            from tianshu_datadev.cre_models import (
+                DecimalStrategy,
+                EnvironmentManifest,
+                NormalizationColumn,
+                NullStrategy,
+                SpecialFloatStrategy,
+            )
+            from tianshu_datadev.spark.physical_verifier import (
+                NormalizationConfig,
+                PhysicalVerifier,
+            )
 
             contract_hash = ""
             if artifacts.data_transform_contract is not None:
@@ -3455,7 +3499,99 @@ class Pipeline:
                 if hasattr(artifacts.compiled_sql, "sql")
                 else str(artifacts.compiled_sql)
             )
-            verifier = PhysicalVerifier()
+            # 从 Contract output_columns 提取权威 schema 列定义
+            norm_columns: list[NormalizationColumn] = []
+            primary_keys: list[str] = []
+            if artifacts.data_transform_contract is not None:
+                from tianshu_datadev.artifacts.models import DataTransformContractV1
+                if isinstance(artifacts.data_transform_contract, DataTransformContractV1):
+                    for col in artifacts.data_transform_contract.output_columns:
+                        norm_columns.append(NormalizationColumn(
+                            column_name=col.alias or col.column_name,
+                            data_type=col.data_type,
+                        ))
+                    # 从 Contract grouping_keys 提取权威主键（CRE shadow 行对齐用）
+                    if artifacts.data_transform_contract.grouping_keys:
+                        primary_keys = list(artifacts.data_transform_contract.grouping_keys)
+
+            # ── 构造 CRE EnvironmentManifest——明确优先级（Point 4）──
+            # 优先级：Contract 显式策略 > 实际执行环境事实 > UNKNOWN
+            # 禁止猜测；UNKNOWN 仅使相关语义进入 HUMAN_REVIEW，不得误伤不涉及该策略的精确一致场景
+
+            # Level 1：检测实际执行环境事实（引擎版本）
+            try:
+                import duckdb as _duckdb_mod
+                _duckdb_ver = _duckdb_mod.__version__
+            except ImportError:
+                _duckdb_ver = "UNKNOWN"
+            try:
+                import pyspark as _pyspark_mod
+                _spark_ver = _pyspark_mod.__version__
+            except ImportError:
+                _spark_ver = "UNKNOWN"
+
+            # Level 2：从 Contract 提取显式策略（如有）
+            contract_timezone = ""
+            has_float_columns = False
+            has_decimal_columns = False
+            if artifacts.data_transform_contract is not None:
+                from tianshu_datadev.artifacts.models import DataTransformContractV1
+                if isinstance(artifacts.data_transform_contract, DataTransformContractV1):
+                    contract_timezone = getattr(
+                        artifacts.data_transform_contract, "timezone", "",
+                    ) or ""
+                    # 分析输出列类型——确定哪些策略是相关的
+                    for col in artifacts.data_transform_contract.output_columns:
+                        dt = (col.data_type or "").lower()
+                        if dt in ("float", "double", "real", "float4", "float8"):
+                            has_float_columns = True
+                        elif dt.startswith("decimal") or dt.startswith("numeric"):
+                            has_decimal_columns = True
+
+            # Level 3：应用优先级——Contract 显式 > 环境事实 > UNKNOWN
+            # - 引擎版本：来自实际执行环境（Level 1）
+            # - 时区：来自 Contract（Level 2）
+            # - 特殊浮点策略：无 float/double 列 → 安全设为 EQUAL（不会遇到 NaN/Inf）
+            #   有 float 列但未声明策略 → UNKNOWN（保守回退）
+            # - Decimal 策略：无 decimal 列 → 安全设为 EXACT
+            #   有 decimal 列但未声明策略 → UNKNOWN
+            # - NULL 策略、ANSI SQL、大小写敏感：无法证明 → UNKNOWN
+            cre_env_manifest = EnvironmentManifest(
+                duckdb_version=_duckdb_ver,
+                spark_version=_spark_ver,
+                timezone=contract_timezone,
+                # 无法从 Contract 或环境证明的字段——设为 None/UNKNOWN
+                ansi_sql=None,
+                case_sensitive_compare=None,
+                # NaN/Inf 策略：无 float 列则安全，否则 UNKNOWN
+                nan_handling=(
+                    SpecialFloatStrategy.EQUAL if not has_float_columns
+                    else SpecialFloatStrategy.UNKNOWN
+                ),
+                pos_inf_handling=(
+                    SpecialFloatStrategy.EQUAL if not has_float_columns
+                    else SpecialFloatStrategy.UNKNOWN
+                ),
+                neg_inf_handling=(
+                    SpecialFloatStrategy.EQUAL if not has_float_columns
+                    else SpecialFloatStrategy.UNKNOWN
+                ),
+                # Decimal 策略：无 decimal 列则安全，否则 UNKNOWN
+                decimal_strategy=(
+                    DecimalStrategy.EXACT if not has_decimal_columns
+                    else DecimalStrategy.UNKNOWN
+                ),
+                # NULL 策略——无法从 Contract 证明，始终 UNKNOWN
+                null_strategy=NullStrategy.UNKNOWN,
+            )
+
+            # 构造规范化配置（Phase 9B）
+            norm_config = NormalizationConfig(
+                output_columns=norm_columns,
+                contract_hash=contract_hash,
+                primary_keys=primary_keys,
+            )
+            verifier = PhysicalVerifier(normalization_config=norm_config)
             report = verifier.verify(
                 sql_query=sql_query,
                 pyspark_code=context.sandbox_transform_code,
@@ -3465,9 +3601,18 @@ class Pipeline:
                 order_keys=order_keys if order_keys else None,
                 uncovered_step_types=uncovered_types if uncovered_types else None,
                 duckdb_path=self._duckdb_path,
+                # CRE shadow 参数——Pipeline 显式传入
+                cre_primary_keys=primary_keys if primary_keys else None,
+                cre_timezone=contract_timezone,
+                cre_environment_manifest=cre_env_manifest,
             )
 
-            # Step 7：判定结果
+            # Step 7：将 CRE shadow 报告存入上下文——严格 Pydantic 模型，清除 dict 逃生口
+            # 后续由 RECAP/REVIEWER 阶段经 PackageInputs → ReviewPackageBuilder 一次性写入
+            if report.cre_shadow_report is not None:
+                context.cre_shadow_report = report.cre_shadow_report
+
+            # Step 8：判定结果
             from tianshu_datadev.spark.physical_verifier import PhysicalVerificationStatus
             if report.status == PhysicalVerificationStatus.RESULT_CONSISTENT:
                 context.stage_results["PHYSICAL_VERIFIER"] = "SUCCESS"
@@ -3482,9 +3627,22 @@ class Pipeline:
                     f"状态={report.status.value}，"
                     f"差异条目数={diff_count}"
                 )
+                # 真实差异总数（与返回的详细差异数可能不同）
+                if report.total_diff_count != diff_count:
+                    diag_msg += f"，总差异数={report.total_diff_count}"
+                if report.diffs_truncated:
+                    diag_msg += "，差异已截断（最多显示20条）"
                 # 附加 report.error_message——包含 DuckDB/Spark 执行失败的详细原因
                 if report.error_message:
                     diag_msg += f"，详情={report.error_message}"
+                # 附加容差配置快照
+                if report.normalization_config_snapshot:
+                    snap = report.normalization_config_snapshot
+                    diag_msg += (
+                        f"，容差配置="
+                        f"float_abs={snap.get('float_abs_tolerance', 'N/A')}, "
+                        f"output_cols={snap.get('output_column_count', 'N/A')}"
+                    )
                 # 附加 DuckDB 侧错误
                 if report.duckdb_result and report.duckdb_result.error_message:
                     diag_msg += f"，DuckDB错误={report.duckdb_result.error_message}"
@@ -3495,7 +3653,6 @@ class Pipeline:
         except Exception as e:
             context.stage_results["PHYSICAL_VERIFIER"] = "FAILURE"
             context.errors.append(f"[PHYSICAL_VERIFIER] 执行异常：{e}")
-
 
 def _safe_enum_value(obj, attr: str) -> str:
     """安全获取枚举属性的字符串值——兼容 Enum 和普通属性。"""
@@ -3579,6 +3736,8 @@ class SparkStageContext:
     annotation_result: "AnnotatedSparkPlan | None" = None
     stage_results: dict[str, str] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    # ── CRE shadow 最终硬化：严格 Pydantic 模型，清除 dict 逃生口 ──
+    cre_shadow_report: "CreShadowReport | None" = None
 
 
 class SparkDependencyMissingError(Exception):
