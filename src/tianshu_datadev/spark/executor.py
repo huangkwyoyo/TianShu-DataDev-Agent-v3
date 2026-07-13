@@ -53,6 +53,8 @@ class SparkExecutionResult:
     return_code: int = -1
     execution_time_ms: float = 0.0
     # 解析后的 DataFrame 输出（行为 dict 列表，由调用方解析）
+    # [CDP v1 迁移提示] Task 9 接管后，PhysicalVerifier 将不再使用 output_rows
+    # 进行逐行对比——CDP 摘要替代全量数据回传。该字段在 Shadow 阶段保留。
     output_rows: list[dict] = field(default_factory=list)
     error_message: str = ""
     # 资源使用记录（可观测性）

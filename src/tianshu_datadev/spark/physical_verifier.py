@@ -1058,6 +1058,9 @@ class PhysicalVerifier:
         }
 
     # ── 差异计算 ──
+    # [CDP v1 迁移提示] _compute_diffs() 将在 Task 9 CDP 接管后删除。
+    # 替换路径：verify() → CDP shadow → compare() → 基于 digest 的判定。
+    # 逐行逐列对比的 legacy 逻辑由 CDP 摘要对比替代。
 
     @staticmethod
     def _compute_diffs(
