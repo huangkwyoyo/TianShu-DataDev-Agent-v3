@@ -420,6 +420,10 @@ class PhysicalVerificationReport(StrictModel):
         default_factory=list,
     )
     error_message: str = ""                        # 整体错误信息
+    cdp_shadow_result: dict | None = Field(       # CDP shadow 摘要对比结果（Task 8）
+        default=None,
+        description="CDP v1 引擎侧摘要对比结果——仅在双引擎均成功时填充。含 status 和 decision_reason。",
+    )
 
 
 # ════════════════════════════════════════════
@@ -628,7 +632,27 @@ class PhysicalVerifier:
                 error_message=f"Spark 执行失败：{spark_result.error_message}",
             )
 
-        # Step 6：对比结果
+        # Step 6：CDP v1 Engine-side Shadow（Task 8）
+        # 在 legacy 判定之外并行计算 CDP 摘要——不影响现有逻辑
+        cdp_shadow_result = None
+        try:
+            cdp_spec = self._infer_cdp_spec(duckdb_result.output_rows)
+            if cdp_spec is not None:
+                cdp_shadow_result = self._run_cdp_shadow(
+                    sql_query=sql_query,
+                    snapshot_dir=snapshot_dir,
+                    cdp_spec=cdp_spec,
+                    snapshot_id=snapshot_id,
+                    duckdb_con=None,  # 新建独立连接
+                )
+        except Exception:
+            # Shadow 异常不影响 legacy 判定
+            import logging
+            logging.getLogger(__name__).warning(
+                "CDP shadow 执行异常——已忽略", exc_info=True,
+            )
+
+        # Step 7：对比结果
         duckdb_canonical_count = len(duckdb_rows)
         spark_canonical_count = len(spark_rows)
         row_count_match = duckdb_canonical_count == spark_canonical_count
@@ -684,6 +708,7 @@ class PhysicalVerifier:
             row_count_match=row_count_match,
             schema_match=schema_match,
             uncovered_step_types=uncovered,
+            cdp_shadow_result=cdp_shadow_result,
         )
 
     # ── DuckDB 执行 ──
@@ -836,6 +861,201 @@ class PhysicalVerifier:
             data_dir=snapshot_dir,
             output_var="result_df",
         )
+
+    # ── CDP v1 Engine-side Shadow（Task 8） ──
+
+    @staticmethod
+    def _infer_cdp_spec(output_rows: list[dict]) -> object | None:
+        """从执行结果的列类型推断 CreDigestSpec——用于 CDP shadow 摘要计算。
+
+        DuckDB 查询结果的 Python 类型 → TypeFamily 映射：
+        - int → INT64（DuckDB 默认整数类型）
+        - float → FLOAT64
+        - str → VARCHAR
+        - bool → BOOLEAN
+        - NoneType / 其他 → 跳过（无法确定类型）
+
+        Args:
+            output_rows: DuckDB 执行结果行列表
+
+        Returns:
+            CreDigestSpec 或 None（列数不足 / 类型不兼容时返回 None）
+        """
+        if not output_rows:
+            return None
+
+        from tianshu_datadev.spark.cdp_spec import CreDigestSpec, TypeFamily
+
+        # 收集所有列名及其可能的 Python 类型
+        col_names = list(output_rows[0].keys())
+        if not col_names:
+            return None
+
+        # 从所有行中推断每列的类型（取第一个非 None 值的类型）
+        col_types: list[TypeFamily] = []
+        for col in col_names:
+            tf = PhysicalVerifier._guess_type_family(col, output_rows)
+            if tf is None:
+                return None  # 无法确定全部列的类型
+            col_types.append(tf)
+
+        n = len(col_names)
+        return CreDigestSpec(
+            output_columns=col_names,
+            type_families=col_types,
+            timezone="UTC",
+            decimal_precision=[None] * n,
+            decimal_scale=[None] * n,
+            float_precision=[None] * n,
+        )
+
+    @staticmethod
+    def _guess_type_family(col: str, rows: list[dict]) -> object | None:
+        """从行数据中推断单列的 TypeFamily——取第一个非 None 值的 Python 类型。
+
+        Args:
+            col: 列名
+            rows: 数据行列表
+
+        Returns:
+            TypeFamily 或 None（无法确定时）
+        """
+        from tianshu_datadev.spark.cdp_spec import TypeFamily
+
+        for row in rows:
+            v = row.get(col)
+            if v is None:
+                continue
+            if isinstance(v, bool):
+                return TypeFamily.BOOLEAN
+            if isinstance(v, int):
+                return TypeFamily.INT64
+            if isinstance(v, float):
+                return TypeFamily.FLOAT64
+            if isinstance(v, str):
+                return TypeFamily.VARCHAR
+            # 其他类型暂不支持
+            return None
+        # 全部为 None——默认 VARCHAR
+        return TypeFamily.VARCHAR
+
+    def _run_cdp_shadow(
+        self,
+        sql_query: str,
+        snapshot_dir: str,
+        cdp_spec: object,
+        snapshot_id: str,
+        duckdb_con=None,
+    ) -> dict | None:
+        """执行 CDP v1 engine-side shadow——双引擎摘要计算 + compare()。
+
+        Shadow 路径禁止接触 output_rows——仅在引擎内部计算 CDP digest，
+        接收两个 DigestExecutionEnvelope，调用 compare() 对比。
+
+        Args:
+            sql_query: DuckDB SQL 查询
+            snapshot_dir: 快照目录
+            cdp_spec: CreDigestSpec 实例
+            snapshot_id: 快照 ID
+            duckdb_con: 可选的已有 DuckDB 连接（None 时新建）
+
+        Returns:
+            dict——含 status, decision_reason, duckdb_digest, spark_digest
+            任一引擎失败时返回 None
+        """
+        import logging
+
+        from tianshu_datadev.spark.cdp_spec import (
+            DigestExecutionEnvelope,
+            EngineDigestSummary,
+            compare,
+            compute_digest_spec_hash,
+        )
+
+        logger = logging.getLogger(__name__)
+        spec_hash_hex = compute_digest_spec_hash(cdp_spec).hex()
+
+        # ── DuckDB CDP ──
+        duckdb_envelope = None
+        own_con = False
+        try:
+            if duckdb_con is None:
+                import duckdb
+
+                duckdb_con = duckdb.connect()
+                own_con = True
+                # 注册快照视图（与 _execute_duckdb 相同的协议）
+                _register_parquet_views(duckdb_con, snapshot_dir)
+
+            from tianshu_datadev.spark.cdp_duckdb_builder import DuckdbCdpBuilder
+
+            builder = DuckdbCdpBuilder()
+            cdp_query = builder.build_query(
+                sql_query, cdp_spec, spec_hash_hex=spec_hash_hex,
+            )
+            result = duckdb_con.execute(cdp_query).fetchone()
+            duckdb_envelope = DigestExecutionEnvelope(
+                execution_status="SUCCESS",
+                snapshot_id=snapshot_id,
+                digest_spec_hash=spec_hash_hex,
+                protocol_version="cdp-v1",
+                engine_version="duckdb",
+                summary=EngineDigestSummary(
+                    row_count=int(result[1]),
+                    full_digest=str(result[0]),
+                    samples=[],
+                ),
+            )
+        except Exception:
+            logger.warning("CDP shadow: DuckDB CDP 计算失败", exc_info=True)
+            return None
+        finally:
+            if own_con and duckdb_con is not None:
+                try:
+                    duckdb_con.close()
+                except Exception:
+                    pass
+
+        # ── Spark CDP ──
+        spark_envelope = None
+        try:
+            spark_envelope = self._spark_executor.execute_with_cdp(
+                spec=cdp_spec,
+                snapshot_id=snapshot_id,
+                data_dir=snapshot_dir,
+            )
+        except Exception:
+            logger.warning("CDP shadow: Spark CDP 计算失败", exc_info=True)
+            return None
+
+        if spark_envelope is None or duckdb_envelope is None:
+            return None
+
+        # 任一引擎失败
+        if duckdb_envelope.execution_status != "SUCCESS":
+            logger.info(
+                "CDP shadow: DuckDB CDP 失败 status=%s",
+                duckdb_envelope.execution_status,
+            )
+            return None
+        if spark_envelope.execution_status != "SUCCESS":
+            logger.info(
+                "CDP shadow: Spark CDP 失败 status=%s",
+                spark_envelope.execution_status,
+            )
+            return None
+
+        # ── 对比 ──
+        comparison = compare(duckdb_envelope, spark_envelope)
+        logger.info(
+            "CDP shadow: status=%s reason=%s",
+            comparison.status,
+            comparison.decision_reason,
+        )
+        return {
+            "status": comparison.status,
+            "decision_reason": comparison.decision_reason,
+        }
 
     # ── 差异计算 ──
 
