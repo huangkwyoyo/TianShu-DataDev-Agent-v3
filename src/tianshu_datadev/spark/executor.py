@@ -826,14 +826,24 @@ class LocalSparkExecutor:
                 error=f"子进程执行失败 ({result.status}): {result.error_message}",
             )
 
-        # 解析 stdout 中的 JSON 结果
+        # 解析 stdout 中标记分隔的 JSON 结果
         try:
             import json
 
+            start_marker = builder._MARKER_START
+            end_marker = builder._MARKER_END
+
+            in_result = False
             for line in result.stdout.split("\n"):
-                line = line.strip()
-                if line.startswith("{"):
-                    data = json.loads(line)
+                stripped = line.strip()
+                if stripped == start_marker:
+                    in_result = True
+                    continue
+                if stripped == end_marker:
+                    in_result = False
+                    continue
+                if in_result and stripped.startswith("{"):
+                    data = json.loads(stripped)
                     full_digest = str(data["full_digest"])
                     row_count = int(data["row_count"])
                     return DigestExecutionEnvelope(
@@ -848,14 +858,17 @@ class LocalSparkExecutor:
                             samples=[],
                         ),
                     )
-            # 未找到 JSON 行
+            # 未找到标记分隔的 JSON 行
             return DigestExecutionEnvelope(
                 execution_status="FAILED",
                 snapshot_id=snapshot_id,
                 digest_spec_hash=spec_hash_hex,
                 protocol_version="cdp-v1",
                 engine_version="spark",
-                error=f"stdout 中未找到 JSON 结果行:\n{result.stdout[:2000]}",
+                error=(
+                    f"stdout 中未找到 CDP 标记分隔的 JSON 结果"
+                    f"（start={start_marker}）：\n{result.stdout[:2000]}"
+                ),
             )
         except Exception as e:
             return DigestExecutionEnvelope(
