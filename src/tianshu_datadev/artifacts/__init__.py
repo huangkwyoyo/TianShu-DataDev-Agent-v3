@@ -10,6 +10,9 @@ DataTransformContract-lite 从 SqlBuildPlan 确定性抽取，不依赖 LLM。
 # ── 数据模型 ──
 # ── Contract 抽取器 ──
 from .contract_extractor import DataTransformContractExtractor
+
+# ── Finalizer ──
+from .finalizer import FinalizerResult, ReviewPackageFinalizer
 from .models import (
     REVIEW_ROUTING_TABLE,
     VALID_REVIEW_TARGETS,
@@ -62,6 +65,9 @@ __all__ = [
     "ValidationSummaryArtifact",
     # Contract 抽取器
     "DataTransformContractExtractor",
+    # Finalizer
+    "FinalizerResult",
+    "ReviewPackageFinalizer",
     # Packager
     "ReviewPackageBuilder",
     # 生成器

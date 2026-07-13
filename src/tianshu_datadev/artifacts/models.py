@@ -13,6 +13,11 @@ from typing import Literal
 
 from pydantic import Field
 
+from tianshu_datadev.cre_models import CreShadowReport
+
+# CreShadowReport 从 spark.cre_models 导入——cre_models 仅依赖 developer_spec.models，
+# 不形成 spark/__init__ → spark/models → artifacts/models → spark/cre_models 的循环。
+# 已验证：运行时导入安全。
 from tianshu_datadev.developer_spec.models import StrictModel
 
 # ── ReviewFeedback 路由 target 字面量类型 ──
@@ -322,6 +327,7 @@ class ReviewPackageManifest(StrictModel):
     sql_artifact_hash: str = ""  # SqlArtifact SHA-256
     data_transform_contract_hash: str = ""  # DataTransformContract SHA-256
     provenance_hash: str = ""  # provenance.yml SHA-256
+    cre_shadow_report_hash: str = ""  # CRE shadow 诊断报告 SHA-256
     retry_count: int = 0  # 返工轮次
 
     @staticmethod
@@ -428,3 +434,7 @@ class PackageInputs(StrictModel):
     sql_program_artifact: dict | None = None  # SqlProgramArtifact.model_dump()——多语句编译产物
     # ── Phase 9B-P0: Snapshot 集成 ──
     snapshot_manifest: dict | None = None  # SnapshotManifest.model_dump()——可选
+    # ── CRE shadow 最终硬化：严格 Pydantic 模型，零 Any 逃生口 ──
+    # cre_models.py 是中立模块（仅依赖 developer_spec.models），
+    # spark/__init__ → spark/models → artifacts/models → spark/cre_models 不形成循环。
+    cre_shadow_report: CreShadowReport | None = None

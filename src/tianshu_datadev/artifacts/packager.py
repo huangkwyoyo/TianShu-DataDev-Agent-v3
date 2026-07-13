@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from datetime import datetime, timezone
 
@@ -108,6 +109,21 @@ class ReviewPackageBuilder:
         # 5.5 validation/
         artifacts.extend(self._write_validation(package_dir, inputs))
 
+        # 5.5.1 CRE shadow 诊断报告（严格模型——经 PackageInputs 传入，进入 Manifest 哈希）
+        if inputs.cre_shadow_report is not None:
+            try:
+                cre_path = os.path.join(package_dir, "validation", "cre_shadow_report.json")
+                # 使用 model_dump() 而非 json.dumps(dict)——保证 CreShadowReport 对象安全序列化
+                cre_dict = inputs.cre_shadow_report.model_dump()
+                cre_json = json.dumps(cre_dict, ensure_ascii=False, indent=2, default=str)
+                cre_sha256 = hashlib.sha256(cre_json.encode("utf-8")).hexdigest()
+                self._write_file(cre_path, cre_json)
+                artifacts.append(
+                    ArtifactRef(path="validation/cre_shadow_report.json", sha256=cre_sha256)
+                )
+            except Exception as e:
+                logging.warning(f"CRE shadow artifact 写入失败：{e}")
+
         # 5.6 feedback/
         artifacts.extend(self._write_feedback_schema(package_dir))
 
@@ -131,8 +147,13 @@ class ReviewPackageBuilder:
             ArtifactRef(path="review.md", sha256=review_sha256)
         )
 
-        # 6. 生成 ReviewPackageManifest
+        # 5.9 manifest.json——持久化清单，供 ReviewPackageFinalizer 验证已有 artifact 哈希
         manifest = self._build_manifest(inputs, artifacts, provenance_sha256)
+        manifest_path = os.path.join(package_dir, "manifest.json")
+        manifest_json = json.dumps(
+            manifest.model_dump(), ensure_ascii=False, indent=2, default=str,
+        )
+        self._write_file(manifest_path, manifest_json)
 
         return manifest
 
@@ -789,6 +810,12 @@ class ReviewPackageBuilder:
         now = self._fixed_timestamp if self._fixed_timestamp else datetime.now(timezone.utc).isoformat()
         package_id = ReviewPackageManifest.generate_package_id(inputs.request_id)
 
+        # 计算 CRE shadow report hash（如有）
+        cre_shadow_hash = ""
+        if inputs.cre_shadow_report is not None:
+            cre_dict = inputs.cre_shadow_report.model_dump()
+            cre_shadow_hash = compute_json_hash(cre_dict)
+
         return ReviewPackageManifest(
             request_id=inputs.request_id,
             package_id=package_id,
@@ -802,5 +829,6 @@ class ReviewPackageBuilder:
                 inputs.data_transform_contract
             ),
             provenance_hash=provenance_sha256,
+            cre_shadow_report_hash=cre_shadow_hash,
             retry_count=inputs.retry_count,
         )

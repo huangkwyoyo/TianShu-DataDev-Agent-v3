@@ -81,6 +81,11 @@ def generate_provenance(
     result_summary_hash = compute_json_hash(inputs.result_summary) if inputs.result_summary else ""
     # ── Phase 9B-P0: 从 PackageInputs 计算 snapshot manifest hash ──
     snapshot_manifest_hash = compute_json_hash(inputs.snapshot_manifest) if inputs.snapshot_manifest else ""
+    # ── CRE shadow 最终硬化：CRE 诊断报告 hash 进入 provenance 溯源 ──
+    cre_shadow_report_hash = (
+        compute_json_hash(inputs.cre_shadow_report.model_dump())
+        if inputs.cre_shadow_report is not None else ""
+    )
 
     # 构建环境指纹
     env_fingerprint = _build_environment_fingerprint()
@@ -102,6 +107,7 @@ statement_sql_sha256: {json.dumps(statement_sql_sha256_entries, ensure_ascii=Fal
 optimized_plan_hash: "{sql_build_plan_hash}"
 data_transform_contract_hash: "{data_transform_contract_hash}"
 snapshot_manifest_hash: "{snapshot_manifest_hash}"
+cre_shadow_report_hash: "{cre_shadow_report_hash}"
 execution_trace_hash: "{execution_trace_hash}"
 result_summary_hash: "{result_summary_hash}"
 
