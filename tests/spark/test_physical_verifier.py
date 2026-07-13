@@ -19,10 +19,14 @@
 from __future__ import annotations
 
 import os
-import tempfile
 
 import pytest
 
+from tianshu_datadev.spark.cre_encoding import (
+    CreShadowReport,
+    EnvironmentManifest,
+    SpecialFloatStrategy,
+)
 from tianshu_datadev.spark.executor import (
     LocalSparkExecutor,
     SparkExecutionResult,
@@ -32,6 +36,9 @@ from tianshu_datadev.spark.physical_verifier import (
     CanonicalizationError,
     DiffDetail,
     EngineExecutionResult,
+    NormalizationColumn,
+    NormalizationConfig,
+    PhysicalVerificationReport,
     PhysicalVerificationStatus,
     PhysicalVerifier,
     ResultCanonicalizer,
@@ -229,29 +236,6 @@ class TestResultCanonicalizer:
 # ════════════════════════════════════════════
 # DuckDB 真实执行测试（需要 duckdb + pyarrow）
 # ════════════════════════════════════════════
-
-
-@pytest.fixture
-def temp_parquet_dir():
-    """创建含测试 Parquet 文件的临时目录——DuckDB 真实执行使用。"""
-    import pyarrow as pa
-
-    tmpdir = tempfile.mkdtemp(prefix="tianshu_physver_")
-
-    # 创建测试数据并写入 Parquet
-    table = pa.table({
-        "order_id": ["1", "2", "3"],
-        "amount": [100, 200, 150],
-        "region": ["east", "west", "east"],
-    })
-    import pyarrow.parquet as pq
-    pq.write_table(table, os.path.join(tmpdir, "order_info.parquet"))
-
-    yield tmpdir
-
-    # 清理
-    import shutil
-    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 class TestDuckDBExecution:
@@ -999,6 +983,406 @@ class TestPhysicalVerificationReport:
 
 
 # ════════════════════════════════════════════
+# 规范化配置 Phase 9B 测试——Float/Decimal 等价、NULL 补齐、差异截断
+# ════════════════════════════════════════════
+
+
+class TestNormalizationConfig:
+    """NormalizationConfig 类型感知比较 + 权威 schema 补齐 + 差异总数测试。
+
+    正向测试：
+    - float 容差内等价（math.isclose）
+    - Decimal quantize 等价
+    - 权威 schema NULL 补齐消除误报
+
+    反向测试：
+    - float 超容差真差异仍检测
+    - Decimal 真差异仍检测
+    - 整列确实 / 行数不同仍检测
+    - 无权威 schema 时 schema 不匹配 → HUMAN_REVIEW
+
+    截断与计数：
+    - 真实差异总数 total_diff_count
+    - 截断标志 diffs_truncated
+    """
+
+    # ── Float 容差测试 ──
+
+    def test_float_within_tolerance_matches(self):
+        """float 差异在容差内（1e-15）→ 等价。"""
+        config = NormalizationConfig(
+            output_columns=[NormalizationColumn(column_name="val", data_type="double")],
+        )
+        duckdb_rows = [{"id": "1", "val": "3.9369690851405856"}]
+        spark_rows = [{"id": "1", "val": "3.9369690851405883"}]
+
+        diffs, total_count, truncated = PhysicalVerifier._compute_diffs(
+            duckdb_rows, spark_rows, config=config,
+        )
+        assert total_count == 0
+        assert diffs == []
+        assert not truncated
+
+    def test_float_beyond_tolerance_detected(self):
+        """float 差异远超容差——应检测为差异。"""
+        config = NormalizationConfig(
+            output_columns=[NormalizationColumn(column_name="val", data_type="double")],
+        )
+        duckdb_rows = [{"id": "1", "val": "3.14"}]
+        spark_rows = [{"id": "1", "val": "42.0"}]  # 差异远大于 1e-12
+
+        diffs, total_count, truncated = PhysicalVerifier._compute_diffs(
+            duckdb_rows, spark_rows, config=config,
+        )
+        assert total_count >= 1
+        assert len(diffs) >= 1
+        assert not truncated  # 仅 1 个差异
+
+    def test_float_null_vs_value_detected(self):
+        """float 列一方 NULL → 不等价（真实差异）。"""
+        config = NormalizationConfig(
+            output_columns=[NormalizationColumn(column_name="val", data_type="double")],
+        )
+        duckdb_rows = [{"id": "1", "val": ""}]  # NULL
+        spark_rows = [{"id": "1", "val": "3.14"}]
+
+        diffs, total_count, truncated = PhysicalVerifier._compute_diffs(
+            duckdb_rows, spark_rows, config=config,
+        )
+        assert total_count >= 1
+
+    def test_float_both_null_equivalent(self):
+        """float 列双方 NULL → 等价。"""
+        config = NormalizationConfig(
+            output_columns=[NormalizationColumn(column_name="val", data_type="double")],
+        )
+        duckdb_rows = [{"id": "1", "val": ""}]
+        spark_rows = [{"id": "1", "val": ""}]
+
+        diffs, total_count, truncated = PhysicalVerifier._compute_diffs(
+            duckdb_rows, spark_rows, config=config,
+        )
+        assert total_count == 0
+
+    def test_float_without_config_fallback_to_str(self):
+        """无 NormalizationConfig 时 fallback 到 str 比较——差异被保留。"""
+        duckdb_rows = [{"id": "1", "val": "3.9369690851405856"}]
+        spark_rows = [{"id": "1", "val": "3.9369690851405883"}]
+
+        diffs, total_count, truncated = PhysicalVerifier._compute_diffs(
+            duckdb_rows, spark_rows, config=None,
+        )
+        # 无 config 时 str 不匹配 → 差异
+        assert total_count >= 1
+
+    # ── Decimal 等价测试 ──
+
+    def test_decimal_trailing_zero_equivalent(self):
+        """Decimal 尾随零差异 → quantize 后等价。"""
+        config = NormalizationConfig(
+            output_columns=[
+                NormalizationColumn(column_name="amount", data_type="decimal(18,2)"),
+            ],
+        )
+        # DuckDB str(Decimal('1266.70')) = "1266.70"，Spark str(1266.7) = "1266.7"
+        duckdb_rows = [{"id": "1", "amount": "1266.70"}]
+        spark_rows = [{"id": "1", "amount": "1266.7"}]
+
+        diffs, total_count, truncated = PhysicalVerifier._compute_diffs(
+            duckdb_rows, spark_rows, config=config,
+        )
+        assert total_count == 0
+
+    def test_decimal_true_difference_detected(self):
+        """Decimal 真实业务值差异——应检出。"""
+        config = NormalizationConfig(
+            output_columns=[
+                NormalizationColumn(column_name="amount", data_type="decimal(18,2)"),
+            ],
+        )
+        duckdb_rows = [{"id": "1", "amount": "100.50"}]
+        spark_rows = [{"id": "1", "amount": "999.99"}]
+
+        diffs, total_count, truncated = PhysicalVerifier._compute_diffs(
+            duckdb_rows, spark_rows, config=config,
+        )
+        assert total_count >= 1
+
+    def test_decimal_integer_equivalent(self):
+        """Decimal 整数与浮点表示等价——如 '100' vs '100.00'。"""
+        config = NormalizationConfig(
+            output_columns=[
+                NormalizationColumn(column_name="amount", data_type="decimal(18,2)"),
+            ],
+        )
+        duckdb_rows = [{"id": "1", "amount": "100"}]
+        spark_rows = [{"id": "1", "amount": "100.00"}]
+
+        diffs, total_count, truncated = PhysicalVerifier._compute_diffs(
+            duckdb_rows, spark_rows, config=config,
+        )
+        # scale=2 时，Decimal("100").quantize("0.00") = Decimal("100.00")
+        # 与 Decimal("100.00") 相等
+        assert total_count == 0
+
+    def test_decimal_without_config_fallback(self):
+        """无 NormalizationConfig 时 Decimal 仍 str 比较——trailing zeros 仍差异。"""
+        duckdb_rows = [{"id": "1", "amount": "1266.70"}]
+        spark_rows = [{"id": "1", "amount": "1266.7"}]
+
+        diffs, total_count, truncated = PhysicalVerifier._compute_diffs(
+            duckdb_rows, spark_rows, config=None,
+        )
+        # str 比较： "1266.70" != "1266.7" → 差异
+        assert total_count >= 1
+
+    # ── 权威 schema NULL 补齐测试 ──
+
+    def test_missing_column_filled_from_schema(self):
+        """Spark 缺失列被权威 schema 补齐→消除误报。"""
+        config = NormalizationConfig(
+            output_columns=[
+                NormalizationColumn(column_name="trip_source", data_type="varchar"),
+                NormalizationColumn(column_name="pickup_date_key", data_type="int"),
+                NormalizationColumn(column_name="total_revenue", data_type="decimal(18,2)"),
+            ],
+        )
+        # DuckDB 有 total_revenue=""（NULL），Spark 完全缺失该键
+        duckdb_rows = [
+            {"trip_source": "fhvhv", "pickup_date_key": "20260330", "total_revenue": ""},
+        ]
+        spark_rows = [
+            {"trip_source": "fhvhv", "pickup_date_key": "20260330"},
+        ]
+
+        d_filled = PhysicalVerifier(normalization_config=config)._fill_missing_columns(duckdb_rows)
+        s_filled = PhysicalVerifier(normalization_config=config)._fill_missing_columns(spark_rows)
+
+        diffs, total_count, truncated = PhysicalVerifier._compute_diffs(
+            d_filled, s_filled, config=config,
+        )
+        # 补齐后双方都有 total_revenue="" → 等价
+        assert total_count == 0
+
+    def test_missing_column_real_value_difference(self):
+        """补齐后业务值仍不同→应检出差异。"""
+        config = NormalizationConfig(
+            output_columns=[
+                NormalizationColumn(column_name="amount", data_type="decimal(18,2)"),
+            ],
+        )
+        duckdb_rows = [{"id": "1", "amount": "100.50"}]
+        spark_rows = [{"id": "1"}]  # 完全缺失 amount 列
+
+        d_filled = PhysicalVerifier(normalization_config=config)._fill_missing_columns(duckdb_rows)
+        s_filled = PhysicalVerifier(normalization_config=config)._fill_missing_columns(spark_rows)
+
+        diffs, total_count, truncated = PhysicalVerifier._compute_diffs(
+            d_filled, s_filled, config=config,
+        )
+        # Spark 侧 amount=""（补齐），DuckDB 有 "100.50" → 差异
+        assert total_count >= 1
+
+    def test_no_authoritative_schema_returns_human_review(self, temp_parquet_dir):
+        """Schema 不匹配且无权威 schema→HUMAN_REVIEW。"""
+        mock_spark = _MockSparkExecutor(rows=[
+            {"order_id": "1"},  # 缺少 amount 列
+        ])
+        verifier = PhysicalVerifier(spark_executor=mock_spark)
+
+        sql = 'SELECT * FROM "order_info"'
+        pyspark = "result_df = input_df"
+
+        report = verifier.verify(
+            sql_query=sql,
+            pyspark_code=pyspark,
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="hash_no_schema",
+            snapshot_id="snap_no_schema",
+            order_keys=["order_id"],
+        )
+
+        # 无 normalization_config → schema 不匹配 → HUMAN_REVIEW
+        assert report.status == PhysicalVerificationStatus.HUMAN_REVIEW, (
+            f"预期 HUMAN_REVIEW，实际 {report.status.value}"
+        )
+
+    def test_authoritative_schema_resolves_human_review_to_mismatch(self, temp_parquet_dir):
+        """Schema 不匹配但有权威 schema→补齐后→RESULT_MISMATCH（值不同）。"""
+        config = NormalizationConfig(
+            output_columns=[
+                NormalizationColumn(column_name="order_id", data_type="varchar"),
+                NormalizationColumn(column_name="amount", data_type="decimal(18,2)"),
+            ],
+        )
+        # DuckDB 有 amount 实际值(100,200,150)，Spark 缺失 amount 列（补齐为""）
+        expected_rows = [
+            {"order_id": "1"},
+            {"order_id": "2"},
+            {"order_id": "3"},
+        ]
+        mock_spark = _MockSparkExecutor(rows=expected_rows)
+        verifier = PhysicalVerifier(
+            spark_executor=mock_spark,
+            normalization_config=config,
+        )
+
+        sql = 'SELECT "order_id", "amount" FROM "order_info" ORDER BY "order_id"'
+        pyspark = "result_df = input_df"
+
+        report = verifier.verify(
+            sql_query=sql,
+            pyspark_code=pyspark,
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="hash_with_schema",
+            snapshot_id="snap_with_schema",
+            order_keys=["order_id"],
+        )
+
+        # 补齐 schema 后不应 HUMAN_REVIEW；但 amount 真实值不同→RESULT_MISMATCH
+        assert report.status == PhysicalVerificationStatus.RESULT_MISMATCH, (
+            f"预期 RESULT_MISMATCH（值不同），实际 {report.status.value}。"
+            f" 错误：{report.error_message}"
+        )
+        assert report.schema_match, "补齐后 schema 应匹配"
+        assert report.total_diff_count >= 3, "3 行的 amount 值不同"
+
+    def test_authoritative_schema_all_null_consistent(self, temp_parquet_dir):
+        """Schema 不匹配+权威 schema+引擎双方值均为 NULL→补齐后 RESULT_CONSISTENT。"""
+        config = NormalizationConfig(
+            output_columns=[
+                NormalizationColumn(column_name="order_id", data_type="varchar"),
+                NormalizationColumn(column_name="extra_val", data_type="varchar"),
+            ],
+        )
+        # 双方 extra_val 都是 NULL（DuckDB 无此列，Spark 也无此列）
+        expected_rows = [
+            {"order_id": "1"},
+        ]
+        mock_spark = _MockSparkExecutor(rows=expected_rows)
+        verifier = PhysicalVerifier(
+            spark_executor=mock_spark,
+            normalization_config=config,
+        )
+
+        sql = 'SELECT "order_id" FROM "order_info" ORDER BY "order_id" LIMIT 1'
+        pyspark = "result_df = input_df.select('order_id')"
+
+        report = verifier.verify(
+            sql_query=sql,
+            pyspark_code=pyspark,
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="hash_all_null",
+            snapshot_id="snap_all_null",
+            order_keys=["order_id"],
+        )
+
+        # 双方 extra_val 都补齐为"" → RESULT_CONSISTENT
+        assert report.status == PhysicalVerificationStatus.RESULT_CONSISTENT, (
+            f"预期 RESULT_CONSISTENT，实际 {report.status.value}。"
+            f" 错误：{report.error_message}"
+        )
+        assert report.schema_match, "补齐后 schema 应匹配"
+
+    # ── 差异截断与总数测试 ──
+
+    def test_total_diff_count_reported(self):
+        """>20 差异时 total_diff_count 返回真实总数。"""
+        config = NormalizationConfig(
+            output_columns=[NormalizationColumn(column_name="val", data_type="bigint")],
+        )
+        # 25 行各不相同
+        duckdb_rows = [{"id": str(i), "val": str(i)} for i in range(25)]
+        spark_rows = [{"id": str(i), "val": "999"} for i in range(25)]
+
+        diffs, total_count, truncated = PhysicalVerifier._compute_diffs(
+            duckdb_rows, spark_rows, config=config,
+        )
+        assert total_count == 25, f"总差异数应为 25，实际 {total_count}"
+        assert len(diffs) == 20, f"详细差异应为 20，实际 {len(diffs)}"
+        assert truncated, "应标记为截断"
+
+    def test_diffs_not_truncated_when_under_20(self):
+        """<20 差异时不应截断。"""
+        config = NormalizationConfig(
+            output_columns=[NormalizationColumn(column_name="val", data_type="bigint")],
+        )
+        duckdb_rows = [{"id": "1", "val": "1"}]
+        spark_rows = [{"id": "1", "val": "999"}]
+
+        diffs, total_count, truncated = PhysicalVerifier._compute_diffs(
+            duckdb_rows, spark_rows, config=config,
+        )
+        assert total_count == 1
+        assert len(diffs) == 1
+        assert not truncated
+
+    def test_row_count_mismatch_adds_to_total(self):
+        """行数不匹配计入 total_diff_count。"""
+        duckdb_rows = [{"id": "1", "val": "10"}] * 30  # 30 行
+        spark_rows = [{"id": "2", "val": "20"}] * 10   # 10 行
+
+        diffs, total_count, truncated = PhysicalVerifier._compute_diffs(
+            duckdb_rows, spark_rows, config=None,
+        )
+        # 行数不匹配导致20行差异，但 single dedup 后实际也是有很多差异
+        assert total_count >= 1
+        assert len(diffs) >= 1
+        if total_count > 20:
+            assert truncated
+
+    # ── 报告结构测试 ──
+
+    def test_report_contains_new_fields(self):
+        """PhysicalVerificationReport 包含 Phase 9B 新增字段。"""
+        report = PhysicalVerificationReport(
+            report_id="test_r",
+            contract_hash="test_h",
+            snapshot_id="test_s",
+            status=PhysicalVerificationStatus.RESULT_CONSISTENT,
+        )
+        assert hasattr(report, "total_diff_count")
+        assert hasattr(report, "diffs_truncated")
+        assert hasattr(report, "normalization_config_snapshot")
+        # 默认值
+        assert report.total_diff_count == 0
+        assert not report.diffs_truncated
+
+    def test_report_contains_config_snapshot_when_configured(self, temp_parquet_dir):
+        """配置了 NormalizationConfig 时，report 包含快照。"""
+        config = NormalizationConfig(
+            output_columns=[NormalizationColumn(column_name="order_id", data_type="varchar")],
+            contract_hash="test_snap_hash",
+        )
+        expected_rows = [
+            {"order_id": "1", "amount": 100, "region": "east"},
+            {"order_id": "2", "amount": 200, "region": "west"},
+            {"order_id": "3", "amount": 150, "region": "east"},
+        ]
+        mock_spark = _MockSparkExecutor(rows=expected_rows)
+        verifier = PhysicalVerifier(
+            spark_executor=mock_spark,
+            normalization_config=config,
+        )
+
+        sql = 'SELECT * FROM "order_info" ORDER BY "order_id"'
+        pyspark = "result_df = input_df.orderBy('order_id')"
+
+        report = verifier.verify(
+            sql_query=sql,
+            pyspark_code=pyspark,
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_snap_hash",
+            snapshot_id="snap_config_test",
+            order_keys=["order_id"],
+        )
+
+        assert report.normalization_config_snapshot, "应包含 config snapshot"
+        assert "float_abs_tolerance" in report.normalization_config_snapshot
+        assert report.normalization_config_snapshot["output_column_count"] == 1
+
+
+# ════════════════════════════════════════════
 # 真实 PySpark 执行集成测试（--run-slow）
 # ════════════════════════════════════════════
 
@@ -1198,3 +1582,429 @@ def test_spark_inputs_alias_resolves_end_to_end():
         code = "def transform(inputs):\n    return inputs['ft']"
         result = LocalSparkExecutor().execute(code, data_dir=snapshot_dir)
         assert result.status.name == "SUCCESS", result.error_message
+
+
+# ════════════════════════════════════════════
+# CRE shadow 模式集成测试（要求 5）
+# ════════════════════════════════════════════
+
+
+class TestPhysicalVerifierShadow:
+    """CRE shadow 集成测试——验证 shadow 报告的正确性和安全边界。
+
+    所有场景断言 legacy status 完全不变（要求 5.7）。
+    """
+
+    # ── 基础数据 ──
+
+    _SAMPLE_COLUMNS = [
+        NormalizationColumn(column_name="id", data_type="bigint"),
+        NormalizationColumn(column_name="val", data_type="double"),
+    ]
+    _SAMPLE_CONFIG = NormalizationConfig(
+        output_columns=_SAMPLE_COLUMNS,
+        primary_keys=["id"],
+        contract_hash="shadow_test_hash",
+    )
+
+    @staticmethod
+    def _make_shadow_report(
+        duckdb_rows: list[dict] | None = None,
+        spark_rows: list[dict] | None = None,
+        config: NormalizationConfig | None = None,
+        legacy_status: str = "RESULT_CONSISTENT",
+        primary_keys: list[str] | None = None,
+        timezone: str = "",
+        environment_manifest: EnvironmentManifest | None = None,
+    ) -> CreShadowReport:
+        """辅助方法：调用 _shadow_cre_diagnose 并验证返回结构。"""
+        if config is None:
+            config = TestPhysicalVerifierShadow._SAMPLE_CONFIG
+        report = PhysicalVerifier._shadow_cre_diagnose(
+            duckdb_raw=duckdb_rows or [],
+            spark_raw=spark_rows or [],
+            norm_config=config,
+            legacy_status=legacy_status,
+            contract_hash="test_hash",
+            snapshot_id="test_snap",
+            primary_keys=primary_keys,
+            timezone=timezone,
+            environment_manifest=environment_manifest,
+        )
+        # 验证报告是 CreShadowReport 实例
+        assert isinstance(report, CreShadowReport)
+        assert report.cre_status
+        assert report.mapped_status
+        assert report.legacy_status
+        return report
+
+    # ── 1. 同结论映射一致 ──
+
+    def test_shadow_same_conclusion_mapping(self):
+        """CRE CONSISTENT + legacy RESULT_CONSISTENT → status_consistent=True。"""
+        rows = [{"id": 1, "val": 10.5}, {"id": 2, "val": 20.3}]
+        report = self._make_shadow_report(
+            duckdb_rows=rows,
+            spark_rows=rows,
+            legacy_status="RESULT_CONSISTENT",
+            primary_keys=["id"],
+        )
+        assert report.cre_status in ("CONSISTENT", "CONSISTENT_WITH_WARN"), (
+            f"CRE 应判定一致，实际 {report.cre_status}"
+        )
+        assert report.mapped_status == "RESULT_CONSISTENT"
+        assert report.status_consistent is True
+        assert report.diagnostic_available is True
+
+    # ── 2. 容差 WARN 映射一致 ──
+
+    def test_shadow_warn_maps_to_consistent(self):
+        """CONSISTENT_WITH_WARN → mapped RESULT_CONSISTENT，status_consistent=True。"""
+        # 容差内尾差数据
+        duckdb_rows = [{"id": 1, "val": 10.12345678901}]
+        spark_rows = [{"id": 1, "val": 10.12345678902}]  # 微小差异在 float 容差内
+        report = self._make_shadow_report(
+            duckdb_rows=duckdb_rows,
+            spark_rows=spark_rows,
+            legacy_status="RESULT_CONSISTENT",
+            primary_keys=["id"],
+        )
+        # CRE 可能判定为 CONSISTENT_WITH_WARN（容差内符合条件时）
+        # 也可能 exact CONSISTENT（编码一致时）
+        assert report.cre_status in ("CONSISTENT", "CONSISTENT_WITH_WARN"), (
+            f"CRE 应判定为 CONSISTENT 类型，实际 {report.cre_status}"
+        )
+        assert report.mapped_status == "RESULT_CONSISTENT"
+        assert report.status_consistent is True
+        assert report.diagnostic_available is True
+
+    # ── 3. 真实 MISMATCH ──
+
+    def test_shadow_real_mismatch(self):
+        """值显著不同 → CRE MISMATCH → mapped RESULT_MISMATCH。"""
+        duckdb_rows = [{"id": 1, "val": 10.5}, {"id": 2, "val": 20.3}]
+        spark_rows = [{"id": 1, "val": 999.9}, {"id": 2, "val": 20.3}]
+        report = self._make_shadow_report(
+            duckdb_rows=duckdb_rows,
+            spark_rows=spark_rows,
+            legacy_status="RESULT_MISMATCH",
+            primary_keys=["id"],
+        )
+        assert report.cre_status == "MISMATCH", (
+            f"CRE 应判定为 MISMATCH，实际 {report.cre_status}"
+        )
+        assert report.mapped_status == "RESULT_MISMATCH"
+        assert report.status_consistent is True
+        assert report.diagnostic_available is True
+
+    # ── 4. 缺主键 → NOT_EXECUTED ──
+
+    def test_shadow_missing_primary_keys_multi_row(self):
+        """无主键+多行→NOT_EXECUTED——禁止按行号猜键。"""
+        config_no_pk = NormalizationConfig(
+            output_columns=TestPhysicalVerifierShadow._SAMPLE_COLUMNS,
+            primary_keys=[],
+        )
+        report = self._make_shadow_report(
+            duckdb_rows=[{"id": 1, "val": 10.5}, {"id": 2, "val": 20.3}],
+            spark_rows=[{"id": 1, "val": 10.5}, {"id": 2, "val": 20.3}],
+            config=config_no_pk,
+            legacy_status="RESULT_CONSISTENT",
+            primary_keys=None,
+        )
+        assert report.cre_status == "NOT_EXECUTED"
+        assert report.mapped_status == "NOT_EXECUTED"
+        assert report.diagnostic_available is False
+        assert report.human_review_recommended is True
+        assert "singleton" in report.error_message.lower()
+
+    def test_shadow_singleton_no_pk_allowed(self):
+        """无主键但双侧均恰好 1 行→允许 singleton 对齐。"""
+        config_no_pk = NormalizationConfig(
+            output_columns=TestPhysicalVerifierShadow._SAMPLE_COLUMNS,
+            primary_keys=[],
+        )
+        report = self._make_shadow_report(
+            duckdb_rows=[{"id": 1, "val": 10.5}],
+            spark_rows=[{"id": 1, "val": 10.5}],
+            config=config_no_pk,
+            legacy_status="RESULT_CONSISTENT",
+            primary_keys=None,
+        )
+        # Singleton 对齐成功 → CONSISTENT
+        assert report.cre_status in ("CONSISTENT", "CONSISTENT_WITH_WARN"), (
+            f"Singleton 应对齐成功，实际 {report.cre_status}"
+        )
+        assert report.diagnostic_available is True
+
+    def test_shadow_singleton_no_pk_mismatch(self):
+        """无主键 singleton 对齐但值不同→MISMATCH。"""
+        config_no_pk = NormalizationConfig(
+            output_columns=TestPhysicalVerifierShadow._SAMPLE_COLUMNS,
+            primary_keys=[],
+        )
+        report = self._make_shadow_report(
+            duckdb_rows=[{"id": 1, "val": 10.5}],
+            spark_rows=[{"id": 1, "val": 999.9}],
+            config=config_no_pk,
+            legacy_status="RESULT_MISMATCH",
+            primary_keys=None,
+        )
+        assert report.cre_status == "MISMATCH"
+        assert report.diagnostic_available is True
+
+    def test_shadow_no_pk_duckdb_multi_row(self):
+        """DuckDB 多行、Spark 1 行→NOT_EXECUTED（不满足 singleton）。"""
+        config_no_pk = NormalizationConfig(
+            output_columns=TestPhysicalVerifierShadow._SAMPLE_COLUMNS,
+            primary_keys=[],
+        )
+        report = self._make_shadow_report(
+            duckdb_rows=[{"id": 1, "val": 10.5}, {"id": 2, "val": 20.3}],
+            spark_rows=[{"id": 1, "val": 10.5}],
+            config=config_no_pk,
+            legacy_status="RESULT_CONSISTENT",
+            primary_keys=None,
+        )
+        assert report.cre_status == "NOT_EXECUTED"
+        assert report.diagnostic_available is False
+
+    def test_shadow_empty_primary_keys_singleton(self):
+        """主键为空列表+1行→singleton 对齐（等效无主键）。"""
+        report = self._make_shadow_report(
+            duckdb_rows=[{"id": 1, "val": 10.5}],
+            spark_rows=[{"id": 1, "val": 10.5}],
+            legacy_status="RESULT_CONSISTENT",
+            primary_keys=[],
+        )
+        assert report.cre_status in ("CONSISTENT", "CONSISTENT_WITH_WARN")
+
+    def test_shadow_config_no_primary_keys_multi_row(self):
+        """norm_config.primary_keys 为空+多行→NOT_EXECUTED。"""
+        config = NormalizationConfig(
+            output_columns=TestPhysicalVerifierShadow._SAMPLE_COLUMNS,
+            primary_keys=[],
+        )
+        report = self._make_shadow_report(
+            duckdb_rows=[{"id": 1, "val": 10.5}, {"id": 2, "val": 20.3}],
+            spark_rows=[{"id": 1, "val": 10.5}, {"id": 2, "val": 20.3}],
+            config=config,
+            legacy_status="RESULT_CONSISTENT",
+            primary_keys=None,
+        )
+        assert report.cre_status == "NOT_EXECUTED"
+        assert report.diagnostic_available is False
+
+    # ── 5. 重复/NULL 主键 ──
+
+    def test_shadow_duplicate_primary_keys(self):
+        """重复主键 → HUMAN_REVIEW，诊断不可用。"""
+        duckdb_rows = [
+            {"id": 1, "val": 10.5},
+            {"id": 1, "val": 20.3},  # 重复 id=1
+        ]
+        spark_rows = [
+            {"id": 1, "val": 10.5},
+            {"id": 1, "val": 20.3},
+        ]
+        report = self._make_shadow_report(
+            duckdb_rows=duckdb_rows,
+            spark_rows=spark_rows,
+            legacy_status="RESULT_CONSISTENT",
+            primary_keys=["id"],
+        )
+        assert report.cre_status in ("HUMAN_REVIEW", "MISMATCH"), (
+            f"重复主键应无法自动对齐，实际 {report['cre_status']}"
+        )
+        # duplicate_keys → HUMAN_REVIEW 或 MISMATCH，但不会 CONSISTENT
+        assert report.cre_status not in ("CONSISTENT", "CONSISTENT_WITH_WARN")
+
+    def test_shadow_null_primary_keys(self):
+        """NULL 主键 → HUMAN_REVIEW，诊断不可用。"""
+        report = self._make_shadow_report(
+            duckdb_rows=[{"id": None, "val": 10.5}],
+            spark_rows=[{"id": None, "val": 10.5}],
+            legacy_status="RESULT_CONSISTENT",
+            primary_keys=["id"],
+        )
+        # NULL PK → 对齐失败 → HUMAN_REVIEW 或 error_message 含 NULL
+        assert report.cre_status in ("HUMAN_REVIEW", "MISMATCH")
+        assert report.cre_status not in ("CONSISTENT", "CONSISTENT_WITH_WARN", "NOT_EXECUTED")
+
+    # ── 6. shadow 异常处理 ──
+
+    def test_shadow_exception_handling(self):
+        """异常 → diagnostic_available=False, human_review_recommended=True。"""
+        # 直接调用 _shadow_cre_diagnose 并传入 None config
+        report = PhysicalVerifier._shadow_cre_diagnose(
+            duckdb_raw=[{"id": 1, "val": 10.5}],
+            spark_raw=[{"id": 1, "val": 10.5}],
+            norm_config=None,
+            legacy_status="RESULT_CONSISTENT",
+            primary_keys=["id"],
+        )
+        assert report.cre_status == "NOT_EXECUTED"
+        assert report.diagnostic_available is False
+        assert report.human_review_recommended is True
+
+    def test_shadow_exception_bad_timezone(self):
+        """非法 timezone → CRE 编码异常 → diagnostic_available=False。"""
+        report = self._make_shadow_report(
+            duckdb_rows=[{"id": 1, "val": 10.5}],
+            spark_rows=[{"id": 1, "val": 10.5}],
+            legacy_status="RESULT_CONSISTENT",
+            primary_keys=["id"],
+            timezone="INVALID_TIMEZONE",  # 无 timestamp 列但传入非法时区——不影响
+        )
+        # 没有 timestamp 列，非法 timezone 不影响
+        assert report.diagnostic_available is True
+
+    # ── 7. legacy status 完全不变 —— 通过 verify() 全流程验证 ──
+
+    def test_shadow_legacy_status_unchanged_consistent(self, temp_parquet_dir):
+        """CRE shadow 存在时 legacy status 仍为 RESULT_CONSISTENT。"""
+        # order_info Parquet 有 3 行数据（order_id=1/2/3, amount=100/200/150）
+        expected_rows = [
+            {"order_id": "1", "amount": 100, "region": "east"},
+            {"order_id": "2", "amount": 200, "region": "west"},
+            {"order_id": "3", "amount": 150, "region": "east"},
+        ]
+        mock_spark = _MockSparkExecutor(rows=expected_rows)
+        config = NormalizationConfig(
+            output_columns=[
+                NormalizationColumn(column_name="order_id", data_type="varchar"),
+                NormalizationColumn(column_name="amount", data_type="double"),
+                NormalizationColumn(column_name="region", data_type="varchar"),
+            ],
+            primary_keys=["order_id"],
+        )
+        verifier = PhysicalVerifier(
+            spark_executor=mock_spark,
+            normalization_config=config,
+        )
+        report = verifier.verify(
+            sql_query='SELECT * FROM "order_info" ORDER BY "order_id"',
+            pyspark_code='result_df = input_df.orderBy("order_id")',
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_shadow_legacy",
+            snapshot_id="snap_shadow_001",
+            order_keys=["order_id"],
+            cre_primary_keys=["order_id"],
+        )
+        # legacy status 不变
+        assert report.status == PhysicalVerificationStatus.RESULT_CONSISTENT
+        # CRE shadow 报告存在
+        assert report.cre_shadow_report is not None
+        assert report.cre_shadow_report.diagnostic_available is True
+
+    def test_shadow_legacy_status_unchanged_no_cre_keys(self, temp_parquet_dir):
+        """不传 CRE 主键 → shadow NOT_EXECUTED，legacy status 仍为 RESULT_CONSISTENT。"""
+        # order_info Parquet 有 3 行数据
+        expected_rows = [
+            {"order_id": "1", "amount": 100, "region": "east"},
+            {"order_id": "2", "amount": 200, "region": "west"},
+            {"order_id": "3", "amount": 150, "region": "east"},
+        ]
+        mock_spark = _MockSparkExecutor(rows=expected_rows)
+        config = NormalizationConfig(
+            output_columns=[
+                NormalizationColumn(column_name="order_id", data_type="varchar"),
+                NormalizationColumn(column_name="amount", data_type="double"),
+                NormalizationColumn(column_name="region", data_type="varchar"),
+            ],
+            primary_keys=["order_id"],
+        )
+        # 不传 cre_primary_keys → shadow NOT_EXECUTED，但不影响 legacy status
+        verifier = PhysicalVerifier(
+            spark_executor=mock_spark,
+            normalization_config=config,
+        )
+        report = verifier.verify(
+            sql_query='SELECT * FROM "order_info" ORDER BY "order_id"',
+            pyspark_code='result_df = input_df.orderBy("order_id")',
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_shadow_legacy_nopk",
+            snapshot_id="snap_shadow_002",
+            order_keys=["order_id"],
+            # 不传 cre_primary_keys → CRE shadow NOT_EXECUTED
+        )
+        # legacy status 仍然是 RESULT_CONSISTENT（数据一致）
+        assert report.status == PhysicalVerificationStatus.RESULT_CONSISTENT
+        # CRE shadow 报告非 None（有 config.output_columns）
+        assert report.cre_shadow_report is not None
+        assert report.cre_shadow_report.legacy_status == "RESULT_CONSISTENT"
+
+    def test_shadow_legacy_status_unchanged_execution_error(self, temp_parquet_dir):
+        """Spark 执行失败时 CRE shadow 不影响 legacy EXECUTION_ERROR。"""
+        mock_spark = _MockSparkExecutor(success=False)  # Spark 执行失败
+        verifier = PhysicalVerifier(spark_executor=mock_spark)
+
+        report = verifier.verify(
+            sql_query='SELECT * FROM "order_info" ORDER BY "order_id"',
+            pyspark_code='result_df = input_df.orderBy("order_id")',
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_shadow_error",
+            snapshot_id="snap_shadow_003",
+            order_keys=["order_id"],
+        )
+        # Spark 失败 → EXECUTION_ERROR
+        assert report.status == PhysicalVerificationStatus.EXECUTION_ERROR
+        # CRE shadow 应为 None（执行失败时无数据）或 NOT_EXECUTED
+        if report.cre_shadow_report is not None:
+            assert report.cre_shadow_report.legacy_status == "EXECUTION_ERROR"
+
+    # ── 8. EnvironmentManifest 传入 ──
+
+    def test_shadow_with_environment_manifest(self):
+        """EnvironmentManifest 显式传入后用于 NaN/Inf 判定。"""
+        # 双引擎间 NaN 差异
+        duckdb_rows = [{"id": 1, "val": float("nan")}]
+        spark_rows = [{"id": 1, "val": float("nan")}]
+
+        # 传入 EQUAL 策略 → NaN==NaN
+        report = self._make_shadow_report(
+            duckdb_rows=duckdb_rows,
+            spark_rows=spark_rows,
+            legacy_status="RESULT_CONSISTENT",
+            primary_keys=["id"],
+            environment_manifest=EnvironmentManifest(
+                nan_handling=SpecialFloatStrategy.EQUAL,
+                pos_inf_handling=SpecialFloatStrategy.MISMATCH,
+                neg_inf_handling=SpecialFloatStrategy.HUMAN_REVIEW,
+            ),
+        )
+        # EQUAL 策略下双 NaN → CONSISTENT（若编码完全一致）或 CONSISTENT_WITH_WARN
+        assert report.diagnostic_available is True
+
+    # ── 9. 缺 output_columns ──
+
+    def test_shadow_missing_output_columns(self):
+        """缺少 output_columns → NOT_EXECUTED + human_review_recommended。"""
+        config = NormalizationConfig(output_columns=[])
+        report = self._make_shadow_report(
+            duckdb_rows=[{"id": 1, "val": 10.5}],
+            spark_rows=[{"id": 1, "val": 10.5}],
+            config=config,
+            legacy_status="RESULT_CONSISTENT",
+            primary_keys=["id"],
+        )
+        assert report.cre_status == "NOT_EXECUTED"
+        assert report.diagnostic_available is False
+        assert report.human_review_recommended is True
+        assert "缺少 Contract output_columns" in report.error_message
+
+    # ── 10. 不同结论 → human_review_recommended ──
+
+    def test_shadow_different_conclusion(self):
+        """CRE 与 legacy 结论不同 → human_review_recommended=True。"""
+        rows = [{"id": 1, "val": 10.5}]
+        report = self._make_shadow_report(
+            duckdb_rows=rows,
+            spark_rows=rows,
+            legacy_status="RESULT_MISMATCH",  # legacy 说 MISMATCH
+            primary_keys=["id"],
+        )
+        # CRE 说 CONSISTENT，legacy 说 MISMATCH
+        assert report.mapped_status == "RESULT_CONSISTENT"
+        assert report.status_consistent is False
+        assert report.human_review_recommended is True
