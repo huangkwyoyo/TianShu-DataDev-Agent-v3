@@ -53,6 +53,8 @@ class SparkExecutionResult:
     return_code: int = -1
     execution_time_ms: float = 0.0
     # 解析后的 DataFrame 输出（行为 dict 列表，由调用方解析）
+    # [CDP v1 迁移提示] Task 9 接管后，PhysicalVerifier 将不再使用 output_rows
+    # 进行逐行对比——CDP 摘要替代全量数据回传。该字段在 Shadow 阶段保留。
     output_rows: list[dict] = field(default_factory=list)
     error_message: str = ""
     # 资源使用记录（可观测性）
@@ -874,6 +876,265 @@ class LocalSparkExecutor:
                 "output_truncated": False,
                 "env_keys_used": env_keys_used,
             },
+        )
+
+    # ── CDP digest 执行（Task 6） ──
+
+    def execute_with_cdp(
+        self,
+        spec,
+        snapshot_id: str,
+        data_dir: str | None = None,
+    ) -> "DigestExecutionEnvelope":
+        """在子进程中计算 CDP v1 full_digest。
+
+        使用 SparkCdpBuilder 生成摘要计算脚本，通过子进程隔离执行，
+        与 execute() 使用相同的沙箱模型。
+
+        Args:
+            spec: CreDigestSpec —— CDP 摘要规范
+            snapshot_id: 快照 ID（用于溯源）
+            data_dir: 数据目录（Parquet 快照文件所在目录）
+
+        Returns:
+            DigestExecutionEnvelope —— 含 full_digest 和 row_count
+        """
+        from tianshu_datadev.spark.cdp_spark_builder import SparkCdpBuilder
+        from tianshu_datadev.spark.cdp_spec import (
+            DigestExecutionEnvelope,
+            EngineDigestSummary,
+            compute_digest_spec_hash,
+        )
+
+        spec_hash_hex = compute_digest_spec_hash(spec).hex()
+        builder = SparkCdpBuilder()
+        cdp_code = builder.build_digest_script(
+            spec, spec_hash_hex, snapshot_id,
+        )
+
+        # 安全扫描——扫描 builder 生成的代码（不含 prologue，与 execute() 一致）
+        violations = scan_pyspark_code(cdp_code)
+        if violations:
+            return DigestExecutionEnvelope(
+                execution_status="FAILED",
+                snapshot_id=snapshot_id,
+                digest_spec_hash=spec_hash_hex,
+                protocol_version="cdp-v1",
+                engine_version="spark",
+                error="安全扫描拒绝：" + "; ".join(violations),
+            )
+
+        # 注入 Spark prologue + 资源限制
+        full_code = self._inject_spark_prologue(cdp_code)
+        full_code = self._inject_resource_limits(full_code)
+
+        # 子进程执行——复用 execute() 的沙箱逻辑
+        result = self._run_cdp_subprocess(full_code, data_dir)
+
+        if result.status != SparkExecutionStatus.SUCCESS:
+            return DigestExecutionEnvelope(
+                execution_status="FAILED",
+                snapshot_id=snapshot_id,
+                digest_spec_hash=spec_hash_hex,
+                protocol_version="cdp-v1",
+                engine_version="spark",
+                error=f"子进程执行失败 ({result.status}): {result.error_message}",
+            )
+
+        # 解析 stdout 中标记分隔的 JSON 结果
+        try:
+            import json
+
+            start_marker = builder._MARKER_START
+            end_marker = builder._MARKER_END
+
+            in_result = False
+            for line in result.stdout.split("\n"):
+                stripped = line.strip()
+                if stripped == start_marker:
+                    in_result = True
+                    continue
+                if stripped == end_marker:
+                    in_result = False
+                    continue
+                if in_result and stripped.startswith("{"):
+                    data = json.loads(stripped)
+                    full_digest = str(data["full_digest"])
+                    row_count = int(data["row_count"])
+                    return DigestExecutionEnvelope(
+                        execution_status="SUCCESS",
+                        snapshot_id=snapshot_id,
+                        digest_spec_hash=spec_hash_hex,
+                        protocol_version="cdp-v1",
+                        engine_version="spark",
+                        summary=EngineDigestSummary(
+                            row_count=row_count,
+                            full_digest=full_digest,
+                            samples=[],
+                        ),
+                    )
+            # 未找到标记分隔的 JSON 行
+            return DigestExecutionEnvelope(
+                execution_status="FAILED",
+                snapshot_id=snapshot_id,
+                digest_spec_hash=spec_hash_hex,
+                protocol_version="cdp-v1",
+                engine_version="spark",
+                error=(
+                    f"stdout 中未找到 CDP 标记分隔的 JSON 结果"
+                    f"（start={start_marker}）：\n{result.stdout[:2000]}"
+                ),
+            )
+        except Exception as e:
+            return DigestExecutionEnvelope(
+                execution_status="FAILED",
+                snapshot_id=snapshot_id,
+                digest_spec_hash=spec_hash_hex,
+                protocol_version="cdp-v1",
+                engine_version="spark",
+                error=f"结果解析失败: {e}",
+            )
+
+    def _run_cdp_subprocess(
+        self,
+        code: str,
+        data_dir: str | None,
+    ) -> SparkExecutionResult:
+        """执行 CDP 子进程——与 execute() 共享的沙箱逻辑。
+
+        此方法从 execute() 抽取了子进程创建/管理/清理的核心流程，
+        但不注入 output collector（CDP 脚本自带输出逻辑）。
+        """
+        # 创建隔离工作目录 + 写入临时文件
+        tmp_path = ""
+        workdir = ""
+        try:
+            workdir = tempfile.mkdtemp(prefix="tianshu_cdp_")
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".py",
+                prefix="tianshu_cdp_",
+                dir=workdir,
+                delete=False,
+                encoding="utf-8",
+            )
+            tmp.write(code)
+            tmp.flush()
+            tmp_path = tmp.name
+        except OSError as e:
+            self._cleanup_workdir(workdir)
+            return SparkExecutionResult(
+                status=SparkExecutionStatus.ENVIRONMENT_ERROR,
+                error_message=f"无法创建临时文件或工作目录：{e}",
+            )
+
+        # 构建沙箱环境变量（白名单）
+        sandbox_env = self._build_sandbox_env(data_dir)
+        env_keys_used = sorted(sandbox_env.keys())
+
+        # 设置 Windows Job Object 资源限制
+        job_handle = self._create_windows_job_object()
+
+        # 子进程执行
+        start_time = time.monotonic()
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                [self._python_cmd, tmp_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=workdir,
+                env=sandbox_env,
+            )
+
+            if job_handle is not None and proc.pid is not None:
+                self._assign_to_job_object(job_handle, proc.pid)
+
+            stdout, stderr = proc.communicate(timeout=self._timeout)
+            return_code = proc.returncode
+            elapsed_ms = (time.monotonic() - start_time) * 1000
+
+        except subprocess.TimeoutExpired:
+            if proc is not None:
+                proc.kill()
+                proc.wait()
+            elapsed_ms = (time.monotonic() - start_time) * 1000
+            self._cleanup_tmp(tmp_path)
+            self._cleanup_workdir(workdir)
+            self._close_job_object(job_handle) if job_handle else None
+            return SparkExecutionResult(
+                status=SparkExecutionStatus.TIMEOUT,
+                execution_time_ms=elapsed_ms,
+                error_message=f"CDP 执行超时（{self._timeout}s）",
+                resource_usage={"env_keys_used": env_keys_used},
+            )
+        except FileNotFoundError:
+            elapsed_ms = (time.monotonic() - start_time) * 1000
+            self._cleanup_tmp(tmp_path)
+            self._cleanup_workdir(workdir)
+            self._close_job_object(job_handle) if job_handle else None
+            return SparkExecutionResult(
+                status=SparkExecutionStatus.ENVIRONMENT_ERROR,
+                execution_time_ms=elapsed_ms,
+                error_message=(
+                    f"Python 解释器不可用：'{self._python_cmd}'。"
+                ),
+                resource_usage={"env_keys_used": env_keys_used},
+            )
+        except OSError as e:
+            elapsed_ms = (time.monotonic() - start_time) * 1000
+            self._cleanup_tmp(tmp_path)
+            self._cleanup_workdir(workdir)
+            self._close_job_object(job_handle) if job_handle else None
+            return SparkExecutionResult(
+                status=SparkExecutionStatus.ENVIRONMENT_ERROR,
+                execution_time_ms=elapsed_ms,
+                error_message=f"子进程启动失败：{e}",
+                resource_usage={"env_keys_used": env_keys_used},
+            )
+
+        # 清理
+        self._cleanup_tmp(tmp_path)
+        self._cleanup_workdir(workdir)
+        if job_handle is not None:
+            self._close_job_object(job_handle)
+
+        # 输出大小检查
+        stdout, stderr, was_truncated = self._check_output_size(stdout, stderr)
+
+        # 判断执行结果
+        if return_code != 0:
+            # stderr 摘要（上限 2000 字符）
+            _stderr_summary = stderr[:2000] if stderr else "（无 stderr）"
+            return SparkExecutionResult(
+                status=SparkExecutionStatus.RUNTIME_ERROR,
+                stdout=stdout,
+                stderr=stderr,
+                return_code=return_code,
+                execution_time_ms=elapsed_ms,
+                error_message=(
+                    f"CDP 执行失败（退出码 {return_code}）：\n"
+                    f"{_stderr_summary}"
+                ),
+            )
+        if was_truncated:
+            return SparkExecutionResult(
+                status=SparkExecutionStatus.OUTPUT_TRUNCATED,
+                stdout=stdout,
+                stderr=stderr,
+                return_code=return_code,
+                execution_time_ms=elapsed_ms,
+                error_message="CDP 输出被截断",
+            )
+
+        return SparkExecutionResult(
+            status=SparkExecutionStatus.SUCCESS,
+            stdout=stdout,
+            stderr=stderr,
+            return_code=return_code,
+            execution_time_ms=elapsed_ms,
+            resource_usage={"env_keys_used": env_keys_used},
         )
 
     # ── 内部方法 ──
