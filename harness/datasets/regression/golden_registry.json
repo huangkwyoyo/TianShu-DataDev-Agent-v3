@@ -1,0 +1,6 @@
+{
+  "version": "1.0.0",
+  "description": "CRE Golden 注册表——每个条目携带预期 CRE 状态标签，用于 Harness 零容忍验证。",
+  "entries": [
+  ]
+}
