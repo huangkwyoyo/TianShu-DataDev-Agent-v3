@@ -4,9 +4,12 @@
 先不构建完整 builder——先证明引擎能产出正确的 tag || length_prefix || value_bytes。
 """
 
+import math
 import struct
 
 import pytest
+from pyspark.sql import functions as F
+from pyspark.sql.types import BinaryType
 
 from tests.spark.test_cdp_golden_vectors import (
     G2_FIELD_BYTES_HEX,
@@ -19,6 +22,29 @@ from tests.spark.test_cdp_golden_vectors import (
     G5_NEG_ZERO_FIELD_BYTES_HEX,
     G5_POS_ZERO_FIELD_BYTES_HEX,
 )
+
+
+def _make_encode_float_udf():
+    """创建 CDP v1 FLOAT64 字段编码 UDF——模块级共享，避免重复定义。"""
+    @F.udf(BinaryType())
+    def _encode_float(v):
+        tag = b"\x07"
+        if v is None:
+            return tag + b"\xff\xff\xff\xff"
+        if math.isnan(v):
+            return tag + struct.pack(">I", 3) + b"nan"
+        if math.isinf(v):
+            value = b"inf" if v > 0 else b"-inf"
+            return tag + struct.pack(">I", len(value)) + value
+        if v == 0.0 and math.copysign(1.0, v) < 0:
+            return tag + struct.pack(">I", 4) + b"-0.0"
+        if v == 0.0:
+            return tag + struct.pack(">I", 3) + b"0.0"
+        value_bytes = str(v).encode("utf-8")
+        return tag + struct.pack(">I", len(value_bytes)) + value_bytes
+    return _encode_float
+
+ENCODE_FLOAT_UDF = _make_encode_float_udf()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -445,92 +471,32 @@ class TestSparkFieldProbes:
 
     def test_udf_field_encode_float_nan(self):
         """Spark UDF FLOAT64 NaN → G5 nan。"""
-        import math
-
-        from pyspark.sql import SparkSession, functions as F
-        from pyspark.sql.types import BinaryType
+        from pyspark.sql import SparkSession
 
         spark = SparkSession.builder.master("local[1]").appName("cdp-test").getOrCreate()
 
-        @F.udf(BinaryType())
-        def _encode_float(v):
-            tag = b"\x07"
-            if v is None:
-                return tag + b"\xff\xff\xff\xff"
-            if math.isnan(v):
-                value_bytes = b"nan"
-            elif math.isinf(v):
-                value_bytes = b"inf" if v > 0 else b"-inf"
-            elif v == 0.0 and math.copysign(1.0, v) < 0:
-                value_bytes = b"-0.0"
-            elif v == 0.0:
-                value_bytes = b"0.0"
-            else:
-                value_bytes = str(v).encode("utf-8")
-            return tag + struct.pack(">I", len(value_bytes)) + value_bytes
-
         df = spark.range(1).select(F.lit(float("nan")).cast("double").alias("v"))
-        result = df.select(_encode_float("v")).collect()[0][0]
+        result = df.select(ENCODE_FLOAT_UDF("v")).collect()[0][0]
         assert result == bytes.fromhex(G5_NAN_FIELD_BYTES_HEX)
 
     def test_udf_field_encode_float_inf(self):
         """Spark UDF FLOAT64 +Inf → G5 inf。"""
-        import math
-
-        from pyspark.sql import SparkSession, functions as F
-        from pyspark.sql.types import BinaryType
+        from pyspark.sql import SparkSession
 
         spark = SparkSession.builder.master("local[1]").appName("cdp-test").getOrCreate()
 
-        @F.udf(BinaryType())
-        def _encode_float(v):
-            tag = b"\x07"
-            if v is None:
-                return tag + b"\xff\xff\xff\xff"
-            if math.isnan(v):
-                value_bytes = b"nan"
-            elif math.isinf(v):
-                value_bytes = b"inf" if v > 0 else b"-inf"
-            elif v == 0.0 and math.copysign(1.0, v) < 0:
-                value_bytes = b"-0.0"
-            elif v == 0.0:
-                value_bytes = b"0.0"
-            else:
-                value_bytes = str(v).encode("utf-8")
-            return tag + struct.pack(">I", len(value_bytes)) + value_bytes
-
         df = spark.range(1).select(F.lit(float("inf")).cast("double").alias("v"))
-        result = df.select(_encode_float("v")).collect()[0][0]
+        result = df.select(ENCODE_FLOAT_UDF("v")).collect()[0][0]
         assert result == bytes.fromhex(G5_INF_FIELD_BYTES_HEX)
 
     def test_udf_field_encode_float_neg_inf(self):
         """Spark UDF FLOAT64 -Inf → G5 -inf。"""
-        import math
-
-        from pyspark.sql import SparkSession, functions as F
-        from pyspark.sql.types import BinaryType
+        from pyspark.sql import SparkSession
 
         spark = SparkSession.builder.master("local[1]").appName("cdp-test").getOrCreate()
 
-        @F.udf(BinaryType())
-        def _encode_float(v):
-            tag = b"\x07"
-            if v is None:
-                return tag + b"\xff\xff\xff\xff"
-            if math.isnan(v):
-                value_bytes = b"nan"
-            elif math.isinf(v):
-                value_bytes = b"inf" if v > 0 else b"-inf"
-            elif v == 0.0 and math.copysign(1.0, v) < 0:
-                value_bytes = b"-0.0"
-            elif v == 0.0:
-                value_bytes = b"0.0"
-            else:
-                value_bytes = str(v).encode("utf-8")
-            return tag + struct.pack(">I", len(value_bytes)) + value_bytes
-
         df = spark.range(1).select(F.lit(float("-inf")).cast("double").alias("v"))
-        result = df.select(_encode_float("v")).collect()[0][0]
+        result = df.select(ENCODE_FLOAT_UDF("v")).collect()[0][0]
         assert result == bytes.fromhex(G5_NEG_INF_FIELD_BYTES_HEX)
 
     def test_udf_field_encode_float_neg_zero(self):
@@ -538,32 +504,12 @@ class TestSparkFieldProbes:
 
         Spark 保留 IEEE 754 负零语义，math.copysign 正确检测符号位。
         """
-        import math
-
-        from pyspark.sql import SparkSession, functions as F
-        from pyspark.sql.types import BinaryType
+        from pyspark.sql import SparkSession
 
         spark = SparkSession.builder.master("local[1]").appName("cdp-test").getOrCreate()
 
-        @F.udf(BinaryType())
-        def _encode_float(v):
-            tag = b"\x07"
-            if v is None:
-                return tag + b"\xff\xff\xff\xff"
-            if math.isnan(v):
-                value_bytes = b"nan"
-            elif math.isinf(v):
-                value_bytes = b"inf" if v > 0 else b"-inf"
-            elif v == 0.0 and math.copysign(1.0, v) < 0:
-                value_bytes = b"-0.0"
-            elif v == 0.0:
-                value_bytes = b"0.0"
-            else:
-                value_bytes = str(v).encode("utf-8")
-            return tag + struct.pack(">I", len(value_bytes)) + value_bytes
-
         df = spark.range(1).select(F.lit(-0.0).cast("double").alias("v"))
-        result = df.select(_encode_float("v")).collect()[0][0]
+        result = df.select(ENCODE_FLOAT_UDF("v")).collect()[0][0]
         assert result == bytes.fromhex(G5_NEG_ZERO_FIELD_BYTES_HEX)
 
     def test_udf_field_encode_float_pos_zero(self):
@@ -571,30 +517,10 @@ class TestSparkFieldProbes:
 
         Spark CAST(0.0 AS string) 产出 "0.0"，与 CDP v1 一致。
         """
-        import math
-
-        from pyspark.sql import SparkSession, functions as F
-        from pyspark.sql.types import BinaryType
+        from pyspark.sql import SparkSession
 
         spark = SparkSession.builder.master("local[1]").appName("cdp-test").getOrCreate()
 
-        @F.udf(BinaryType())
-        def _encode_float(v):
-            tag = b"\x07"
-            if v is None:
-                return tag + b"\xff\xff\xff\xff"
-            if math.isnan(v):
-                value_bytes = b"nan"
-            elif math.isinf(v):
-                value_bytes = b"inf" if v > 0 else b"-inf"
-            elif v == 0.0 and math.copysign(1.0, v) < 0:
-                value_bytes = b"-0.0"
-            elif v == 0.0:
-                value_bytes = b"0.0"
-            else:
-                value_bytes = str(v).encode("utf-8")
-            return tag + struct.pack(">I", len(value_bytes)) + value_bytes
-
         df = spark.range(1).select(F.lit(0.0).cast("double").alias("v"))
-        result = df.select(_encode_float("v")).collect()[0][0]
+        result = df.select(ENCODE_FLOAT_UDF("v")).collect()[0][0]
         assert result == bytes.fromhex(G5_POS_ZERO_FIELD_BYTES_HEX)
