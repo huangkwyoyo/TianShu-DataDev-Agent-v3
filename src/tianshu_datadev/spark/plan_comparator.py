@@ -1310,7 +1310,10 @@ class PlanComparator:
                     # input_column 扁平化（Spark 侧 input_column 可能已为字符串）
                     raw_input_expr = flat_expr.pop("input", None)
                     if raw_input_expr is not None and isinstance(raw_input_expr, dict):
-                        name = raw_input_expr.get("normalized_name", "") or raw_input_expr.get("column_name", "")
+                        name = (
+                            raw_input_expr.get("normalized_name", "")
+                            or raw_input_expr.get("column_name", "")
+                        )
                         flat_expr["input_column"] = normalize_field_name(str(name))
                     elif flat_expr.get("input_column") is not None:
                         # 字符串格式的 input_column 无需进一步处理
