@@ -334,6 +334,11 @@ class TestSparkBuiltinProbes:
     def _check_pyspark(self):
         """跳过测试（若 PySpark 不可用）。"""
         pytest.importorskip("pyspark")
+        # Windows 上 Spark UDF Worker 需要 python 而非 python3
+        import os
+
+        if os.name == "nt":
+            os.environ.setdefault("PYSPARK_PYTHON", "python")
         try:
             from pyspark.sql import SparkSession
 
@@ -446,6 +451,11 @@ class TestSparkFullDigest:
     def _check_pyspark(self):
         """跳过测试（若 PySpark 不可用）。"""
         pytest.importorskip("pyspark")
+        # Windows 上 Spark UDF Worker 需要 python 而非 python3
+        import os
+
+        if os.name == "nt":
+            os.environ.setdefault("PYSPARK_PYTHON", "python")
 
     @staticmethod
     def _int64_spec():

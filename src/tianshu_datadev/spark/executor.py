@@ -977,13 +977,18 @@ class LocalSparkExecutor:
 
         # 判断执行结果
         if return_code != 0:
+            # stderr 摘要（上限 2000 字符）
+            _stderr_summary = stderr[:2000] if stderr else "（无 stderr）"
             return SparkExecutionResult(
                 status=SparkExecutionStatus.RUNTIME_ERROR,
                 stdout=stdout,
                 stderr=stderr,
                 return_code=return_code,
                 execution_time_ms=elapsed_ms,
-                error_message=f"CDP 执行失败（退出码 {return_code}）",
+                error_message=(
+                    f"CDP 执行失败（退出码 {return_code}）：\n"
+                    f"{_stderr_summary}"
+                ),
             )
         if was_truncated:
             return SparkExecutionResult(
