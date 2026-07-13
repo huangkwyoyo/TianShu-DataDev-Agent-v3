@@ -1,7 +1,7 @@
 # Phase 6-8 已知风险登记
 
-> 日期：2026-07-06 | 最后更新：2026-07-06 Spark Comparator 内容级对齐完成——Case 06 LOGIC_EQUIVALENT 达成，"三层剥离"闭环
-> 状态：C1-C4 全部点亮，Case 06 内容级对齐完成（8 commits），809 passed / 11 skipped (core)，2105 passed / 11 skipped (total)
+> 日期：2026-07-06 | 最后更新：2026-07-13 CRE v2.3 最终准入硬化完成
+> 状态：C1-C4 全部点亮，Case 06 内容级对齐完成（8 commits），CRE v2.3 shadow 硬化完成（8 项要求），2568 passed / 24 skipped / 10 预存失败 / 2 xfailed (total backend)
 
 ---
 

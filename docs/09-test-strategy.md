@@ -1,12 +1,14 @@
 # 测试策略 — TianShu DataDev Agent v3
 
-> 文档版本：Phase 0.5 DeveloperSpec-first 架构校正版
+> 文档版本：Phase 0.5 DeveloperSpec-first 架构校正版 | 2026-07-13 更新：Phase 0-8 全部完成，实际测试量远超预算（详见下文 §3 注释）
+>
+> **当前实际测试基线**：2568 passed / 24 skipped / 10 预存失败（test_nyc_business_case）——详见 `docs/current-state-and-verification-status.md`
 
 ## 1. 目标
 
 测试用于保护高风险契约和关键行为，不追求数量。pytest 覆盖确定性逻辑和少量隔离集成；Prompt、模型、规模和性能评测进入 Harness。
 
-## 2. 当前基线
+## 2. 当前基线（Phase 0.5 历史记录）
 
 Phase 0 实际已有 22 个 pytest 用例，超过原定 `≤10` 预算。进入 Phase 1 前不继续为 Protocol 属性和枚举组合增加测试；在具体 Pydantic 模型落地后，合并或删除低价值反射测试。
 
@@ -31,7 +33,7 @@ Phase 0 实际已有 22 个 pytest 用例，超过原定 `≤10` 预算。进入
 | Phase 7 | 135-175 | PlanEquivalenceComparator、Snapshot Builder 关系一致抽取、ResultComparator 10 维度、差异诊断路由 |
 | Phase 8 | 140-190 | LangGraph 编排壳、Graph State 边界、返工上限、Spark Harness、前端 Spark-first 视图 |
 
-## 4. pytest 覆盖范围
+> **📌 实际完成统计（2026-07-13）**：Phase 0-8 全部完成后，全量后端测试实际达到 **2568 passed / 24 skipped / 10 预存失败**，远超 Phase 8 预算上限 190。主要原因是：（1）CRE v2 双引擎编码比较体系新增 118 个测试；（2）Spark Comparator + Physical Verifier 双链验证体系大幅扩展；（3）前端冒烟 + Playwright E2E 新增 29 个测试。每项超预算测试均保护独立风险（双引擎一致性、Comparator 逻辑等价、CRE 编码确定性），符合"超过预算必须说明"原则。
 
 - Pydantic/JSON Schema 拒绝非法和额外字段。
 - DeveloperSpec Parser 允许/禁止宽松封闭表（golden + rejection fixture）。

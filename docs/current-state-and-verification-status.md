@@ -1,6 +1,6 @@
 # 项目当前状态与验证进度 — TianShu DataDev Agent v3
 
-> 文档版本：2026-07-06 Spark Comparator 内容级对齐 | 最后更新：2026-07-06 Case 06 Spark 双链 LOGIC_EQUIVALENT 达成——"三层剥离"（_temp_* scan/join 过滤 + grain-aware aggregate 合并 + target_grain 过滤），1 xfail 转正，809 passed (core) / 2105 passed (total)
+> 文档版本：2026-07-13 CRE 物理验证可用 | 最后更新：2026-07-13 CRE shadow 最终验收通过——物理验证可用，CRE 保持 shadow，legacy 继续负责最终状态判定
 > 本文是项目当前实施状态的**唯一权威文档**。各 Phase 设计文档（docs/00-09、docs/roadmap/）描述的是目标设计，实际建成状态以本文为准。
 
 ## 1. Phase 进度矩阵
@@ -32,8 +32,22 @@
 | 9A4-NYC | 真实业务样本——NYC 案例 01-05 | ✅ | ✅ | 🟡 | Case 01-04 SQL+Spark 双链 LOGIC_EQUIVALENT，Case 05 Comparator NOT_COVERED（窗口函数），2026-07-05 |
 | 10-Case06 | SqlProgram 多语句 DAG——NYC Case 06 | ✅ | ✅ | ✅ | **2026-07-06 闭环**："三层剥离"（_temp_* scan/join 过滤 + grain-aware aggregate 合并 + target_grain 透传），1 xfail 转正（test_spark_orchestrator_logic_equivalence → LOGIC_EQUIVALENT），659 passed / 11 skipped（spark+artifacts+api） |
 | 10-ContentAlign | Spark Comparator 内容级对齐 | ✅ | ✅ | ✅ | **2026-07-06 完成**：8 commits，PlanComparator.compare_program() 三层剥离 + Orchestrator target_grain 透传 + Contract _temp_ 守卫，详见 `docs/superpowers/specs/2026-07-06-spark-comparator-closure-and-risks.md` |
+| CRE Phase 2 | CRE shadow 最终准入硬化 | ✅ | ✅ | ✅ | **2026-07-13 物理验证可用**：三条 Pipeline 证据通过——RESULT_CONSISTENT（一致）、CONSISTENT_WITH_WARN（浮点容差）、RESULT_MISMATCH（真实差异）。CRE 保持 shadow，legacy 继续负责最终状态判定。不切换生产门禁。详见 `docs/CRE_v2_设计文档_20260713_1745.md` |
 
-**当前测试基线**：809 passed / 11 skipped / 0 xfailed / 0 xpassed（spark+artifacts+api+harness 全量后端，Case 06 LOGIC_EQUIVALENT xfail 已消除）+ 23 passed（前端冒烟全量）+ 6 passed / 0 skipped（Playwright E2E），ruff/tsc/build 零告警。全量项目：2105 passed / 11 skipped（10 个预存失败与本次无关）
+**当前测试基线**：2601 passed / 24 skipped / 2 xfailed / 13 预存失败（NYC Case 03/04 DuckDB 扩展依赖 + harness gate 缺真实人工数据），ruff/tsc/build 零告警。
+
+CRE 相关测试基线：
+- CRE 核心（test_cre / test_cre_dual_engine / test_cre_shadow_pipeline / test_cre_finalizer）：125 passed / 7 skipped
+- Physical Verifier（test_physical_verifier，含 CRE shadow 集成）：191 passed / 11 skipped
+- artifacts 层（含 finalizer E2E）：全部通过
+
+**三条 Pipeline 验收证据（2026-07-13）**：
+
+| 证据 | 测试 | 路径 | 结果 |
+|:----:|------|------|:----:|
+| 证据 1：一致 | `TestPhysicalVerifierWithMock::test_result_consistent` | `verifier.verify()` 全链路 → CRE shadow | **RESULT_CONSISTENT** — DuckDB/Spark 完全一致 |
+| 证据 2：浮点容差 WARN | `TestPhysicalVerifierShadow::test_shadow_warn_maps_to_consistent` | `_shadow_cre_diagnose()` → DecisionEngine | **CONSISTENT_WITH_WARN** — 浮点 1e-11 级差异在容差内，WARN 但不阻断 |
+| 证据 3：真实差异 | `TestPhysicalVerifierWithMock::test_result_mismatch` | `verifier.verify()` 全链路 → CRE shadow | **RESULT_MISMATCH** — Spark 返回不同值，正确检出，原因清晰 |
 
 ## 2. C1-C4 业务集成验证
 
@@ -54,13 +68,16 @@
 | R6 | ~~Harness Runner 为结果聚合器~~ | 已消除 | Phase 9A3 已升级为自动评测驱动器 |
 | R7 | ~~真实业务样本——NYC 案例 01-06 全部完成。Case 06 Spark Comparator LOGIC_EQUIVALENT 仍 xfail~~ | 已消除 | **2026-07-06 消除**：Spark Comparator 内容级对齐完成，"三层剥离"使 Case 06 双链达到 LOGIC_EQUIVALENT，xfail 转正 |
 | R-CA-1 | `target_grain` 过滤是 Case 06 特化——基于"非目标粒度=内部实现"假设，不能误解为通用业务真理。多输出粒度场景需扩展为 `target_grains` | **C** | **架构风险**——当前逻辑对 Case 06 正确，但不得推广。详见 `docs/superpowers/specs/2026-07-06-spark-comparator-closure-and-risks.md` |
-| R-CA-3 | Builder 缺 join——Case 06 Step 4 的 join step 在 builder 输出中缺失，新 case 可能暴露 | **中高（B）** | **B 类设计修复项**——独立排查 builder join 生成逻辑，下一轮迭代优先处理 |
+| R-CA-3 | Builder 缺 join——Case 06 Step 4 的 join step 在 builder 输出中缺失，新 case 可能暴露 | **中高（B）** | **B 类设计修复项**——独立排查 builder join 生成逻辑，记忆文件：[[rc-a-3-builder-join-bug]] |
 | R8 | ~~LLM 生产环境验证~~ | 已消除 | 2026-07-05 真实 LLM 验证 8/8 通过，100% pass rate，31,517 tokens，269.7s，DeepSeek v4-pro，报告：`llm_reports/verify_20260705.json`（已脱敏） |
 | R9 | Case 05 Spark Comparator 窗口函数 NOT_COVERED——仅排除 LOGIC_MISMATCH，未证明等价 | C | 窗口函数（ROW_NUMBER）Comparator 覆盖待完善 |
 | R10 | ~~Snapshot Builder 未集成到 REVIEW_READY 流程~~ | 已消除 | Phase 9B-P0 已将 SnapshotBuilder.build() 接入 Pipeline.run_all()，snapshot hash 写入 provenance.yml |
 | R11 | ~~前端无自动化测试框架~~ | 已消除 | Phase 9B 源码级 + Phase 9C Playwright E2E |
 | R15 | ~~SQL 成功态 pipeline_stages 为空~~ | 已消除 | handleRunAll 成功路径注入全成功阶段——SQL 指示灯始终可见 |
-| R16 | ~~Playwright E2E 缺少 table_paths 配置~~ | 已消除 | Phase 9C-R16 + R16b：CSV fixture 自动发现（E2E 模式）+ None/{}} 语义区分 + 边界硬化 |
+| R16 | ~~Playwright E2E 缺少 table_paths 配置~~ | 已消除 | Phase 9C-R16 + R16b：CSV fixture 自动发现（E2E 模式）+ None/{} 语义区分 + 边界硬化 |
+| R-CRE-Golden | Golden Registry 为空——`passes_admission` 要求至少一个 golden MISMATCH 样本验证 Harness 判别能力 | 低（非阻断） | 后续 Phase 业务方填充已知差异样本 |
+| R-CRE-Null | `null_strategy` 始终 UNKNOWN——无法从 Contract 或执行环境证明 NULL 语义一致性 | 低（非阻断） | 仅使相关语义进入 HUMAN_REVIEW，不误伤不涉及该策略的场景 |
+| R-CRE-Finalizer | ReviewPackageFinalizer 为审计附属能力——写入失败只影响审计完整性，不改变 legacy 比较结论 | 低（非阻断） | 已实现并测试，明确为非阻断附属能力 |
 
 ## 4. 当前架构全景
 
@@ -97,13 +114,18 @@ DeveloperSpec (.md 项目书)
 
 ## 5. 下一步方向（Phase 10+）
 
-1. ~~**Case 06 Spark 双链 LOGIC_EQUIVALENT**~~ → **✅ 已完成（2026-07-06）**——"三层剥离"使 Case 06 达到 LOGIC_EQUIVALENT，xfail 转正。闭环报告：`docs/superpowers/specs/2026-07-06-spark-comparator-closure-and-risks.md`
-2. **Case 05 Comparator 升级**——窗口函数（ROW_NUMBER）Comparator 从 NOT_COVERED 升级到严格等价判定
-3. **Builder join 缺陷修复**（R-CA-3，中高）——Case 06 Step 4 的 join 在 builder 输出中缺失，新 case 可能暴露。B 类设计修复项，下一轮迭代优先处理
-4. **target_grain 扩展为 target_grains**（R-CA-1，C）——当前单粒度过滤是 Case 06 特化，多输出粒度场景需重构
-5. **`_temp_` 前缀检测统一**（R-CA-2，B）——提取共享 `_is_temp_table()` 谓词，消除 plan_comparator/contract_extractor 两处检测逻辑不一致
-6. **生产环境 LLM 验证**——R8 脚本就绪，待 API key 配置后执行：`TIANSHU_RUN_REAL_LLM=1 python scripts/real_llm_regression.py --output llm_reports/verify_$(date +%Y%m%d).json`
-7. **Case 06 遗留工作**（C 类→后续 Phase）：
+1. ~~**Case 06 Spark 双链 LOGIC_EQUIVALENT**~~ → **✅ 已完成（2026-07-06）**
+2. ~~**CRE shadow 最终准入硬化**~~ → **✅ 已完成（2026-07-13）——物理验证可用，CRE 保持 shadow**
+3. **CRE 门禁切换（非阻断后续事项）**——以下三项为已知缺口，记录为后续 Phase 工作，不阻塞当前物理验证上线：
+   - **Golden Registry 为空**：`harness/datasets/regression/golden_registry.json` 无已知差异样本，`passes_admission` 要求 `total_known_differences > 0`（至少一个 golden MISMATCH 样本）才能验证 Harness 判别能力。需业务方注册已知差异样本后门禁切换前提才算完全满足。
+   - **NULL strategy 始终 UNKNOWN**：无法从 Contract 或执行环境证明 NULL 语义一致性，仅使相关语义进入 HUMAN_REVIEW，不误伤不涉及该策略的精确一致场景。
+   - **门禁切换需 Owner 批准**：设计文档 v2.3 中的接入前提（可执行样本一致率 100%、零假阴性、CRE/legacy 冲突 0）已全部满足，但正式接管生产门禁需显式批准。
+4. **Case 05 Comparator 升级**——窗口函数（ROW_NUMBER）Comparator 从 NOT_COVERED 升级到严格等价判定
+5. **Builder join 缺陷修复**（R-CA-3，中高）——Case 06 Step 4 的 join 在 builder 输出中缺失，新 case 可能暴露。B 类设计修复项，下一轮迭代优先处理
+6. **target_grain 扩展为 target_grains**（R-CA-1，C）——当前单粒度过滤是 Case 06 特化，多输出粒度场景需重构
+7. **`_temp_` 前缀检测统一**（R-CA-2，B）——提取共享 `_is_temp_table()` 谓词，消除 plan_comparator/contract_extractor 两处检测逻辑不一致
+8. **生产环境 LLM 验证**——R8 脚本就绪，待 API key 配置后执行：`TIANSHU_RUN_REAL_LLM=1 python scripts/real_llm_regression.py --output llm_reports/verify_$(date +%Y%m%d).json`
+9. **Case 06 遗留工作**（C 类→后续 Phase）：
    - `violation_county` 代码映射的方案通用化（当前硬编码 NYC 5 个代码）
    - `test_temp_tables_cleaned_after_execution` 真正的 temp 表清理验证（需 Pipeline 暴露 cleanup_status）
 

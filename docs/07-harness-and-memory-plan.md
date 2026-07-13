@@ -1,7 +1,7 @@
 # Phase 4 Harness + 回归 / 规则 / Schema 标注 — TianShu DataDev Agent v3
 
-> 文档版本：2026-07-03 更新版
-> 状态：Phase 4 已退出，Harness 七维门禁已落地。Phase 8 将扩展 Spark 5 维度评测。
+> 文档版本：2026-07-13 更新版
+> 状态：Phase 4 已退出，Harness 七维门禁已落地，Phase 8 Spark 5 维度评测已完成。当前测试基线 2568 passed / 24 skipped / 10 预存失败。
 
 ## 1. 当前状态
 
@@ -56,9 +56,9 @@ harness/datasets/
 - Harness 数据库和日志独立于产品运行时的 artifact store
 - 评测结果可生成 HarnessReport，但不参与自动路由、自动通过或自动上线决策
 
-## 6. Phase 8 Spark 扩展维度
+## 6. Phase 8 Spark 扩展维度（已完成）
 
-Phase 8 在已有 SQL Harness 基础上新增 5 个 Spark 专属评测维度：
+Phase 8 在已有 SQL Harness 基础上新增 5 个 Spark 专属评测维度（已落地，详见 `docs/superpowers/specs/2026-07-03-spark-first-phase-6-8-design.md` §3.3）：
 
 | 维度 | 说明 |
 |------|------|
