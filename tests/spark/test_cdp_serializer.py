@@ -17,6 +17,7 @@ from tests.spark.test_cdp_golden_vectors import (
     G5_NEG_INF_FIELD_BYTES_HEX,
     G5_NEG_ZERO_FIELD_BYTES_HEX,
     G5_POS_ZERO_FIELD_BYTES_HEX,
+    G6_FULL_DIGEST_HEX,
 )
 
 
@@ -86,6 +87,21 @@ class TestOracleVsGoldenVectors:
         result = oracle.compute_full_digest([{"id": 42}], spec)
         assert result == G2_FULL_DIGEST_HEX, (
             f"oracle {result} ≠ golden {G2_FULL_DIGEST_HEX}"
+        )
+
+    def test_g6_duplicate_rows(self, oracle):
+        """G6：两行相同值 → 多重集 full_digest ≠ 单行，且必须 == 硬编码 G6_FULL_DIGEST_HEX。"""
+        spec = self._int64_spec()
+        rows = [{"id": 42}, {"id": 42}]  # 两行相同
+        result = oracle.compute_full_digest(rows, spec)
+
+        # 必须匹配 G6 硬编码常量
+        assert result == G6_FULL_DIGEST_HEX, (
+            f"oracle {result} ≠ golden G6 {G6_FULL_DIGEST_HEX}"
+        )
+        # 多重集语义：两行相同 ≠ 单行
+        assert result != G2_FULL_DIGEST_HEX, (
+            f"两行相同 digest 不应 == 单行 digest G2"
         )
 
 
