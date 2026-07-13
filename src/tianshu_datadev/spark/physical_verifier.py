@@ -11,6 +11,12 @@
 - HUMAN_REVIEW：自动判定无法得出结论，需人工介入
 - NOT_EXECUTED：尚未执行物理验证
 - EXECUTION_ERROR：任一引擎执行失败
+
+物理验证规范化配置（Phase 9B）：
+- NormalizationConfig：控制比较策略和容差
+- float/double 使用 math.isclose（非全局 round）
+- Decimal 禁止转 float，按 Contract precision/scale 精确比较
+- NULL 缺失键用权威 schema 补齐（Contract output_columns）
 """
 
 from __future__ import annotations
@@ -23,6 +29,11 @@ from typing import Any
 
 from pydantic import Field
 
+from tianshu_datadev.cre_models import (
+    CreShadowReport,
+    EnvironmentManifest,
+    NormalizationColumn,
+)
 from tianshu_datadev.developer_spec.models import StrictModel
 from tianshu_datadev.spark.executor import (
     LocalSparkExecutor,
@@ -257,9 +268,9 @@ class ResultCanonicalizer:
             import math
             if math.isnan(value):
                 return ""
-        # Decimal 归一化——转为字符串以避免精度差异
+        # Decimal 归一化——转为字符串（禁止转 float，避免大值精度损失）
         if hasattr(value, "__class__") and value.__class__.__name__ == "Decimal":
-            return str(float(value))
+            return str(value)
         # datetime.date → 规范化为 YYYY-MM-DD 格式
         if isinstance(value, _dt.date) and not isinstance(value, _dt.datetime):
             return value.isoformat()
@@ -381,6 +392,32 @@ class DiffDetail(StrictModel):
     description: str = ""                          # 差异描述
 
 
+# NormalizationColumn 已移至 cre_models.py 消除循环依赖。
+# 在此保留导入以支持本文件的引用——所有新代码应直接从 cre_models 导入。
+
+
+class NormalizationConfig(StrictModel):
+    """物理验证规范化配置——控制比较策略和容差。
+
+    由 pipeline._do_spark_physical_verify() 从 Contract 构造并传入。
+    用于：
+    1. float/double → math.isclose 类型感知比较
+    2. Decimal → quantize 精确比较（禁止 float 转换）
+    3. NULL 缺失键 → 用权威 schema 补齐（非数据发现）
+    """
+
+    # 浮点绝对容差——仅作用于 float/double 字段
+    float_abs_tolerance: float = 1e-12
+    # 浮点相对容差——仅作用于 float/double 字段
+    float_rel_tolerance: float = 1e-12
+    # 权威 schema 输出列定义——用于 NULL 补齐和类型感知比较
+    output_columns: list[NormalizationColumn] = Field(default_factory=list)
+    # Contract hash——用于 normalization_config_snapshot 追溯
+    contract_hash: str = ""
+    # 权威主键列名（来自 Contract grouping_keys）——CRE shadow 行对齐用
+    primary_keys: list[str] = Field(default_factory=list)
+
+
 class PhysicalVerificationReport(StrictModel):
     """物理验证完整报告——双引擎执行 + 规范化 + 对比的完整记录。"""
 
@@ -397,6 +434,15 @@ class PhysicalVerificationReport(StrictModel):
         default_factory=list,
     )
     error_message: str = ""                        # 整体错误信息
+    # Phase 9B 新增字段
+    total_diff_count: int = 0                      # 真实差异总数（不含截断）
+    diffs_truncated: bool = False                  # 是否有差异被截断
+    normalization_config_snapshot: dict[str, Any] = Field(  # 本次验证用容差参数快照
+        default_factory=dict,
+    )
+    # CRE shadow 诊断报告（最终硬化）——严格 Pydantic 模型，与生产验证并行
+    # 类型已通过 cre_models.py 中立模块解除循环依赖——直接使用 CreShadowReport 类型
+    cre_shadow_report: CreShadowReport | None = Field(default=None)
 
 
 # ════════════════════════════════════════════
@@ -434,14 +480,17 @@ class PhysicalVerifier:
     def __init__(
         self,
         spark_executor: LocalSparkExecutor | None = None,
+        normalization_config: NormalizationConfig | None = None,
     ) -> None:
         """初始化物理验证器。
 
         Args:
             spark_executor: LocalSparkExecutor 实例，None 时创建默认实例
+            normalization_config: 规范化配置（Phase 9B），控制比较策略和容差
         """
         self._spark_executor = spark_executor or LocalSparkExecutor()
         self._canonicalizer = ResultCanonicalizer()
+        self._normalization_config = normalization_config
 
     # ── 公共 API ──
 
@@ -456,6 +505,10 @@ class PhysicalVerifier:
         order_keys: list[str] | None = None,
         uncovered_step_types: list[str] | None = None,
         duckdb_path: str | None = None,
+        # CRE shadow 参数——不影响生产验证结论
+        cre_primary_keys: list[str] | None = None,
+        cre_timezone: str = "",
+        cre_environment_manifest: EnvironmentManifest | None = None,
     ) -> PhysicalVerificationReport:
         """执行双引擎物理验证。
 
@@ -619,16 +672,79 @@ class PhysicalVerifier:
             spark_cols.update(row.keys())
         schema_match = duckdb_cols == spark_cols
 
-        # 逐行逐列对比
-        diffs = self._compute_diffs(duckdb_rows, spark_rows)
+        # Step 6.5：Schema 不匹配时——尝试用权威 schema 补齐
+        has_authoritative_schema = (
+            self._normalization_config is not None
+            and len(self._normalization_config.output_columns) > 0
+        )
+        if not schema_match and has_authoritative_schema:
+            duckdb_rows = self._fill_missing_columns(duckdb_rows)
+            spark_rows = self._fill_missing_columns(spark_rows)
+            # 补齐后重新判断 schema_match
+            duckdb_cols = set()
+            for row in duckdb_rows:
+                duckdb_cols.update(row.keys())
+            spark_cols = set()
+            for row in spark_rows:
+                spark_cols.update(row.keys())
+            schema_match = duckdb_cols == spark_cols
+        elif not schema_match and not has_authoritative_schema:
+            # 无权威 schema 又收到 schema 不匹配 → 无法自动判断
+            return PhysicalVerificationReport(
+                report_id=self._generate_report_id(contract_hash, snapshot_id),
+                contract_hash=contract_hash,
+                snapshot_id=snapshot_id,
+                status=PhysicalVerificationStatus.HUMAN_REVIEW,
+                duckdb_result=EngineExecutionResult(
+                    engine="duckdb",
+                    success=True,
+                    execution_time_ms=duckdb_result.execution_time_ms,
+                    raw_row_count=duckdb_result.output_rows.__len__(),
+                    canonical_row_count=duckdb_canonical_count,
+                    sample_rows=duckdb_rows[:5],
+                ),
+                spark_result=EngineExecutionResult(
+                    engine="spark",
+                    success=True,
+                    execution_time_ms=spark_result.execution_time_ms,
+                    raw_row_count=spark_result.output_rows.__len__(),
+                    canonical_row_count=spark_canonical_count,
+                    sample_rows=spark_rows[:5],
+                ),
+                uncovered_step_types=uncovered,
+                row_count_match=row_count_match,
+                schema_match=False,
+                error_message=(
+                    f"Schema 不匹配且缺少权威 schema（Contract output_columns）——"
+                    f"无法自动补齐判断。DuckDB 列={sorted(duckdb_cols)}，"
+                    f"Spark 列={sorted(spark_cols)}。需人工介入。"
+                ),
+            )
+
+        # Step 7：类型感知差异计算
+        diffs, total_diff_count, diffs_truncated = self._compute_diffs(
+            duckdb_rows, spark_rows, config=self._normalization_config,
+        )
 
         # 判定最终状态
-        if not diffs and row_count_match and schema_match:
+        if total_diff_count == 0 and row_count_match and schema_match:
             status = PhysicalVerificationStatus.RESULT_CONSISTENT
         elif not schema_match or (duckdb_canonical_count > 0 and spark_canonical_count > 0):
             status = PhysicalVerificationStatus.RESULT_MISMATCH
         else:
             status = PhysicalVerificationStatus.HUMAN_REVIEW
+
+        # 构建 normalization_config_snapshot
+        config_snapshot: dict[str, Any] = {}
+        if self._normalization_config:
+            cfg = self._normalization_config
+            config_snapshot = {
+                "float_abs_tolerance": cfg.float_abs_tolerance,
+                "float_rel_tolerance": cfg.float_rel_tolerance,
+                "output_column_count": len(cfg.output_columns),
+                "has_output_columns": bool(cfg.output_columns),
+                "contract_hash_prefix": cfg.contract_hash[:12] if cfg.contract_hash else "",
+            }
 
         # 生成 report_id
         report_id = self._generate_report_id(contract_hash, snapshot_id)
@@ -650,6 +766,22 @@ class PhysicalVerifier:
             sample_rows=spark_rows[:5],
         )
 
+        duckdb_success = duckdb_result.status == SparkExecutionStatus.SUCCESS
+        spark_success = spark_result.status == SparkExecutionStatus.SUCCESS
+
+        # CRE shadow 诊断（最终硬化）——不改变现有结论
+        cre_shadow_report = self._shadow_cre_diagnose(
+            duckdb_raw=duckdb_result.output_rows if duckdb_success else [],
+            spark_raw=spark_result.output_rows if spark_success else [],
+            norm_config=self._normalization_config,
+            legacy_status=status.value,
+            contract_hash=contract_hash,
+            snapshot_id=snapshot_id,
+            primary_keys=cre_primary_keys,
+            timezone=cre_timezone,
+            environment_manifest=cre_environment_manifest,
+        )
+
         return PhysicalVerificationReport(
             report_id=report_id,
             contract_hash=contract_hash,
@@ -661,7 +793,51 @@ class PhysicalVerifier:
             row_count_match=row_count_match,
             schema_match=schema_match,
             uncovered_step_types=uncovered,
+            total_diff_count=total_diff_count,
+            diffs_truncated=diffs_truncated,
+            normalization_config_snapshot=config_snapshot,
+            cre_shadow_report=cre_shadow_report,
         )
+
+    # ── 权威 schema NULL 补齐 ──
+
+    def _fill_missing_columns(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """用权威 schema（Contract output_columns）补齐缺失列。
+
+        PySpark toJSON() 在列值为 NULL 时完全省略该键，导致引擎间
+        schema 不匹配。本方法通过 Contract output_columns 的列名集合
+        将每行中缺失的键统一填充为空字符串（与 NULL 归一化一致）。
+
+        仅在该列属于权威 schema 且当前行为空（NULL）时填充。
+
+        Args:
+            rows: 规范化后的行列表
+
+        Returns:
+            补齐后的行列表（所有行都包含权威 schema 的全部列）
+        """
+        if not self._normalization_config or not self._normalization_config.output_columns:
+            return rows
+
+        # 归一化权威 schema 列名（与 ResultCanonicalizer 逻辑一致）
+        expected_cols = {
+            self._canonicalizer._normalize_column_name(col.column_name)
+            for col in self._normalization_config.output_columns
+        }
+        if not expected_cols:
+            return rows
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            new_row = dict(row)
+            for col in expected_cols:
+                if col not in new_row:
+                    new_row[col] = ""  # NULL 在规范化后为空字符串
+            result.append(new_row)
+        return result
 
     # ── DuckDB 执行 ──
 
@@ -817,58 +993,174 @@ class PhysicalVerifier:
     # ── 差异计算 ──
 
     @staticmethod
+    def _parse_decimal_scale(dtype: str) -> int | None:
+        """从 data_type 字符串解析 Decimal scale。
+
+        支持标准格式如 "decimal(18,2)" → 2，"decimal(10,0)" → 0。
+        不支持格式或无 scale 信息时返回 None。
+
+        Args:
+            dtype: 数据类型字符串
+
+        Returns:
+            scale 值，无法解析时返回 None
+        """
+        m = re.match(r"decimal\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)", dtype)
+        if m:
+            return int(m.group(2))
+        return None
+
+    @staticmethod
+    def _values_are_equivalent(
+        duckdb_val: str,
+        spark_val: str,
+        column: str,
+        col_types: dict[str, str],
+        config: NormalizationConfig | None,
+    ) -> bool:
+        """类型感知的等价性判断——str 相等无法覆盖时使用。
+
+        优先级：
+        1. 空值判断——两个都为空视为等价
+        2. str 精确相等——最快路径
+        3. float/double——math.isclose（仅配置了类型时）
+        4. Decimal——quantize 精确比较（仅配置了类型时）
+        5. 以上都不满足 → 不等价
+
+        Args:
+            duckdb_val: DuckDB 侧规范化后的字符串值
+            spark_val: Spark 侧规范化后的字符串值
+            column: 列名（已规范化）
+            col_types: 列名 → 类型名映射
+            config: 规范化配置（可为 None）
+
+        Returns:
+            True 如果两值等价，否则 False
+        """
+        # 都为空 → 等价（NULL 补齐后双方缺失键→"")
+        if not duckdb_val and not spark_val:
+            return True
+        # 一方为空 → 不等价（真正缺失 vs 有值）
+        if not duckdb_val or not spark_val:
+            return False
+        # 精确 str 匹配 → 等价（最快路径）
+        if duckdb_val == spark_val:
+            return True
+
+        if config is None:
+            return False
+
+        import math
+        from decimal import Decimal as _Decimal
+
+        dtype = col_types.get(column, "").lower()
+
+        # Float/double → math.isclose
+        if dtype and ("float" in dtype or "double" in dtype):
+            try:
+                dv = float(duckdb_val)
+                sv = float(spark_val)
+                if math.isclose(
+                    dv, sv,
+                    rel_tol=config.float_rel_tolerance,
+                    abs_tol=config.float_abs_tolerance,
+                ):
+                    return True
+            except (ValueError, TypeError):
+                pass
+            return False  # float 列不匹配且不满足容差 → 不等价
+
+        # Decimal → quantize 精确比较
+        if dtype and "decimal" in dtype:
+            try:
+                dd = _Decimal(duckdb_val)
+                sd = _Decimal(spark_val)
+                scale = PhysicalVerifier._parse_decimal_scale(dtype)
+                if scale is not None:
+                    quantize_str = "0." + "0" * scale if scale > 0 else "1"
+                    quant = _Decimal(quantize_str)
+                    dd = dd.quantize(quant)
+                    sd = sd.quantize(quant)
+                return dd == sd
+            except Exception:
+                pass
+            return False  # Decimal 列不精确匹配 → 不等价
+
+        return False
+
+    @classmethod
     def _compute_diffs(
+        cls,
         duckdb_rows: list[dict[str, Any]],
         spark_rows: list[dict[str, Any]],
-    ) -> list[DiffDetail]:
+        config: NormalizationConfig | None = None,
+    ) -> tuple[list[DiffDetail], int, bool]:
         """逐行逐列对比 DuckDB 和 Spark 规范化后的结果。
 
         按行索引逐一对比——两方对齐后比较每列值。
-        最多返回 20 个差异项（防止超大输出）。
+        最多返回 20 条详细差异，同时返回真实差异总数和截断标志。
 
         Args:
             duckdb_rows: DuckDB 规范化后的行列表
             spark_rows: Spark 规范化后的行列表
+            config: 规范化配置（Phase 9B），用于类型感知比较
 
         Returns:
-            差异项列表
+            (diffs, total_diff_count, diffs_truncated) 三元组
         """
         diffs: list[DiffDetail] = []
+        total_diff_count = 0
         max_len = max(len(duckdb_rows), len(spark_rows))
+        max_detail_diffs = 20  # 最多返回 20 条详细差异
+
+        # 从 NormalizationConfig 构建列名→类型映射
+        col_types: dict[str, str] = {}
+        if config:
+            for col in config.output_columns:
+                norm_name = ResultCanonicalizer._normalize_column_name(col.column_name)
+                if col.data_type:
+                    col_types[norm_name] = col.data_type
 
         for i in range(max_len):
-            if len(diffs) >= 20:
-                break
-
             duckdb_row = duckdb_rows[i] if i < len(duckdb_rows) else {}
             spark_row = spark_rows[i] if i < len(spark_rows) else {}
 
             # 行数不对齐
             if not duckdb_row:
-                diffs.append(DiffDetail(
-                    row_index=i,
-                    column="(整行)",
-                    duckdb_value="(缺失)",
-                    spark_value=str(spark_row)[:200],
-                    description=f"第 {i} 行：DuckDB 侧缺失，Spark 侧有数据",
-                ))
+                total_diff_count += 1
+                if len(diffs) < max_detail_diffs:
+                    diffs.append(DiffDetail(
+                        row_index=i,
+                        column="(整行)",
+                        duckdb_value="(缺失)",
+                        spark_value=str(spark_row)[:200],
+                        description=f"第 {i} 行：DuckDB 侧缺失，Spark 侧有数据",
+                    ))
                 continue
             if not spark_row:
-                diffs.append(DiffDetail(
-                    row_index=i,
-                    column="(整行)",
-                    duckdb_value=str(duckdb_row)[:200],
-                    spark_value="(缺失)",
-                    description=f"第 {i} 行：DuckDB 侧有数据，Spark 侧缺失",
-                ))
+                total_diff_count += 1
+                if len(diffs) < max_detail_diffs:
+                    diffs.append(DiffDetail(
+                        row_index=i,
+                        column="(整行)",
+                        duckdb_value=str(duckdb_row)[:200],
+                        spark_value="(缺失)",
+                        description=f"第 {i} 行：DuckDB 侧有数据，Spark 侧缺失",
+                    ))
                 continue
 
             # 逐列对比
             all_columns = sorted(set(duckdb_row.keys()) | set(spark_row.keys()))
             for col in all_columns:
-                duckdb_val = duckdb_row.get(col)
-                spark_val = spark_row.get(col)
-                if duckdb_val != spark_val:
+                duckdb_val = duckdb_row.get(col, "")
+                spark_val = spark_row.get(col, "")
+
+                # 类型感知等价判断
+                if cls._values_are_equivalent(duckdb_val, spark_val, col, col_types, config):
+                    continue
+
+                total_diff_count += 1
+                if len(diffs) < max_detail_diffs:
                     diffs.append(DiffDetail(
                         row_index=i,
                         column=col,
@@ -876,10 +1168,9 @@ class PhysicalVerifier:
                         spark_value=str(spark_val)[:200],
                         description=f"第 {i} 行 {col} 列值不一致",
                     ))
-                    if len(diffs) >= 20:
-                        break
 
-        return diffs
+        diffs_truncated = total_diff_count > len(diffs)
+        return diffs, total_diff_count, diffs_truncated
 
     # ── 报告 ID ──
 
@@ -894,6 +1185,235 @@ class PhysicalVerifier:
         content = json.dumps(payload, sort_keys=True, default=str)
         hash_hex = hashlib.sha256(content.encode()).hexdigest()[:12]
         return f"physver_{hash_hex}"
+
+    # ════════════════════════════════════════════
+    # CRE 状态 → 生产状态映射表
+    # ════════════════════════════════════════════
+
+    _CRE_TO_LEGACY_MAP: dict[str, str] = {
+        "CONSISTENT": "RESULT_CONSISTENT",
+        "CONSISTENT_WITH_WARN": "RESULT_CONSISTENT",
+        "MISMATCH": "RESULT_MISMATCH",
+        "HUMAN_REVIEW": "HUMAN_REVIEW",
+    }
+
+    # ── CRE shadow 模式诊断（要求 5/6）──
+
+    @staticmethod
+    def _shadow_cre_diagnose(
+        duckdb_raw: list[dict[str, Any]],
+        spark_raw: list[dict[str, Any]],
+        norm_config: NormalizationConfig | None,
+        legacy_status: str,
+        contract_hash: str = "",
+        snapshot_id: str = "",
+        primary_keys: list[str] | None = None,
+        timezone: str = "",
+        environment_manifest: EnvironmentManifest | None = None,
+    ) -> CreShadowReport:
+        """以 shadow 模式运行 CRE 诊断——不改变现有结论。
+
+        Args:
+            duckdb_raw: DuckDB 原始行数据
+            spark_raw: Spark 原始行数据
+            norm_config: 规范化配置（含 Contract 列定义）
+            legacy_status: 生产 verify() 的原始状态
+            contract_hash: Contract hash（审计追溯）
+            snapshot_id: 快照 ID（审计追溯）
+            primary_keys: 权威主键列名（来自 Contract grouping_keys），
+                          None 时使用 norm_config.primary_keys
+            timezone: 时区标识，如 "Asia/Shanghai"
+            environment_manifest: EnvironmentManifest 对象（Pipeline 显式传入），
+                                  为 None 时特殊浮点值策略回退为 HUMAN_REVIEW
+
+        Returns:
+            CreShadowReport 严格模型——始终返回，不返回 None
+        """
+        # 惰性导入避免循环依赖
+        from tianshu_datadev.spark.cre_encoding import (
+            CreShadowReport,
+            CreShadowStatus,
+            CreShadowWarning,
+        )
+
+        # ── 前置条件检查 1：缺少 Contract output_columns ──
+        if not norm_config or not norm_config.output_columns:
+            return CreShadowReport(
+                diagnostic_available=False,
+                contract_hash=contract_hash,
+                snapshot_id=snapshot_id,
+                cre_status=CreShadowStatus.NOT_EXECUTED,
+                mapped_status="NOT_EXECUTED",
+                legacy_status=legacy_status,
+                status_consistent=False,
+                human_review_recommended=True,
+                decision_reason="缺少 Contract output_columns——无法运行 CRE 诊断",
+                error_message="缺少 Contract output_columns——无法运行 CRE 诊断",
+            )
+
+        # 确定主键：优先用传入的 primary_keys，后备 norm_config.primary_keys
+        resolved_pks = primary_keys if primary_keys is not None else norm_config.primary_keys
+
+        # ── 前置条件检查 2：无主键时的 singleton 对齐（Req 3）──
+        if not resolved_pks:
+            duckdb_count = len(duckdb_raw)
+            spark_count = len(spark_raw)
+            if duckdb_count == 1 and spark_count == 1:
+                # 双侧恰好各 1 行 → singleton 对齐允许
+                pass
+            else:
+                # 任一侧多行 → NOT_EXECUTED，禁止按行号或全部列猜键
+                return CreShadowReport(
+                    diagnostic_available=False,
+                    contract_hash=contract_hash,
+                    snapshot_id=snapshot_id,
+                    cre_status=CreShadowStatus.NOT_EXECUTED,
+                    mapped_status="NOT_EXECUTED",
+                    legacy_status=legacy_status,
+                    status_consistent=False,
+                    human_review_recommended=True,
+                    decision_reason=(
+                        "缺少权威主键（primary_keys）且双侧行数不满足 singleton 条件——"
+                        f"DuckDB={duckdb_count}行，Spark={spark_count}行，"
+                        f"禁止按行号或全部列猜键，需人工介入指定主键"
+                    ),
+                    error_message=(
+                        f"缺少权威主键（primary_keys）——DuckDB={duckdb_count}行，"
+                        f"Spark={spark_count}行——不满足 singleton 对齐条件"
+                    ),
+                )
+
+        # ── 前置条件检查 3：缺少 output_columns ──
+        # 已在上面检查过，此处防御
+        if not norm_config.output_columns:
+            return CreShadowReport(
+                diagnostic_available=False,
+                contract_hash=contract_hash,
+                snapshot_id=snapshot_id,
+                cre_status=CreShadowStatus.NOT_EXECUTED,
+                mapped_status="NOT_EXECUTED",
+                legacy_status=legacy_status,
+                status_consistent=False,
+                human_review_recommended=True,
+                error_message="缺少 Contract output_columns——无法运行 CRE 诊断",
+            )
+
+        try:
+            from tianshu_datadev.spark.cre import (
+                BucketHasher,
+                CreConfig,
+                CREEncoder,
+                DecisionEngine,
+                KeyBasedRowAligner,
+                ToleranceComparator,
+            )
+            # 构造 CreConfig——singleton 模式下用占位主键通过 DecisionEngine PK gate
+            singleton_mode = not resolved_pks
+            effective_pks = list(resolved_pks) if not singleton_mode else ["__singleton__"]
+            config = CreConfig(
+                output_columns=list(norm_config.output_columns),
+                primary_keys=effective_pks,
+                float_abs_tolerance=norm_config.float_abs_tolerance,
+                float_rel_tolerance=norm_config.float_rel_tolerance,
+                timezone=timezone,
+                environment_manifest=environment_manifest,
+            )
+            encoder = CREEncoder(config)
+
+            # 行对齐——singleton 跳过 KeyBasedRowAligner 主键校验，直接配对
+            if singleton_mode:
+                from tianshu_datadev.spark.cre_alignment import AlignmentResult
+                alignment = AlignmentResult(
+                    aligned_pairs=[(duckdb_raw[0], spark_raw[0])],
+                    duckdb_only=[],
+                    spark_only=[],
+                    error_message="",
+                    duplicate_keys=False,
+                )
+            else:
+                alignment = KeyBasedRowAligner.align(duckdb_raw, spark_raw, config, encoder)
+
+            # 逐行比较——singleton 和非 singleton 统一路径
+            pairs = alignment.aligned_pairs
+            row_results = [
+                (d, s, ToleranceComparator.compare_row(d, s, config, encoder))
+                for d, s in pairs
+            ] if pairs else []
+
+            # 分桶——singleton 模式跳过 BucketHasher（占位 PK 不可用于 digest）
+            if singleton_mode:
+                from tianshu_datadev.spark.cre_alignment import BucketResult
+                buckets = BucketResult(
+                    duckdb_bucket_digests=[],
+                    spark_bucket_digests=[],
+                    mismatched_buckets=[],
+                    num_buckets=config.num_buckets,
+                )
+            elif pairs:
+                buckets = BucketHasher.compute_bucket_digests(pairs, encoder, config)
+            else:
+                buckets = BucketHasher.compute_bucket_digests([], encoder, config)
+
+            # 判定——统一走 DecisionEngine（Req 6：singleton 不再手写分支）
+            cre_result = DecisionEngine.decide(alignment, row_results, buckets, config)
+
+            # ── 状态映射（要求 2）──
+            cre_status = cre_result.status
+            mapped_status = PhysicalVerifier._CRE_TO_LEGACY_MAP.get(
+                cre_status, "NOT_EXECUTED"
+            )
+
+            # status_consistent 必须比较映射后的语义状态
+            status_consistent = (mapped_status == legacy_status)
+
+            # 两套结论不同 → HUMAN_REVIEW 提示
+            human_review_recommended = not status_consistent
+
+            # 收集 WARN（严格模型——field_details 直接传递，不再 model_dump）
+            warnings_list: list[CreShadowWarning] = []
+            for w in cre_result.warnings:
+                warnings_list.append(CreShadowWarning(
+                    action=getattr(w, "action", ""),
+                    tolerated_ratio=getattr(w, "tolerated_ratio", 0.0),
+                    affected_row_count=getattr(w, "affected_row_count", 0),
+                    affected_cell_count=getattr(w, "affected_cell_count", 0),
+                    total_comparison_rows=getattr(w, "total_comparison_rows", 0),
+                    field_details=list(w.field_details),
+                ))
+
+            return CreShadowReport(
+                diagnostic_available=True,
+                contract_hash=contract_hash,
+                snapshot_id=snapshot_id,
+                cre_status=CreShadowStatus(cre_status),
+                mapped_status=mapped_status,
+                legacy_status=legacy_status,
+                status_consistent=status_consistent,
+                human_review_recommended=human_review_recommended,
+                has_warnings=len(cre_result.warnings) > 0,
+                warnings=warnings_list,
+                total_rows=cre_result.aligned_rows,
+                exact_match_rows=cre_result.exact_match_rows,
+                tolerance_match_rows=cre_result.tolerance_match_rows,
+                affected_row_count=cre_result.tolerance_match_rows,
+                mismatched_bucket_count=cre_result.mismatched_bucket_count,
+                decision_reason=cre_result.decision_reason,
+                error_message=alignment.error_message or "",
+            )
+        except Exception as e:
+            # shadow 失败不阻断主流程（要求 3）
+            return CreShadowReport(
+                diagnostic_available=False,
+                contract_hash=contract_hash,
+                snapshot_id=snapshot_id,
+                cre_status=CreShadowStatus.ERROR,
+                mapped_status="NOT_EXECUTED",
+                legacy_status=legacy_status,
+                status_consistent=False,
+                human_review_recommended=True,
+                decision_reason=f"CRE shadow 诊断异常：{e}",
+                error_message=f"CRE shadow 诊断异常：{e}",
+            )
 
 
 # ════════════════════════════════════════════

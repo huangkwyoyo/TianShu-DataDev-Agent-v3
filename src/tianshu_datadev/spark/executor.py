@@ -110,6 +110,95 @@ _CPU_LIMIT_SECONDS = 60
 # 内存上限（字节）
 _MEMORY_LIMIT_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
+# ── Java 版本兼容性辅助函数 ──
+
+
+def _probe_java_major_version(java_home: str) -> int:
+    """探测指定 JAVA_HOME 路径下 Java 的主版本号。
+
+    Args:
+        java_home: JAVA_HOME 目录路径
+
+    Returns:
+        主版本号（如 17），探测失败返回 0
+    """
+    java_bin = os.path.join(
+        java_home, "bin",
+        "java.exe" if os.name == "nt" else "java",
+    )
+    if not os.path.isfile(java_bin):
+        return 0
+    try:
+        result = subprocess.run(
+            [java_bin, "-version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        # java -version 输出到 stderr
+        # 格式 1：java version "1.8.0_341" → 1.8 格式 → major=8
+        # 格式 2：java version "17.0.8" 2023 → 9+ 格式 → major=17
+        match = re.search(r'"(?:1[.])?(\d+)', result.stderr)
+        if match:
+            return int(match.group(1))
+        match = re.search(r'"(?:1[.])?(\d+)', result.stdout)
+        if match:
+            return int(match.group(1))
+        return 0
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+
+
+def _find_compatible_java_home(min_version: int = 17) -> str | None:
+    r"""搜索系统中满足最低版本要求的 Java HOME。
+
+    在 Windows 上搜索常见 JDK 安装目录（Program Files\Java 等）。
+    返回第一个检测到的主版本号 >= min_version 的 JAVA_HOME 路径，
+    优先使用更高版本。
+
+    Args:
+        min_version: 最低主版本号（默认 17）
+
+    Returns:
+        兼容的 JAVA_HOME 路径，未找到返回 None
+    """
+    candidates: list[tuple[int, str]] = []  # (version, path)
+
+    # 搜索基础目录列表（Windows 常见 JDK 安装位置）
+    base_dirs: list[str] = []
+    for env_key in ("ProgramFiles", "ProgramW6432", "LOCALAPPDATA"):
+        val = os.environ.get(env_key)
+        if val:
+            base_dirs.append(val)
+
+    checked: set[str] = set()
+    for base in base_dirs:
+        if not base:
+            continue
+        for java_root in (
+            os.path.join(base, "Java"),
+            os.path.join(base, "Eclipse Adoptium"),
+            os.path.join(base, "Eclipse Foundation"),
+            os.path.join(base, "Amazon Corretto"),
+            os.path.join(base, "BellSoft"),
+            os.path.join(base, "Microsoft"),
+        ):
+            if not os.path.isdir(java_root):
+                continue
+            for entry in sorted(os.listdir(java_root), reverse=True):
+                entry_path = os.path.join(java_root, entry)
+                if entry_path in checked:
+                    continue
+                checked.add(entry_path)
+                if not os.path.isdir(os.path.join(entry_path, "bin")):
+                    continue
+                version = _probe_java_major_version(entry_path)
+                if version >= min_version:
+                    candidates.append((version, entry_path))
+
+    # 按版本降序排列，返回最高版本
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1] if candidates else None
+
+
 # ── 环境变量白名单 ──
 
 # 子进程只暴露这些环境变量——禁止 token/secret/凭据泄露
@@ -137,6 +226,12 @@ _tianshu_builder = _tianshu_builder.appName("tianshu_executor")
 _tianshu_builder = _tianshu_builder.master("local[1]")
 _tianshu_builder = _tianshu_builder.config("spark.ui.enabled", "false")
 _tianshu_builder = _tianshu_builder.config("spark.sql.adaptive.enabled", "false")
+# Java 17+ 模块系统兼容——PySpark 需要访问 sun.nio.ch.DirectBuffer
+_tianshu_builder = _tianshu_builder.config(
+    "spark.driver.extraJavaOptions",
+    "--add-exports java.base/sun.nio.ch=ALL-UNNAMED "
+    "--add-opens java.base/sun.nio.ch=ALL-UNNAMED",
+)
 _tianshu_spark = _tianshu_builder.getOrCreate()
 # 构造 inputs 字典——优先读快照侧车索引（key=别名），无索引时回退按文件名 stem
 inputs: dict = {}
@@ -294,8 +389,8 @@ class LocalSparkExecutor:
                 print(row)
     """
 
-    # 默认超时（秒）
-    DEFAULT_TIMEOUT_SECONDS = 120
+    # 默认超时（秒）——PySpark 首次启动 JVM + 数据加载可能较慢
+    DEFAULT_TIMEOUT_SECONDS = 300
 
     # 查找 PySpark 可执行环境
     _PYTHON_CMD = os.environ.get("PYSPARK_PYTHON", "python")
@@ -320,6 +415,10 @@ class LocalSparkExecutor:
     def _build_sandbox_env(data_dir: str | None) -> dict[str, str]:
         """构建白名单环境变量——只暴露必要变量，防止凭据泄露。
 
+        特殊处理：
+        - JAVA_HOME：自动检测 Java 版本兼容性——若当前 JAVA_HOME 指向 Java < 17，
+          则搜索系统已安装的 Java 17+ 路径并覆写，确保 PySpark 4.x 正常运行
+
         Args:
             data_dir: 数据目录路径，注入为 SPARK_DATA_DIR
 
@@ -333,6 +432,20 @@ class LocalSparkExecutor:
                 sandbox[key] = value
         if data_dir:
             sandbox["SPARK_DATA_DIR"] = data_dir
+
+        # PySpark 4.x 需要 Java 17+——自动检测并修正 JAVA_HOME
+        java_home = sandbox.get("JAVA_HOME", "")
+        if java_home:
+            current_ver = _probe_java_major_version(java_home)
+            if 0 < current_ver < 17:
+                compatible_java = _find_compatible_java_home(min_version=17)
+                if compatible_java:
+                    logging.getLogger(__name__).info(
+                        "JAVA_HOME 自动修正：%s（v%s）→ %s",
+                        java_home, current_ver, compatible_java,
+                    )
+                    sandbox["JAVA_HOME"] = compatible_java
+
         return sandbox
 
     @staticmethod
