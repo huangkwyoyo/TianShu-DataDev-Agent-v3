@@ -1106,6 +1106,24 @@ class TestNormalizationConfig:
         assert diffs == []
         assert not truncated
 
+    def test_float_within_tolerance_unknown_type(self):
+        """float 差异在容差内但 data_type=unknown——数值回退应使等价。
+
+        对应 data_type="unknown"（contract_extractor 硬编码）场景。
+        """
+        config = NormalizationConfig(
+            output_columns=[NormalizationColumn(column_name="val", data_type=None)],
+        )
+        duckdb_rows = [{"id": "1", "val": "3.9369690851405856"}]
+        spark_rows = [{"id": "1", "val": "3.9369690851405883"}]
+
+        diffs, total_count, truncated = PhysicalVerifier._compute_diffs(
+            duckdb_rows, spark_rows, config=config,
+        )
+        assert total_count == 0
+        assert diffs == []
+        assert not truncated
+
     def test_float_beyond_tolerance_detected(self):
         """float 差异远超容差——应检测为差异。"""
         config = NormalizationConfig(

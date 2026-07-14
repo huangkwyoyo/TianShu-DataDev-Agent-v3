@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from enum import Enum
 from typing import Any
@@ -574,10 +575,21 @@ class PhysicalVerifier:
         # Step 3：Spark 执行 PySpark DSL
         spark_result = self._execute_spark(pyspark_code, snapshot_dir)
 
-        # 自动检测排序键：当无显式排序键时，从 DuckDB 结果列名自动提取
-        # 确保双引擎结果按相同键排序，实现确定性行级对比
+        # ── 诊断日志：输出 snapshot_dir 和执行行数（安全——不走文件 I/O，不走字符串拼接 \n）──
+        _diag_logger = logging.getLogger(__name__)
+        _diag_logger.info("[PHYS_VERIFIER_DIAG] snapshot_dir=%s", snapshot_dir)
+        _diag_logger.info("[PHYS_VERIFIER_DIAG] duckdb_rows=%s spark_rows=%s",
+                          len(duckdb_result.output_rows) if duckdb_result.output_rows else 0,
+                          len(spark_result.output_rows) if spark_result.output_rows else 0)
+
+        # 自动检测排序键：当无显式排序键时，优先使用业务主键（cre_primary_keys），
+        # 否则从 DuckDB 结果列名自动提取。使用业务主键排序可避免聚合指标列
+        # （如 avg_distance、total_fare）参与排序导致浮点尾差行错位。
         if not order_keys and duckdb_result.output_rows:
-            order_keys = list(duckdb_result.output_rows[0].keys())
+            if cre_primary_keys:
+                order_keys = list(cre_primary_keys)
+            else:
+                order_keys = list(duckdb_result.output_rows[0].keys())
 
         # Step 4：规范化
         duckdb_rows: list[dict] = []
@@ -760,8 +772,18 @@ class PhysicalVerifier:
             )
 
         # Step 7：类型感知差异计算
+        # 传入归一化后的 order_keys 用于基于键的行对齐
+        # 确保列名与 ResultCanonicalizer 处理后的行数据一致
+        norm_order_keys: list[str] | None = None
+        if order_keys:
+            norm_order_keys = [
+                self._canonicalizer._normalize_column_name(k)
+                for k in order_keys
+            ]
         diffs, total_diff_count, diffs_truncated = self._compute_diffs(
-            duckdb_rows, spark_rows, config=self._normalization_config,
+            duckdb_rows, spark_rows,
+            config=self._normalization_config,
+            order_keys=norm_order_keys,
         )
 
         # 判定最终状态
@@ -1323,7 +1345,35 @@ class PhysicalVerifier:
                 pass
             return False  # Decimal 列不精确匹配 → 不等价
 
+        # 数值回退——当 data_type 为 "unknown" 或缺失时，
+        # DuckDB vs PySpark 浮点末位差异（~1e-15）仍用 math.isclose 消除
+        # 仅当双方都能解析为 float 时启用，不影响非数值列
+        try:
+            dv = float(duckdb_val)
+            sv = float(spark_val)
+            if math.isclose(
+                dv, sv,
+                rel_tol=config.float_rel_tolerance,
+                abs_tol=config.float_abs_tolerance,
+            ):
+                return True
+        except (ValueError, TypeError):
+            pass
+
         return False
+
+    @staticmethod
+    def _build_sort_key(row: dict[str, Any], keys: list[str]) -> str:
+        """从行数据中提取排序键的规范化字符串——用于基于键的行对齐。
+
+        Args:
+            row: 规范化后的行 dict
+            keys: 排序键列名列表（已归一化）
+
+        Returns:
+            排序键字符串（用 | 连接）
+        """
+        return "|".join(str(row.get(k, "")) for k in keys)
 
     @classmethod
     def _compute_diffs(
@@ -1331,23 +1381,24 @@ class PhysicalVerifier:
         duckdb_rows: list[dict[str, Any]],
         spark_rows: list[dict[str, Any]],
         config: NormalizationConfig | None = None,
+        order_keys: list[str] | None = None,
     ) -> tuple[list[DiffDetail], int, bool]:
         """逐行逐列对比 DuckDB 和 Spark 规范化后的结果。
 
-        按行索引逐一对比——两方对齐后比较每列值。
-        最多返回 20 条详细差异，同时返回真实差异总数和截断标志。
+        优先按排序键（order_keys）对齐行——避免一方多行时后续全部错位。
+        无排序键时回退到按索引对比（原行为）。
 
         Args:
             duckdb_rows: DuckDB 规范化后的行列表
             spark_rows: Spark 规范化后的行列表
             config: 规范化配置（Phase 9B），用于类型感知比较
+            order_keys: 排序键列名列表（已归一化），用于基于键的行对齐
 
         Returns:
             (diffs, total_diff_count, diffs_truncated) 三元组
         """
         diffs: list[DiffDetail] = []
         total_diff_count = 0
-        max_len = max(len(duckdb_rows), len(spark_rows))
         max_detail_diffs = 20  # 最多返回 20 条详细差异
 
         # 从 NormalizationConfig 构建列名→类型映射
@@ -1358,53 +1409,122 @@ class PhysicalVerifier:
                 if col.data_type:
                     col_types[norm_name] = col.data_type
 
-        for i in range(max_len):
-            duckdb_row = duckdb_rows[i] if i < len(duckdb_rows) else {}
-            spark_row = spark_rows[i] if i < len(spark_rows) else {}
+        # ── 基于排序键的行对齐（order_keys 可用时）──
+        # 优先使用 key-based 对齐，避免 index-based 的错位级联
+        if order_keys:
+            # Step 1：构建 DuckDB 行索引（sort_key → row）
+            duckdb_index: dict[str, dict[str, Any]] = {}
+            duckdb_keys_seen: set[str] = set()
+            for row in duckdb_rows:
+                sk = cls._build_sort_key(row, order_keys)
+                if sk not in duckdb_keys_seen:
+                    duckdb_index[sk] = row
+                    duckdb_keys_seen.add(sk)
 
-            # 行数不对齐
-            if not duckdb_row:
-                total_diff_count += 1
-                if len(diffs) < max_detail_diffs:
-                    diffs.append(DiffDetail(
-                        row_index=i,
-                        column="(整行)",
-                        duckdb_value="(缺失)",
-                        spark_value=str(spark_row)[:200],
-                        description=f"第 {i} 行：DuckDB 侧缺失，Spark 侧有数据",
-                    ))
-                continue
-            if not spark_row:
-                total_diff_count += 1
-                if len(diffs) < max_detail_diffs:
-                    diffs.append(DiffDetail(
-                        row_index=i,
-                        column="(整行)",
-                        duckdb_value=str(duckdb_row)[:200],
-                        spark_value="(缺失)",
-                        description=f"第 {i} 行：DuckDB 侧有数据，Spark 侧缺失",
-                    ))
-                continue
+            # Step 2：逐行对比 Spark 侧 vs DuckDB 侧
+            spark_keys_matched: set[str] = set()
+            for i, spark_row in enumerate(spark_rows):
+                sk = cls._build_sort_key(spark_row, order_keys)
+                duckdb_row = duckdb_index.get(sk)
 
-            # 逐列对比
-            all_columns = sorted(set(duckdb_row.keys()) | set(spark_row.keys()))
-            for col in all_columns:
-                duckdb_val = duckdb_row.get(col, "")
-                spark_val = spark_row.get(col, "")
-
-                # 类型感知等价判断
-                if cls._values_are_equivalent(duckdb_val, spark_val, col, col_types, config):
+                if duckdb_row is None:
+                    # Spark 侧独有的行
+                    spark_keys_matched.add(sk)  # 标记已处理
+                    total_diff_count += 1
+                    if len(diffs) < max_detail_diffs:
+                        diffs.append(DiffDetail(
+                            row_index=i,
+                            column="(整行)",
+                            duckdb_value="(缺失)",
+                            spark_value=str(spark_row)[:200],
+                            description=f"Row {i}（key={sk}）：DuckDB 侧缺失，Spark 侧有数据",
+                        ))
                     continue
 
-                total_diff_count += 1
-                if len(diffs) < max_detail_diffs:
-                    diffs.append(DiffDetail(
-                        row_index=i,
-                        column=col,
-                        duckdb_value=str(duckdb_val)[:200],
-                        spark_value=str(spark_val)[:200],
-                        description=f"第 {i} 行 {col} 列值不一致",
-                    ))
+                spark_keys_matched.add(sk)
+
+                # 已找到对应行——逐列对比
+                all_columns = sorted(set(duckdb_row.keys()) | set(spark_row.keys()))
+                for col in all_columns:
+                    duckdb_val = duckdb_row.get(col, "")
+                    spark_val = spark_row.get(col, "")
+
+                    if cls._values_are_equivalent(duckdb_val, spark_val, col, col_types, config):
+                        continue
+
+                    total_diff_count += 1
+                    if len(diffs) < max_detail_diffs:
+                        diffs.append(DiffDetail(
+                            row_index=i,
+                            column=col,
+                            duckdb_value=str(duckdb_val)[:200],
+                            spark_value=str(spark_val)[:200],
+                            description=f"Row {i}（key={sk}）：{col} 列值不一致",
+                        ))
+
+            # Step 3：DuckDB 侧独特行（未在 Spark 中找到对应 key）
+            for i, row in enumerate(duckdb_rows):
+                sk = cls._build_sort_key(row, order_keys)
+                if sk not in spark_keys_matched:
+                    total_diff_count += 1
+                    if len(diffs) < max_detail_diffs:
+                        diffs.append(DiffDetail(
+                            row_index=i,
+                            column="(整行)",
+                            duckdb_value=str(row)[:200],
+                            spark_value="(缺失)",
+                            description=f"Row {i}（key={sk}）：DuckDB 侧有数据，Spark 侧缺失",
+                        ))
+
+        else:
+            # ── 无排序键时回退到按索引对比（原行为）──
+            max_len = max(len(duckdb_rows), len(spark_rows))
+            for i in range(max_len):
+                duckdb_row = duckdb_rows[i] if i < len(duckdb_rows) else {}
+                spark_row = spark_rows[i] if i < len(spark_rows) else {}
+
+                # 行数不对齐
+                if not duckdb_row:
+                    total_diff_count += 1
+                    if len(diffs) < max_detail_diffs:
+                        diffs.append(DiffDetail(
+                            row_index=i,
+                            column="(整行)",
+                            duckdb_value="(缺失)",
+                            spark_value=str(spark_row)[:200],
+                            description=f"第 {i} 行：DuckDB 侧缺失，Spark 侧有数据",
+                        ))
+                    continue
+                if not spark_row:
+                    total_diff_count += 1
+                    if len(diffs) < max_detail_diffs:
+                        diffs.append(DiffDetail(
+                            row_index=i,
+                            column="(整行)",
+                            duckdb_value=str(duckdb_row)[:200],
+                            spark_value="(缺失)",
+                            description=f"第 {i} 行：DuckDB 侧有数据，Spark 侧缺失",
+                        ))
+                    continue
+
+                # 逐列对比
+                all_columns = sorted(set(duckdb_row.keys()) | set(spark_row.keys()))
+                for col in all_columns:
+                    duckdb_val = duckdb_row.get(col, "")
+                    spark_val = spark_row.get(col, "")
+
+                    if cls._values_are_equivalent(duckdb_val, spark_val, col, col_types, config):
+                        continue
+
+                    total_diff_count += 1
+                    if len(diffs) < max_detail_diffs:
+                        diffs.append(DiffDetail(
+                            row_index=i,
+                            column=col,
+                            duckdb_value=str(duckdb_val)[:200],
+                            spark_value=str(spark_val)[:200],
+                            description=f"第 {i} 行 {col} 列值不一致",
+                        ))
 
         diffs_truncated = total_diff_count > len(diffs)
         return diffs, total_diff_count, diffs_truncated
