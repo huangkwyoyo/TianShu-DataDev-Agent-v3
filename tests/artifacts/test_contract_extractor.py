@@ -47,11 +47,13 @@ from tianshu_datadev.planning.sql_program import (
     StatementKind,
 )
 from tianshu_datadev.planning.temp_table import TempTableSpec
+from tests._test_utils import read_fixture
+
 
 # ── 辅助 ──
 
 
-def _read_fixture(path: str) -> str:
+def read_fixture(path: str) -> str:
     """读取测试 fixture 文件。"""
     abs_path = os.path.join(os.path.dirname(__file__), "..", path)
     with open(abs_path, "r", encoding="utf-8") as f:
@@ -61,7 +63,7 @@ def _read_fixture(path: str) -> str:
 def _parse_spec(fixture_path: str):
     """解析 fixture 文件为 ParsedDeveloperSpec。"""
     parser = DeveloperSpecParser()
-    text = _read_fixture(fixture_path)
+    text = read_fixture(fixture_path)
     return parser.parse(text)
 
 

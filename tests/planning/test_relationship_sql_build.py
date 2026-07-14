@@ -24,13 +24,9 @@ from tianshu_datadev.planning.sql_build_plan import (
     SqlBuildPlanBuilder,
 )
 
+from tests._test_utils import read_fixture
+
 # ── 辅助 ──
-
-
-def _read_fixture(path: str) -> str:
-    abs_path = os.path.join(os.path.dirname(__file__), "..", path)
-    with open(abs_path, "r", encoding="utf-8") as f:
-        return f.read()
 
 
 # ════════════════════════════════════════════
@@ -44,7 +40,7 @@ class TestSingleTablePlan:
     def test_single_table_plan_structure(self):
         """单表 golden fixture → Scan → (Aggregate) → Project。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/golden/golden_no_time_range.md")
+        text = read_fixture("fixtures/golden/golden_no_time_range.md")
         spec = parser.parse(text)
 
         builder = SqlBuildPlanBuilder()
@@ -70,7 +66,7 @@ class TestSingleTablePlan:
     def test_single_table_with_metrics_has_aggregate(self):
         """单表含指标 → 应有 AggregateStep。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/golden/golden_no_time_range.md")
+        text = read_fixture("fixtures/golden/golden_no_time_range.md")
         spec = parser.parse(text)
 
         builder = SqlBuildPlanBuilder()
@@ -94,7 +90,7 @@ class TestExplicitJoinIntegration:
     def test_explicit_join_to_strong_candidate(self):
         """显式 Join fixture → FakeRelationshipPlanner → STRONG JoinCandidate。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/relationship/explicit_join_spec.md")
+        text = read_fixture("fixtures/relationship/explicit_join_spec.md")
         spec = parser.parse(text)
 
         planner = FakeRelationshipPlanner()
@@ -117,7 +113,7 @@ class TestExplicitJoinIntegration:
     def test_explicit_join_produces_join_step(self):
         """显式 Join → SqlBuildPlan 应包含 JoinStep。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/relationship/explicit_join_spec.md")
+        text = read_fixture("fixtures/relationship/explicit_join_spec.md")
         spec = parser.parse(text)
 
         planner = FakeRelationshipPlanner()
@@ -136,7 +132,7 @@ class TestExplicitJoinIntegration:
     def test_no_joins_empty_candidates(self):
         """无 Join 声明 → 空 candidates。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/golden/golden_no_explicit_joins.md")
+        text = read_fixture("fixtures/golden/golden_no_explicit_joins.md")
         spec = parser.parse(text)
 
         planner = FakeRelationshipPlanner()
@@ -149,7 +145,7 @@ class TestExplicitJoinIntegration:
     def test_multi_table_flag(self):
         """多表 spec → multi_table=True。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/relationship/explicit_join_spec.md")
+        text = read_fixture("fixtures/relationship/explicit_join_spec.md")
         spec = parser.parse(text)
 
         planner = FakeRelationshipPlanner()
@@ -158,7 +154,7 @@ class TestExplicitJoinIntegration:
         assert hypothesis.multi_table is True
 
         # 单表应 multi_table=False
-        text_single = _read_fixture("fixtures/golden/golden_no_time_range.md")
+        text_single = read_fixture("fixtures/golden/golden_no_time_range.md")
         spec_single = parser.parse(text_single)
         hyp_single, _ = planner.plan(spec_single)
         assert hyp_single.multi_table is False
@@ -175,7 +171,7 @@ class TestFakePlannerDeterminism:
     def test_planner_determinism(self):
         """相同 spec 两次 plan → 相同 hypothesis_id + 相同候选数。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/relationship/explicit_join_spec.md")
+        text = read_fixture("fixtures/relationship/explicit_join_spec.md")
         spec = parser.parse(text)
 
         planner = FakeRelationshipPlanner()
@@ -189,7 +185,7 @@ class TestFakePlannerDeterminism:
     def test_builder_determinism(self):
         """相同 spec + hypothesis 两次 build → 相同 plan_id + 相同 step 数。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/relationship/explicit_join_spec.md")
+        text = read_fixture("fixtures/relationship/explicit_join_spec.md")
         spec = parser.parse(text)
 
         planner = FakeRelationshipPlanner()
@@ -207,7 +203,7 @@ class TestFakePlannerDeterminism:
     def test_evidence_chain_yaml_generated(self):
         """JoinCandidate 证据链 YAML 包含完整字段。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/relationship/explicit_join_spec.md")
+        text = read_fixture("fixtures/relationship/explicit_join_spec.md")
         spec = parser.parse(text)
 
         planner = FakeRelationshipPlanner()
@@ -276,7 +272,7 @@ class TestRelationshipPlannerDegradation:
     def test_degradation_explicit_join(self):
         """无 LLM client → 显式 Join 与 Fake 一致。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/relationship/explicit_join_spec.md")
+        text = read_fixture("fixtures/relationship/explicit_join_spec.md")
         spec = parser.parse(text)
 
         fake = FakeRelationshipPlanner()
@@ -292,7 +288,7 @@ class TestRelationshipPlannerDegradation:
     def test_degradation_no_joins(self):
         """无 LLM client + 无 Join → 与 Fake 一致。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/golden/golden_no_explicit_joins.md")
+        text = read_fixture("fixtures/golden/golden_no_explicit_joins.md")
         spec = parser.parse(text)
 
         fake = FakeRelationshipPlanner()
@@ -311,7 +307,7 @@ class TestRelationshipPlannerContextBuilder:
     def test_context_contains_table_schemas(self):
         """context 必须包含所有表的结构信息。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/relationship/explicit_join_spec.md")
+        text = read_fixture("fixtures/relationship/explicit_join_spec.md")
         spec = parser.parse(text)
 
         manifest = _build_test_manifest(
@@ -343,7 +339,7 @@ class TestRelationshipPlannerContextBuilder:
     def test_context_contains_existing_joins(self):
         """context 必须包含程序员的显式声明（H4 保护）。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/relationship/explicit_join_spec.md")
+        text = read_fixture("fixtures/relationship/explicit_join_spec.md")
         spec = parser.parse(text)
 
         manifest = _build_test_manifest(
@@ -364,7 +360,7 @@ class TestRelationshipPlannerContextBuilder:
     def test_context_contains_title_and_description(self):
         """context 必须包含业务描述（LLM 语义推断的依据）。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/golden/golden_no_explicit_joins.md")
+        text = read_fixture("fixtures/golden/golden_no_explicit_joins.md")
         spec = parser.parse(text)
 
         manifest = _build_test_manifest(
@@ -443,7 +439,7 @@ class TestCrossValidator:
     def _make_spec_with_metrics(self, metrics, grain=None):
         """解析 fixture 并覆盖指标和粒度，返回 (spec, manifest)。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/relationship/explicit_join_spec.md")
+        text = read_fixture("fixtures/relationship/explicit_join_spec.md")
         spec = parser.parse(text)
         # 覆盖指标
         spec.metrics = metrics
@@ -617,7 +613,7 @@ class TestCrossValidator:
     def test_null_hypothesis_returns_empty(self):
         """hypothesis=None → 跳过所有检查，返回空列表。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/golden/golden_no_time_range.md")
+        text = read_fixture("fixtures/golden/golden_no_time_range.md")
         spec = parser.parse(text)
         manifest = _build_test_manifest(
             [{"table_ref": "tf", "columns": [("id", "bigint")]}],
@@ -629,7 +625,7 @@ class TestCrossValidator:
     def test_empty_candidates_returns_empty(self):
         """无 JOIN 候选 → 跳过检查，返回空列表。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/golden/golden_no_time_range.md")
+        text = read_fixture("fixtures/golden/golden_no_time_range.md")
         spec = parser.parse(text)
         manifest = _build_test_manifest(
             [{"table_ref": "tf", "columns": [("id", "bigint")]}],

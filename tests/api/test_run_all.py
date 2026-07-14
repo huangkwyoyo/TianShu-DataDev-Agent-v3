@@ -1,23 +1,16 @@
 """tests/api/test_run_all.py——POST /api/run-all 测试。"""
 
-import os
-
 import pytest
-
-_CSV_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv")
-)
-
 
 class TestRunAll:
     """POST /api/run-all——全流程+打包 → RunAllResponse 摘要。"""
 
-    def test_run_all_success(self, client, golden_spec_passing):
+    def test_run_all_success(self, client, golden_spec_passing, csv_path):
         """全流程成功——需要 DuckDB 和 CSV fixture。"""
         resp = client.post("/api/run-all", json={
             "markdown_text": golden_spec_passing,
             "table_mapping": {"tf": "test_fact"},
-            "table_paths": {"test_fact": _CSV_PATH},
+            "table_paths": {"test_fact": csv_path},
         })
         assert resp.status_code == 200, f"期望 200，实际 {resp.status_code}: {resp.text}"
         data = resp.json()
@@ -29,7 +22,7 @@ class TestRunAll:
         assert "validation_passed" in data
         assert "open_questions" in data
 
-    def test_run_all_invalid_spec(self, client):
+    def test_run_all_invalid_spec(self, client, csv_path):
         """无效输入 → 200 + pipeline_error（Pipeline 内部捕获，8 阶段）。"""
         resp = client.post("/api/run-all", json={"markdown_text": ""})
         assert resp.status_code == 200, f"期望 200，实际 {resp.status_code}: {resp.text}"
@@ -43,17 +36,22 @@ class TestRunAll:
         assert "contract" in stage_names
         assert "package" in stage_names
 
-    def test_run_all_success_no_pipeline_error(self, client, golden_spec_passing):
+    def test_run_all_success_no_pipeline_error(self, client, golden_spec_passing, csv_path):
         """成功全流程 → 不含 pipeline_error 字段。"""
         resp = client.post("/api/run-all", json={
             "markdown_text": golden_spec_passing,
             "table_mapping": {"tf": "test_fact"},
-            "table_paths": {"test_fact": _CSV_PATH},
+            "table_paths": {"test_fact": csv_path},
         })
         assert resp.status_code == 200
         data = resp.json()
         assert "pipeline_error" not in data
-        assert "pipeline_stages" not in data
+        # 成功路径应包含 pipeline_stages（8 阶段全部 ok），供流式进度使用
+        assert "pipeline_stages" in data
+        assert len(data["pipeline_stages"]) == 8
+        assert all(s["status"] == "ok" for s in data["pipeline_stages"])
+        stage_names = [s["stage"] for s in data["pipeline_stages"]]
+        assert stage_names == ["parser", "enrich", "build", "validate", "compile", "execute", "contract", "package"]
         assert data["package_id"].startswith("pkg_")
         # 成功路径应包含链路状态字段
         assert "validation_passed" in data

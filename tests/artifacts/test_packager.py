@@ -20,11 +20,13 @@ from tianshu_datadev.artifacts.provenance import compute_json_hash
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan, SqlBuildPlanBuilder
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
+from tests._test_utils import read_fixture
+
 
 # ── 辅助 ──
 
 
-def _read_fixture(path: str) -> str:
+def read_fixture(path: str) -> str:
     abs_path = os.path.join(os.path.dirname(__file__), "..", path)
     with open(abs_path, "r", encoding="utf-8") as f:
         return f.read()
@@ -32,7 +34,7 @@ def _read_fixture(path: str) -> str:
 
 def _build_single_table_inputs(request_id: str = "test_req_pkg") -> PackageInputs:
     """构建单表的完整 PackageInputs。"""
-    spec_text = _read_fixture("fixtures/golden/golden_no_time_range.md")
+    spec_text = read_fixture("fixtures/golden/golden_no_time_range.md")
     parser = DeveloperSpecParser()
     spec = parser.parse(spec_text)
 

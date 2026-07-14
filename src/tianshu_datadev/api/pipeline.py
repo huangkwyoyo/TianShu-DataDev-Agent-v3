@@ -1869,6 +1869,8 @@ class Pipeline:
             ),
             "artifact_count": len(package_manifest.artifacts),
             "llm_traces": self._get_llm_traces(request_id),  # 新增——LLM 调用追踪
+            # 流式进度支持——SQL 管线阶段状态列表（全部 ok），供 run_all_full_stream 提取
+            "pipeline_stages": [{"stage": s, "status": "ok"} for s in _run_all_stages],
         }
         if rich:
             # 提取 SQL 文本——兼容 CompiledSql 对象和纯字符串
@@ -2089,29 +2091,23 @@ class Pipeline:
             """后台线程——执行 SQL + Spark 全流程，将事件推入队列。"""
             try:
                 # ── Step 1: SQL 管线 ──
-                # TeeCollector 拦截 stage 事件（run_all 内部调用 collector.stage()）
-                # 注意：当前 run_all() 通过 get_collector() 获取采集器，
-                # TeeCollector 包装无法直接注入——改为从 run_all 返回的 pipeline_stages
-                # 中提取阶段信息，逐阶段发送合成事件。
-                # 这一简化避免了全局状态替换的复杂性。
-                sql_result = self.run_all(markdown_text, table_mapping, table_paths, rich=True)
+                # 通过 ContextVar 注入流式事件队列——run_all() 内部调用 get_collector()
+                # 时，将返回 TeeCollector 包装的 collector，实时推送 SQL 阶段
+                # started/completed 事件（含 duration_ms）。
+                from tianshu_datadev.monitor.collector import _stream_event_queue
+                _token = _stream_event_queue.set(event_queue)
+                try:
+                    sql_result = self.run_all(markdown_text, table_mapping, table_paths, rich=True)
+                finally:
+                    _stream_event_queue.reset(_token)
+
                 request_id = sql_result.get("request_id")
                 sql_ok = sql_result.get("pipeline_error") is None
                 generated_sql = sql_result.get("generated_sql", "") if sql_ok else ""
 
-                # 从 SQL 结果中提取阶段信息并发送事件
+                # 提取 pipeline_stages 供 done 事件使用（TeeCollector 已在 run_all()
+                # 执行期间实时推送了所有 SQL 阶段事件到 event_queue）
                 sql_pipeline_stages = sql_result.get("pipeline_stages", []) or []
-                for s in sql_pipeline_stages:
-                    stage_name = s.get("stage", "unknown")
-                    stage_status = s.get("status", "skipped")
-                    event_queue.put({
-                        "event": "stage",
-                        "pipeline": "sql",
-                        "stage": stage_name,
-                        "status": "completed" if stage_status == "ok" else stage_status,
-                        "message": s.get("error_message") if stage_status != "ok" else None,
-                        "error_type": s.get("error_type") if stage_status != "ok" else None,
-                    })
 
                 # ── Step 2: Spark 管线 ──
                 spark_stages: list[dict] = []

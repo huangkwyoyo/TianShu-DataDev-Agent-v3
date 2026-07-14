@@ -8,17 +8,13 @@ import pytest
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
 
-def _read_fixture(filename: str) -> str:
-    """读取测试 fixture 文件。"""
-    path = os.path.join(_ROOT, "tests", "fixtures", "golden", filename)
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+from tests._test_utils import read_fixture
 
 
 @pytest.fixture
 def temp_spec_file(tmp_path):
     """创建临时 DeveloperSpec 文件——内容来自 golden fixture。"""
-    content = _read_fixture("golden_passing.md")
+    content = read_fixture("fixtures/golden/golden_passing.md")
     f = tmp_path / "spec.md"
     f.write_text(content, encoding="utf-8")
     return str(f)

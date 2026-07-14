@@ -31,11 +31,13 @@ from tianshu_datadev.planning.sql_build_plan import (
     SqlBuildPlan,
 )
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
+from tests._test_utils import read_fixture
+
 
 # ── 辅助 ──
 
 
-def _read_fixture(path: str) -> str:
+def read_fixture(path: str) -> str:
     abs_path = os.path.join(os.path.dirname(__file__), "..", path)
     with open(abs_path, "r", encoding="utf-8") as f:
         return f.read()
@@ -157,7 +159,7 @@ class TestLeftJoinSafetyGate:
     def test_left_join_with_primary_key_passes(self):
         """右表 primary_key 覆盖 join key → 不阻断。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/relationship/explicit_join_spec.md")
+        text = read_fixture("fixtures/relationship/explicit_join_spec.md")
         spec = parser.parse(text)
 
         # 修改 joins 为 LEFT JOIN
@@ -199,7 +201,7 @@ class TestLeftJoinSafetyGate:
     def test_left_join_with_unique_keys_passes(self):
         """右表 unique_keys（非 primary_key）覆盖 join key → 不阻断。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/relationship/explicit_join_spec.md")
+        text = read_fixture("fixtures/relationship/explicit_join_spec.md")
         spec = parser.parse(text)
 
         from tianshu_datadev.developer_spec.models import JoinTypeEnum
@@ -236,7 +238,7 @@ class TestLeftJoinSafetyGate:
     def test_left_join_no_unique_keys_blocks(self):
         """无 manifest（无 unique_keys）→ blocking OpenQuestion。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/relationship/explicit_join_spec.md")
+        text = read_fixture("fixtures/relationship/explicit_join_spec.md")
         spec = parser.parse(text)
 
         from tianshu_datadev.developer_spec.models import JoinTypeEnum
@@ -257,7 +259,7 @@ class TestLeftJoinSafetyGate:
     def test_left_join_unique_keys_no_coverage_blocks(self):
         """有 unique_keys 但不覆盖联结键 → blocking OpenQuestion。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/relationship/explicit_join_spec.md")
+        text = read_fixture("fixtures/relationship/explicit_join_spec.md")
         spec = parser.parse(text)
 
         from tianshu_datadev.developer_spec.models import JoinTypeEnum
@@ -295,7 +297,7 @@ class TestLeftJoinSafetyGate:
     def test_inner_join_skips_safety_gate(self):
         """INNER JOIN 不触发 LEFT JOIN 安全门禁。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/relationship/explicit_join_spec.md")
+        text = read_fixture("fixtures/relationship/explicit_join_spec.md")
         spec = parser.parse(text)
 
         # 保持 INNER JOIN（fixture 默认）

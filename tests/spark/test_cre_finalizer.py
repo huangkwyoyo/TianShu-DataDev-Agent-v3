@@ -33,13 +33,15 @@ from tianshu_datadev.harness import (
 )
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan, SqlBuildPlanBuilder
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
+from tests._test_utils import read_fixture
+
 
 # ════════════════════════════════════════════
 # 辅助函数
 # ════════════════════════════════════════════
 
 
-def _read_fixture(path: str) -> str:
+def read_fixture(path: str) -> str:
     """读取测试 fixture 文件。"""
     abs_path = os.path.join(os.path.dirname(__file__), "..", path)
     with open(abs_path, "r", encoding="utf-8") as f:
@@ -60,7 +62,7 @@ def _build_test_package(
         include_cre: 是否在构建时包含 CRE shadow 报告
         cre_status: CRE 状态（include_cre=True 时生效）
     """
-    spec_text = _read_fixture("fixtures/golden/golden_no_time_range.md")
+    spec_text = read_fixture("fixtures/golden/golden_no_time_range.md")
     parser = DeveloperSpecParser()
     spec = parser.parse(spec_text)
 

@@ -17,6 +17,7 @@ import os
 import shutil
 
 import pytest
+from tests._test_utils import read_fixture
 
 from tianshu_datadev.api.pipeline import Pipeline
 from tianshu_datadev.spark.snapshot import (
@@ -821,16 +822,6 @@ class TestSnapshotPipelineIntegration:
     # ── 辅助方法 ──
 
     @staticmethod
-    def _read_fixture(name: str) -> str:
-        """读取 tests/fixtures/ 下的文件内容。"""
-        path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
-            "fixtures", name,
-        )
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-
-    @staticmethod
     def _tests_dir() -> str:
         """返回 tests/ 目录的绝对路径。"""
         return os.path.dirname(os.path.dirname(__file__))
@@ -840,7 +831,7 @@ class TestSnapshotPipelineIntegration:
     def test_run_all_without_snapshot_builder_still_works(self):
         """无 SnapshotBuilder 时 run_all() 行为不变——向后兼容。"""
         pipeline = Pipeline()  # 不注入 SnapshotBuilder
-        md = self._read_fixture("golden/golden_passing.md")
+        md = read_fixture("fixtures/golden/golden_passing.md")
 
         # 需提供 test_fact 的 table_paths 以保证 golden spec SQL 可执行
         fixture_dir = self._tests_dir()
@@ -869,7 +860,7 @@ class TestSnapshotPipelineIntegration:
             snapshot_builder=snapshot_builder,
             snapshot_provider=local_fixture_provider,
         )
-        md = self._read_fixture("golden/golden_passing.md")
+        md = read_fixture("fixtures/golden/golden_passing.md")
 
         # table_paths 中需同时包含：
         #   - test_fact：golden spec SQL 执行所需
@@ -915,7 +906,7 @@ class TestSnapshotPipelineIntegration:
             snapshot_builder=snapshot_builder,
             snapshot_provider=local_fixture_provider,
         )
-        md = self._read_fixture("golden/golden_passing.md")
+        md = read_fixture("fixtures/golden/golden_passing.md")
         fixture_dir = self._tests_dir()
         table_paths = {
             "test_fact": os.path.join(fixture_dir, "fixtures", "sql", "test_fact.csv"),
@@ -957,7 +948,7 @@ class TestSnapshotPipelineIntegration:
             snapshot_builder=SnapshotBuilder(output_dir=tmpdir),
             snapshot_provider=local_fixture_provider,
         )
-        md = self._read_fixture("golden/golden_passing.md")
+        md = read_fixture("fixtures/golden/golden_passing.md")
         # 传入白名单外的表——会被过滤掉，source_tables 为空，跳过 snapshot
         # 同时需提供 test_fact 保证 golden spec SQL 可正常执行
         fixture_dir = self._tests_dir()
@@ -1006,7 +997,7 @@ class TestSnapshotPipelineIntegration:
             snapshot_builder=snapshot_builder,
             snapshot_provider=local_fixture_provider,
         )
-        md = self._read_fixture("golden/golden_passing.md")
+        md = read_fixture("fixtures/golden/golden_passing.md")
         fixture_dir = self._tests_dir()
         table_paths = {
             "test_fact": os.path.join(fixture_dir, "fixtures", "sql", "test_fact.csv"),
@@ -1063,7 +1054,7 @@ class TestSnapshotPipelineIntegration:
 
         # 不注入 SnapshotBuilder——模拟生产默认路径
         pipeline = Pipeline(base_output_dir=out_dir)
-        md = self._read_fixture("golden/golden_passing.md")
+        md = read_fixture("fixtures/golden/golden_passing.md")
         fixture_dir = self._tests_dir()
         table_paths = {
             "test_fact": os.path.join(fixture_dir, "fixtures", "sql", "test_fact.csv"),

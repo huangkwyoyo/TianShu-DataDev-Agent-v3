@@ -7,10 +7,12 @@ from tianshu_datadev.developer_spec.models import (
 )
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
 from tianshu_datadev.developer_spec.source_manifest import SourceManifestBuilder
+from tests._test_utils import read_fixture
+
 
 # ── 辅助函数 ──
 
-def _read_fixture(path: str) -> str:
+def read_fixture(path: str) -> str:
     import os
     abs_path = os.path.join(os.path.dirname(__file__), path)
     with open(abs_path, "r", encoding="utf-8") as f:
@@ -43,7 +45,7 @@ class TestSourceManifestBuilder:
     def test_build_without_registry(self):
         """无 SchemaRegistry 时正常构建——所有字段标记 developer_spec。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/golden/golden_no_time_range.md")
+        text = read_fixture("fixtures/golden/golden_no_time_range.md")
         spec = parser.parse(text)
 
         builder = SourceManifestBuilder()
@@ -62,7 +64,7 @@ class TestSourceManifestBuilder:
     def test_build_with_registry_supplements(self):
         """SchemaRegistry 补充缺失字段信息——不产生冲突。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/golden/golden_type_inferred_from_registry.md")
+        text = read_fixture("fixtures/golden/golden_type_inferred_from_registry.md")
         spec = parser.parse(text)
 
         # SchemaRegistry 提供 amount 字段的类型
@@ -97,7 +99,7 @@ class TestSourceConflict:
         """类型不一致产生 SOURCE_CONFLICT。"""
         parser = DeveloperSpecParser()
         # golden_type_inferred_from_registry 中 amount 无类型声明
-        text = _read_fixture("fixtures/golden/golden_no_time_range.md")
+        text = read_fixture("fixtures/golden/golden_no_time_range.md")
         spec = parser.parse(text)
 
         # Registry 中 event_time 类型与 DeveloperSpec 不同
@@ -120,7 +122,7 @@ class TestSourceConflict:
     def test_conflict_becomes_blocking_open_question(self):
         """SOURCE_CONFLICT 转为 OpenQuestion(blocking=true)。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/golden/golden_no_time_range.md")
+        text = read_fixture("fixtures/golden/golden_no_time_range.md")
         spec = parser.parse(text)
 
         registry = DictSchemaRegistry({
@@ -147,7 +149,7 @@ class TestRegistryNoOverride:
     def test_registry_does_not_override_declared_type(self):
         """Registry 类型与 DeveloperSpec 一致时不产生冲突，但也标记为 developer_spec。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/golden/golden_no_time_range.md")
+        text = read_fixture("fixtures/golden/golden_no_time_range.md")
         spec = parser.parse(text)
 
         # Registry 中类型与 DeveloperSpec 完全一致
@@ -177,7 +179,7 @@ class TestManifestAnomaly:
     def test_table_not_found_in_registry(self):
         """表在 Registry 中不存在——产生 TABLE_NOT_FOUND anomaly。"""
         parser = DeveloperSpecParser()
-        text = _read_fixture("fixtures/golden/golden_no_time_range.md")
+        text = read_fixture("fixtures/golden/golden_no_time_range.md")
         spec = parser.parse(text)
 
         # Registry 不包含此表

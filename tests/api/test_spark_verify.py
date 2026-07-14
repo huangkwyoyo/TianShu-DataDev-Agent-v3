@@ -9,27 +9,21 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 # 用于 run_all DuckDB 执行的 CSV fixture 路径
-_CSV_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv")
-)
-
 
 class TestSparkVerifySuccess:
     """正常流程——run_all 产出 artifacts 后 spark/verify 返回完整结果。"""
 
-    def test_spark_verify_full_chain_returns_200(self, client, golden_spec_passing):
+    def test_spark_verify_full_chain_returns_200(self, client, golden_spec_passing, csv_path):
         """run_all → spark/verify → 200 + 6 阶段 + review_ready=True。"""
 
         # ── Step 1: 先执行全流程 Run-All ──
         resp_run = client.post("/api/run-all", json={
             "markdown_text": golden_spec_passing,
             "table_mapping": {"tf": "test_fact"},
-            "table_paths": {"test_fact": _CSV_PATH},
+            "table_paths": {"test_fact": csv_path},
         })
         assert resp_run.status_code == 200, (
             f"run-all 应返回 200，实际 {resp_run.status_code}: {resp_run.text}"
@@ -80,11 +74,10 @@ class TestSparkVerifySuccess:
             f"package_id 应以 pkg_ 开头，实际 {data['package_id']}"
         )
 
-
 class TestSparkVerifyErrors:
     """错误路径——404 / 422。"""
 
-    def test_invalid_request_id_returns_404(self, client):
+    def test_invalid_request_id_returns_404(self, client, csv_path):
         """不存在的 request_id → 404 SPARK_ARTIFACTS_NOT_FOUND。"""
         resp = client.post("/api/spark/verify", json={
             "request_id": "req_nonexistent_12345",
@@ -96,7 +89,7 @@ class TestSparkVerifyErrors:
         assert data["error_code"] == "SPARK_ARTIFACTS_NOT_FOUND"
         assert "不存在" in data["message"] or "已过期" in data["message"]
 
-    def test_incomplete_artifacts_returns_422(self, client, golden_spec_passing):
+    def test_incomplete_artifacts_returns_422(self, client, golden_spec_passing, csv_path):
         """仅 build_plan（无 contract）→ 422 SPARK_ARTIFACTS_INCOMPLETE。"""
         # ── 先执行 build_plan（不产生 contract）──
         resp_plan = client.post("/api/plan", json={
@@ -118,7 +111,7 @@ class TestSparkVerifyErrors:
         assert "data_transform_contract" in data["message"]
 
     def test_stage_failure_returns_422_when_contract_none(
-        self, client, golden_spec_passing,
+        self, client, golden_spec_passing, csv_path,
     ):
         """contract 为 None → 422 SPARK_ARTIFACTS_INCOMPLETE。
 
@@ -129,7 +122,7 @@ class TestSparkVerifyErrors:
         resp_run = client.post("/api/run-all", json={
             "markdown_text": golden_spec_passing,
             "table_mapping": {"tf": "test_fact"},
-            "table_paths": {"test_fact": _CSV_PATH},
+            "table_paths": {"test_fact": csv_path},
         })
         assert resp_run.status_code == 200
         request_id = resp_run.json()["request_id"]

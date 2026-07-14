@@ -294,6 +294,16 @@ export default function App() {
 
           if (event.event === 'done') {
             const fr = event.result;
+            // 诊断日志——排查代码框不显示原因
+            console.log('[RunAll done]', {
+              sql_ok: fr.sql_ok,
+              request_id: fr.request_id,
+              generated_sql_len: fr.generated_sql?.length || 0,
+              pyspark_code_len: fr.pyspark_code?.length || 0,
+              standalone_pyspark_len: fr.standalone_pyspark?.length || 0,
+              spark_ok: fr.spark_ok,
+              spark_stages_count: fr.spark_stages?.length || 0,
+            });
             // 构建 SQL 管线阶段指示灯
             const sqlStages: StageInfo[] = fr.sql_pipeline_stages
               ? fr.sql_pipeline_stages.map((s) => ({
@@ -343,12 +353,7 @@ export default function App() {
               // SQL 成功就展示代码（即使 Spark 失败也保留，标注由 Spark 阶段状态体现）
               showCodeDownload: fr.sql_ok,
               sparkStages,
-              pipelineStages: sqlStages.length > 0 ? sqlStages : [
-                { stage: 'parser', status: 'ok' }, { stage: 'enrich', status: 'ok' },
-                { stage: 'build', status: 'ok' }, { stage: 'validate', status: 'ok' },
-                { stage: 'compile', status: 'ok' }, { stage: 'execute', status: 'ok' },
-                { stage: 'contract', status: 'ok' }, { stage: 'package', status: 'ok' },
-              ],
+              pipelineStages: sqlStages,
               llmTraces: fr.llm_traces,
               activePanel: 'sql' as Panel,
               // SQL 失败时的错误

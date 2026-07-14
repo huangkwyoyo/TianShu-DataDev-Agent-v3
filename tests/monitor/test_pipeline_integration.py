@@ -9,6 +9,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests._test_utils import read_fixture
+
 # ═══════════════════════════════════════════════════════════
 # 辅助：MockCollector——轻量替代 RunLogCollector，避免文件 IO
 # ═══════════════════════════════════════════════════════════
@@ -115,19 +117,13 @@ def pipeline(mock_collector):
 @pytest.fixture
 def golden_spec() -> str:
     """读取 golden fixture。"""
-    _root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    path = os.path.join(_root, "tests", "fixtures", "golden", "golden_no_time_range.md")
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+    return read_fixture("fixtures/golden/golden_no_time_range.md")
 
 
 @pytest.fixture
 def golden_spec_passing() -> str:
     """读取通过验证的 golden fixture。"""
-    _root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    path = os.path.join(_root, "tests", "fixtures", "golden", "golden_passing.md")
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+    return read_fixture("fixtures/golden/golden_passing.md")
 
 
 # ═══════════════════════════════════════════════════════════

@@ -25,9 +25,7 @@ from tianshu_datadev.llm.models import LlmTraceNode
 from tianshu_datadev.spark.orchestrator import SparkPipelineStage
 
 # 用于 DuckDB 执行的 CSV fixture 路径（与 test_run_all.py 一致）
-_CSV_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv")
-)
+
 # 两表 Join 测试用 CSV 路径
 _CSV_FACT_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv")
@@ -35,7 +33,6 @@ _CSV_FACT_PATH = os.path.abspath(
 _CSV_DIM_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_dim.csv")
 )
-
 
 # ── Fixtures ──
 
@@ -45,18 +42,6 @@ def client():
     pipeline = Pipeline()
     app = create_app(pipeline=pipeline)
     return TestClient(app)
-
-
-@pytest.fixture
-def golden_spec_passing():
-    """读取 golden fixture——golden_passing.md（行数低于阈值，可通过验证）。"""
-    path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-        "tests", "fixtures", "golden", "golden_passing.md",
-    )
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
-
 
 @pytest.fixture
 def two_table_join_spec():
@@ -68,20 +53,18 @@ def two_table_join_spec():
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
-
 # ── 测试用例 ──
-
 
 class TestExecuteRichProducesContract:
     """execute-rich 成功后 export_artifacts() 返回非空 contract。"""
 
-    def test_produces_contract(self, client, golden_spec_passing):
+    def test_produces_contract(self, client, golden_spec_passing, csv_path):
         """验证 execute-rich 后 contract 被正确缓存。"""
 
         resp = client.post("/api/execute-rich", json={
             "markdown_text": golden_spec_passing,
             "table_mapping": {"tf": "test_fact"},
-            "table_paths": {"test_fact": _CSV_PATH},
+            "table_paths": {"test_fact": csv_path},
         })
         assert resp.status_code == 200, (
             f"execute-rich 应返回 200，实际 {resp.status_code}: {resp.text}"
@@ -98,18 +81,17 @@ class TestExecuteRichProducesContract:
             f"MAPPER 应成功执行（依赖 contract），实际返回 {map_resp.status_code}: {map_resp.json()}"
         )
 
-
 class TestSparkMapAfterExecuteRich:
     """execute-rich 后调用 /api/spark/map 返回 200。"""
 
-    def test_map_returns_ok(self, client, golden_spec_passing):
+    def test_map_returns_ok(self, client, golden_spec_passing, csv_path):
         """验证完整的 execute-rich → MAPPER 链路。"""
 
         # Step 1: execute-rich
         exec_resp = client.post("/api/execute-rich", json={
             "markdown_text": golden_spec_passing,
             "table_mapping": {"tf": "test_fact"},
-            "table_paths": {"test_fact": _CSV_PATH},
+            "table_paths": {"test_fact": csv_path},
         })
         assert exec_resp.status_code == 200
         request_id = exec_resp.json()["request_id"]
@@ -125,18 +107,17 @@ class TestSparkMapAfterExecuteRich:
         # spark_stages 应包含至少 MAPPER 的状态
         assert len(data["spark_stages"]) >= 1
 
-
 class TestSparkCompileMissingSparkPlan:
     """未执行 MAPPER 直接调用 COMPILER 返回 422。"""
 
-    def test_compile_missing_dependency(self, client, golden_spec_passing):
+    def test_compile_missing_dependency(self, client, golden_spec_passing, csv_path):
         """验证依赖门禁——缺少 spark_plan 时 COMPILER 被拒。"""
 
         # execute-rich 产出 contract 但不执行 MAPPER
         exec_resp = client.post("/api/execute-rich", json={
             "markdown_text": golden_spec_passing,
             "table_mapping": {"tf": "test_fact"},
-            "table_paths": {"test_fact": _CSV_PATH},
+            "table_paths": {"test_fact": csv_path},
         })
         assert exec_resp.status_code == 200
         request_id = exec_resp.json()["request_id"]
@@ -150,17 +131,16 @@ class TestSparkCompileMissingSparkPlan:
         assert data["error_code"] == "SPARK_DEPENDENCY_MISSING"
         assert "spark_plan" in data["message"]
 
-
 class TestSparkDeveloperSkippedWithoutService:
     """DEVELOPER 未配置时返回 SKIPPED，不阻断。"""
 
-    def test_developer_skipped(self, client, golden_spec_passing):
+    def test_developer_skipped(self, client, golden_spec_passing, csv_path):
         """验证 DEVELOPER 在无 service 注入时 graceful degradation。"""
 
         exec_resp = client.post("/api/execute-rich", json={
             "markdown_text": golden_spec_passing,
             "table_mapping": {"tf": "test_fact"},
-            "table_paths": {"test_fact": _CSV_PATH},
+            "table_paths": {"test_fact": csv_path},
         })
         assert exec_resp.status_code == 200
         request_id = exec_resp.json()["request_id"]
@@ -177,17 +157,16 @@ class TestSparkDeveloperSkippedWithoutService:
         assert data["stage"] == "DEVELOPER"
         assert data["status"] == "skipped"
 
-
 class TestSparkValidateMissingCompileResult:
     """未执行 COMPILER 直接调用 VALIDATOR 返回 422。"""
 
-    def test_validate_missing_dependency(self, client, golden_spec_passing):
+    def test_validate_missing_dependency(self, client, golden_spec_passing, csv_path):
         """验证依赖门禁——缺少 compile_result 时 VALIDATOR 被拒。"""
 
         exec_resp = client.post("/api/execute-rich", json={
             "markdown_text": golden_spec_passing,
             "table_mapping": {"tf": "test_fact"},
-            "table_paths": {"test_fact": _CSV_PATH},
+            "table_paths": {"test_fact": csv_path},
         })
         assert exec_resp.status_code == 200
         request_id = exec_resp.json()["request_id"]
@@ -204,17 +183,16 @@ class TestSparkValidateMissingCompileResult:
         assert data["error_code"] == "SPARK_DEPENDENCY_MISSING"
         assert "compile_result" in str(data)
 
-
 class TestSparkCompareNeedsSqlAndSparkPlan:
     """缺少 SqlBuildPlan 或 SparkPlan 时 COMPARATOR 返回 422。"""
 
-    def test_compare_missing_spark_plan(self, client, golden_spec_passing):
+    def test_compare_missing_spark_plan(self, client, golden_spec_passing, csv_path):
         """验证 COMPARATOR 依赖——缺少 spark_plan 时被拒。"""
 
         exec_resp = client.post("/api/execute-rich", json={
             "markdown_text": golden_spec_passing,
             "table_mapping": {"tf": "test_fact"},
-            "table_paths": {"test_fact": _CSV_PATH},
+            "table_paths": {"test_fact": csv_path},
         })
         assert exec_resp.status_code == 200
         request_id = exec_resp.json()["request_id"]
@@ -227,34 +205,32 @@ class TestSparkCompareNeedsSqlAndSparkPlan:
         data = resp.json()
         assert data["error_code"] == "SPARK_DEPENDENCY_MISSING"
 
-
 class TestLlmTracesInExecuteRichResponse:
     """execute-rich 响应含 llm_traces 字段。"""
 
-    def test_llm_traces_field_present(self, client, golden_spec_passing):
+    def test_llm_traces_field_present(self, client, golden_spec_passing, csv_path):
         """验证 execute-rich 响应中包含 llm_traces 字段。"""
 
         resp = client.post("/api/execute-rich", json={
             "markdown_text": golden_spec_passing,
             "table_mapping": {"tf": "test_fact"},
-            "table_paths": {"test_fact": _CSV_PATH},
+            "table_paths": {"test_fact": csv_path},
         })
         assert resp.status_code == 200
         data = resp.json()
         # llm_traces 应为 None 或 dict（无 LLM 调用时为空）
         assert "llm_traces" in data
 
-
 class TestLlmTracesInSparkStageResponse:
     """spark 单阶段响应含 llm_traces 字段。"""
 
-    def test_spark_stage_has_llm_traces(self, client, golden_spec_passing):
+    def test_spark_stage_has_llm_traces(self, client, golden_spec_passing, csv_path):
         """验证 spark/map 响应中包含 llm_traces 字段。"""
 
         exec_resp = client.post("/api/execute-rich", json={
             "markdown_text": golden_spec_passing,
             "table_mapping": {"tf": "test_fact"},
-            "table_paths": {"test_fact": _CSV_PATH},
+            "table_paths": {"test_fact": csv_path},
         })
         assert exec_resp.status_code == 200
         request_id = exec_resp.json()["request_id"]
@@ -266,11 +242,10 @@ class TestLlmTracesInSparkStageResponse:
         data = map_resp.json()
         assert "llm_traces" in data
 
-
 class TestLlmTracesNotInReviewReady:
     """llm_traces 不参与 REVIEW_READY 判定。"""
 
-    def test_traces_not_affect_review(self, client, golden_spec_passing):
+    def test_traces_not_affect_review(self, client, golden_spec_passing, csv_path):
         """验证 llm_traces 不会影响 Spark 管线的 REVIEW_READY 结果。
 
         通过 /api/spark/verify 执行全链路，确认 llm_traces 不参与判定。
@@ -281,7 +256,7 @@ class TestLlmTracesNotInReviewReady:
         run_resp = client.post("/api/run-all", json={
             "markdown_text": golden_spec_passing,
             "table_mapping": {"tf": "test_fact"},
-            "table_paths": {"test_fact": _CSV_PATH},
+            "table_paths": {"test_fact": csv_path},
         })
         assert run_resp.status_code == 200
         request_id = run_resp.json()["request_id"]
@@ -296,9 +271,7 @@ class TestLlmTracesNotInReviewReady:
         # llm_traces 不应出现在 verify 响应中（verify 端点保持原有行为）
         # 这是设计意图——verify 端点保持 SparkStageResponse 模型不变
 
-
 # ── 单元测试：SparkDependencyMissingError ──
-
 
 class TestSparkDependencyMissingErrorUnit:
     """SparkDependencyMissingError 异常类的单元测试。"""
@@ -316,9 +289,7 @@ class TestSparkDependencyMissingErrorUnit:
         assert exc.stage == SparkPipelineStage.COMPILER
         assert exc.missing == ["spark_plan", "compile_result"]
 
-
 # ── 单元测试：SparkStageContext ──
-
 
 class TestSparkStageContextUnit:
     """SparkStageContext 数据类的单元测试。"""
@@ -351,9 +322,7 @@ class TestSparkStageContextUnit:
         ctx1.stage_results["MAPPER"] = "SUCCESS"
         assert ctx2.stage_results == {}  # 独立
 
-
 # ── 单元测试：LlmTraceNode ──
-
 
 class TestLlmTraceNodeUnit:
     """LlmTraceNode 模型单元测试。"""
@@ -385,14 +354,12 @@ class TestLlmTraceNodeUnit:
         assert node.latency_ms == 350
         assert node.status == "valid"
 
-
 # ── Artifacts 状态检查端点测试 ──
-
 
 class TestArtifactsStatusEndpoint:
     """GET /api/artifacts/{request_id}/status 端点测试。"""
 
-    def test_nonexistent_request_id(self, client):
+    def test_nonexistent_request_id(self, client, csv_path):
         """不存在的 request_id → artifacts_ready=false + 空列表。"""
         resp = client.get("/api/artifacts/nonexistent_req_12345/status")
         assert resp.status_code == 200
@@ -401,7 +368,7 @@ class TestArtifactsStatusEndpoint:
         assert data["artifacts_ready"] is False
         assert data["available_artifacts"] == []
 
-    def test_parse_only_not_ready(self, client, golden_spec_passing):
+    def test_parse_only_not_ready(self, client, golden_spec_passing, csv_path):
         """仅 parse（无 execute）→ artifacts_ready=false（缺少 contract）。"""
 
         # 仅 parse-rich（不执行 execute-rich）
@@ -419,13 +386,13 @@ class TestArtifactsStatusEndpoint:
         # 仅 parse 存入 {parsed_spec}，没有 contract
         assert data["artifacts_ready"] is False
 
-    def test_execute_rich_ready(self, client, golden_spec_passing):
+    def test_execute_rich_ready(self, client, golden_spec_passing, csv_path):
         """execute-rich 成功后 → artifacts_ready=true + contract 就绪。"""
 
         exec_resp = client.post("/api/execute-rich", json={
             "markdown_text": golden_spec_passing,
             "table_mapping": {"tf": "test_fact"},
-            "table_paths": {"test_fact": _CSV_PATH},
+            "table_paths": {"test_fact": csv_path},
         })
         assert exec_resp.status_code == 200
         request_id = exec_resp.json()["request_id"]
@@ -438,7 +405,6 @@ class TestArtifactsStatusEndpoint:
         assert data["artifacts_ready"] is True
         assert "data_transform_contract" in data["available_artifacts"]
         assert "sql_build_plan" in data["available_artifacts"]
-
 
 class TestSparkDependencyMissingErrorMessage:
     """SPARK_DEPENDENCY_MISSING 错误消息包含用户引导。"""
@@ -476,11 +442,9 @@ class TestSparkDependencyMissingErrorMessage:
         assert "data_transform_contract" in data["message"]
         assert "编译执行" in data["message"]
 
-
 # ════════════════════════════════════════════
 # 错误去重测试（B 类修复）
 # ════════════════════════════════════════════
-
 
 class TestErrorDedupOnRerun:
     """同一阶段重复触发不得累积完全相同的 errors。"""
@@ -534,7 +498,6 @@ class TestErrorDedupOnRerun:
 # Mapper→Developer→Compiler 集成测试（E2E 别名验证——Phase 5 迁移自 scripts/e2e_alias_verify.py）
 # ════════════════════════════════════════════
 
-
 class TestE2EAliasVerification:
     """Phase 5 迁移——真实 HTTP API 管线：execute-rich → spark/map → spark/develop → spark/compile。
 
@@ -542,7 +505,7 @@ class TestE2EAliasVerification:
     单表拓扑验证别名解析器全链路；两表 Join 拓扑由 test_alias_resolver.py 单元层覆盖。
     """
 
-    def test_full_api_chain_produces_only_tn_fn_aliases(self, client, golden_spec_passing):
+    def test_full_api_chain_produces_only_tn_fn_aliases(self, client, golden_spec_passing, csv_path):
         """完整的 API 管线——编译产物仅含 tN/fN 别名。
 
         验收标准：
@@ -557,7 +520,7 @@ class TestE2EAliasVerification:
         resp = client.post("/api/execute-rich", json={
             "markdown_text": golden_spec_passing,
             "table_mapping": {"tf": "test_fact"},
-            "table_paths": {"test_fact": _CSV_PATH},
+            "table_paths": {"test_fact": csv_path},
         })
         assert resp.status_code == 200, f"execute-rich 应返回 200: {resp.text[:500]}"
         data = resp.json()

@@ -4,6 +4,7 @@
 emit() 非阻塞入队，队列满时丢弃并计数。
 """
 
+import contextvars as _contextvars
 import json
 import logging
 import os
@@ -26,6 +27,13 @@ from tianshu_datadev.monitor.renderer import LogRenderer
 from tianshu_datadev.monitor.sanitizer import Sanitizer
 
 logger = logging.getLogger(__name__)
+
+# 流式事件队列注入——run_all_full_stream 通过此 ContextVar 注入 queue.Queue，
+# 使 get_collector() 返回的 collector 被包装为 TeeCollector，实时推送阶段事件。
+# 未设置时返回原始 collector（默认行为，保持向后兼容）。
+_stream_event_queue: _contextvars.ContextVar = _contextvars.ContextVar(
+    "tianshu_stream_event_queue", default=None
+)
 
 
 class NullCollector:
@@ -265,9 +273,19 @@ def get_collector(
     """
     run_id = os.environ.get("TIANSHU_RUN_ID", "").strip()
     if not run_id:
-        return NullCollector()
-    if log_dir is None:
-        log_dir = Path("logs/monitor")
-    if text_log_dir is None:
-        text_log_dir = log_dir
-    return RunLogCollector(log_dir, run_id, text_log_dir=text_log_dir)
+        collector = NullCollector()
+    else:
+        if log_dir is None:
+            log_dir = Path("logs/monitor")
+        if text_log_dir is None:
+            text_log_dir = log_dir
+        collector = RunLogCollector(log_dir, run_id, text_log_dir=text_log_dir)
+
+    # 流式进度注入——如果 ContextVar 中有事件队列，包装为 TeeCollector
+    # 用于 run_all_full_stream 实时推送 SQL 管线阶段事件
+    _queue = _stream_event_queue.get(None)
+    if _queue is not None:
+        from tianshu_datadev.api.streaming import TeeCollector
+        return TeeCollector(collector, _queue, pipeline="sql")
+
+    return collector

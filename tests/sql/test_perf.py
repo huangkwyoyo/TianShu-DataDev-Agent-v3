@@ -32,10 +32,12 @@ from tianshu_datadev.planning.sql_build_plan import (
 )
 from tianshu_datadev.sql.models import PerfSeverity
 from tianshu_datadev.sql.perf_validator import PerfValidator
+from tests._test_utils import read_fixture
+
 
 # ── 辅助 ──
 
-def _read_fixture(path: str) -> str:
+def read_fixture(path: str) -> str:
     abs_path = os.path.join(os.path.dirname(__file__), "..", path)
     with open(abs_path, "r", encoding="utf-8") as f:
         return f.read()
@@ -43,7 +45,7 @@ def _read_fixture(path: str) -> str:
 
 def _parse_spec(fixture_path: str):
     parser = DeveloperSpecParser()
-    text = _read_fixture(fixture_path)
+    text = read_fixture(fixture_path)
     return parser.parse(text)
 
 

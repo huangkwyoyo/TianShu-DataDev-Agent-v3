@@ -22,10 +22,12 @@ from tianshu_datadev.sql.models import (
     SqlArtifact,
 )
 from tianshu_datadev.sql.validator import SqlBuildPlanValidator
+from tests._test_utils import read_fixture
+
 
 # ── 辅助 ──
 
-def _read_fixture(path: str) -> str:
+def read_fixture(path: str) -> str:
     """读取测试 fixture 文件。"""
     abs_path = os.path.join(os.path.dirname(__file__), "..", path)
     with open(abs_path, "r", encoding="utf-8") as f:
@@ -120,7 +122,7 @@ class TestPipelineE2E:
     def test_full_pipeline_single_table(self):
         """单表 golden fixture 全链路验证——从解析到执行结果。"""
         # 1. 解析 golden fixture
-        spec_text = _read_fixture("fixtures/golden/golden_no_time_range.md")
+        spec_text = read_fixture("fixtures/golden/golden_no_time_range.md")
         parser = DeveloperSpecParser()
         spec = parser.parse(spec_text)
 
@@ -187,7 +189,7 @@ class TestPipelineE2E:
         )
 
         spec = DeveloperSpecParser().parse(
-            _read_fixture("fixtures/relationship/explicit_join_spec.md")
+            read_fixture("fixtures/relationship/explicit_join_spec.md")
         )
 
         # 2. 构建 SourceManifest
@@ -243,7 +245,7 @@ class TestPipelineE2E:
         golden_passing 行数低于 100 万，不应触发 Validator blocking。
         如果 blocking 出现则表明 golden fixture 退化，测试应失败而非跳过。
         """
-        spec_text = _read_fixture("fixtures/golden/golden_passing.md")
+        spec_text = read_fixture("fixtures/golden/golden_passing.md")
         parser = DeveloperSpecParser()
         spec = parser.parse(spec_text)
         manifest = _build_manifest(spec)

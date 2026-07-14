@@ -9,10 +9,12 @@ from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
 from tianshu_datadev.sql.executor import DuckDBExecutor
 from tianshu_datadev.sql.models import ExecutionStatus
+from tests._test_utils import read_fixture
+
 
 # ── 辅助 ──
 
-def _read_fixture(path: str) -> str:
+def read_fixture(path: str) -> str:
     abs_path = os.path.join(os.path.dirname(__file__), "..", path)
     with open(abs_path, "r", encoding="utf-8") as f:
         return f.read()
@@ -21,7 +23,7 @@ def _read_fixture(path: str) -> str:
 def _parse_and_compile():
     """解析 golden fixture 并编译为 CompiledSql。"""
     parser = DeveloperSpecParser()
-    text = _read_fixture("fixtures/golden/golden_no_time_range.md")
+    text = read_fixture("fixtures/golden/golden_no_time_range.md")
     spec = parser.parse(text)
 
     builder = SqlBuildPlanBuilder()

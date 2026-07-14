@@ -26,10 +26,14 @@ function statusIcon(status: string): string {
 /** 阶段名 → 中文显示名 */
 function stageLabel(stage: string): string {
   const labels: Record<string, string> = {
+    // SQL 管线短名（pipeline_stages 中的名称）
     parser: '解析', enrich: '增强', build: '构建', validate: '校验',
     compile: '编译', execute: '执行', contract: '契约', package: '打包',
-    sql_builder: 'SQL 构建', sql_validator: 'SQL 校验', sql_compiler: 'SQL 编译',
-    sql_executor: 'SQL 执行', contract_extractor: '契约提取',
+    // SQL 管线长名（collector.stage() 真实节点名——TeeCollector 实时事件使用）
+    sql_parser: '解析', sql_enricher: '增强', sql_builder: 'SQL 构建',
+    sql_validator: 'SQL 校验', sql_compiler: 'SQL 编译', sql_executor: 'SQL 执行',
+    contract_extractor: '契约提取', snapshot_builder: '快照', packager: '打包',
+    // Spark 管线
     MAPPER: '映射', DEVELOPER: '标注', COMPILER: '编译',
     VALIDATOR: '校验', COMPARATOR: '对比', PHYSICAL_VERIFIER: '物理验证',
   };

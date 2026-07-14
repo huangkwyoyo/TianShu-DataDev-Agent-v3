@@ -1,9 +1,20 @@
-"""Spark 测试共享 fixture——Parquet 临时目录等。"""
+"""Spark 测试共享 fixture——Pipeline + Parquet 临时目录等。"""
 
 import os
+import shutil
 import tempfile
 
 import pytest
+
+from tianshu_datadev.api.pipeline import Pipeline
+
+
+@pytest.fixture
+def pipeline():
+    """创建带临时目录的 Pipeline——测试结束后自动清理。"""
+    tmpdir = tempfile.mkdtemp(prefix="tianshu_spark_")
+    yield Pipeline(base_output_dir=tmpdir)
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 @pytest.fixture

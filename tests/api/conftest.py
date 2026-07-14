@@ -13,11 +13,7 @@ from tianshu_datadev.api.pipeline import Pipeline
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
 
-def _read_fixture(filename: str) -> str:
-    """读取测试 fixture 文件。"""
-    path = os.path.join(_ROOT, "tests", "fixtures", "golden", filename)
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+from tests._test_utils import read_fixture as _read_fixture
 
 
 @pytest.fixture
@@ -39,10 +35,19 @@ def client(pipeline):
 @pytest.fixture
 def golden_spec():
     """读取 golden fixture——golden_no_time_range.md（会触发 Validator 阻断）。"""
-    return _read_fixture("golden_no_time_range.md")
+    return _read_fixture("fixtures/golden/golden_no_time_range.md")
+
+
+@pytest.fixture
+def csv_path():
+    """返回 test_fact.csv 的绝对路径——消除 5 处 _CSV_PATH 重复定义。"""
+    return os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "fixtures", "sql", "test_fact.csv",
+    )
 
 
 @pytest.fixture
 def golden_spec_passing():
     """读取 golden fixture——golden_passing.md（行数低于阈值，可通过 Validator 校验）。"""
-    return _read_fixture("golden_passing.md")
+    return _read_fixture("fixtures/golden/golden_passing.md")

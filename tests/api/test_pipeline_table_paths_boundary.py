@@ -15,16 +15,12 @@ from tianshu_datadev.api.app import _discover_csv_fixtures, create_app
 from tianshu_datadev.api.pipeline import Pipeline
 
 # CSV fixture 文件路径
-_CSV_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "fixtures", "sql", "test_fact.csv")
-)
-
 
 class TestTablePathsNoneVsEmptyDict:
     """Pipeline 层：table_paths=None 回退到默认值，table_paths={} 不回退。"""
 
     @pytest.fixture
-    def pipeline_with_default(self):
+    def pipeline_with_default(self, csv_path):
         """创建带 default_table_paths 的 Pipeline——使用临时目录。"""
         import shutil
         import tempfile
@@ -32,7 +28,7 @@ class TestTablePathsNoneVsEmptyDict:
         tmpdir = tempfile.mkdtemp()
         pipeline = Pipeline(
             base_output_dir=tmpdir,
-            default_table_paths={"test_fact": _CSV_PATH},
+            default_table_paths={"test_fact": csv_path},
         )
         yield pipeline
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -120,7 +116,6 @@ class TestTablePathsNoneVsEmptyDict:
         else:
             # 如果没有失败，说明 DuckDB 可能缓存了之前的表——仍然验证 trace 存在
             assert "execution_trace" in result
-
 
 class TestCreateAppE2EMode:
     """create_app() 生产模式 vs E2E 模式——CSV fixture 自动发现开关。"""
