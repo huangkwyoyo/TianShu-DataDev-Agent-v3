@@ -896,14 +896,111 @@ class TestNormalizeFilterRights:
         assert steps[1]["right"] == "original"
 
     def test_unknown_operator_untouched(self):
-        """未知操作符（如 EQ/GT/LIKE）不修改 right。"""
+        """非简单比较/非列表/非单目操作符——不修改 right。
+
+        AND/OR/NOT/PREDICATE_TREE 等复合操作符 right 值保持不变。
+        """
         steps = [
-            {"step_type": "filter", "operator": "EQ", "right": "100"},
+            {"step_type": "filter", "operator": "AND", "right": ""},
+            {"step_type": "filter", "operator": "OR", "right": ""},
+            {"step_type": "filter", "operator": "PREDICATE_TREE", "right": ""},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == ""
+        assert steps[1]["right"] == ""
+        assert steps[2]["right"] == ""
+
+    # ── 字符串字面量引号剥离（EQ/NEQ/GT/GTE/LT/LTE/LIKE）────────
+
+    def test_eq_quoted_string_stripped(self):
+        """EQ + 'PAID' → right 剥引号后为 PAID。"""
+        steps = [
+            {"step_type": "filter", "operator": "EQ", "right": "'PAID'"},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "PAID"
+
+    def test_gte_quoted_date_stripped(self):
+        """GTE + '2025-01-01' → right 剥引号后为 2025-01-01。"""
+        steps = [
+            {"step_type": "filter", "operator": "GTE", "right": "'2025-01-01'"},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "2025-01-01"
+
+    def test_lte_quoted_datetime_stripped(self):
+        """LTE + '2025-01-31 23:59:59' → right 剥引号后为裸值。"""
+        steps = [
+            {"step_type": "filter", "operator": "LTE",
+             "right": "'2025-01-31 23:59:59'"},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "2025-01-31 23:59:59"
+
+    def test_like_unquoted_pattern_unchanged(self):
+        """LIKE + %test%（无引号）→ 保持不变。"""
+        steps = [
             {"step_type": "filter", "operator": "LIKE", "right": "%test%"},
         ]
         PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "%test%"
+
+    def test_eq_unquoted_number_unchanged(self):
+        """EQ + 100（无引号数字）→ 保持不变。"""
+        steps = [
+            {"step_type": "filter", "operator": "EQ", "right": "100"},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
         assert steps[0]["right"] == "100"
-        assert steps[1]["right"] == "%test%"
+
+    def test_eq_double_quoted_string_stripped(self):
+        """EQ + \"value\"（双引号包裹）→ 剥去双引号。"""
+        steps = [
+            {"step_type": "filter", "operator": "EQ", "right": '"value"'},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "value"
+
+    def test_eq_single_quote_only_start_unchanged(self):
+        """仅首引号无尾引号 → 保持不变（防御畸形值）。"""
+        steps = [
+            {"step_type": "filter", "operator": "EQ", "right": "'incomplete"},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "'incomplete"
+
+    def test_eq_mixed_quotes_unchanged(self):
+        """首尾引号不匹配（\"...'）→ 保持不变。"""
+        steps = [
+            {"step_type": "filter", "operator": "EQ", "right": "\"value'"},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == "\"value'"
+
+    def test_eq_empty_string_unchanged(self):
+        """空字符串 right → 不修改。"""
+        steps = [
+            {"step_type": "filter", "operator": "EQ", "right": ""},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] == ""
+
+    def test_eq_none_right_unchanged(self):
+        """right=None → 不修改。"""
+        steps = [
+            {"step_type": "filter", "operator": "EQ", "right": None},
+        ]
+        PlanComparator._normalize_filter_rights(steps)
+        assert steps[0]["right"] is None
+
+    def test_ne_gt_lt_also_stripped(self):
+        """NEQ/GT/LT 同样剥引号——覆盖全部简单比较操作符。"""
+        for op in ("NEQ", "GT", "LT"):
+            steps = [
+                {"step_type": "filter", "operator": op, "right": "'val'"},
+            ]
+            PlanComparator._normalize_filter_rights(steps)
+            assert steps[0]["right"] == "val", f"{op} 应剥引号"
 
     def test_empty_steps_list(self):
         """空列表不抛异常。"""

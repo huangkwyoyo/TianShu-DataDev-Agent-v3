@@ -1135,15 +1135,38 @@ class PlanComparator:
         return self._TYPE_NORMALIZE_MAP.get(step_type, step_type)
 
     @staticmethod
+    def _strip_literal_quotes(s: str) -> str:
+        """剥去字符串字面量的外层配对引号。
+
+        仅当字符串长度≥2、首尾为相同引号字符（' 或 "）、
+        且该引号在串中出现≥2次时才剥去——防止误处理仅有一端引号的畸形值。
+
+        例如：
+        - \"'2025-01-01'\" → \"2025-01-01\"
+        - \"'PAID'\" → \"PAID\"
+        - \"100\" → \"100\"（无引号，不变）
+        - \"'incomplete\" → \"'incomplete\"（仅首引号，不变）
+        """
+        if len(s) < 2:
+            return s
+        for q in ("'", '"'):
+            if s.startswith(q) and s.endswith(q) and s.count(q) >= 2:
+                return s[1:-1]
+        return s
+
+    @staticmethod
     def _normalize_filter_rights(steps_data: list[dict[str, Any]]) -> None:
         """原地规范化所有 filter step 的右值。
 
-        处理三种场景：
+        处理四种场景：
         1. BETWEEN/IN/NOT_IN——SQL 侧 right 是 SqlLiteral 列表，Spark 侧是
            Python repr 字符串。统一提取为规范字符串 [v1,v2,...]。
            BETWEEN 保序，IN/NOT_IN 排序（列表元素可交换）。
         2. IS_NULL/IS_NOT_NULL——SQL 侧 right 为 None/空，Spark 侧可为任意值。
            统一为规范占位符 <NULL>（与 _render_operand 行为一致）。
+        3. EQ/NEQ/GT/GTE/LT/LTE/LIKE——字符串字面量可能被外层引号包裹
+           （ContractExtractor._render_operand 对 SqlLiteral 字符串加引号），
+           剥去外层配对引号以与 SQL 侧裸值对齐。
 
         对非 filter step 无操作。
         """
@@ -1153,6 +1176,8 @@ class PlanComparator:
         _sorted_list_ops = {"IN", "NOT_IN"}
         # 单目操作符（right 应为占位符）
         _nullary_ops = {"IS_NULL", "IS_NOT_NULL"}
+        # 简单比较操作符——右值可能是带引号的字符串字面量
+        _simple_cmp_ops = {"EQ", "NEQ", "GT", "GTE", "LT", "LTE", "LIKE"}
 
         for s in steps_data:
             stype = s.get("step_type", "")
@@ -1181,6 +1206,9 @@ class PlanComparator:
                 # IS_NULL/IS_NOT_NULL：统一 right 为 <NULL> 占位符
                 # SQL 侧 right=None（flatten 后为 ""），Spark 侧可能为任意值
                 s["right"] = "<NULL>"
+            elif operator in _simple_cmp_ops and isinstance(right_val, str) and right_val:
+                # 简单比较操作符——剥去字符串字面量的外层配对引号
+                s["right"] = PlanComparator._strip_literal_quotes(right_val)
 
     @staticmethod
     def _render_frame_boundary(boundary: dict) -> str:
