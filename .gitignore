@@ -26,6 +26,9 @@ node_modules/
 generated/review_packages/
 frontend/generated/
 
+# 项目级缓存——快照、临时数据
+.tianshu_cache/
+
 # Superpowers 内部跟踪文件
 .superpowers/
 
