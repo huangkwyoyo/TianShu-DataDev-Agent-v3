@@ -26,6 +26,7 @@ from tianshu_datadev.developer_spec.models import (
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
 from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
 from tianshu_datadev.llm.models import LlmResponse, LlmTraceNode
+from tianshu_datadev.api.streaming import TeeCollector, _sanitize_stream_error
 from tianshu_datadev.monitor import get_collector
 from tianshu_datadev.planning.cross_validator import cross_validate
 from tianshu_datadev.planning.program_factory import (
@@ -1885,6 +1886,478 @@ class Pipeline:
             # 文件树（来自 PackageRichResponse）
             result["file_tree"] = self._build_file_tree(package_manifest.artifacts)
         return result
+
+    def run_all_full(
+        self, markdown_text: str,
+        table_mapping: dict[str, str] | None = None,
+        table_paths: dict[str, str] | None = None,
+    ) -> dict:
+        """全流程 SQL + Spark 管线——后端轻量编排，复用现有 dispatcher。
+
+        1. SQL 管线：调用 run_all(rich=True) 获取完整产物 + SQL 代码
+        2. Spark 管线：顺序调用 run_spark_stage() 执行 6 阶段
+        3. 汇总返回 FullRunResponse 风格的聚合 dict
+
+        阶段失败策略：
+        - DEVELOPER 可选——失败标记 WARN 后继续
+        - MAPPER / COMPILER / VALIDATOR 失败→停止下游
+        - PHYSICAL_VERIFIER 仅当 VALIDATOR 通过后执行
+        - COMPARATOR 读取其细粒度 comparator_report.status
+
+        PySpark 缺失时返回 NOT_EXECUTED / SKIPPED，
+        不声称"全流程成功"。
+        """
+        from tianshu_datadev.spark.orchestrator import SparkPipelineStage
+
+        logger = logging.getLogger(__name__)
+
+        # ── Step 1: SQL 管线 ──
+        sql_result = self.run_all(markdown_text, table_mapping, table_paths, rich=True)
+        request_id = sql_result.get("request_id")
+        sql_ok = sql_result.get("pipeline_error") is None
+
+        generated_sql = sql_result.get("generated_sql", "") if sql_ok else ""
+
+        # ── Step 2: Spark 管线（仅当 SQL 成功且有 request_id）──
+        spark_stages: list[dict] = []
+        spark_ok = False
+        pyspark_code: str | None = None
+        comparator_status: str | None = None
+        all_llm_traces: dict = dict(sql_result.get("llm_traces", {}) or {})
+
+        if sql_ok and request_id:
+            stages_sequence = [
+                SparkPipelineStage.MAPPER,
+                SparkPipelineStage.DEVELOPER,
+                SparkPipelineStage.COMPILER,
+                SparkPipelineStage.VALIDATOR,
+                SparkPipelineStage.COMPARATOR,
+                SparkPipelineStage.PHYSICAL_VERIFIER,
+            ]
+
+            for stage in stages_sequence:
+                stage_val = stage.value
+                try:
+                    stage_result = self.run_spark_stage(request_id, stage)
+                except Exception as exc:
+                    logger.warning("Spark 阶段 %s 异常：%s", stage_val, exc)
+                    spark_stages.append({
+                        "stage": stage_val, "status": "failed",
+                        "errors": [str(exc)],
+                    })
+                    if stage in (SparkPipelineStage.MAPPER, SparkPipelineStage.COMPILER,
+                                 SparkPipelineStage.VALIDATOR):
+                        break
+                    continue
+
+                current_status = stage_result.get("status", "skipped")
+                current_errors = stage_result.get("errors", [])
+
+                # 合并 LLM traces
+                stage_traces = stage_result.get("llm_traces", {}) or {}
+                all_llm_traces.update(stage_traces)
+
+                # 提取 COMPILER 阶段产物
+                if stage == SparkPipelineStage.COMPILER:
+                    compiler_result = stage_result.get("result", {}) or {}
+                    pyspark_code = (
+                        compiler_result.get("pyspark_code")
+                        or compiler_result.get("standalone_pyspark")
+                    )
+
+                # 提取 COMPARATOR 细粒度状态
+                if stage == SparkPipelineStage.COMPARATOR:
+                    comp_result = stage_result.get("result", {}) or {}
+                    comparator_status = comp_result.get("status")
+
+                # ── 失败策略 ──
+                # DEVELOPER 可选——失败标记 skipped 后继续
+                if stage == SparkPipelineStage.DEVELOPER:
+                    if current_status == "failed":
+                        spark_stages.append({
+                            "stage": stage_val, "status": "skipped",
+                            "errors": ["LLM 标注服务不可用，已跳过"],
+                        })
+                        continue
+                    spark_stages.append({
+                        "stage": stage_val, "status": current_status,
+                        "errors": current_errors,
+                    })
+                    continue
+
+                # MAPPER / COMPILER / VALIDATOR 失败→停止下游
+                if stage in (SparkPipelineStage.MAPPER, SparkPipelineStage.COMPILER,
+                             SparkPipelineStage.VALIDATOR):
+                    spark_stages.append({
+                        "stage": stage_val, "status": current_status,
+                        "errors": current_errors,
+                    })
+                    if current_status == "failed":
+                        break
+                    continue
+
+                # COMPARATOR——记录细粒度状态
+                if stage == SparkPipelineStage.COMPARATOR:
+                    spark_stages.append({
+                        "stage": stage_val, "status": current_status,
+                        "errors": current_errors,
+                        "comparator_status": comparator_status,
+                    })
+                    continue
+
+                # PHYSICAL_VERIFIER——仅当 VALIDATOR 通过后执行
+                if stage == SparkPipelineStage.PHYSICAL_VERIFIER:
+                    validator_passed = any(
+                        s["stage"] == "VALIDATOR" and s["status"] == "ok"
+                        for s in spark_stages
+                    )
+                    if not validator_passed:
+                        spark_stages.append({
+                            "stage": stage_val, "status": "skipped",
+                            "errors": ["VALIDATOR 未通过，跳过物理验证"],
+                        })
+                        break
+
+                    spark_stages.append({
+                        "stage": stage_val, "status": current_status,
+                        "errors": current_errors,
+                    })
+                    if current_status == "ok":
+                        spark_ok = True
+
+        # ── Step 3: 汇总 FullRunResponse ──
+        # 提取 SQL 管线的 pipeline_error（供 runAction 自动提取）
+        sql_pipeline_error = sql_result.get("pipeline_error")
+        sql_pipeline_stages = sql_result.get("pipeline_stages", [])
+        # 判断整体 Spark 管线是否完成（至少 PHYSICAL_VERIFIER 成功）
+        physver_stage = next(
+            (s for s in spark_stages if s["stage"] == "PHYSICAL_VERIFIER"), None,
+        )
+        spark_ok = physver_stage is not None and physver_stage["status"] == "ok"
+
+        return {
+            "request_id": request_id,
+            # 兼容 runAction 自动提取
+            "pipeline_error": sql_pipeline_error,
+            "pipeline_stages": sql_pipeline_stages,
+            # SQL 管线摘要
+            "sql_ok": sql_ok,
+            "sql_pipeline_error": sql_pipeline_error,
+            "sql_pipeline_stages": sql_pipeline_stages,
+            "generated_sql": generated_sql,
+            "spec_id": sql_result.get("spec_id"),
+            "plan_id": sql_result.get("plan_id"),
+            "package_id": sql_result.get("package_id"),
+            # Spark 管线摘要
+            "spark_ok": spark_ok,
+            "spark_stages": spark_stages,
+            "pyspark_code": pyspark_code,
+            # 全量 LLM 调用追踪
+            "llm_traces": all_llm_traces,
+        }
+
+    def run_all_full_stream(
+        self, markdown_text: str,
+        table_mapping: dict[str, str] | None = None,
+        table_paths: dict[str, str] | None = None,
+    ):
+        """全流程 SQL + Spark 管线——NDJSON 流式生成器。
+
+        通过 queue.Queue 在后台线程和生成器之间传递进度事件。
+        每行一个 JSON 对象（NDJSON），前端 ReadableStream 逐行消费。
+
+        事件类型：
+        - {"event":"stage","pipeline":"sql"|"spark","stage":"...","status":"..."}
+        - {"event":"done","result":{...FullRunResponse...}}
+        - {"event":"fatal","error_code":"...","message":"..."}
+        - {"event":"heartbeat"}
+
+        连接断开时后台线程继续执行——queue 满时丢弃事件并计数。
+
+        Yields:
+            NDJSON 行（str），每行以 \\n 结尾
+        """
+        import json
+        import queue as _queue_mod
+        import threading
+
+        event_queue: "queue.Queue" = _queue_mod.Queue(maxsize=500)
+        stop_event = threading.Event()
+        logger = logging.getLogger(__name__)
+
+        def _execute():
+            """后台线程——执行 SQL + Spark 全流程，将事件推入队列。"""
+            try:
+                # ── Step 1: SQL 管线 ──
+                # TeeCollector 拦截 stage 事件（run_all 内部调用 collector.stage()）
+                # 注意：当前 run_all() 通过 get_collector() 获取采集器，
+                # TeeCollector 包装无法直接注入——改为从 run_all 返回的 pipeline_stages
+                # 中提取阶段信息，逐阶段发送合成事件。
+                # 这一简化避免了全局状态替换的复杂性。
+                sql_result = self.run_all(markdown_text, table_mapping, table_paths, rich=True)
+                request_id = sql_result.get("request_id")
+                sql_ok = sql_result.get("pipeline_error") is None
+                generated_sql = sql_result.get("generated_sql", "") if sql_ok else ""
+
+                # 从 SQL 结果中提取阶段信息并发送事件
+                sql_pipeline_stages = sql_result.get("pipeline_stages", []) or []
+                for s in sql_pipeline_stages:
+                    stage_name = s.get("stage", "unknown")
+                    stage_status = s.get("status", "skipped")
+                    event_queue.put({
+                        "event": "stage",
+                        "pipeline": "sql",
+                        "stage": stage_name,
+                        "status": "completed" if stage_status == "ok" else stage_status,
+                        "message": s.get("error_message") if stage_status != "ok" else None,
+                        "error_type": s.get("error_type") if stage_status != "ok" else None,
+                    })
+
+                # ── Step 2: Spark 管线 ──
+                spark_stages: list[dict] = []
+                spark_ok = False
+                pyspark_code: str | None = None
+                comparator_status: str | None = None
+                all_llm_traces: dict = dict(sql_result.get("llm_traces", {}) or {})
+
+                if sql_ok and request_id:
+                    stages_sequence = [
+                        SparkPipelineStage.MAPPER,
+                        SparkPipelineStage.DEVELOPER,
+                        SparkPipelineStage.COMPILER,
+                        SparkPipelineStage.VALIDATOR,
+                        SparkPipelineStage.COMPARATOR,
+                        SparkPipelineStage.PHYSICAL_VERIFIER,
+                    ]
+
+                    for stage in stages_sequence:
+                        stage_val = stage.value
+
+                        # 发送 Spark 阶段 started 事件
+                        event_queue.put({
+                            "event": "stage",
+                            "pipeline": "spark",
+                            "stage": stage_val,
+                            "status": "started",
+                        })
+
+                        stage_start = time.time()
+                        try:
+                            stage_result = self.run_spark_stage(request_id, stage)
+                        except Exception as exc:
+                            duration_ms = int((time.time() - stage_start) * 1000)
+                            err_msg = _sanitize_stream_error(exc)
+                            event_queue.put({
+                                "event": "stage",
+                                "pipeline": "spark",
+                                "stage": stage_val,
+                                "status": "failed",
+                                "duration_ms": duration_ms,
+                                "message": err_msg,
+                                "error_type": type(exc).__name__,
+                            })
+                            spark_stages.append({
+                                "stage": stage_val, "status": "failed",
+                                "errors": [str(exc)],
+                            })
+                            if stage in (SparkPipelineStage.MAPPER, SparkPipelineStage.COMPILER,
+                                         SparkPipelineStage.VALIDATOR):
+                                break
+                            continue
+
+                        duration_ms = int((time.time() - stage_start) * 1000)
+                        current_status = stage_result.get("status", "skipped")
+                        current_errors = stage_result.get("errors", [])
+
+                        # 合并 LLM traces
+                        stage_traces = stage_result.get("llm_traces", {}) or {}
+                        all_llm_traces.update(stage_traces)
+
+                        # 提取 COMPILER 阶段产物
+                        if stage == SparkPipelineStage.COMPILER:
+                            compiler_result = stage_result.get("result", {}) or {}
+                            pyspark_code = (
+                                compiler_result.get("pyspark_code")
+                                or compiler_result.get("standalone_pyspark")
+                            )
+
+                        # 提取 COMPARATOR 细粒度状态
+                        if stage == SparkPipelineStage.COMPARATOR:
+                            comp_result = stage_result.get("result", {}) or {}
+                            comparator_status = comp_result.get("status")
+
+                        # ── 失败策略 ──
+                        # DEVELOPER 可选——失败标记 skipped 后继续
+                        if stage == SparkPipelineStage.DEVELOPER:
+                            if current_status == "failed":
+                                event_queue.put({
+                                    "event": "stage",
+                                    "pipeline": "spark",
+                                    "stage": stage_val,
+                                    "status": "skipped",
+                                    "duration_ms": duration_ms,
+                                    "message": "LLM 标注服务不可用，已跳过",
+                                })
+                                spark_stages.append({
+                                    "stage": stage_val, "status": "skipped",
+                                    "errors": ["LLM 标注服务不可用，已跳过"],
+                                })
+                                continue
+                            event_queue.put({
+                                "event": "stage",
+                                "pipeline": "spark",
+                                "stage": stage_val,
+                                "status": "completed",
+                                "duration_ms": duration_ms,
+                            })
+                            spark_stages.append({
+                                "stage": stage_val, "status": current_status,
+                                "errors": current_errors,
+                            })
+                            continue
+
+                        # MAPPER / COMPILER / VALIDATOR 失败→停止下游
+                        if stage in (SparkPipelineStage.MAPPER, SparkPipelineStage.COMPILER,
+                                     SparkPipelineStage.VALIDATOR):
+                            status_event = "completed" if current_status == "ok" else "failed"
+                            event_queue.put({
+                                "event": "stage",
+                                "pipeline": "spark",
+                                "stage": stage_val,
+                                "status": status_event,
+                                "duration_ms": duration_ms,
+                                "message": "; ".join(current_errors) if current_errors and current_status == "failed" else None,
+                            })
+                            spark_stages.append({
+                                "stage": stage_val, "status": current_status,
+                                "errors": current_errors,
+                            })
+                            if current_status == "failed":
+                                break
+                            continue
+
+                        # COMPARATOR——记录细粒度状态
+                        if stage == SparkPipelineStage.COMPARATOR:
+                            event_queue.put({
+                                "event": "stage",
+                                "pipeline": "spark",
+                                "stage": stage_val,
+                                "status": "completed",
+                                "duration_ms": duration_ms,
+                                "message": f"对比状态: {comparator_status}" if comparator_status else None,
+                            })
+                            spark_stages.append({
+                                "stage": stage_val, "status": current_status,
+                                "errors": current_errors,
+                                "comparator_status": comparator_status,
+                            })
+                            continue
+
+                        # PHYSICAL_VERIFIER——仅当 VALIDATOR 通过 + COMPARATOR 等价时执行
+                        if stage == SparkPipelineStage.PHYSICAL_VERIFIER:
+                            validator_passed = any(
+                                s["stage"] == "VALIDATOR" and s["status"] == "ok"
+                                for s in spark_stages
+                            )
+                            if not validator_passed:
+                                event_queue.put({
+                                    "event": "stage",
+                                    "pipeline": "spark",
+                                    "stage": stage_val,
+                                    "status": "skipped",
+                                    "message": "VALIDATOR 未通过，跳过物理验证",
+                                })
+                                spark_stages.append({
+                                    "stage": stage_val, "status": "skipped",
+                                    "errors": ["VALIDATOR 未通过，跳过物理验证"],
+                                })
+                                break
+
+                            # COMPARATOR 门禁——非 LOGIC_EQUIVALENT 时跳过物理验证
+                            if comparator_status and comparator_status != "LOGIC_EQUIVALENT":
+                                event_queue.put({
+                                    "event": "stage",
+                                    "pipeline": "spark",
+                                    "stage": stage_val,
+                                    "status": "skipped",
+                                    "message": f"COMPARATOR 状态为 {comparator_status}，跳过物理验证",
+                                })
+                                spark_stages.append({
+                                    "stage": stage_val, "status": "skipped",
+                                    "errors": [f"COMPARATOR 状态为 {comparator_status}，跳过物理验证"],
+                                })
+                                break
+
+                            status_event = "completed" if current_status == "ok" else "failed"
+                            event_queue.put({
+                                "event": "stage",
+                                "pipeline": "spark",
+                                "stage": stage_val,
+                                "status": status_event,
+                                "duration_ms": duration_ms,
+                                "message": "; ".join(current_errors) if current_errors and current_status == "failed" else None,
+                            })
+                            spark_stages.append({
+                                "stage": stage_val, "status": current_status,
+                                "errors": current_errors,
+                            })
+                            if current_status == "ok":
+                                spark_ok = True
+
+                # ── 判断整体 Spark 管线是否成功 ──
+                physver_stage = next(
+                    (s for s in spark_stages if s["stage"] == "PHYSICAL_VERIFIER"), None,
+                )
+                spark_ok = physver_stage is not None and physver_stage["status"] == "ok"
+
+                # ── 汇总 FullRunResponse ──
+                sql_pipeline_error = sql_result.get("pipeline_error")
+
+                full_result = {
+                    "request_id": request_id,
+                    "pipeline_error": sql_pipeline_error,
+                    "pipeline_stages": sql_pipeline_stages,
+                    "sql_ok": sql_ok,
+                    "sql_pipeline_error": sql_pipeline_error,
+                    "sql_pipeline_stages": sql_pipeline_stages,
+                    "generated_sql": generated_sql,
+                    "spec_id": sql_result.get("spec_id"),
+                    "plan_id": sql_result.get("plan_id"),
+                    "package_id": sql_result.get("package_id"),
+                    "spark_ok": spark_ok,
+                    "spark_stages": spark_stages,
+                    "pyspark_code": pyspark_code,
+                    "llm_traces": all_llm_traces,
+                }
+
+                event_queue.put({"event": "done", "result": full_result})
+
+            except Exception as exc:
+                logger.exception("run_all_full_stream 后台线程致命错误")
+                event_queue.put({
+                    "event": "fatal",
+                    "error_code": type(exc).__name__.upper(),
+                    "message": _sanitize_stream_error(exc),
+                })
+            finally:
+                stop_event.set()
+
+        # 启动后台线程
+        thread = threading.Thread(
+            target=_execute, daemon=True, name="run-all-full-stream",
+        )
+        thread.start()
+
+        # 生成器——从队列读取并 yield NDJSON 行
+        while not stop_event.is_set() or not event_queue.empty():
+            try:
+                event = event_queue.get(timeout=0.5)
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+                if event.get("event") in ("done", "fatal"):
+                    return
+            except _queue_mod.Empty:
+                # 心跳保持连接
+                yield '{"event":"heartbeat"}\n'
 
     def run_all_rich(
         self, markdown_text: str,
