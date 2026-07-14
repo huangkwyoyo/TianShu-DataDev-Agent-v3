@@ -760,6 +760,47 @@ class TestSnapshotBuilderAliases:
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    def test_dev_warehouse_writes_inputs_index(self):
+        """非 LOCAL_FIXTURE（DEV_WAREHOUSE）也写 _inputs_index.json。
+
+        回归：SnapshotBuilder 非 LOCAL_FIXTURE 分支遗漏 _write_inputs_index 调用，
+        导致 executor prologue 无法按别名装载 inputs → KeyError。
+        """
+        import json
+        import tempfile
+        tmpdir = tempfile.mkdtemp(prefix="tianshu_dw_index_")
+        try:
+            from tianshu_datadev.spark.snapshot import (
+                SnapshotBuilder, SnapshotSourceProvider, SnapshotSourceType,
+            )
+            builder = SnapshotBuilder(output_dir=tmpdir)
+            provider = SnapshotSourceProvider(
+                provider_id="dev_wh_001",
+                source_type=SnapshotSourceType.DEV_WAREHOUSE,
+                connection_alias="dev_warehouse_readonly",
+                allowlisted_tables=["dw.dim_date", "dw.fact_orders"],
+                base_path="/data/dev_warehouse/",
+                description="开发环境只读数据仓库",
+            )
+            manifest = builder.build(
+                contract_hash="dw_test",
+                source_tables=["dw.dim_date", "dw.fact_orders"],
+                provider=provider,
+                table_aliases={"dw.dim_date": "dd", "dw.fact_orders": "fo"},
+            )
+            index_path = os.path.join(manifest.snapshot_dir, "_inputs_index.json")
+            assert os.path.isfile(index_path), (
+                f"DEV_WAREHOUSE 路径应写 _inputs_index.json——路径={index_path}"
+            )
+            with open(index_path, encoding="utf-8") as fp:
+                index = json.load(fp)
+            assert index == {
+                "dd": "dw.dim_date.parquet",
+                "fo": "dw.fact_orders.parquet",
+            }
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 # ════════════════════════════════════════════
 # Phase 9B-P0: Pipeline + SnapshotBuilder 集成测试

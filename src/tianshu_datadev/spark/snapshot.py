@@ -240,8 +240,11 @@ class SnapshotBuilder:
             self._write_inputs_index(snapshot_dir, files)
         else:
             # 非 LOCAL_FIXTURE：占位清单（Phase 7B+ 实现实际写入）
+            # 仍需创建目录和写入 _inputs_index.json——确保 executor prologue
+            # 能按别名装载 inputs（即使 parquet 文件尚不存在，索引提供正确映射）
             files: list[SnapshotFile] = []
             _aliases = table_aliases or {}
+            os.makedirs(snapshot_dir, exist_ok=True)
             for table_name in sorted(source_tables):
                 file_path = os.path.join(snapshot_dir, f"{table_name}.parquet")
                 files.append(SnapshotFile(
@@ -251,6 +254,9 @@ class SnapshotBuilder:
                     row_count=0,           # Phase 7B 填充
                     file_sha256="",        # Phase 7B 填充
                 ))
+            # 写 inputs 索引侧车——executor prologue 按别名装载 inputs
+            # 即使 parquet 文件尚未写入，索引提供正确的 别名→物理文件名 映射
+            self._write_inputs_index(snapshot_dir, files)
 
         # 计算快照整体 hash
         snapshot_sha256 = self._compute_snapshot_hash(files)
