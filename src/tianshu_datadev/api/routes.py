@@ -30,7 +30,7 @@ from collections import defaultdict
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 if TYPE_CHECKING:
     from tianshu_datadev.spark.orchestrator import SparkPipelineStage
@@ -114,6 +114,48 @@ async def run_all(request: Request, body: RunAllRequest):
     pipeline = request.app.state.pipeline
     result = pipeline.run_all(body.markdown_text, body.table_mapping, body.table_paths)
     return result
+
+
+@api_router.post("/run-all-full")
+async def run_all_full(request: Request, body: RunAllRequest):
+    """全流程 SQL + Spark 管线——后端轻量编排，复用现有 dispatcher。
+
+    串联：
+    1. SQL 管线 8 阶段（parser → package）
+    2. Spark 管线 6 阶段（MAPPER → PHYSICAL_VERIFIER）
+
+    返回聚合 FullRunResponse：SQL 代码、PySpark 代码、双管线阶段状态、LLM 追踪。
+    前端只需一次请求。
+    """
+    pipeline = request.app.state.pipeline
+    result = pipeline.run_all_full(body.markdown_text, body.table_mapping, body.table_paths)
+    return result
+
+
+@api_router.post("/run-all-full/stream")
+async def run_all_full_stream(request: Request, body: RunAllRequest):
+    """全流程 SQL + Spark 管线——NDJSON 流式进度推送。
+
+    返回 application/x-ndjson 流，每行一个 JSON 事件：
+    - stage: 阶段进度（pipeline + stage + status + duration_ms）
+    - done: 全流程完成（含完整 FullRunResponse）
+    - fatal: 致命错误
+    - heartbeat: 心跳（保持连接）
+
+    前端通过 fetch + ReadableStream 逐行消费，实时更新进度面板。
+    连接断开时后台继续执行——结果通过 done 事件的 result 字段返回。
+    """
+    pipeline = request.app.state.pipeline
+    return StreamingResponse(
+        pipeline.run_all_full_stream(
+            body.markdown_text, body.table_mapping, body.table_paths,
+        ),
+        media_type="application/x-ndjson",
+        headers={
+            "X-Accel-Buffering": "no",   # 禁用 nginx 缓冲
+            "Cache-Control": "no-cache",  # 禁用缓存
+        },
+    )
 
 
 @api_router.post("/run-all-rich")
