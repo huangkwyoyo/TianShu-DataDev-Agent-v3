@@ -420,22 +420,46 @@ class TestSparkPipelineFrontend:
         """runAction 中 partial 可以覆盖 pipelineStages——使得成功态可自定义阶段。"""
         src = self._read_file("frontend", "src", "App.tsx")
         # 验证 merge 顺序：pipelineStages 在 ...partial 之前（partial 后覆盖）
-        # 新的顺序应为: { isLoading: false, pipelineError, pipelineStages, ...partial }
-        # 找到 runAction 中的 update 调用
-        match = re.search(
-            r'update\(\{[^}]+pipelineStages[^}]+}\)',
-            src, re.DOTALL,
+        # 策略：找到 runAction 函数中同时包含 pipelineStages 和 ...partial 的 update 调用
+        # 先用 runAction 函数体范围限定搜索
+        run_action_start = src.find("const runAction = async")
+        assert run_action_start != -1, "未找到 runAction 函数定义"
+        # runAction 函数结束于下一个顶层函数定义之前
+        next_fn = src.find("\nconst ", run_action_start + 10)
+        if next_fn == -1:
+            next_fn = len(src)
+        run_action_body = src[run_action_start:next_fn]
+
+        # 在 runAction 体内找 ...partial（这是全局唯一的 runAction 内 ...partial）
+        partial_idx = run_action_body.find("...partial")
+        assert partial_idx != -1, "runAction 中未找到 ...partial"
+        # 从 ...partial 反向搜索最近的 update(
+        search_start = run_action_body.rfind("update(", 0, partial_idx)
+        assert search_start != -1, "...partial 之前未找到 update 调用"
+
+        # 手工配对大括号确定 update({...}) 范围
+        depth = 0
+        update_end = -1
+        for i in range(search_start + len("update("), len(run_action_body)):
+            ch = run_action_body[i]
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    update_end = i + 1
+                    break
+        assert update_end != -1, "无法确定 update 调用的结束位置"
+        update_block = run_action_body[search_start:update_end]
+
+        # pipelineStages 应在 ...partial 之前
+        ps_pos = update_block.find("pipelineStages")
+        partial_pos = update_block.find("...partial")
+        assert ps_pos != -1 and partial_pos != -1 and ps_pos < partial_pos, (
+            f"runAction 中 pipelineStages 应在 ...partial 之前——"
+            f"当前顺序使得 partial 无法覆盖 API 响应中的空 stages。"
+            f"ps_pos={ps_pos}, partial_pos={partial_pos}"
         )
-        if match:
-            update_block = match.group(0)
-            # pipelineStages 应该在 ...partial 之前出现（按源码从上到下）
-            ps_pos = update_block.find("pipelineStages")
-            partial_pos = update_block.find("...partial")
-            assert ps_pos < partial_pos, (
-                f"runAction 中 pipelineStages 应在 ...partial 之前——"
-                f"当前顺序使得 partial 无法覆盖 API 响应中的空 stages。"
-                f"update 块: {update_block[:120]}..."
-            )
 
     def test_handle_run_all_sets_success_stages(self):
         """handleRunAll 成功路径设置全成功阶段——SQL 指示灯在成功后可见。"""
