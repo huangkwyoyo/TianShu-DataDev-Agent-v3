@@ -1,0 +1,143 @@
+/* Run-All 实时进度面板 */
+
+.run-progress-panel {
+  border: 1px solid var(--border, #444);
+  border-radius: 8px;
+  margin-bottom: 12px;
+  background: var(--panel-bg, #1e1e2e);
+}
+
+.run-progress-panel.progress-done {
+  border-color: var(--success, #4caf50);
+}
+
+.run-progress-panel.progress-fatal {
+  border-color: var(--error, #f44336);
+}
+
+.progress-pipeline-group {
+  margin: 8px 16px 12px;
+}
+
+.progress-pipeline-header {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary, #e0e0e0);
+  margin-bottom: 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border, #444);
+}
+
+.progress-stage-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.progress-stage-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--text-secondary, #aaa);
+}
+
+.progress-stage-row.stage-started {
+  color: var(--text-primary, #e0e0e0);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.progress-stage-row.stage-completed {
+  color: var(--success, #4caf50);
+}
+
+.progress-stage-row.stage-failed {
+  color: var(--error, #f44336);
+  background: rgba(244, 67, 54, 0.08);
+}
+
+.progress-stage-row.stage-skipped {
+  color: var(--text-muted, #888);
+  font-style: italic;
+}
+
+.progress-stage-icon {
+  width: 18px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.progress-stage-name {
+  flex-shrink: 0;
+  min-width: 60px;
+}
+
+.progress-stage-duration {
+  font-family: monospace;
+  font-size: 11px;
+  color: var(--text-muted, #888);
+  margin-left: auto;
+}
+
+.progress-stage-message {
+  font-size: 11px;
+  color: var(--text-muted, #999);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 300px;
+}
+
+.progress-waiting {
+  padding: 16px;
+  text-align: center;
+  color: var(--text-muted, #888);
+  font-size: 13px;
+}
+
+.progress-stream-error {
+  margin: 8px 16px;
+  padding: 8px 12px;
+  border-radius: 4px;
+  background: rgba(255, 152, 0, 0.1);
+  color: var(--warning, #ff9800);
+  font-size: 12px;
+}
+
+.progress-fatal-error {
+  margin: 8px 16px 12px;
+  padding: 8px 12px;
+  border-radius: 4px;
+  background: rgba(244, 67, 54, 0.1);
+  color: var(--error, #f44336);
+  font-size: 12px;
+}
+
+.streaming-badge {
+  font-size: 11px;
+  font-weight: normal;
+  color: var(--info, #2196f3);
+  margin-left: 8px;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.done-badge {
+  font-size: 11px;
+  font-weight: normal;
+  color: var(--success, #4caf50);
+  margin-left: 8px;
+}
+
+.fatal-badge {
+  font-size: 11px;
+  font-weight: normal;
+  color: var(--error, #f44336);
+  margin-left: 8px;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
