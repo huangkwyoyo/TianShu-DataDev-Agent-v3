@@ -31,7 +31,7 @@ TEMPLATES: list[dict] = [
             '  summary: "按日期和行政区统计出租车行程量和收入"\n'
             "\n"
             "  time_range:\n"
-            '    start: "2026-01-01"  # 数据起始日期\n'
+            '    start: "2026-03-25"  # 数据起始日期（7 天窗口，避免全量导出）\n'
             '    end: "2026-03-31"    # 数据截止日期\n'
             "\n"
             "  source_tables:\n"
@@ -139,7 +139,7 @@ TEMPLATES: list[dict] = [
             "\n"
             "## 业务目标\n"
             "按日期和行政区统计行程量、总收入和平均距离。\n"
-            "数据范围：2026年Q1 NYC 出租车 + FHV 行程数据（Yellow/Green/FHV/FHVHV 四种来源）。\n"
+            "数据范围：最近7天（2026-03-25~03-31）NYC 出租车 + FHV 行程数据（Yellow/Green/FHV/FHVHV 四种来源）。\n"
             "\n"
             "## 加工步骤\n"
             "1. 从 gold.fact_trips 扫描行程记录（含 pickup_at 时间过滤，避免全表扫描）\n"
@@ -164,7 +164,7 @@ TEMPLATES: list[dict] = [
             '  summary: "行程距离分类打标——短途/中途/长途/异常"\n'
             "\n"
             "  time_range:\n"
-            '    start: "2026-01-01"  # 数据起始日期\n'
+            '    start: "2026-03-25"  # 数据起始日期（7 天窗口，避免全量导出）\n'
             '    end: "2026-03-31"    # 数据截止日期\n'
             "\n"
             "  source_tables:\n"
@@ -230,7 +230,7 @@ TEMPLATES: list[dict] = [
             "- distance_miles > 10 → long（长途）\n"
             "\n"
             "## 数据说明\n"
-            "- 数据源：gold.fact_trips（8032万行，2026Q1 含历史数据）\n"
+            "- 数据源：gold.fact_trips（8032万行），示例取最近7天数据\n"
             "- 距离分布：min=0, avg=4.94, max=328522.20 英里\n"
             "- 建议添加 pickup_at 时间过滤缩小处理范围\n"
             "```\n"
@@ -251,7 +251,7 @@ TEMPLATES: list[dict] = [
             '  summary: "多步骤行程分析——关联出租区域维和日期维，按日期/行政区/区域统计行程量"\n'
             "\n"
             "  time_range:\n"
-            '    start: "2026-01-01"  # 数据起始日期\n'
+            '    start: "2026-03-25"  # 数据起始日期（7 天窗口，避免全量导出）\n'
             '    end: "2026-03-31"    # 数据截止日期\n'
             "\n"
             "  source_tables:\n"
@@ -400,7 +400,7 @@ TEMPLATES: list[dict] = [
             "行程量、总收入和平均距离。\n"
             "\n"
             "## 加工步骤\n"
-            "1. 从 gold.fact_trips 扫描行程记录，添加 pickup_at 时间过滤（如 pickup_at >= '2026-01-01'）\n"
+            "1. 从 gold.fact_trips 扫描行程记录，添加 pickup_at 时间过滤（如 pickup_at >= '2026-03-25'）\n"
             "2. 过滤异常数据：is_distance_outlier = false\n"
             "3. LEFT JOIN silver.taxi_zone ON ft.pickup_location_id = tz.location_id（获取 borough + zone_name）\n"
             "4. LEFT JOIN gold.dim_date ON ft.pickup_date_key = dd.date_key（获取日期属性）\n"
@@ -429,7 +429,7 @@ TEMPLATES: list[dict] = [
             '  summary: "行程明细宽表——关联出租区域维表，展开上客/下客区域名称和行政区"\n'
             "\n"
             "  time_range:\n"
-            '    start: "2026-01-01"  # 数据起始日期\n'
+            '    start: "2026-03-25"  # 数据起始日期（7 天窗口，避免全量导出）\n'
             '    end: "2026-03-31"    # 数据截止日期\n'
             "\n"
             "  source_tables:\n"
@@ -580,7 +580,7 @@ TEMPLATES: list[dict] = [
             '  summary: "各行政区 Top10 热门出租区域——按行程量降序排名"\n'
             "\n"
             "  time_range:\n"
-            '    start: "2026-01-01"  # 数据起始日期\n'
+            '    start: "2026-03-25"  # 数据起始日期（7 天窗口，避免全量导出）\n'
             '    end: "2026-03-31"    # 数据截止日期\n'
             "\n"
             "  source_tables:\n"
@@ -679,7 +679,7 @@ TEMPLATES: list[dict] = [
             "## 关联推理提示\n"
             "- ft.pickup_location_id → tz.location_id（事实表上客区域编码 → 维表区域编码）\n"
             "- 区域维表仅 265 行，INNER JOIN 过滤无上客位置信息的记录\n"
-            "- 务必添加 pickup_at 时间过滤（如 2026 Q1），8032 万行全表扫描不可接受\n"
+            "- 务必添加 pickup_at 时间过滤（如最近7天 2026-03-25~03-31），8032 万行全表扫描不可接受\n"
             "```\n"
         ),
     },
@@ -698,7 +698,7 @@ TEMPLATES: list[dict] = [
             '  summary: "一句话描述业务目标"\n'
             "\n"
             "  time_range:\n"
-            '    start: "2026-01-01"  # 数据起始日期\n'
+            '    start: "2026-03-25"  # 数据起始日期（推荐 7 天窗口）\n'
             '    end: "2026-03-31"    # 数据截止日期（大事实表必须设定，否则触发 Q-VAL-TIME 阻塞）\n'
             "\n"
             "  source_tables:\n"
@@ -755,7 +755,7 @@ TEMPLATES: list[dict] = [
             "## 数据说明\n"
             "数据源：D:\\\\ProgramData\\\\Datawarehouse\\\\纽约市城市交通\\\\nyc_transport.duckdb\n"
             "可用表：bronze（原始层 16 表）/ silver（明细层 9 表）/ gold（聚合层 15 表）。\n"
-            "时间范围：2009-2026，主数据集中在 2026 Q1。\n"
+            "时间范围：2009-2026，示例取最近7天（2026-03-25~03-31）。\n"
             "```\n"
         ),
     },
