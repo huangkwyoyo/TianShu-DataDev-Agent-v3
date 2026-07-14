@@ -9,6 +9,7 @@ import { SqlDisplay } from './components/SqlDisplay';
 import { PackageTree } from './components/PackageTree';
 import { ErrorDisplay } from './components/ErrorDisplay';
 import { StatusBar } from './components/StatusBar';
+import { RunProgressPanel } from './components/RunProgressPanel';
 import { SparkStageButtons } from './components/SparkStageButtons';
 import { SparkStageResultPanel } from './components/SparkStageResultPanel';
 import { LlmTracePanel } from './components/LlmTracePanel';
@@ -21,8 +22,8 @@ import {
   parseSpecRich,
   buildPlanRich,
   executeRich,
-  runAll,
-  getPackageRich,
+  runAllFull,
+  runAllFullStream,
   sparkVerify,
   checkArtifactsStatus,
   ApiError,
@@ -33,7 +34,8 @@ import {
   SparkVerifyResponse,
   SparkStageResponse,
   LlmTraceNode,
-  RunAllResponse,
+  FullRunResponse,
+  FullRunEvent,
   SparkStageResult,
   TemplateFull,
 } from './api/client';
@@ -70,8 +72,19 @@ interface AppState {
   // Spark 单阶段触发的产物内容（供面板展示）
   sparkStageResult: { stage: string; result: SparkStageResult; status: string } | null;
 
+  // 持久化 COMPILER 阶段产物（不被后续阶段覆盖）
+  compilerCode: { pyspark: string; standalone: string } | null;
+  // 是否展示代码下载区
+  showCodeDownload: boolean;
+
   // LLM 调用追踪（各阶段累积）
   llmTraces: Record<string, LlmTraceNode> | null;
+
+  // Run-All 流式进度
+  runProgressEvents: FullRunEvent[];
+  isStreaming: boolean;
+  streamError: string | null;
+  streamAbortController: AbortController | null;
 
   // 数据源映射——编译执行和全流程时传入后端
   tableMapping: Record<string, string>;
@@ -95,7 +108,13 @@ export default function App() {
     sparkVerifyResult: null,
     artifactsReady: false,
     sparkStageResult: null,
+    compilerCode: null,
+    showCodeDownload: false,
     llmTraces: null,
+    runProgressEvents: [],
+    isStreaming: false,
+    streamError: null,
+    streamAbortController: null,
     tableMapping: {},
     tablePaths: {},
   });
@@ -234,90 +253,149 @@ export default function App() {
           sparkStages: [],
           sparkVerifyResult: null,
           sparkStageResult: null,
+          compilerCode: null,
+          showCodeDownload: false,
         };
       },
     );
   };
 
-  /** 全流程一键执行 */
+  /** 全流程 Run-All——流式进度版（NDJSON 消费） */
   const handleRunAll = () => {
     if (!state.markdownText.trim()) {
       update({ error: { error_code: 'EMPTY_INPUT', message: '请输入 DeveloperSpec 内容', field_ref: 'markdown_text' } });
       return;
     }
-    runAction(
-      () => runAll(state.markdownText, state.tableMapping, state.tablePaths),
-      async (result) => {
-        // run-all 成功后异步验证 artifacts 是否就绪
-        let artifactsReady = false;
-        if (result.request_id) {
-          try {
-            const status = await checkArtifactsStatus(result.request_id);
-            artifactsReady = status.artifacts_ready;
-          } catch {
-            artifactsReady = false;
+
+    // 清理旧状态
+    update({
+      isLoading: true,
+      error: null,
+      pipelineError: null,
+      pipelineStages: [],
+      runProgressEvents: [],
+      isStreaming: true,
+      streamError: null,
+      sparkStageResult: null,
+      showCodeDownload: false,
+    });
+
+    const controller = runAllFullStream(
+      state.markdownText,
+      state.tableMapping,
+      state.tablePaths,
+      // onEvent——每收到一个事件
+      (event: FullRunEvent) => {
+        setState((prev) => {
+          const newEvents = [...prev.runProgressEvents, event];
+
+          if (event.event === 'heartbeat') {
+            return { ...prev, runProgressEvents: newEvents };
           }
-        }
-        // 如果管线执行失败（Validator 阻断等），不尝试获取 package
-        // pipeline_error 和 pipeline_stages 由 runAction 自动提取并展示在 PipelineStageIndicator
-        if (result.pipeline_error) {
-          return {
-            requestId: result.request_id,
-            activePanel: 'sql' as Panel,
-            artifactsReady,
-            llmTraces: (result as RunAllResponse).llm_traces || null,
-            sparkStageResult: null,
-          };
-        }
-        // 管线成功——尝试获取 package
-        try {
-          const pkg = await getPackageRich(result.request_id);
-          return {
-            executeResult: {
-              request_id: result.request_id,
-              spec_id: result.spec_id,
-              plan_id: result.plan_id,
-              generated_sql: '',
-              sql_sha256: '',
-              compiler_version: '',
-              execution_trace: result.execution_trace!,
-              result_summary: result.result_summary!,
-              open_questions: [],
-            },
-            packageResult: pkg,
-            requestId: result.request_id,
-            activePanel: 'package' as Panel,
-            artifactsReady,
-            sparkStageResult: null,
-            llmTraces: (result as RunAllResponse).llm_traces || null,
-            // SQL 管线成功——设置全部 8 阶段为 ok，使指示灯在成功后仍然可见
-            pipelineStages: [
-              { stage: 'parser', status: 'ok' },
-              { stage: 'enrich', status: 'ok' },
-              { stage: 'build', status: 'ok' },
-              { stage: 'validate', status: 'ok' },
-              { stage: 'compile', status: 'ok' },
-              { stage: 'execute', status: 'ok' },
-              { stage: 'contract', status: 'ok' },
-              { stage: 'package', status: 'ok' },
-            ],
-          };
-        } catch {
-          return {
-            requestId: result.request_id,
-            activePanel: 'sql' as Panel,
-            artifactsReady,
-            llmTraces: (result as RunAllResponse).llm_traces || null,
-            sparkStageResult: null,
-            error: {
-              error_code: 'PACKAGE_FETCH_FAILED',
-              message: 'RunAll 成功但获取 Package 失败',
-              field_ref: null,
-            },
-          };
-        }
+
+          if (event.event === 'done') {
+            const fr = event.result;
+            // 构建 SQL 管线阶段指示灯
+            const sqlStages: StageInfo[] = fr.sql_pipeline_stages
+              ? fr.sql_pipeline_stages.map((s) => ({
+                  stage: s.stage,
+                  status: s.status === 'ok' ? 'ok' : s.status === 'failed' ? 'failed' : 'skipped',
+                }))
+              : [];
+            // 构建 Spark 管线阶段指示灯
+            const sparkStages: StageInfo[] = fr.spark_stages.map((s) => ({
+              stage: s.stage,
+              status: s.status === 'ok' ? 'ok' : s.status === 'failed' ? 'failed' : 'skipped',
+            }));
+            // 构建 executeResult（含 SQL 代码）
+            const executeResult: ExecuteRichResponse | null = fr.sql_ok && fr.request_id
+              ? {
+                  request_id: fr.request_id,
+                  spec_id: fr.spec_id || '',
+                  plan_id: fr.plan_id || '',
+                  generated_sql: fr.generated_sql || '',
+                  sql_sha256: '',
+                  compiler_version: '',
+                  execution_trace: { trace_id: '', status: '', row_count: 0, execution_time_ms: 0, error_message: null },
+                  result_summary: { summary_id: '', columns: [], column_types: [], row_count: 0, null_counts: {}, numeric_sums: {} },
+                  open_questions: [],
+                }
+              : null;
+            // 持久化 PySpark 代码（即使 Spark 失败也保留）
+            const compilerCode = fr.pyspark_code
+              ? { pyspark: fr.pyspark_code, standalone: '' }
+              : prev.compilerCode;
+
+            // 异步验证 artifacts 是否就绪
+            if (fr.request_id) {
+              checkArtifactsStatus(fr.request_id).then((status) => {
+                setState((prev2) => ({ ...prev2, artifactsReady: status.artifacts_ready }));
+              }).catch(() => {});
+            }
+
+            return {
+              ...prev,
+              isLoading: false,
+              isStreaming: false,
+              runProgressEvents: newEvents,
+              requestId: fr.request_id,
+              executeResult,
+              compilerCode,
+              // SQL 成功就展示代码（即使 Spark 失败也保留，标注由 Spark 阶段状态体现）
+              showCodeDownload: fr.sql_ok,
+              sparkStages,
+              pipelineStages: sqlStages.length > 0 ? sqlStages : [
+                { stage: 'parser', status: 'ok' }, { stage: 'enrich', status: 'ok' },
+                { stage: 'build', status: 'ok' }, { stage: 'validate', status: 'ok' },
+                { stage: 'compile', status: 'ok' }, { stage: 'execute', status: 'ok' },
+                { stage: 'contract', status: 'ok' }, { stage: 'package', status: 'ok' },
+              ],
+              llmTraces: fr.llm_traces,
+              activePanel: 'sql' as Panel,
+              // SQL 失败时的错误
+              error: fr.sql_pipeline_error
+                ? {
+                    error_code: `PIPELINE_${fr.sql_pipeline_error.stage.toUpperCase()}_FAILED`,
+                    message: fr.sql_pipeline_error.error_message,
+                    field_ref: fr.sql_pipeline_error.stage,
+                  }
+                : null,
+            };
+          }
+
+          if (event.event === 'fatal') {
+            return {
+              ...prev,
+              isLoading: false,
+              isStreaming: false,
+              runProgressEvents: newEvents,
+              error: {
+                error_code: event.error_code,
+                message: event.message,
+                field_ref: null,
+              },
+            };
+          }
+
+          // stage 事件——仅累积进度
+          return { ...prev, runProgressEvents: newEvents };
+        });
+      },
+      // onError
+      (err: Error) => {
+        update({
+          isLoading: false,
+          isStreaming: false,
+          streamError: err.message,
+        });
+      },
+      // onDone
+      () => {
+        setState((prev) => ({ ...prev, isStreaming: false }));
       },
     );
+
+    update({ streamAbortController: controller });
   };
 
   /** Spark 管线验证 */
@@ -351,6 +429,14 @@ export default function App() {
       stage: s.stage,
       status: s.status,
     }));
+    // 持久化 COMPILER 阶段的 PySpark 代码（不被后续阶段覆盖）
+    const compilerCode =
+      response.stage === 'COMPILER' && response.status === 'ok' && response.result
+        ? {
+            pyspark: response.result.pyspark_code || '',
+            standalone: response.result.standalone_pyspark || '',
+          }
+        : state.compilerCode;
     update({
       sparkStages: stages,
       sparkVerifyResult: {
@@ -370,6 +456,11 @@ export default function App() {
       llmTraces: response.llm_traces
         ? { ...(state.llmTraces || {}), ...response.llm_traces }
         : state.llmTraces,
+      compilerCode,
+      // 物理验证成功时自动展示代码下载区
+      showCodeDownload:
+        (response.stage === 'PHYSICAL_VERIFIER' && response.status === 'ok') ||
+        state.showCodeDownload,
     });
   };
 
@@ -409,6 +500,8 @@ export default function App() {
 
           {/* 操作按钮栏 */}
           <div className="action-bar">
+            {/* SQL 管线 */}
+            <span className="pipeline-label">SQL 管线</span>
             <button
               className="btn btn-primary"
               disabled={!hasContent || state.isLoading}
@@ -430,13 +523,11 @@ export default function App() {
             >
               编译执行
             </button>
-            <button
-              className="btn btn-accent"
-              disabled={!hasContent || state.isLoading}
-              onClick={handleRunAll}
-            >
-              全流程 Run-All
-            </button>
+
+            <span className="pipeline-separator">|</span>
+
+            {/* Spark 管线 */}
+            <span className="pipeline-label">Spark 管线</span>
             <SparkStageButtons
               requestId={state.requestId}
               artifactsReady={state.artifactsReady}
@@ -445,6 +536,18 @@ export default function App() {
               onError={(err) => update({ error: err })}
               disabled={state.isLoading}
             />
+
+            <span className="pipeline-separator">|</span>
+
+            {/* 全流程一键执行 */}
+            <button
+              className="btn btn-accent"
+              disabled={!hasContent || state.isLoading}
+              onClick={handleRunAll}
+            >
+              全流程 Run-All
+            </button>
+
             {state.isLoading && <span className="loading-indicator">处理中...</span>}
           </div>
 
@@ -455,6 +558,14 @@ export default function App() {
 
           {/* 面板区域 */}
           <div className="panels">
+            {/* Run-All 流式进度面板——全流程执行期间展示 */}
+            <RunProgressPanel
+              events={state.runProgressEvents}
+              isStreaming={state.isStreaming}
+              streamError={state.streamError}
+              visible={state.isStreaming || state.runProgressEvents.length > 0}
+            />
+
             {state.specResult && (
               <ParsePreview spec={state.specResult} visible={state.activePanel === 'parse'} />
             )}
@@ -491,6 +602,72 @@ export default function App() {
                 status={state.sparkStageResult.status}
                 visible={true}
               />
+            )}
+
+            {/* 代码下载区——物理验证成功后独立展示（不依赖 SparkStageResultPanel） */}
+            {state.showCodeDownload && (
+              <div className="panel code-download-panel">
+                <div className="panel-header">
+                  <h3>📥 代码下载</h3>
+                </div>
+
+                {/* SQL 代码框 */}
+                {state.executeResult?.generated_sql ? (
+                  <div className="code-block-wrapper">
+                    <div className="code-block-header">
+                      <span className="code-block-title">📜 SQL 代码</span>
+                      <button
+                        className="btn-download"
+                        onClick={() => {
+                          const blob = new Blob([state.executeResult!.generated_sql], { type: 'text/sql' });
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement('a');
+                          a.href = url; a.download = 'query.sql';
+                          document.body.appendChild(a); a.click();
+                          document.body.removeChild(a);
+                          URL.revokeObjectURL(url);
+                        }}
+                      >
+                        ⬇ 下载 .sql
+                      </button>
+                    </div>
+                    <pre className="code-block"><code>{state.executeResult!.generated_sql}</code></pre>
+                  </div>
+                ) : (
+                  <p className="spark-result-note" style={{ padding: '8px 14px', margin: 0, fontSize: 12, color: 'var(--text-muted)' }}>
+                    SQL 代码不可用——请先执行"编译执行"。
+                  </p>
+                )}
+
+                {/* PySpark 代码框 */}
+                {state.compilerCode?.pyspark || state.compilerCode?.standalone ? (
+                  <div className="code-block-wrapper">
+                    <div className="code-block-header">
+                      <span className="code-block-title">🐍 PySpark 代码</span>
+                      <button
+                        className="btn-download"
+                        onClick={() => {
+                          const code = state.compilerCode!.pyspark || state.compilerCode!.standalone;
+                          const blob = new Blob([code], { type: 'text/x-python' });
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement('a');
+                          a.href = url; a.download = 'spark_job.py';
+                          document.body.appendChild(a); a.click();
+                          document.body.removeChild(a);
+                          URL.revokeObjectURL(url);
+                        }}
+                      >
+                        ⬇ 下载 .py
+                      </button>
+                    </div>
+                    <pre className="code-block"><code>{state.compilerCode!.pyspark || state.compilerCode!.standalone}</code></pre>
+                  </div>
+                ) : (
+                  <p className="spark-result-note" style={{ padding: '8px 14px', margin: 0, fontSize: 12, color: 'var(--text-muted)' }}>
+                    PySpark 代码不可用——请先执行 COMPILER 阶段。
+                  </p>
+                )}
+              </div>
             )}
 
             {state.executeResult && state.executeResult.generated_sql && (
