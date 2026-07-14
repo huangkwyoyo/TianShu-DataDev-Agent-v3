@@ -449,6 +449,35 @@ export function runSparkStage(
   return apiPost<SparkStageResponse>(`/spark/${stage}`, { request_id: requestId });
 }
 
+/** 全流程 Run-All-Full 响应——SQL + Spark 双管线聚合 */
+export interface FullRunResponse {
+  request_id: string | null;
+  sql_ok: boolean;
+  sql_pipeline_error: { stage: string; error_type: string; error_message: string } | null;
+  sql_pipeline_stages: { stage: string; status: string; error_type?: string; error_message?: string }[];
+  generated_sql: string;
+  spec_id: string | null;
+  plan_id: string | null;
+  package_id: string | null;
+  spark_ok: boolean;
+  spark_stages: { stage: string; status: string; errors: string[]; comparator_status?: string }[];
+  pyspark_code: string | null;
+  llm_traces: Record<string, LlmTraceNode> | null;
+}
+
+/** 全流程一键执行——SQL + Spark 双管线 */
+export function runAllFull(
+  markdownText: string,
+  tableMapping?: Record<string, string>,
+  tablePaths?: Record<string, string>,
+): Promise<FullRunResponse> {
+  return apiPost<FullRunResponse>('/run-all-full', {
+    markdown_text: markdownText,
+    table_mapping: (tableMapping && Object.keys(tableMapping).length > 0) ? tableMapping : null,
+    table_paths: (tablePaths && Object.keys(tablePaths).length > 0) ? tablePaths : null,
+  });
+}
+
 /** Artifacts 状态响应 */
 export interface ArtifactsStatusResponse {
   request_id: string;
@@ -459,4 +488,125 @@ export interface ArtifactsStatusResponse {
 /** 检查 artifacts 是否就绪——供 Spark 按钮 gating 使用 */
 export function checkArtifactsStatus(requestId: string): Promise<ArtifactsStatusResponse> {
   return apiGet<ArtifactsStatusResponse>(`/artifacts/${requestId}/status`);
+}
+
+// ── 流式全流程 Run-All ──
+
+/** 流式进度事件——统一模型，不区分 sql_stage/spark_stage */
+export type FullRunEvent =
+  | {
+      event: "stage";
+      pipeline: "sql" | "spark";
+      stage: string;
+      status: "started" | "completed" | "failed" | "skipped";
+      duration_ms?: number;
+      message?: string;
+      error_type?: string;
+    }
+  | {
+      event: "done";
+      result: FullRunResponse;
+    }
+  | {
+      event: "fatal";
+      error_code: string;
+      message: string;
+    }
+  | {
+      event: "heartbeat";
+    };
+
+/** 流式全流程 Run-All——通过 NDJSON 流实时接收进度事件。
+ *
+ * @param onEvent 每收到一个事件时调用
+ * @param onError 流错误或网络错误时调用
+ * @param onDone 流正常结束时调用
+ * @returns AbortController——调用 .abort() 可取消请求
+ */
+export function runAllFullStream(
+  markdownText: string,
+  tableMapping?: Record<string, string>,
+  tablePaths?: Record<string, string>,
+  onEvent?: (event: FullRunEvent) => void,
+  onError?: (err: Error) => void,
+  onDone?: () => void,
+): AbortController {
+  const controller = new AbortController();
+
+  fetch(`${BASE}/run-all-full/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      markdown_text: markdownText,
+      table_mapping: (tableMapping && Object.keys(tableMapping).length > 0) ? tableMapping : null,
+      table_paths: (tablePaths && Object.keys(tablePaths).length > 0) ? tablePaths : null,
+    }),
+    signal: controller.signal,
+  })
+    .then(async (resp) => {
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => resp.statusText);
+        onError?.(new Error(`HTTP ${resp.status}: ${text}`));
+        return;
+      }
+
+      const reader = resp.body?.getReader();
+      if (!reader) {
+        onError?.(new Error("浏览器不支持 ReadableStream"));
+        return;
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          // 按行分割 NDJSON
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+              const event = JSON.parse(trimmed) as FullRunEvent;
+              onEvent?.(event);
+            } catch {
+              // 忽略解析失败的行（畸形 JSON）
+            }
+          }
+        }
+
+        // 处理缓冲区中剩余的内容
+        if (buffer.trim()) {
+          try {
+            const event = JSON.parse(buffer.trim()) as FullRunEvent;
+            onEvent?.(event);
+          } catch {
+            // 忽略
+          }
+        }
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") {
+          // 用户主动取消——不报错
+          return;
+        }
+        onError?.(err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
+
+      onDone?.();
+    })
+    .catch((err) => {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        return; // 用户主动取消
+      }
+      onError?.(err instanceof Error ? err : new Error(String(err)));
+    });
+
+  return controller;
 }
