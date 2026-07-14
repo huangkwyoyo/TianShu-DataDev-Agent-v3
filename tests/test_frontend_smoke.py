@@ -366,10 +366,10 @@ class TestSparkPipelineFrontend:
         )
 
     def test_app_has_second_pipeline_indicator_with_spark_title(self):
-        """App.tsx 包含第二个 PipelineStageIndicator 且 title='Spark 管线'。"""
+        """App.tsx 包含第二个 PipelineStageIndicator 且 title='Spark'。"""
         src = self._read_file("frontend", "src", "App.tsx")
-        assert 'title="Spark 管线"' in src, (
-            "App.tsx 中第二个 PipelineStageIndicator 缺少 title='Spark 管线'"
+        assert 'title="Spark"' in src, (
+            "App.tsx 中第二个 PipelineStageIndicator 缺少 title='Spark'"
         )
         # 验证 sparkStages 被传给第二个指示灯的 stages prop
         assert "sparkStages" in src, (

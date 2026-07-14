@@ -703,7 +703,6 @@ class PhysicalVerifier:
                 )
         except Exception:
             # Shadow 异常不影响 legacy 判定
-            import logging
             logging.getLogger(__name__).warning(
                 "CDP shadow 执行异常——已忽略", exc_info=True,
             )

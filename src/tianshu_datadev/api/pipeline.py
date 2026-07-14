@@ -1922,6 +1922,7 @@ class Pipeline:
         spark_stages: list[dict] = []
         spark_ok = False
         pyspark_code: str | None = None
+        standalone_pyspark: str | None = None
         comparator_status: str | None = None
         all_llm_traces: dict = dict(sql_result.get("llm_traces", {}) or {})
 
@@ -1960,10 +1961,8 @@ class Pipeline:
                 # 提取 COMPILER 阶段产物
                 if stage == SparkPipelineStage.COMPILER:
                     compiler_result = stage_result.get("result", {}) or {}
-                    pyspark_code = (
-                        compiler_result.get("pyspark_code")
-                        or compiler_result.get("standalone_pyspark")
-                    )
+                    pyspark_code = compiler_result.get("pyspark_code")
+                    standalone_pyspark = compiler_result.get("standalone_pyspark")
 
                 # 提取 COMPARATOR 细粒度状态
                 if stage == SparkPipelineStage.COMPARATOR:
@@ -2052,6 +2051,7 @@ class Pipeline:
             "spark_ok": spark_ok,
             "spark_stages": spark_stages,
             "pyspark_code": pyspark_code,
+            "standalone_pyspark": standalone_pyspark,
             # 全量 LLM 调用追踪
             "llm_traces": all_llm_traces,
         }
@@ -2117,6 +2117,7 @@ class Pipeline:
                 spark_stages: list[dict] = []
                 spark_ok = False
                 pyspark_code: str | None = None
+                standalone_pyspark: str | None = None
                 comparator_status: str | None = None
                 all_llm_traces: dict = dict(sql_result.get("llm_traces", {}) or {})
 
@@ -2176,10 +2177,8 @@ class Pipeline:
                         # 提取 COMPILER 阶段产物
                         if stage == SparkPipelineStage.COMPILER:
                             compiler_result = stage_result.get("result", {}) or {}
-                            pyspark_code = (
-                                compiler_result.get("pyspark_code")
-                                or compiler_result.get("standalone_pyspark")
-                            )
+                            pyspark_code = compiler_result.get("pyspark_code")
+                            standalone_pyspark = compiler_result.get("standalone_pyspark")
 
                         # 提取 COMPARATOR 细粒度状态
                         if stage == SparkPipelineStage.COMPARATOR:
@@ -2327,6 +2326,7 @@ class Pipeline:
                     "spark_ok": spark_ok,
                     "spark_stages": spark_stages,
                     "pyspark_code": pyspark_code,
+                    "standalone_pyspark": standalone_pyspark,
                     "llm_traces": all_llm_traces,
                 }
 

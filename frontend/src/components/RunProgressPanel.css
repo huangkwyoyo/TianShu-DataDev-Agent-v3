@@ -1,143 +1,170 @@
-/* Run-All 实时进度面板 */
+/* Run-All 实时进度面板——终端风格 */
 
 .run-progress-panel {
-  border: 1px solid var(--border, #444);
-  border-radius: 8px;
-  margin-bottom: 12px;
-  background: var(--panel-bg, #1e1e2e);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  margin-bottom: var(--space);
+  overflow: hidden;
 }
 
-.run-progress-panel.progress-done {
-  border-color: var(--success, #4caf50);
+.run-progress-panel .panel-header {
+  display: flex;
+  align-items: center;
+  padding: var(--space-sm) var(--space-md);
+  height: 30px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
 }
 
-.run-progress-panel.progress-fatal {
-  border-color: var(--error, #f44336);
+.run-progress-panel .panel-header h3 {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-dim);
 }
 
+/* 管线分组 */
 .progress-pipeline-group {
-  margin: 8px 16px 12px;
+  margin: var(--space-sm) var(--space-md);
 }
 
 .progress-pipeline-header {
-  font-size: 13px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
   font-weight: 600;
-  color: var(--text-primary, #e0e0e0);
-  margin-bottom: 6px;
-  padding-bottom: 4px;
-  border-bottom: 1px solid var(--border, #444);
+  color: var(--text-faint);
+  margin-bottom: var(--space-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
 }
 
 .progress-stage-list {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
 }
 
 .progress-stage-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 3px 8px;
-  border-radius: 4px;
-  font-size: 12px;
-  color: var(--text-secondary, #aaa);
+  gap: var(--space-sm);
+  padding: 2px var(--space-sm);
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-dim);
 }
 
 .progress-stage-row.stage-started {
-  color: var(--text-primary, #e0e0e0);
-  background: rgba(255, 255, 255, 0.03);
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.02);
 }
 
 .progress-stage-row.stage-completed {
-  color: var(--success, #4caf50);
+  color: var(--success);
 }
 
 .progress-stage-row.stage-failed {
-  color: var(--error, #f44336);
-  background: rgba(244, 67, 54, 0.08);
+  color: var(--error);
+  background: var(--error-bg);
 }
 
 .progress-stage-row.stage-skipped {
-  color: var(--text-muted, #888);
-  font-style: italic;
+  color: var(--text-faint);
 }
 
 .progress-stage-icon {
-  width: 18px;
+  width: 16px;
   text-align: center;
   flex-shrink: 0;
+  font-size: var(--font-size-xs);
 }
 
 .progress-stage-name {
   flex-shrink: 0;
-  min-width: 60px;
+  min-width: 64px;
+  font-weight: 500;
 }
 
 .progress-stage-duration {
-  font-family: monospace;
-  font-size: 11px;
-  color: var(--text-muted, #888);
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
   margin-left: auto;
 }
 
 .progress-stage-message {
-  font-size: 11px;
-  color: var(--text-muted, #999);
+  font-size: var(--font-size-xs);
+  color: var(--text-dim);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 300px;
+  max-width: 280px;
 }
 
+/* 等待状态 */
 .progress-waiting {
-  padding: 16px;
+  padding: var(--space-md);
   text-align: center;
-  color: var(--text-muted, #888);
-  font-size: 13px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
 }
 
-.progress-stream-error {
-  margin: 8px 16px;
-  padding: 8px 12px;
-  border-radius: 4px;
-  background: rgba(255, 152, 0, 0.1);
-  color: var(--warning, #ff9800);
-  font-size: 12px;
-}
-
-.progress-fatal-error {
-  margin: 8px 16px 12px;
-  padding: 8px 12px;
-  border-radius: 4px;
-  background: rgba(244, 67, 54, 0.1);
-  color: var(--error, #f44336);
-  font-size: 12px;
-}
-
+/* 流式徽章 */
 .streaming-badge {
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   font-weight: normal;
-  color: var(--info, #2196f3);
-  margin-left: 8px;
+  color: var(--accent);
+  margin-left: var(--space-sm);
   animation: pulse 1.5s ease-in-out infinite;
 }
 
 .done-badge {
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   font-weight: normal;
-  color: var(--success, #4caf50);
-  margin-left: 8px;
+  color: var(--success);
+  margin-left: var(--space-sm);
 }
 
 .fatal-badge {
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   font-weight: normal;
-  color: var(--error, #f44336);
-  margin-left: 8px;
+  color: var(--error);
+  margin-left: var(--space-sm);
+}
+
+/* 错误信息 */
+.progress-stream-error {
+  margin: var(--space-sm) var(--space-md);
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius);
+  background: var(--warning-bg);
+  color: var(--warning);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+}
+
+.progress-fatal-error {
+  margin: var(--space-sm) var(--space-md) var(--space-md);
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius);
+  background: var(--error-bg);
+  color: var(--error);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+}
+
+/* 面板状态边框 */
+.run-progress-panel.progress-done {
+  border-color: var(--success);
+}
+
+.run-progress-panel.progress-fatal {
+  border-color: var(--error);
 }
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
+  50% { opacity: 0.4; }
 }

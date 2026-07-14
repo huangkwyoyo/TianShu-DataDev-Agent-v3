@@ -5,57 +5,69 @@ interface Props {
   onSelect: (template: TemplateFull) => void;
 }
 
-/** 模板选择器——加载模板按钮，提供汇总表、标签表、多步骤加工三类模板 */
+/** 模板选择器——头部下拉菜单，极简风格 */
 export function TemplateSelector({ onSelect }: Props) {
   const [templates, setTemplates] = useState<TemplateSummary[]>([]);
+  const [open, setOpen] = useState(false);
   const [loadErr, setLoadErr] = useState<string | null>(null);
 
   useEffect(() => {
     fetchTemplates()
       .then((res) => setTemplates(res.templates))
-      .catch(() => setLoadErr('模板加载失败——API 不可用'));
+      .catch(() => setLoadErr('模板加载失败'));
   }, []);
 
   const handleClick = async (tpl: TemplateSummary) => {
     try {
+      setOpen(false);
       const full = await fetchTemplate(tpl.template_id);
       onSelect(full);
     } catch {
-      setLoadErr(`模板 "${tpl.name}" 加载失败`);
+      setLoadErr(`"${tpl.name}" 加载失败`);
     }
   };
 
   const categoryLabel: Record<string, string> = {
-    aggregation: '汇总表',
-    label: '标签表',
-    multi_step: '多步骤',
-    join: '关联宽表',
-    window: '窗口排名',
-    empty: '空白模板',
+    aggregation: '汇总',
+    label: '标签',
+    multi_step: '多步',
+    join: '关联',
+    window: '窗口',
+    empty: '空白',
   };
 
   return (
-    <div className="template-selector panel">
-      <h3>📋 加载模板</h3>
-      {loadErr && <div className="error-display" style={{ marginBottom: 8, fontSize: 11 }}>
-        <span>{loadErr}</span>
-      </div>}
-      {templates.map((tpl) => (
-        <button
-          key={tpl.template_id}
-          className="template-card"
-          onClick={() => handleClick(tpl)}
-        >
-          <div className="tpl-name">{tpl.name}</div>
-          <div className="tpl-desc">{tpl.description}</div>
-          <span className="tpl-category">
-            {categoryLabel[tpl.category] || tpl.category}
-          </span>
-        </button>
-      ))}
-      <div className="dry-run-notice" style={{ marginTop: 10 }}>
-        ⚠️ 加载模板将替换当前编辑器内容
-      </div>
+    <div className="header-template-select">
+      <button
+        className="header-template-btn"
+        onClick={() => setOpen(!open)}
+        title="加载模板"
+      >
+        Templates <span className="arrow">{open ? '▲' : '▼'}</span>
+      </button>
+
+      {open && (
+        <>
+          <div className="template-overlay" onClick={() => setOpen(false)} />
+          <div className="template-dropdown">
+            {loadErr && (
+              <div className="template-dropdown-item" style={{ color: 'var(--error)', cursor: 'default' }}>
+                {loadErr}
+              </div>
+            )}
+            {templates.map((tpl) => (
+              <button
+                key={tpl.template_id}
+                className="template-dropdown-item"
+                onClick={() => handleClick(tpl)}
+              >
+                <span className="tpl-tag">{categoryLabel[tpl.category] || tpl.category}</span>
+                <span className="tpl-name">{tpl.name}</span>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }

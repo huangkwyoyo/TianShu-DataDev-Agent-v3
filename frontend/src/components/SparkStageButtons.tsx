@@ -124,7 +124,6 @@ export function SparkStageButtons({ requestId, artifactsReady, stages, onStageCo
 
   return (
     <div className="spark-stage-buttons">
-      <span className="section-label">Spark 管线</span>
       {STAGE_ORDER.map((stageEnum) => {
         const status = statusMap[stageEnum] || 'none';
         const isAvailable = available.has(stageEnum);

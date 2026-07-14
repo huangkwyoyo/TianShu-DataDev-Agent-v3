@@ -1,147 +1,146 @@
-/* ── SparkStageResultPanel ── */
+/* Spark 单阶段结果面板——终端风格 */
 
 .spark-stage-result {
   padding: 0;
 }
 
 .spark-stage-result .panel-header {
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--panel-border);
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--border);
 }
 
 .spark-stage-result .spark-stage-id {
-  font-size: 11px;
-  color: var(--text-muted);
-  margin-left: 8px;
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
+  margin-left: var(--space);
 }
 
 .spark-stage-result .skipped-badge {
   display: inline-block;
-  font-size: 10px;
+  font-size: var(--font-size-xs);
   font-weight: 600;
   padding: 1px 6px;
-  border-radius: 3px;
-  background: #fef7e0;
-  color: #e37400;
-  margin-left: 8px;
+  border-radius: var(--radius);
+  background: var(--warning-bg);
+  color: var(--warning);
+  margin-left: var(--space);
 }
 
-/* 跳过态面板边框呈黄色 */
 .spark-stage-result.stage-skipped {
-  border-left: 3px solid #e37400;
+  border-left: 2px solid var(--warning);
 }
 
 /* 概览统计条 */
 .spark-plan-summary {
-  padding: 8px 14px;
-  background: var(--bg-subtle);
-  font-size: 12px;
+  padding: var(--space-sm) var(--space-md);
+  background: var(--bg);
+  font-size: var(--font-size-sm);
   display: flex;
   align-items: center;
-  gap: 4px;
-  border-bottom: 1px solid var(--panel-border);
+  gap: var(--space-xs);
+  border-bottom: 1px solid var(--border);
 }
 
 .spark-plan-summary .stat-label {
-  color: var(--text-muted);
-  margin-right: 2px;
+  color: var(--text-faint);
 }
 
 .spark-plan-summary .stat-value {
   font-weight: 600;
   color: var(--text);
-  margin-right: 12px;
+  margin-right: var(--space-md);
 }
 
 /* 步骤表格 */
 .spark-step-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 13px;
+  font-size: var(--font-size-sm);
 }
 
 .spark-step-table th {
   text-align: left;
-  padding: 6px 14px;
-  font-size: 11px;
-  text-transform: uppercase;
-  color: var(--text-muted);
-  border-bottom: 1px solid var(--panel-border);
-  background: var(--bg-subtle);
+  padding: var(--space-xs) var(--space-md);
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
   font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
 }
 
 .spark-step-table td {
-  padding: 6px 14px;
-  border-bottom: 1px solid var(--panel-border);
+  padding: var(--space-xs) var(--space-md);
+  border-bottom: 1px solid var(--border);
   vertical-align: top;
 }
 
 .spark-step-table .step-idx {
-  width: 32px;
-  color: var(--text-muted);
-  font-size: 11px;
+  width: 28px;
+  color: var(--text-faint);
+  font-size: var(--font-size-xs);
 }
 
 .spark-step-table .step-desc {
-  font-size: 12px;
+  font-size: var(--font-size-sm);
 }
 
 .step-type-badge {
   display: inline-block;
-  background: var(--accent-bg, #e8f0fe);
-  color: var(--accent, #1a73e8);
-  font-size: 10px;
+  background: var(--accent-bg);
+  color: var(--accent);
+  font-size: var(--font-size-xs);
   font-weight: 600;
-  padding: 2px 6px;
-  border-radius: 3px;
-  text-transform: uppercase;
-  letter-spacing: 0.3px;
+  padding: 1px 6px;
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
 }
 
 /* 代码标签切换 */
 .spark-code-tabs {
   display: flex;
   gap: 0;
-  border-bottom: 1px solid var(--panel-border);
-  background: var(--bg-subtle);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
 }
 
 .spark-code-tab {
-  padding: 6px 14px;
+  padding: var(--space-sm) var(--space-md);
   cursor: pointer;
-  font-size: 12px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
   font-weight: 500;
-  color: var(--text-muted);
+  color: var(--text-dim);
   border-bottom: 2px solid transparent;
-  transition: all 0.15s ease;
+  transition: all 0.1s;
   user-select: none;
 }
 
 .spark-code-tab:hover {
   color: var(--text);
-  background: var(--bg-hover, rgba(0,0,0,0.03));
+  background: var(--bg-elevated);
 }
 
 .spark-code-tab.active {
-  color: var(--accent, #1a73e8);
-  border-bottom-color: var(--accent, #1a73e8);
-  background: transparent;
+  color: var(--accent);
+  border-bottom-color: var(--accent);
 }
 
 /* PySpark 代码块 */
 .pyspark-code-block {
-  background: #1e1e2e;
-  color: #cdd6f4;
-  font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
-  font-size: 12px;
-  line-height: 1.6;
-  padding: 14px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--font-size);
+  line-height: 1.65;
+  padding: var(--space-md);
   margin: 0;
   overflow-x: auto;
   white-space: pre;
   max-height: 500px;
   overflow-y: auto;
+  tab-size: 2;
 }
 
 .pyspark-code-block code {
@@ -151,101 +150,100 @@
 /* 验证结果徽章 */
 .validator-badge {
   display: inline-block;
-  padding: 6px 14px;
-  margin: 10px 14px;
-  font-size: 13px;
+  padding: var(--space-sm) var(--space-md);
+  margin: var(--space) var(--space-md);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
   font-weight: 600;
-  border-radius: 4px;
+  border-radius: var(--radius);
 }
 
 .validator-badge.valid {
-  background: #e6f4ea;
-  color: #1e7e34;
+  background: var(--success-bg);
+  color: var(--success);
 }
 
 .validator-badge.invalid {
-  background: #fce8e6;
-  color: #c5221f;
+  background: var(--error-bg);
+  color: var(--error);
 }
 
 /* 对比结论徽章 */
 .verdict-badge {
   display: inline-block;
-  font-size: 10px;
+  font-size: var(--font-size-xs);
   font-weight: 600;
-  padding: 2px 8px;
-  border-radius: 3px;
-  text-transform: uppercase;
-  letter-spacing: 0.3px;
+  padding: 1px 8px;
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
 }
 
 .verdict-badge.equiv {
-  background: #e6f4ea;
-  color: #1e7e34;
+  background: var(--success-bg);
+  color: var(--success);
 }
 
 .verdict-badge.mismatch {
-  background: #fce8e6;
-  color: #c5221f;
+  background: var(--error-bg);
+  color: var(--error);
 }
 
 /* 错误列表 */
 .spark-result-errors {
-  padding: 10px 14px;
+  padding: var(--space) var(--space-md);
 }
 
 .error-title {
-  color: #c5221f;
+  color: var(--error);
   font-weight: 600;
-  margin: 0 0 6px;
+  margin: 0 0 var(--space-sm);
+  font-size: var(--font-size-sm);
 }
 
 .error-list {
   margin: 0;
   padding-left: 18px;
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   color: var(--text);
 }
 
 .error-list li {
-  margin-bottom: 3px;
+  margin-bottom: 2px;
 }
 
 /* 跳过提示 */
 .spark-result-skipped {
-  padding: 14px;
-  font-size: 13px;
-  color: var(--text-muted);
-  background: var(--bg-subtle);
-  border-radius: 4px;
-  margin: 10px 14px;
+  padding: var(--space-md);
+  font-size: var(--font-size-sm);
+  color: var(--text-dim);
+  background: var(--bg);
+  border-radius: var(--radius);
+  margin: var(--space) var(--space-md);
 }
 
 /* 信息消息 */
 .spark-result-message {
-  padding: 14px;
-  font-size: 13px;
+  padding: var(--space-md);
+  font-size: var(--font-size-sm);
   color: var(--text);
 }
 
 /* 备注说明 */
 .spark-result-note {
-  padding: 8px 14px 10px;
-  font-size: 12px;
-  color: var(--text-muted);
+  padding: var(--space-sm) var(--space-md);
+  font-size: var(--font-size-sm);
+  color: var(--text-dim);
   margin: 0;
 }
 
-/* ── Phase 8: LLM 标注意图分类标签 ── */
+/* LLM 标注意图分类标签——Phase 8 */
 .intent-badge {
   display: inline-block;
-  background: #e8f0fe;
-  color: #1a73e8;
-  font-size: 10px;
+  background: var(--accent-bg);
+  color: var(--accent);
+  font-size: var(--font-size-xs);
   font-weight: 600;
-  padding: 2px 6px;
-  border-radius: 3px;
-  text-transform: uppercase;
-  letter-spacing: 0.3px;
-  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  padding: 1px 6px;
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
 }

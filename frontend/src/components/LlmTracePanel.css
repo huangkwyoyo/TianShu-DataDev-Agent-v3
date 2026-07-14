@@ -1,31 +1,37 @@
-/* LLM 调用追踪面板 */
+/* LLM 调用追踪面板——终端风格 */
+
 .llm-trace-panel {
-  margin: 12px 0;
-  border: 1px solid #e2e8f0;
-  border-radius: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  margin-bottom: var(--space);
   overflow: hidden;
 }
 
 .llm-trace-header {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  background: #f8fafc;
+  gap: var(--space);
+  padding: var(--space-sm) var(--space-md);
+  height: 30px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
   cursor: pointer;
   user-select: none;
-  font-size: 13px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
   font-weight: 600;
-  color: #475569;
+  color: var(--text-dim);
 }
 
 .llm-trace-header:hover {
-  background: #f1f5f9;
+  color: var(--text);
 }
 
 .llm-trace-chevron {
-  transition: transform 0.2s;
-  font-size: 10px;
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
+  transition: transform 0.15s;
 }
 
 .llm-trace-chevron.expanded {
@@ -34,52 +40,87 @@
 
 .llm-trace-badge {
   margin-left: auto;
-  background: #3b82f6;
-  color: #fff;
-  font-size: 11px;
-  padding: 1px 6px;
-  border-radius: 10px;
+  background: var(--accent);
+  color: #0d1117;
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  padding: 0 6px;
+  border-radius: var(--radius);
 }
 
+.llm-trace-body {
+  padding: var(--space-md);
+}
+
+/* 汇总行 */
+.llm-trace-summary {
+  display: flex;
+  gap: var(--space-lg);
+  padding: var(--space-sm) var(--space-md);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-dim);
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.llm-trace-summary-item {
+  display: flex;
+  gap: var(--space-xs);
+}
+
+.llm-trace-summary-item .label {
+  color: var(--text-faint);
+}
+
+.llm-trace-summary-item .value {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* 调用节点表 */
 .llm-trace-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 12px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
 }
 
 .llm-trace-table th {
   text-align: left;
-  padding: 6px 10px;
-  background: #f1f5f9;
-  color: #64748b;
+  padding: var(--space-xs) var(--space-sm);
+  color: var(--text-faint);
   font-weight: 600;
-  border-bottom: 1px solid #e2e8f0;
+  border-bottom: 1px solid var(--border);
 }
 
 .llm-trace-table td {
-  padding: 5px 10px;
-  border-bottom: 1px solid #f1f5f9;
-  color: #334155;
+  padding: var(--space-xs) var(--space-sm);
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+}
+
+.llm-trace-table tr:last-child td {
+  border-bottom: none;
 }
 
 .llm-trace-table tr.status-valid td:first-child {
-  border-left: 3px solid #22c55e;
+  color: var(--success);
 }
 
 .llm-trace-table tr.status-error td:first-child {
-  border-left: 3px solid #ef4444;
+  color: var(--error);
 }
 
 .llm-trace-table tr.status-skipped td:first-child {
-  border-left: 3px solid #94a3b8;
+  color: var(--text-faint);
 }
 
-.llm-trace-summary {
-  background: #f8fafc;
-  font-weight: 600;
-  color: #1e293b;
-}
-
-.llm-trace-summary td {
-  border-top: 2px solid #e2e8f0;
+/* 空状态 */
+.llm-trace-empty {
+  padding: var(--space-md);
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-dim);
 }

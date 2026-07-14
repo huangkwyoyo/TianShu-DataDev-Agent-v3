@@ -8,7 +8,6 @@ import { PlanStepsPanel } from './components/PlanStepsPanel';
 import { SqlDisplay } from './components/SqlDisplay';
 import { PackageTree } from './components/PackageTree';
 import { ErrorDisplay } from './components/ErrorDisplay';
-import { StatusBar } from './components/StatusBar';
 import { RunProgressPanel } from './components/RunProgressPanel';
 import { SparkStageButtons } from './components/SparkStageButtons';
 import { SparkStageResultPanel } from './components/SparkStageResultPanel';
@@ -321,9 +320,9 @@ export default function App() {
                   open_questions: [],
                 }
               : null;
-            // 持久化 PySpark 代码（即使 Spark 失败也保留）
-            const compilerCode = fr.pyspark_code
-              ? { pyspark: fr.pyspark_code, standalone: '' }
+            // 持久化 PySpark 代码（standalone 优先——完整可运行脚本）
+            const compilerCode = fr.pyspark_code || fr.standalone_pyspark
+              ? { pyspark: fr.pyspark_code || '', standalone: fr.standalone_pyspark || '' }
               : prev.compilerCode;
 
             // 异步验证 artifacts 是否就绪
@@ -469,65 +468,58 @@ export default function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>TianShu DataDev Agent — 内部工作台</h1>
-        <div className="header-right">
-          <PipelineStageIndicator
-            stages={state.pipelineStages}
-            error={state.pipelineError}
-            testId="run-all-status"
-          />
-          <PipelineStageIndicator
-            stages={state.sparkStages}
-            error={null}
-            title="Spark 管线"
-            testId="spark-status"
-          />
-          <span className="app-version">v0.1.0 | dry_run 模式 | 不做生产执行</span>
-        </div>
+        <span className="header-logo"><span>TianShu</span> DataDev</span>
+        <TemplateSelector onSelect={handleLoadTemplate} />
+        <span className="header-spacer" />
+        <PipelineStageIndicator
+          stages={state.pipelineStages}
+          error={state.pipelineError}
+          testId="run-all-status"
+        />
+        <PipelineStageIndicator
+          stages={state.sparkStages}
+          error={null}
+          title="Spark"
+          testId="spark-status"
+        />
+        <span className="header-info">dry_run</span>
       </header>
 
       <div className="app-body">
-        {/* 左侧：编辑器 + 模板 */}
-        <aside className="app-sidebar">
-          <TemplateSelector onSelect={handleLoadTemplate} />
-        </aside>
-
         <main className="app-main">
           <SpecEditor
             value={state.markdownText}
             onChange={(v) => update({ markdownText: v })}
           />
 
-          {/* 操作按钮栏 */}
-          <div className="action-bar">
-            {/* SQL 管线 */}
-            <span className="pipeline-label">SQL 管线</span>
+          {/* 工具栏 */}
+          <div className="toolbar">
+            <span className="toolbar-label">SQL</span>
             <button
               className="btn btn-primary"
               disabled={!hasContent || state.isLoading}
               onClick={handleParse}
             >
-              解析预览
+              Parse
             </button>
             <button
-              className="btn btn-secondary"
+              className="btn"
               disabled={!hasContent || state.isLoading}
               onClick={handlePlan}
             >
-              构建 Plan
+              Plan
             </button>
             <button
-              className="btn btn-secondary"
+              className="btn"
               disabled={!hasContent || state.isLoading}
               onClick={handleExecute}
             >
-              编译执行
+              Execute
             </button>
 
-            <span className="pipeline-separator">|</span>
+            <span className="toolbar-separator" />
 
-            {/* Spark 管线 */}
-            <span className="pipeline-label">Spark 管线</span>
+            <span className="toolbar-label">Spark</span>
             <SparkStageButtons
               requestId={state.requestId}
               artifactsReady={state.artifactsReady}
@@ -537,18 +529,17 @@ export default function App() {
               disabled={state.isLoading}
             />
 
-            <span className="pipeline-separator">|</span>
+            <span className="toolbar-separator" />
 
-            {/* 全流程一键执行 */}
             <button
               className="btn btn-accent"
               disabled={!hasContent || state.isLoading}
               onClick={handleRunAll}
             >
-              全流程 Run-All
+              Run All
             </button>
 
-            {state.isLoading && <span className="loading-indicator">处理中...</span>}
+            {state.isLoading && <span className="loading-indicator">...</span>}
           </div>
 
           {/* 错误态展示 */}
@@ -556,8 +547,8 @@ export default function App() {
             <ErrorDisplay error={state.error} onDismiss={clearError} />
           )}
 
-          {/* 面板区域 */}
-          <div className="panels">
+          {/* 输出区域 */}
+          <div className="output-area">
             {/* Run-All 流式进度面板——全流程执行期间展示 */}
             <RunProgressPanel
               events={state.runProgressEvents}
@@ -604,69 +595,64 @@ export default function App() {
               />
             )}
 
-            {/* 代码下载区——物理验证成功后独立展示（不依赖 SparkStageResultPanel） */}
+            {/* 代码下载区 */}
             {state.showCodeDownload && (
-              <div className="panel code-download-panel">
+              <div className="panel">
                 <div className="panel-header">
-                  <h3>📥 代码下载</h3>
+                  <h3>Code</h3>
                 </div>
-
-                {/* SQL 代码框 */}
-                {state.executeResult?.generated_sql ? (
-                  <div className="code-block-wrapper">
-                    <div className="code-block-header">
-                      <span className="code-block-title">📜 SQL 代码</span>
-                      <button
-                        className="btn-download"
-                        onClick={() => {
-                          const blob = new Blob([state.executeResult!.generated_sql], { type: 'text/sql' });
-                          const url = URL.createObjectURL(blob);
-                          const a = document.createElement('a');
-                          a.href = url; a.download = 'query.sql';
-                          document.body.appendChild(a); a.click();
-                          document.body.removeChild(a);
-                          URL.revokeObjectURL(url);
-                        }}
-                      >
-                        ⬇ 下载 .sql
-                      </button>
+                <div className="panel-body">
+                  {state.executeResult?.generated_sql ? (
+                    <div className="code-block-wrapper">
+                      <div className="code-block-header">
+                        <span className="code-block-title">SQL</span>
+                        <button
+                          className="btn-download"
+                          onClick={() => {
+                            const blob = new Blob([state.executeResult!.generated_sql], { type: 'text/sql' });
+                            const url = URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            a.href = url; a.download = 'query.sql';
+                            document.body.appendChild(a); a.click();
+                            document.body.removeChild(a);
+                            URL.revokeObjectURL(url);
+                          }}
+                        >
+                          download .sql
+                        </button>
+                      </div>
+                      <pre className="code-block"><code>{state.executeResult!.generated_sql}</code></pre>
                     </div>
-                    <pre className="code-block"><code>{state.executeResult!.generated_sql}</code></pre>
-                  </div>
-                ) : (
-                  <p className="spark-result-note" style={{ padding: '8px 14px', margin: 0, fontSize: 12, color: 'var(--text-muted)' }}>
-                    SQL 代码不可用——请先执行"编译执行"。
-                  </p>
-                )}
+                  ) : (
+                    <p className="spark-result-note">SQL: not available</p>
+                  )}
 
-                {/* PySpark 代码框 */}
-                {state.compilerCode?.pyspark || state.compilerCode?.standalone ? (
-                  <div className="code-block-wrapper">
-                    <div className="code-block-header">
-                      <span className="code-block-title">🐍 PySpark 代码</span>
-                      <button
-                        className="btn-download"
-                        onClick={() => {
-                          const code = state.compilerCode!.pyspark || state.compilerCode!.standalone;
-                          const blob = new Blob([code], { type: 'text/x-python' });
-                          const url = URL.createObjectURL(blob);
-                          const a = document.createElement('a');
-                          a.href = url; a.download = 'spark_job.py';
-                          document.body.appendChild(a); a.click();
-                          document.body.removeChild(a);
-                          URL.revokeObjectURL(url);
-                        }}
-                      >
-                        ⬇ 下载 .py
-                      </button>
+                  {state.compilerCode?.standalone || state.compilerCode?.pyspark ? (
+                    <div className="code-block-wrapper">
+                      <div className="code-block-header">
+                        <span className="code-block-title">PySpark</span>
+                        <button
+                          className="btn-download"
+                          onClick={() => {
+                            const code = state.compilerCode!.standalone || state.compilerCode!.pyspark;
+                            const blob = new Blob([code], { type: 'text/x-python' });
+                            const url = URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            a.href = url; a.download = 'spark_job.py';
+                            document.body.appendChild(a); a.click();
+                            document.body.removeChild(a);
+                            URL.revokeObjectURL(url);
+                          }}
+                        >
+                          download .py
+                        </button>
+                      </div>
+                      <pre className="code-block"><code>{state.compilerCode!.standalone || state.compilerCode!.pyspark}</code></pre>
                     </div>
-                    <pre className="code-block"><code>{state.compilerCode!.pyspark || state.compilerCode!.standalone}</code></pre>
-                  </div>
-                ) : (
-                  <p className="spark-result-note" style={{ padding: '8px 14px', margin: 0, fontSize: 12, color: 'var(--text-muted)' }}>
-                    PySpark 代码不可用——请先执行 COMPILER 阶段。
-                  </p>
-                )}
+                  ) : (
+                    <p className="spark-result-note">PySpark: run COMPILER first</p>
+                  )}
+                </div>
               </div>
             )}
 
@@ -700,11 +686,21 @@ export default function App() {
         </main>
       </div>
 
-      <StatusBar
-        requestId={state.requestId}
-        isLoading={state.isLoading}
-        hasError={state.error !== null}
-      />
+      <footer className="status-bar">
+        <div className="status-section">
+          <span className={`status-dot ${state.isLoading ? 'loading' : state.error ? 'error' : state.requestId ? 'ok' : 'idle'}`} />
+          <span>{state.requestId || 'ready'}</span>
+        </div>
+        <span className="status-spacer" />
+        <div className="status-section">
+          <span>SQL: </span>
+          <span className={`status-dot ${state.pipelineStages.length > 0 && state.pipelineStages.every(s => s.status === 'ok') ? 'ok' : state.pipelineError ? 'error' : 'idle'}`} />
+          <span>Spark: </span>
+          <span className={`status-dot ${state.sparkStages.length > 0 && state.sparkStages.every(s => s.status === 'ok') ? 'ok' : state.sparkStages.some(s => s.status === 'failed') ? 'error' : 'idle'}`} />
+        </div>
+        <span className="status-spacer" />
+        <span>dry_run</span>
+      </footer>
     </div>
   );
 }

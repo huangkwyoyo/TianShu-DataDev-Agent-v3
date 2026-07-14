@@ -1,62 +1,58 @@
-/* Spark 阶段独立按钮组 */
+/* Spark 阶段按钮组——终端风格 */
+
 .spark-stage-buttons {
   display: flex;
-  gap: 8px;
   align-items: center;
-  flex-wrap: wrap;
-  margin: 8px 0;
-}
-
-.spark-stage-buttons .section-label {
-  font-size: 13px;
-  font-weight: 600;
-  color: #64748b;
-  margin-right: 4px;
-  white-space: nowrap;
+  gap: 2px;
 }
 
 .spark-stage-btn {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 4px 12px;
-  border: 1px solid #cbd5e1;
-  border-radius: 6px;
-  background: #fff;
-  font-size: 12px;
+  gap: 3px;
+  padding: 3px 8px;
+  height: 26px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-dim);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
   cursor: pointer;
-  transition: all 0.15s;
   white-space: nowrap;
+  transition: background 0.1s;
+  user-select: none;
 }
 
 .spark-stage-btn:hover:not(:disabled) {
-  border-color: #3b82f6;
-  background: #eff6ff;
+  background: var(--bg-elevated);
+  border-color: var(--text-dim);
+  color: var(--text);
 }
 
 .spark-stage-btn:disabled {
-  opacity: 0.45;
+  opacity: 0.3;
   cursor: not-allowed;
-  background: #f1f5f9;
 }
 
 .spark-stage-btn.status-ok {
-  border-color: #22c55e;
-  background: #f0fdf4;
+  border-color: var(--success);
+  color: var(--success);
+  background: var(--success-bg);
 }
 
 .spark-stage-btn.status-failed {
-  border-color: #ef4444;
-  background: #fef2f2;
+  border-color: var(--error);
+  color: var(--error);
+  background: var(--error-bg);
 }
 
 .spark-stage-btn.status-skipped {
-  border-color: #94a3b8;
-  background: #f8fafc;
+  color: var(--text-faint);
 }
 
 .spark-stage-btn .stage-icon {
-  font-size: 14px;
+  font-size: var(--font-size-xs);
 }
 
 .spark-stage-btn .stage-label {
@@ -64,10 +60,11 @@
 }
 
 .spark-stage-btn .stage-loading {
-  animation: spin 1s linear infinite;
+  opacity: 0.6;
+  animation: spark-pulse 1s ease-in-out infinite;
 }
 
-@keyframes spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
+@keyframes spark-pulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 0.3; }
 }

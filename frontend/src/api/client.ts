@@ -462,6 +462,7 @@ export interface FullRunResponse {
   spark_ok: boolean;
   spark_stages: { stage: string; status: string; errors: string[]; comparator_status?: string }[];
   pyspark_code: string | null;
+  standalone_pyspark: string | null;
   llm_traces: Record<string, LlmTraceNode> | null;
 }
 
