@@ -3306,7 +3306,28 @@ class Pipeline:
             elif isinstance(contract, _Lite):
                 contract_hash = _Lite.compute_contract_hash(contract)
 
-        snap_dir = _tempfile.mkdtemp(prefix="tianshu_snap_")
+        # 使用 D: 盘项目缓存（~124GB 空闲），避免系统 temp 空间耗尽
+        import pathlib as _pathlib
+        import shutil as _shutil
+        _cache_dir = _os.path.join(
+            str(_pathlib.Path(__file__).resolve().parent.parent.parent.parent),
+            ".tianshu_cache", "snapshots",
+        )
+        _os.makedirs(_cache_dir, exist_ok=True)
+        # 清理旧快照——仅保留最近 3 次，防止无限累积
+        _existing = sorted([
+            _os.path.join(_cache_dir, d)
+            for d in _os.listdir(_cache_dir)
+            if _os.path.isdir(_os.path.join(_cache_dir, d))
+        ])
+        while len(_existing) > 3:
+            _old = _existing.pop(0)
+            try:
+                _shutil.rmtree(_old)
+                logger.debug("清理旧快照：%s", _os.path.basename(_old))
+            except Exception:
+                pass
+        snap_dir = _tempfile.mkdtemp(prefix="snap_", dir=_cache_dir)
         files: list[SnapshotFile] = []
 
         try:
@@ -3322,6 +3343,8 @@ class Pipeline:
 
         try:
             for table_name in source_tables:
+                # 单表导出——失败则立即终止整个快照构建（防止部分快照导致
+                # _inputs_index.json 缺失条目 → Spark KeyError）
                 try:
                     # 查询全表 → PyArrow Table → 写入 Parquet
                     # 使用 to_arrow_table() 而非 .arrow()——
@@ -3356,11 +3379,16 @@ class Pipeline:
                         table_name, row_count,
                     )
                 except Exception as _exp_err:
-                    logger.warning(
+                    logger.error(
                         "DuckDB 快照导出失败（表 %s）：%s",
                         table_name, _exp_err,
                     )
-                    continue
+                    context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
+                    context.errors.append(
+                        f"[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
+                        f"DuckDB 快照导出失败——表 {table_name}：{_exp_err}"
+                    )
+                    return None
         finally:
             con.close()
 
@@ -3482,6 +3510,21 @@ class Pipeline:
                 PhysicalVerifier,
             )
 
+            # ── 入口适配：DataTransformContractLite → DataTransformContractV1 ──
+            # 单表路径（run_all）产出 DataTransformContractLite，而物理验证的所有
+            # isinstance(contract, DataTransformContractV1) 检查仅在 V1 路径下提取
+            # output_columns / grouping_keys / timezone / 列类型信息。
+            # Lite 路径下这些检查全部跳过 → output_cols=0、primary_keys=[]、
+            # 类型分析跳过 → 所有类型感知特性失效（float isclose、Decimal quantize、
+            # CRE shadow 行对齐）。入口适配一次，后续所有 V1 检查自然命中。
+            if artifacts.data_transform_contract is not None:
+                from tianshu_datadev.artifacts.models import DataTransformContractLite
+                if isinstance(artifacts.data_transform_contract, DataTransformContractLite):
+                    from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+                    artifacts.data_transform_contract = adapt_lite_to_v1(
+                        artifacts.data_transform_contract,
+                    )
+
             contract_hash = ""
             if artifacts.data_transform_contract is not None:
                 from tianshu_datadev.artifacts.models import DataTransformContractV1
@@ -3511,8 +3554,14 @@ class Pipeline:
                             data_type=col.data_type,
                         ))
                     # 从 Contract grouping_keys 提取权威主键（CRE shadow 行对齐用）
+                    # fallback 链：grouping_keys → output_grain → business_keys → 全部非聚合列
+                    # 目标：避免聚合列（avg_distance, total_fare）参与排序导致浮点尾差误报
                     if artifacts.data_transform_contract.grouping_keys:
                         primary_keys = list(artifacts.data_transform_contract.grouping_keys)
+                    elif artifacts.data_transform_contract.output_grain:
+                        primary_keys = list(artifacts.data_transform_contract.output_grain)
+                    elif artifacts.data_transform_contract.business_keys:
+                        primary_keys = list(artifacts.data_transform_contract.business_keys)
 
             # ── 构造 CRE EnvironmentManifest——明确优先级（Point 4）──
             # 优先级：Contract 显式策略 > 实际执行环境事实 > UNKNOWN
@@ -3635,6 +3684,36 @@ class Pipeline:
                 # 附加 report.error_message——包含 DuckDB/Spark 执行失败的详细原因
                 if report.error_message:
                     diag_msg += f"，详情={report.error_message}"
+                # 附加行数与 schema 一致性——快速判断差异量级
+                diag_msg += (
+                    f"，行数一致={report.row_count_match}"
+                    f"，schema一致={report.schema_match}"
+                )
+                if report.duckdb_result:
+                    diag_msg += f"，DuckDB行数={report.duckdb_result.raw_row_count}"
+                if report.spark_result:
+                    diag_msg += f"，Spark行数={report.spark_result.raw_row_count}"
+                # 附加有效排序键——诊断行错位根因
+                # 注意：order_keys 是 pipeline 从 SparkSortStep 提取的（可能为空）；
+                # verify() 内部会使用 cre_primary_keys 作为回退。此处显示实际生效的键。
+                if order_keys:
+                    sort_key_desc = str(order_keys)
+                elif primary_keys:
+                    sort_key_desc = str(primary_keys)
+                else:
+                    sort_key_desc = "自动(全部结果列)"
+                diag_msg += f"，排序键={sort_key_desc}"
+                # 附加差异列分布——区分"少数列有系统偏差"与"全列错位"
+                if report.diffs:
+                    from collections import Counter
+                    col_dist = Counter(d.column for d in report.diffs)
+                    diag_msg += f"，差异列分布={col_dist.most_common(10)}"
+                # 附加 CRE shadow 状态
+                if report.cre_shadow_report is not None:
+                    cre_status_val = _safe_enum_value(
+                        report.cre_shadow_report, "cre_status",
+                    )
+                    diag_msg += f"，CRE状态={cre_status_val}"
                 # 附加容差配置快照
                 if report.normalization_config_snapshot:
                     snap = report.normalization_config_snapshot
