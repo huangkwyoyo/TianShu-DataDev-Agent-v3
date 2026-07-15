@@ -49,10 +49,22 @@ export function SparkStageResultPanel({ stage, result, status, visible }: Props)
   const [compilerTab, setCompilerTab] = useState<'annotated' | 'standalone'>(
     result.standalone_pyspark ? 'standalone' : 'annotated'
   );
+  // 代码复制按钮状态
+  const [codeCopied, setCodeCopied] = useState(false);
+  // 面板折叠
+  const [collapsed, setCollapsed] = useState(false);
+
+  const handleCopyCode = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCodeCopied(true);
+      setTimeout(() => setCodeCopied(false), 1800);
+    } catch { /* 剪贴板不可用 */ }
+  };
 
   return (
     <div className={`spark-stage-result panel ${status === 'skipped' ? 'stage-skipped' : ''}`}>
-      <div className="panel-header">
+      <div className="panel-header" onClick={() => setCollapsed(!collapsed)}>
         <h3>
           {statusIcon(status)} Spark {stageCn}
           <span className="spark-stage-id">
@@ -60,7 +72,12 @@ export function SparkStageResultPanel({ stage, result, status, visible }: Props)
           </span>
           {result.skipped && <span className="skipped-badge">已跳过</span>}
         </h3>
+        <span className={`panel-collapse-arrow${collapsed ? ' collapsed' : ''}`}>
+          ▼
+        </span>
       </div>
+
+      <div className={`panel-body-content${collapsed ? ' is-collapsed' : ''}`}>
 
       {/* 失败态 */}
       {status === 'failed' && (
@@ -171,7 +188,7 @@ export function SparkStageResultPanel({ stage, result, status, visible }: Props)
         </>
       )}
 
-      {/* COMPILER——PySpark 代码展示（带标签切换） */}
+      {/* COMPILER——PySpark 代码展示（带标签切换 + 复制按钮） */}
       {result.type === 'compiler' && status === 'ok' && (
         <>
           <div className="section-title">🐍 PySpark DSL 代码（最终产物）</div>
@@ -206,11 +223,27 @@ export function SparkStageResultPanel({ stage, result, status, visible }: Props)
             </div>
           )}
 
-          <pre className="pyspark-code-block"><code>
-            {compilerTab === 'standalone' && result.standalone_pyspark
-              ? result.standalone_pyspark
-              : result.pyspark_code}
-          </code></pre>
+          <div className="code-block-wrapper">
+            <div className="code-block-header">
+              <span className="code-block-title">PySpark</span>
+              <button
+                className={`btn-copy${codeCopied ? ' copied' : ''}`}
+                onClick={() => {
+                  const text = compilerTab === 'standalone' && result.standalone_pyspark
+                    ? result.standalone_pyspark
+                    : (result.pyspark_code || '');
+                  handleCopyCode(text);
+                }}
+              >
+                {codeCopied ? '✅ 已复制' : '📋 复制'}
+              </button>
+            </div>
+            <pre className="pyspark-code-block"><code>
+              {compilerTab === 'standalone' && result.standalone_pyspark
+                ? result.standalone_pyspark
+                : result.pyspark_code}
+            </code></pre>
+          </div>
         </>
       )}
 
@@ -303,6 +336,7 @@ export function SparkStageResultPanel({ stage, result, status, visible }: Props)
           )}
         </div>
       )}
+      </div>{/* panel-body-content */}
     </div>
   );
 }

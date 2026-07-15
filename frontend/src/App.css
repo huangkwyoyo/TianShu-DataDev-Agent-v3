@@ -356,10 +356,12 @@ pre, code, textarea, .code-block {
 .editor-container {
   display: flex;
   flex-direction: column;
+  flex: 1;
+  min-height: 160px;
+  max-height: 70vh;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   overflow: hidden;
-  flex-shrink: 0;
 }
 
 .editor-container:focus-within {
@@ -385,15 +387,23 @@ pre, code, textarea, .code-block {
   font-weight: 600;
 }
 
+.spec-editor {
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  flex: 1;
+  min-height: 0;
+  background: var(--bg-input);
+}
+
 .spec-editor textarea {
   display: block;
-  width: 100%;
-  min-height: 260px;
-  max-height: 400px;
+  flex: 1;
+  min-height: 0;
   padding: var(--space-md);
   border: none;
   border-radius: 0;
-  background: var(--bg-input);
+  background: transparent;
   color: var(--text);
   font-family: var(--font-mono);
   font-size: var(--font-size);
@@ -401,10 +411,51 @@ pre, code, textarea, .code-block {
   resize: vertical;
   tab-size: 2;
   outline: none;
+  overflow-y: auto;
+}
+
+/* 行号列 */
+.editor-gutter {
+  flex-shrink: 0;
+  overflow: hidden;
+  background: var(--bg);
+  border-right: 1px solid var(--border);
+  user-select: none;
+  min-width: 32px;
+}
+
+.editor-gutter-inner {
+  padding: var(--space-md) 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.editor-line-no {
+  padding: 0 var(--space-sm) 0 var(--space);
+  font-family: var(--font-mono);
+  font-size: var(--font-size);
+  line-height: 1.65;
+  color: var(--text-faint);
+  min-width: 20px;
+  text-align: right;
 }
 
 .spec-editor textarea::placeholder {
   color: var(--text-faint);
+}
+
+/* Execute 后布局：编辑器放底部，输出面板放上面 */
+.app-main.layout-executed .editor-container {
+  flex: none;
+  height: 400px;
+  order: 10;
+}
+.app-main.layout-executed .output-area {
+  order: 3;
+}
+.app-main.layout-executed .error-display {
+  order: 4;
 }
 
 /* ── 工具栏 ── */
@@ -440,6 +491,13 @@ pre, code, textarea, .code-block {
 }
 
 /* ── 按钮系统 ── */
+
+/* 按钮图标——辅助文字识别 */
+.btn-icon {
+  font-size: 11px;
+  line-height: 1;
+  flex-shrink: 0;
+}
 
 .btn {
   display: inline-flex;
@@ -604,6 +662,44 @@ pre, code, textarea, .code-block {
   margin-bottom: 0;
 }
 
+/* 按钮容器——位于代码块头部右侧 */
+.code-block-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* 复制按钮 */
+.btn-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1px 6px;
+  height: 20px;
+  min-width: 20px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.1s ease;
+}
+
+.btn-copy:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+
+.btn-copy.copied {
+  color: var(--success);
+  border-color: var(--success);
+  background: var(--success-bg);
+}
+
 /* 下载按钮 */
 .btn-download {
   display: inline-flex;
@@ -624,6 +720,51 @@ pre, code, textarea, .code-block {
   color: var(--accent);
   border-color: var(--accent);
   background: var(--accent-bg);
+}
+
+/* ── 状态概览条 ── */
+
+.status-strip {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  padding: var(--space-sm) var(--space-md);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: var(--font-size-xs);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.status-strip-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+}
+
+.status-strip-label {
+  color: var(--text-faint);
+  font-family: var(--font-ui);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.status-strip-value {
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+}
+
+.status-strip-mono {
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.status-strip-ok {
+  color: var(--success);
 }
 
 /* ── 错误显示 ── */
@@ -734,21 +875,57 @@ pre, code, textarea, .code-block {
 .stat-item {
   display: flex;
   flex-direction: column;
-  padding: var(--space-sm) var(--space);
+  padding: var(--space) var(--space-md);
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius);
+  position: relative;
 }
 
+/* 左侧色条——按统计类型着色 */
+.stat-item::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  border-radius: var(--radius) 0 0 var(--radius);
+  background: var(--accent);
+  opacity: 0.5;
+}
+
+.stat-item:hover {
+  border-color: var(--text-dim);
+}
+
+.exec-stat:hover {
+  border-color: var(--text-dim);
+}
+
+.stat-item:first-child::before { background: var(--accent); }
+.stat-item:nth-child(2)::before { background: var(--success); }
+.stat-item:nth-child(3)::before { background: var(--warning); }
+.stat-item:nth-child(4)::before { background: var(--error); }
+.stat-item:nth-child(5)::before { background: #a890f0; }
+.stat-item:nth-child(6)::before { background: #60c8d8; }
+
 .stat-item .stat-label {
-  font-size: var(--font-size-xs);
+  font-size: 9px;
   color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-family: var(--font-ui);
+  order: 2;
+  margin-top: 2px;
 }
 
 .stat-item .stat-value {
-  font-size: var(--font-size-lg);
+  font-size: var(--font-size-xl);
   font-weight: 600;
   color: var(--text);
+  font-family: var(--font-mono);
+  order: 1;
 }
 
 .table-card {
@@ -989,21 +1166,39 @@ pre, code, textarea, .code-block {
 }
 
 .exec-stat {
-  padding: var(--space-sm) var(--space);
+  padding: var(--space) var(--space-md);
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   font-size: var(--font-size-sm);
+  position: relative;
+}
+
+.exec-stat::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  border-radius: var(--radius) 0 0 var(--radius);
+  background: var(--accent);
+  opacity: 0.5;
 }
 
 .exec-stat .ex-label {
-  font-size: var(--font-size-xs);
+  font-size: 9px;
   color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-family: var(--font-ui);
 }
 
 .exec-stat .ex-value {
-  font-size: var(--font-size-lg);
+  font-size: var(--font-size-xl);
   font-weight: 600;
+  color: var(--text);
+  font-family: var(--font-mono);
 }
 
 /* ── 流水线阶段指示器 ── */

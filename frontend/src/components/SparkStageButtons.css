@@ -55,6 +55,13 @@
   font-size: var(--font-size-xs);
 }
 
+.spark-stage-btn .stage-purpose-icon {
+  font-size: 10px;
+  line-height: 1;
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+
 .spark-stage-btn .stage-label {
   font-weight: 500;
 }

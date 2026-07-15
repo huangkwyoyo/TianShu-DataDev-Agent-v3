@@ -500,13 +500,8 @@ export default function App() {
       </header>
 
       <div className="app-body">
-        <main className="app-main">
-          <SpecEditor
-            value={state.markdownText}
-            onChange={(v) => update({ markdownText: v })}
-          />
-
-          {/* 工具栏 */}
+        <main className={`app-main${state.executeResult ? ' layout-executed' : ''}`}>
+          {/* 工具栏——始终在编辑器上方，不会被内容挡住 */}
           <div className="toolbar">
             <span className="toolbar-label">SQL</span>
             <button
@@ -514,21 +509,21 @@ export default function App() {
               disabled={!hasContent || state.isLoading}
               onClick={handleParse}
             >
-              Parse
+              <span className="btn-icon">🔍</span> Parse
             </button>
             <button
               className="btn"
               disabled={!hasContent || state.isLoading}
               onClick={handlePlan}
             >
-              Plan
+              <span className="btn-icon">📋</span> Plan
             </button>
             <button
               className="btn"
               disabled={!hasContent || state.isLoading}
               onClick={handleExecute}
             >
-              Execute
+              <span className="btn-icon">▶️</span> Execute
             </button>
 
             <span className="toolbar-separator" />
@@ -550,11 +545,62 @@ export default function App() {
               disabled={!hasContent || state.isLoading}
               onClick={handleRunAll}
             >
-              Run All
+              <span className="btn-icon">⚡</span> Run All
             </button>
 
             {state.isLoading && <span className="loading-indicator">...</span>}
           </div>
+
+          {/* 状态概览条——让左侧内容区有即时上下文 */}
+          <div className="status-strip">
+            <div className="status-strip-item">
+              <span className="status-strip-label">状态</span>
+              <span className="status-strip-value">
+                {state.isStreaming ? '运行中' :
+                 state.isLoading ? '处理中' :
+                 state.error || state.streamError ? '异常' :
+                 state.executeResult ? '执行完成' :
+                 state.planResult ? 'Plan 就绪' :
+                 state.specResult ? '解析完成' :
+                 '编辑中'}
+              </span>
+            </div>
+            {state.artifactsReady && (
+              <div className="status-strip-item">
+                <span className="status-strip-label">制品</span>
+                <span className="status-strip-value status-strip-ok">就绪</span>
+              </div>
+            )}
+            {state.requestId && (
+              <div className="status-strip-item">
+                <span className="status-strip-label">请求 ID</span>
+                <span className="status-strip-value status-strip-mono">{state.requestId.slice(0, 12)}…</span>
+              </div>
+            )}
+            <div className="status-strip-item">
+              <span className="status-strip-label">SQL 管线</span>
+              <span className="status-strip-value">
+                {state.pipelineStages.length === 0 ? '待执行' :
+                 state.pipelineStages.every(s => s.status === 'ok') ? '✅ 通过' :
+                 state.pipelineStages.some(s => s.status === 'failed') ? '❌ 失败' :
+                 '进行中'}
+              </span>
+            </div>
+            <div className="status-strip-item">
+              <span className="status-strip-label">Spark 管线</span>
+              <span className="status-strip-value">
+                {state.sparkStages.length === 0 ? '待执行' :
+                 state.sparkStages.every(s => s.status === 'ok') ? '✅ 通过' :
+                 state.sparkStages.some(s => s.status === 'failed') ? '❌ 失败' :
+                 '进行中'}
+              </span>
+            </div>
+          </div>
+
+          <SpecEditor
+            value={state.markdownText}
+            onChange={(v) => update({ markdownText: v })}
+          />
 
           {/* 错误态展示 */}
           {state.error && (
@@ -620,20 +666,35 @@ export default function App() {
                     <div className="code-block-wrapper">
                       <div className="code-block-header">
                         <span className="code-block-title">SQL</span>
-                        <button
-                          className="btn-download"
-                          onClick={() => {
-                            const blob = new Blob([state.executeResult!.generated_sql], { type: 'text/sql' });
-                            const url = URL.createObjectURL(blob);
-                            const a = document.createElement('a');
-                            a.href = url; a.download = 'query.sql';
-                            document.body.appendChild(a); a.click();
-                            document.body.removeChild(a);
-                            URL.revokeObjectURL(url);
-                          }}
-                        >
-                          download .sql
-                        </button>
+                        <div className="code-block-actions">
+                          <button
+                            className="btn-copy"
+                            onClick={async () => {
+                              try {
+                                await navigator.clipboard.writeText(state.executeResult!.generated_sql);
+                                const btn = document.activeElement as HTMLElement;
+                                btn.textContent = '✅';
+                                setTimeout(() => { btn.textContent = '📋'; }, 1800);
+                              } catch { /* ignore */ }
+                            }}
+                          >
+                            📋
+                          </button>
+                          <button
+                            className="btn-download"
+                            onClick={() => {
+                              const blob = new Blob([state.executeResult!.generated_sql], { type: 'text/sql' });
+                              const url = URL.createObjectURL(blob);
+                              const a = document.createElement('a');
+                              a.href = url; a.download = 'query.sql';
+                              document.body.appendChild(a); a.click();
+                              document.body.removeChild(a);
+                              URL.revokeObjectURL(url);
+                            }}
+                          >
+                            ↓ .sql
+                          </button>
+                        </div>
                       </div>
                       <pre className="code-block"><code>{state.executeResult!.generated_sql}</code></pre>
                     </div>
@@ -645,21 +706,37 @@ export default function App() {
                     <div className="code-block-wrapper">
                       <div className="code-block-header">
                         <span className="code-block-title">PySpark</span>
-                        <button
-                          className="btn-download"
-                          onClick={() => {
-                            const code = state.compilerCode!.standalone || state.compilerCode!.pyspark;
-                            const blob = new Blob([code], { type: 'text/x-python' });
-                            const url = URL.createObjectURL(blob);
-                            const a = document.createElement('a');
-                            a.href = url; a.download = 'spark_job.py';
-                            document.body.appendChild(a); a.click();
-                            document.body.removeChild(a);
-                            URL.revokeObjectURL(url);
-                          }}
-                        >
-                          download .py
-                        </button>
+                        <div className="code-block-actions">
+                          <button
+                            className="btn-copy"
+                            onClick={async () => {
+                              try {
+                                const code = state.compilerCode!.standalone || state.compilerCode!.pyspark;
+                                await navigator.clipboard.writeText(code);
+                                const btn = document.activeElement as HTMLElement;
+                                btn.textContent = '✅';
+                                setTimeout(() => { btn.textContent = '📋'; }, 1800);
+                              } catch { /* ignore */ }
+                            }}
+                          >
+                            📋
+                          </button>
+                          <button
+                            className="btn-download"
+                            onClick={() => {
+                              const code = state.compilerCode!.standalone || state.compilerCode!.pyspark;
+                              const blob = new Blob([code], { type: 'text/x-python' });
+                              const url = URL.createObjectURL(blob);
+                              const a = document.createElement('a');
+                              a.href = url; a.download = 'spark_job.py';
+                              document.body.appendChild(a); a.click();
+                              document.body.removeChild(a);
+                              URL.revokeObjectURL(url);
+                            }}
+                          >
+                            ↓ .py
+                          </button>
+                        </div>
                       </div>
                       <pre className="code-block"><code>{state.compilerCode!.standalone || state.compilerCode!.pyspark}</code></pre>
                     </div>

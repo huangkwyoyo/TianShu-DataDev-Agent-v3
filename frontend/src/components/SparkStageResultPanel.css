@@ -7,6 +7,39 @@
 .spark-stage-result .panel-header {
   padding: var(--space-sm) var(--space-md);
   border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  user-select: none;
+}
+
+.spark-stage-result .panel-header:hover {
+  background: var(--bg-elevated);
+}
+
+/* 折叠箭头——位于面板标题右侧 */
+.panel-collapse-arrow {
+  font-size: 9px;
+  color: var(--text-faint);
+  margin-left: auto;
+  transition: transform 0.15s ease;
+  flex-shrink: 0;
+}
+
+.panel-collapse-arrow.collapsed {
+  transform: rotate(-90deg);
+}
+
+/* 面板体——折叠动画 */
+.spark-stage-result .panel-body-content {
+  overflow: hidden;
+  transition: max-height 0.2s ease, opacity 0.15s ease;
+  max-height: 2000px;
+  opacity: 1;
+}
+
+.spark-stage-result .panel-body-content.is-collapsed {
+  max-height: 0;
+  opacity: 0;
+  padding: 0;
 }
 
 .spark-stage-result .spark-stage-id {
@@ -76,6 +109,14 @@
   vertical-align: top;
 }
 
+.spark-step-table tbody tr {
+  transition: background 0.08s ease;
+}
+
+.spark-step-table tbody tr:hover {
+  background: var(--bg-active);
+}
+
 .spark-step-table .step-idx {
   width: 28px;
   color: var(--text-faint);
@@ -141,6 +182,13 @@
   max-height: 500px;
   overflow-y: auto;
   tab-size: 2;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.code-block-header + .pyspark-code-block {
+  border-top: none;
+  border-radius: 0 0 var(--radius) var(--radius);
 }
 
 .pyspark-code-block code {

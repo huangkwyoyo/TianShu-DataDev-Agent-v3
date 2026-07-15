@@ -17,6 +17,16 @@ const STAGE_CN: Record<string, string> = {
   PHYSICAL_VERIFIER: '物理验证',
 };
 
+/** 功能图标——体现每个阶段的操作语义 */
+const STAGE_ICON: Record<string, string> = {
+  MAPPER: '🗺️',
+  DEVELOPER: '🏷️',
+  COMPILER: '🔧',
+  VALIDATOR: '🔒',
+  COMPARATOR: '🔗',
+  PHYSICAL_VERIFIER: '🧪',
+};
+
 /** 阶段 slug → 枚举名映射 */
 const SLUG_TO_STAGE: Record<string, string> = {
   map: 'MAPPER',
@@ -152,6 +162,7 @@ export function SparkStageButtons({ requestId, artifactsReady, stages, onStageCo
             <span className="stage-icon">
               {isLoading ? '⏳' : stageIcon(status)}
             </span>
+            <span className="stage-purpose-icon">{STAGE_ICON[stageEnum]}</span>
             <span className="stage-label">{cn}</span>
           </button>
         );

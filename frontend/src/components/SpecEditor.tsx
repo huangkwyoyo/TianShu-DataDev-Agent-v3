@@ -1,3 +1,5 @@
+import { useRef, useMemo, useCallback } from 'react';
+
 interface Props {
   value: string;
   onChange: (value: string) => void;
@@ -48,12 +50,27 @@ const placeholder = `spec:
     - name: stat_date
     - name: pv`;
 
-/** DeveloperSpec Markdown 编辑器
+/** DeveloperSpec Markdown 编辑器（含行号）
  *
  * textarea 仅展示内部正文，外层 ```markdown / ``` 以装饰性元素呈现。
- * onChange 自动添加外层包裹，确保提交到 API 的文本总是合法格式。 */
+ * 左侧行号动态跟随文本行数变化，滚动同步。 */
 export function SpecEditor({ value, onChange }: Props) {
   const innerValue = unwrap(value);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const gutterRef = useRef<HTMLDivElement>(null);
+
+  // 计算行号列表（空格处理——末尾空行也映射为行号）
+  const lines = useMemo(() => {
+    if (innerValue.length === 0) return [1];
+    return innerValue.split('\n').map((_, i) => i + 1);
+  }, [innerValue]);
+
+  // 同步滚动——行号列跟随 textarea 滚动
+  const handleScroll = useCallback(() => {
+    if (textareaRef.current && gutterRef.current) {
+      gutterRef.current.scrollTop = textareaRef.current.scrollTop;
+    }
+  }, []);
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     onChange(wrap(e.target.value));
@@ -65,9 +82,18 @@ export function SpecEditor({ value, onChange }: Props) {
         <span className="prompt">$</span> markdown
       </div>
       <div className="spec-editor">
+        <div className="editor-gutter" ref={gutterRef} aria-hidden="true">
+          <div className="editor-gutter-inner">
+            {lines.map(n => (
+              <div key={n} className="editor-line-no">{n}</div>
+            ))}
+          </div>
+        </div>
         <textarea
+          ref={textareaRef}
           value={innerValue}
           onChange={handleChange}
+          onScroll={handleScroll}
           placeholder={placeholder}
           spellCheck={false}
         />
