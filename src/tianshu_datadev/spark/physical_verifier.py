@@ -25,7 +25,9 @@ import hashlib
 import json
 import logging
 import re
+from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from pydantic import Field
@@ -575,12 +577,19 @@ class PhysicalVerifier:
         # Step 3：Spark 执行 PySpark DSL
         spark_result = self._execute_spark(pyspark_code, snapshot_dir)
 
-        # ── 诊断日志：输出 snapshot_dir 和执行行数（安全——不走文件 I/O，不走字符串拼接 \n）──
+        # ── 诊断日志：输出关键中间数据（用 warning 级别确保输出）──
         _diag_logger = logging.getLogger(__name__)
-        _diag_logger.info("[PHYS_VERIFIER_DIAG] snapshot_dir=%s", snapshot_dir)
-        _diag_logger.info("[PHYS_VERIFIER_DIAG] duckdb_rows=%s spark_rows=%s",
-                          len(duckdb_result.output_rows) if duckdb_result.output_rows else 0,
-                          len(spark_result.output_rows) if spark_result.output_rows else 0)
+        _diag_logger.warning("[PHYS_VERIFIER_DIAG] snapshot_dir=%s snapshot_id=%s "
+                             "duckdb_status=%s duckdb_rows=%s "
+                             "spark_status=%s spark_rows=%s spark_error=%s "
+                             "pyspark_code_len=%s order_keys=%s primary_keys=%s",
+                             snapshot_dir, snapshot_id,
+                             duckdb_result.status,
+                             len(duckdb_result.output_rows) if duckdb_result.output_rows else 0,
+                             spark_result.status,
+                             len(spark_result.output_rows) if spark_result.output_rows else 0,
+                             spark_result.error_message or "无",
+                             len(pyspark_code), order_keys, cre_primary_keys)
 
         # 自动检测排序键：当无显式排序键时，优先使用业务主键（cre_primary_keys），
         # 否则从 DuckDB 结果列名自动提取。使用业务主键排序可避免聚合指标列
@@ -793,6 +802,19 @@ class PhysicalVerifier:
         else:
             status = PhysicalVerificationStatus.HUMAN_REVIEW
 
+        # ── 诊断：仅 RESULT_MISMATCH 时保存双引擎行数据到日志目录 ──
+        if status == PhysicalVerificationStatus.RESULT_MISMATCH:
+            self._save_mismatch_diagnostics(
+                pyspark_code=pyspark_code,
+                sql_query=sql_query,
+                duckdb_rows=duckdb_result.output_rows,
+                spark_rows=spark_result.output_rows,
+                snapshot_id=snapshot_id,
+                contract_hash=contract_hash,
+                duckdb_row_count=duckdb_canonical_count,
+                spark_row_count=spark_canonical_count,
+            )
+
         # 构建 normalization_config_snapshot
         config_snapshot: dict[str, Any] = {}
         if self._normalization_config:
@@ -899,6 +921,80 @@ class PhysicalVerifier:
             result.append(new_row)
         return result
 
+    # ── RESULT_MISMATCH 诊断保存 ──
+
+    def _save_mismatch_diagnostics(
+        self,
+        pyspark_code: str,
+        sql_query: str,
+        duckdb_rows: list[dict[str, Any]] | None,
+        spark_rows: list[dict[str, Any]] | None,
+        snapshot_id: str,
+        contract_hash: str,
+        duckdb_row_count: int,
+        spark_row_count: int,
+    ) -> None:
+        """RESULT_MISMATCH 时保存双引擎行数据到日志目录用于离线分析。
+
+        保存到 logs/monitor/diagnostics/ 下按时间戳命名的子目录中。
+        静默异常——不影响验证主流程。
+
+        Args:
+            pyspark_code: Spark 执行的 PySpark DSL 代码
+            sql_query: DuckDB 执行的 SQL 查询
+            duckdb_rows: DuckDB 原始输出行
+            spark_rows: Spark 原始输出行
+            snapshot_id: 快照 ID
+            contract_hash: Contract hash
+            duckdb_row_count: DuckDB 规范化后行数
+            spark_row_count: Spark 规范化后行数
+        """
+        _diag_logger = logging.getLogger(__name__)
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            diag_dir = Path("logs/monitor/diagnostics") / f"physver_{snapshot_id}_{ts}"
+            diag_dir.mkdir(parents=True, exist_ok=True)
+
+            # 保存代码和查询
+            (diag_dir / "pyspark_code.py").write_text(pyspark_code, encoding="utf-8")
+            (diag_dir / "sql_query.sql").write_text(sql_query, encoding="utf-8")
+
+            # 保存行数据（default=str 处理 Decimal 不可序列化问题）
+            if duckdb_rows:
+                (diag_dir / "duckdb_rows.json").write_text(
+                    json.dumps(duckdb_rows, ensure_ascii=False, indent=1, default=str),
+                    encoding="utf-8",
+                )
+            if spark_rows:
+                (diag_dir / "spark_rows.json").write_text(
+                    json.dumps(spark_rows, ensure_ascii=False, indent=1, default=str),
+                    encoding="utf-8",
+                )
+
+            # 保存元数据
+            manifest = {
+                "diagnostic_type": "physver_mismatch",
+                "snapshot_id": snapshot_id,
+                "contract_hash": contract_hash,
+                "saved_at": datetime.now().isoformat(),
+                "duckdb_canonical_count": duckdb_row_count,
+                "spark_canonical_count": spark_row_count,
+                "duckdb_raw_count": len(duckdb_rows) if duckdb_rows else 0,
+                "spark_raw_count": len(spark_rows) if spark_rows else 0,
+            }
+            (diag_dir / "manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            _diag_logger.warning(
+                "[PHYS_VERIFIER_DIAG] RESULT_MISMATCH 诊断已保存到 %s", diag_dir,
+            )
+        except Exception as exc:
+            _diag_logger.warning(
+                "[PHYS_VERIFIER_DIAG] 保存 MISMATCH 诊断失败: %s", exc,
+            )
+
     # ── DuckDB 执行 ──
 
     def _execute_duckdb(
@@ -940,6 +1036,8 @@ class PhysicalVerifier:
             import duckdb
 
             con = duckdb.connect()
+            # 统一时区为 UTC——与 Spark 端 spark.sql.session.timeZone=UTC 对齐
+            con.execute("SET TimeZone = 'UTC'")
 
             # Step 1：ATTACH 外部 DuckDB 数据库——使 gold/silver schema 表可用
             # 先 ATTACH，后用快照 Parquet 覆盖——确保快照数据优先

@@ -228,6 +228,10 @@ _tianshu_builder = _tianshu_builder.appName("tianshu_executor")
 _tianshu_builder = _tianshu_builder.master("local[1]")
 _tianshu_builder = _tianshu_builder.config("spark.ui.enabled", "false")
 _tianshu_builder = _tianshu_builder.config("spark.sql.adaptive.enabled", "false")
+# 统一时区为 UTC——与 DuckDB 默认行为一致，防止 JVM 本地时区（如 UTC+8）
+# 导致 timestamp 比较偏移，误将过滤边界外的行纳入（如 pickup_at>= 在 UTC+8
+# 下相当于提前 8h，产生 72 行 vs 63 行的 GROUP BY 差异）
+_tianshu_builder = _tianshu_builder.config("spark.sql.session.timeZone", "UTC")
 # Java 17+ 模块系统兼容——PySpark 需要访问 sun.nio.ch.DirectBuffer
 _tianshu_builder = _tianshu_builder.config(
     "spark.driver.extraJavaOptions",

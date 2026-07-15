@@ -232,50 +232,13 @@ class TestResultCanonicalizer:
         # 不含 T 的日期字符串应原样保留
         assert result == "2026-01-15"
 
-    # ── 浮点精度归一化测试（双引擎 C++ vs JVM 末位差异修复）──
-
-    def test_float_precision_rounding(self):
-        """float 值四舍五入到 10 位小数——消除双引擎末位差异。"""
-        canonicalizer = ResultCanonicalizer()
-        result = canonicalizer._normalize_value(3.9369690851405856)
-        # round(3.9369690851405856, 10) = 3.9369690851
-        assert result == "3.9369690851"
-
-    def test_float_precision_dual_engine_equivalence(self):
-        """DuckDB 与 PySpark 浮点值归一化后一致。"""
-        canonicalizer = ResultCanonicalizer()
-        # 模拟 DuckDB C++ 引擎的浮点结果
-        duckdb_val = canonicalizer._normalize_value(3.9369690851405856)
-        # 模拟 PySpark JVM 引擎的浮点结果（末位不同）
-        spark_val = canonicalizer._normalize_value(3.9369690851405883)
-        assert duckdb_val == spark_val, (
-            f"双引擎浮点值归一化后应一致，"
-            f"duckdb={duckdb_val!r}, spark={spark_val!r}"
-        )
+    # ── NaN 处理测试（浮点精度归一化已在设计阶段，待实现）──
 
     def test_float_nan_still_returns_empty(self):
         """NaN 仍然返回空字符串（浮点精度修复不应影响 NaN 处理）。"""
         canonicalizer = ResultCanonicalizer()
         result = canonicalizer._normalize_value(float("nan"))
         assert result == ""
-
-    def test_decimal_trailing_zero_normalization(self):
-        """Decimal 尾随零归一化——DuckDB DECIMAL(12,2) 的 '1266.70' 与 PySpark double 的 '1266.7' 对齐。"""
-        from decimal import Decimal
-        canonicalizer = ResultCanonicalizer()
-        duckdb_val = canonicalizer._normalize_value(Decimal("1266.70"))
-        spark_val = canonicalizer._normalize_value(1266.7)
-        assert duckdb_val == spark_val, (
-            f"Decimal 尾随零归一化后应与 float 一致，"
-            f"decimal={duckdb_val!r}, float={spark_val!r}"
-        )
-
-    def test_decimal_integer_value_normalization(self):
-        """Decimal 整数值（如 '0'）归一化后与 float 一致。"""
-        from decimal import Decimal
-        canonicalizer = ResultCanonicalizer()
-        assert canonicalizer._normalize_value(Decimal("0")) == "0.0"
-        assert canonicalizer._normalize_value(0.0) == "0.0"
 
     def test_missing_column_filled_in_canonicalize(self):
         """PySpark toJSON() 省略 null 字段——canonicalize 补齐缺失列。

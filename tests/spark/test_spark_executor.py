@@ -385,6 +385,16 @@ class TestExecutorBehavior:
         # 索引读取用 json
         assert "json" in tpl
 
+    def test_prologue_timezone_utc(self):
+        """prologue 必须设 spark.sql.session.timeZone=UTC——防止 JVM 本地时区导致
+        timestamp 过滤偏移，避免双引擎（DuckDB vs Spark）日期边界不一致。"""
+        from tianshu_datadev.spark.executor import _SPARK_PROLOGUE_TEMPLATE
+
+        tpl = _SPARK_PROLOGUE_TEMPLATE
+        assert 'spark.sql.session.timeZone' in tpl, \
+            "必须设置 spark.sql.session.timeZone，确保 Spark 与 DuckDB 的 timestamp 比较行为一致"
+        assert '"UTC"' in tpl, \
+            "必须设为 UTC，与 DuckDB 默认行为对齐"
 
 # ════════════════════════════════════════════
 # 真实 PySpark 集成测试（有 pyspark 守卫）
