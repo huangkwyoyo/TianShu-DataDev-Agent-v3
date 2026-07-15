@@ -199,6 +199,15 @@ from tianshu_datadev.developer_spec.models import (
     LabelCompare, LabelIsNull, LabelIsNotNull,
     LabelAnd, LabelOr, LabelNot,
     LabelPredicateNode, LabelPredicateCondition,
+    # v4-light 最终版: LLM 输出层 + 系统层标签模型
+    LabelDomainOutput,
+    LabelBranchProposalOutput,
+    LabelRuleProposalOutput,
+    LabelRuleProposalList,
+    LabelDomain,
+    LabelBranchProposal,
+    LabelRuleProposal,
+    LabelPredicateBranch,
 )
 
 
@@ -327,3 +336,136 @@ class TestLabelPredicateConditionRootConstraint:
             "node_type": "LITERAL", "value": 5, "data_type": "number",
         })
         assert node.node_type == "LITERAL"
+
+
+# ================================================
+# v4-light 最终版: LLM 输出 Schema 与系统模型分离 + 必需字段强制
+# ================================================
+
+
+class TestLabelDomainOutput:
+    """LLM 输出的标签值域——不含系统字段。"""
+
+    def test_llm_output_no_system_fields(self):
+        domain = LabelDomainOutput(
+            values=["unknown", "short", "medium", "long"],
+            source_evidence="分为四类",
+            is_exhaustive=True,
+            completeness_evidence="以上四类覆盖全部",
+        )
+        assert "domain_id" not in LabelDomainOutput.model_fields
+
+
+class TestLabelRuleProposalOutput:
+    """LLM 输出不含 proposal_id/source_spec_hash。"""
+
+    def test_forbidden_system_fields(self):
+        output = LabelRuleProposalOutput(
+            output_column="distance_category",
+            branches=[
+                LabelBranchProposalOutput(
+                    condition=LabelCompare(
+                        left="distance_miles", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                    ),
+                    then_label="short",
+                    evidence="<=2 -> short",
+                ),
+            ],
+            else_value="long",
+            label_domain=LabelDomainOutput(values=["short", "long"]),
+        )
+        assert "proposal_id" not in LabelRuleProposalOutput.model_fields
+        assert "source_spec_hash" not in LabelRuleProposalOutput.model_fields
+
+    def test_literal_root_condition_rejected_in_branch(self):
+        """LITERAL 不可作 LabelBranchProposalOutput 的 condition。"""
+        with pytest.raises(ValidationError):
+            LabelBranchProposalOutput(
+                condition=LabelTypedLiteral(value="short", data_type="string"),
+                then_label="short",
+                evidence="非法根条件",
+            )
+
+
+class TestSystemModelRequiredFields:
+    """系统模型——else_value/label_domain/evidence 均为必需。"""
+
+    def test_else_value_required(self):
+        """else_value 为必填 str——不可为 None 或缺失。"""
+        with pytest.raises(ValidationError):
+            LabelRuleProposal(
+                proposal_id="p1", source_spec_hash="h",
+                output_column="distance_category",
+                branches=[
+                    LabelBranchProposal(
+                        condition=LabelCompare(
+                            left="distance_miles", op=CompareOp.LTE,
+                            right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                        ),
+                        then_label="short",
+                        evidence="<=2 -> short",
+                    ),
+                ],
+                # else_value 缺失 → ValidationError
+            )
+
+    def test_label_domain_required(self):
+        """label_domain 为必填 LabelDomain——不可为 None 或缺失。"""
+        with pytest.raises(ValidationError):
+            LabelRuleProposal(
+                proposal_id="p1", source_spec_hash="h",
+                output_column="distance_category",
+                branches=[
+                    LabelBranchProposal(
+                        condition=LabelCompare(
+                            left="distance_miles", op=CompareOp.LTE,
+                            right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                        ),
+                        then_label="short",
+                        evidence="<=2 -> short",
+                    ),
+                ],
+                else_value="long",
+                # label_domain 缺失 → ValidationError
+            )
+
+    def test_evidence_required_in_branch(self):
+        """evidence 为必填 str——空字符串导致 Promotion 拒绝。"""
+        # Pydantic 层允许空字符串（非 None），但 Promotion 检查非空
+        branch = LabelBranchProposal(
+            condition=LabelCompare(
+                left="distance_miles", op=CompareOp.LTE,
+                right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+            ),
+            then_label="short",
+            evidence="",  # 空字符串——Promotion 阶段拒绝
+        )
+        assert branch.evidence == ""
+
+    def test_system_model_has_id_and_domain_fields(self):
+        """系统层含 proposal_id/source_spec_hash/label_domain/else_value。"""
+        proposal = LabelRuleProposal(
+            proposal_id="sys_gen_001",
+            source_spec_hash="hash_abc",
+            output_column="distance_category",
+            branches=[
+                LabelBranchProposal(
+                    condition=LabelCompare(
+                        left="distance_miles", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                    ),
+                    then_label="short",
+                    evidence="<=2 -> short",
+                ),
+            ],
+            else_value="long",
+            label_domain=LabelDomain(
+                domain_id="dom_001",
+                values=["short", "long"],
+                source_evidence="原文分类",
+            ),
+        )
+        assert proposal.proposal_id == "sys_gen_001"
+        assert proposal.else_value == "long"
+        assert proposal.label_domain.values == ["short", "long"]

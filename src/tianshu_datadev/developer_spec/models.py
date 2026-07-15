@@ -326,6 +326,86 @@ LabelPredicateCondition = Annotated[
 ]
 
 
+# ================================================
+# v4-light 最终版: LLM 输出 Schema——LLM 直接产出的结构化数据
+# 原则：LLM 只输出规则、标签域和 evidence
+#       proposal_id / source_spec_hash / extraction_time 由系统生成
+#       LabelBranchProposalOutput.condition 使用 LabelPredicateCondition
+#       （排除 LITERAL/COLUMN_REF 根条件）
+# ================================================
+
+class LabelDomainOutput(StrictModel):
+    """LLM 从原文提取的标签值域——不含系统生成字段。"""
+    values: list[str] = []
+    source_evidence: str = ""
+    is_exhaustive: bool = False
+    completeness_evidence: str = ""
+
+
+class LabelBranchProposalOutput(StrictModel):
+    """LLM 输出的单条 WHEN-THEN 分支——condition 仅允许 6 种根条件类型。"""
+    condition: LabelPredicateCondition  # ← LITERAL/COLUMN_REF 在 Schema 层拒绝
+    then_label: str
+    evidence: str = ""  # LLM 层可为空——系统包装时由 Extractor 校验非空
+
+
+class LabelRuleProposalOutput(StrictModel):
+    """LLM 输出的单条标签规则——不含 proposal_id/source_spec_hash。"""
+    output_column: str
+    branches: list[LabelBranchProposalOutput]
+    else_value: str  # LLM 层必填——label_table v1 要求 ELSE
+    label_domain: LabelDomainOutput | None = None
+
+
+class LabelRuleProposalList(StrictModel):
+    """LLM 输出的规则列表——顶层 Schema，注册到 _SCHEMA_PATH_MAP。"""
+    rules: list[LabelRuleProposalOutput]
+
+
+# ================================================
+# 系统内部模型——由 LlmLabelExtractor 包装 LLM 输出后生成
+# proposal_id / source_spec_hash / extraction_time 由系统注入
+# else_value / label_domain / evidence 均为必需——缺失时 Promotion 拒绝
+# ================================================
+
+class LabelDomain(StrictModel):
+    """系统包装的标签值域——含系统生成的 domain_id。"""
+    domain_id: str = ""
+    values: list[str] = []
+    source_evidence: str = ""
+    is_exhaustive: bool = False
+    completeness_evidence: str = ""
+
+
+class LabelBranchProposal(StrictModel):
+    """系统包装的单条 WHEN-THEN 分支——evidence 必填非空。"""
+    condition: LabelPredicateCondition  # ← LITERAL/COLUMN_REF 在 Schema 层拒绝
+    then_label: str
+    evidence: str  # 必填——Promotion 阶段检查非空
+
+
+class LabelRuleProposal(StrictModel):
+    """系统包装的标签规则候选——proposal_id/source_spec_hash 由系统生成。
+
+    label_table v1 强制要求：
+    - else_value: str（必填——ELSE 子句）
+    - label_domain: LabelDomain（必填——标签值域）
+    - 每个 branch.evidence 非空
+    """
+    proposal_id: str
+    source_spec_hash: str
+    output_column: str
+    branches: list[LabelBranchProposal]
+    else_value: str  # ← 必填 str（非 Optional）
+    label_domain: LabelDomain  # ← 必填 LabelDomain（非 Optional）
+
+
+class LabelPredicateBranch(StrictModel):
+    """已验证的类型化 WHEN-THEN 分支——仅含确定性信息。"""
+    condition: LabelPredicateCondition
+    then_label: str
+
+
 # ════════════════════════════════════════════
 # 字段级声明模型
 # ════════════════════════════════════════════
@@ -645,6 +725,8 @@ class CaseWhenDecl(StrictModel):
     branches: list[CaseWhenBranchDecl] = []  # WHEN-THEN 分支列表（至少 1 个）
     else_value: str | None = None  # ELSE 默认值（None 表示无 ELSE）
     output_column: str = ""  # 输出列别名（对应 output_spec.columns 中的列名）
+    # ── v4-light 最终版: 类型化的标签分支（Label Extractor 填充）──
+    typed_branches: list[LabelPredicateBranch] = []  # 类型化 WHEN-THEN 分支
 
 
 # ════════════════════════════════════════════
@@ -844,6 +926,9 @@ class ParsedDeveloperSpec(StrictModel):
     output_spec: OutputSpecDecl
     compute_steps: list[ComputeStep] | None = None  # 分步计算声明——None 时走原路径
     inferred_window_metrics: list[InferredWindowMetric] = []  # SpecEnricher 推断的窗口指标
+    # ── v4-light 最终版: 标签表支持 ──
+    dataset_type: DatasetType = DatasetType.UNSPECIFIED  # 数据产品类型——Label Extractor 推断
+    label_rules: list[LabelRuleProposal] = []  # 标签规则候选——仅 LABEL_TABLE 时非空
     open_questions: list[OpenQuestion] = []
     parse_warnings: list[ParseWarning] = []
 
