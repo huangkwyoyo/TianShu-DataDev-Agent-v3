@@ -19,6 +19,17 @@ const STAGE_CN: Record<string, string> = {
   PHYSICAL_VERIFIER: '物理验证',
 };
 
+/** 对比结论 → 中文映射 */
+const VERDICT_CN: Record<string, string> = {
+  'LOGIC_EQUIVALENT': '逻辑等价',
+  'LOGIC_MISMATCH': '逻辑不等价',
+  'NOT_EXECUTED': '未执行',
+  'NOT_COVERED': '未覆盖',
+  'EQUIVALENT': '等价',
+  'NOT_EQUIVALENT': '不等价',
+  'UNSUPPORTED_COMPARISON': '不支持对比',
+};
+
 /** 状态图标 */
 function statusIcon(status: string): string {
   switch (status) {
@@ -227,7 +238,7 @@ export function SparkStageResultPanel({ stage, result, status, visible }: Props)
           <div className="section-title">🔗 SQL ↔ Spark 逻辑对比</div>
           <div className="spark-plan-summary">
             <span className="stat-label">对比状态</span>
-            <span className="stat-value">{result.status}</span>
+            <span className="stat-value">{VERDICT_CN[result.status || ''] || result.status}</span>
           </div>
           {result.step_results && result.step_results.length > 0 && (
             <table className="spark-step-table">
@@ -243,7 +254,7 @@ export function SparkStageResultPanel({ stage, result, status, visible }: Props)
                     <td><code className="step-type-badge">{r.step_type}</code></td>
                     <td>
                       <span className={`verdict-badge ${r.verdict === 'LOGIC_EQUIVALENT' ? 'equiv' : 'mismatch'}`}>
-                        {r.verdict}
+                        {VERDICT_CN[r.verdict] || r.verdict}
                       </span>
                     </td>
                   </tr>
@@ -266,9 +277,30 @@ export function SparkStageResultPanel({ stage, result, status, visible }: Props)
 
       {/* PHYSICAL_VERIFIER——物理验证结果（含 skipped 原因展示） */}
       {result.type === 'physical_verify' && (
-        <div className={`spark-result-message${result.skipped ? ' stage-skipped' : ''}`}>
-          {result.skipped ? '⏭️ ' : '✅ '}
-          {result.message || '物理验证结果'}
+        <div className={`physver-section${result.skipped ? ' stage-skipped' : ''}`}>
+          <div className="physver-header">
+            <span className="physver-status-icon">
+              {result.skipped ? '⏭️' : '✅'}
+            </span>
+            <span className="physver-brief">
+              {result.skipped ? '物理验证已跳过' : '物理验证完成'}
+            </span>
+          </div>
+          {result.message && (
+            <div className="physver-message">{result.message}</div>
+          )}
+          {result.errors && result.errors.length > 1 && (
+            <details className="physver-details">
+              <summary className="physver-details-summary">
+                详细错误 ({result.errors.length - 1} 条)
+              </summary>
+              <ul className="physver-error-list">
+                {result.errors.slice(1).map((e, i) => (
+                  <li key={i}>{e}</li>
+                ))}
+              </ul>
+            </details>
+          )}
         </div>
       )}
     </div>

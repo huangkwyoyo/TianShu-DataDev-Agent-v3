@@ -3368,6 +3368,7 @@ class Pipeline:
                     "type": "physical_verify",
                     "message": reason,
                     "skipped": current_status == "skipped",
+                    "errors": verify_errors,  # 完整错误列表，供前端展示
                 }
 
         return {
