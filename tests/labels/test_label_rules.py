@@ -308,3 +308,43 @@ class TestValidatorV1LabelDomain:
         )
         report = validator.validate(proposal, _make_test_spec())
         assert any("ultra_short" in e for e in report.blocking_errors)
+
+# ================================================
+# v4-light 最终版: FakeLabelExtractor 测试
+# ================================================
+
+
+class TestFakeLabelExtractor:
+    """FakeLabelExtractor——pytest 专用，确定性返回预定义 Proposal。"""
+
+    def test_returns_predefined_proposals(self):
+        from tianshu_datadev.labels.label_extractor import FakeLabelExtractor
+        proposal = LabelRuleProposal(
+            proposal_id="p1", source_spec_hash="h",
+            output_column="col",
+            branches=[
+                LabelBranchProposal(
+                    condition=LabelCompare(
+                        left="x", op=CompareOp.EQ,
+                        right=LabelTypedLiteral(value="a", data_type="string"),
+                    ),
+                    then_label="label_a", evidence="x=a",
+                ),
+            ],
+            else_value="label_b",
+            label_domain=LabelDomain(values=["label_a", "label_b"]),
+        )
+        extractor = FakeLabelExtractor(proposals=[proposal])
+        spec = _make_test_spec()
+        result, artifact = extractor.extract(spec, ["col"])
+        assert len(result) == 1
+        assert result[0].output_column == "col"
+        assert artifact.llm_model == "fake"
+
+    def test_empty_by_default(self):
+        from tianshu_datadev.labels.label_extractor import FakeLabelExtractor
+        extractor = FakeLabelExtractor()
+        spec = _make_test_spec()
+        result, artifact = extractor.extract(spec, [])
+        assert result == []
+        assert artifact.unresolved_columns == []

@@ -39,6 +39,10 @@ _SCHEMA_PATH_MAP: dict[str, str] = {
     "AnnotatedSparkPlan": (
         "tianshu_datadev.spark.annotations.AnnotatedSparkPlan"
     ),
+    # label_table——标签规则提取（v4-light 最终版）
+    "LabelRuleProposalList": (
+        "tianshu_datadev.developer_spec.models.LabelRuleProposalList"
+    ),
 }
 
 
