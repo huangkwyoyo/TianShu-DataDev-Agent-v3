@@ -24,7 +24,9 @@ from tianshu_datadev.developer_spec.models import (
     StrictModel,
 )
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
+from tianshu_datadev.developer_spec.models import DatasetType
 from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
+from tianshu_datadev.labels.resolver import _find_unresolved_derived_columns
 from tianshu_datadev.llm.models import LlmResponse, LlmTraceNode
 from tianshu_datadev.api.streaming import TeeCollector, _sanitize_stream_error
 from tianshu_datadev.monitor import get_collector
@@ -362,6 +364,59 @@ class Pipeline:
 
     # ── 核心管线方法 ──────────────────────────────
 
+    def _prepare_spec_for_planning(
+        self, spec: ParsedDeveloperSpec,
+    ) -> ParsedDeveloperSpec:
+        """label_table 预处理——在 Enrich 之前执行标签提取+验证+提升。
+
+        仅处理 dataset_type == LABEL_TABLE 的 Spec。
+        其他类型直接返回原 spec。
+        """
+        if spec.dataset_type != DatasetType.LABEL_TABLE:
+            return spec
+
+        # 1. 查找未解析的派生列
+        unresolved = _find_unresolved_derived_columns(spec)
+        if not unresolved:
+            return spec
+
+        # 2. 尝试标签提取
+        label_extractor = getattr(self, "_label_extractor", None)
+        if label_extractor is None:
+            return spec
+
+        try:
+            proposals, extraction_artifact = label_extractor.extract(
+                spec, unresolved,
+            )
+        except Exception:
+            return spec
+
+        if not proposals:
+            return spec
+
+        # 3. 逐条验证
+        from tianshu_datadev.labels.label_rule_validator import LabelRuleValidator
+        validator = LabelRuleValidator()
+        reports = [validator.validate(p, spec) for p in proposals]
+
+        # 4. Promotion——双空阻断
+        from tianshu_datadev.labels.promotion import Promotion
+        promoter = Promotion()
+        promoted_rules, promotion_artifact = promoter.promote(
+            spec.spec_hash, proposals, reports, extraction_artifact,
+        )
+
+        # 5. 将 CaseWhenDecl 附加到 spec.label_rules
+        for case_when in promoted_rules:
+            # 找到对应的 Proposal 以获取 proposal_id
+            for proposal in proposals:
+                if proposal.output_column == case_when.output_column:
+                    spec.label_rules.append(proposal)
+                    break
+
+        return spec
+
     @staticmethod
     def _gen_request_id(spec: ParsedDeveloperSpec) -> str:
         """从 spec_hash 生成确定性 request_id。"""
@@ -439,6 +494,8 @@ class Pipeline:
                 spec = parser.parse(markdown_text)
                 ctx.set_result(artifact_path=f"spec/{spec.spec_hash[:12]}")
             manifest = build_manifest_from_spec(spec)
+            # ── label_table 预处理（v4-light 最终版）──
+            spec = self._prepare_spec_for_planning(spec)
         except Exception as e:
             self._log_stage_failure(method, "parser", e)
             error_info = self._capture_error("parser", e)

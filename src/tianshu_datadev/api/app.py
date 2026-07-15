@@ -162,6 +162,27 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
             "SparkDeveloperService 跳过，DEVELOPER 阶段将标记 SKIPPED"
         )
 
+    # ── v4-light 最终版: 创建 LlmLabelExtractor（label_table 支持）──
+    llm_label_extractor = None
+    if api_key and spark_developer_service is not None:
+        try:
+            from tianshu_datadev.llm.gateway import LLMGateway
+            from tianshu_datadev.labels.llm_label_extractor import LlmLabelExtractor
+            llm_gateway = LLMGateway(
+                adapter=adapter,
+                prompt_manager=prompt_manager,
+                response_root="llm_responses",
+            )
+            llm_label_extractor = LlmLabelExtractor(gateway=llm_gateway)
+            logger.info("LlmLabelExtractor 初始化成功——label_table 请求将调用 LLM 提取标签")
+        except Exception as exc:
+            logger.warning("LlmLabelExtractor 创建失败: %s", exc)
+    elif not api_key:
+        logger.info(
+            "未检测到 API Key——label_table 请求将返回 CONFIG_ERROR"
+            "（禁止回退 Fake）"
+        )
+
     # 监控系统自动启用——仅当 TIANSHU_RUN_ID 未设置时自动生成
     # 环境变量存在但为空字符串 → 显式禁用（get_collector 返回 NullCollector）
     # 环境变量不存在 → 自动生成 run_id（默认启用）
@@ -211,6 +232,8 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
             )
     app.state.pipeline = pipeline
     app.state.spark_developer_service = spark_developer_service
+    # ── v4-light 最终版: 注入 LlmLabelExtractor 到 Pipeline ──
+    pipeline._label_extractor = llm_label_extractor
 
     # 注册异常处理器
     register_error_handlers(app)
