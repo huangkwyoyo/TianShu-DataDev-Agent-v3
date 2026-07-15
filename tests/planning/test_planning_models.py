@@ -186,3 +186,144 @@ class TestPredicateAdvanced:
             operator=PredicateOperator.IS_NULL,
         )
         assert p.right is None
+
+
+# ================================================
+# v4-light 最终版: DatasetType + LabelPredicateNode + 根条件约束
+# ================================================
+
+from decimal import Decimal
+from tianshu_datadev.developer_spec.models import (
+    DatasetType, CompareOp,
+    LabelColumnRef, LabelTypedLiteral,
+    LabelCompare, LabelIsNull, LabelIsNotNull,
+    LabelAnd, LabelOr, LabelNot,
+    LabelPredicateNode, LabelPredicateCondition,
+)
+
+
+class TestDatasetType:
+    def test_serialize_label_table(self):
+        assert DatasetType.LABEL_TABLE.value == "label_table"
+
+    def test_default_unspecified(self):
+        assert DatasetType.UNSPECIFIED.value == "unspecified"
+
+
+class TestLabelPredicateNodeDiscriminator:
+    """8 子类 discriminator 联合 AST。"""
+
+    def test_compare_node(self):
+        node = LabelCompare(
+            left="distance_miles", op=CompareOp.LTE,
+            right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+        )
+        assert node.node_type == "COMPARE"
+
+    def test_is_null_node(self):
+        node = LabelIsNull(column="distance_miles")
+        assert node.node_type == "IS_NULL"
+
+    def test_is_not_null_node(self):
+        node = LabelIsNotNull(column="distance_miles")
+        assert node.node_type == "IS_NOT_NULL"
+
+    def test_and_node(self):
+        node = LabelAnd(children=[
+            LabelCompare(left="a", op=CompareOp.GT,
+                        right=LabelTypedLiteral(value=Decimal("0"), data_type="number")),
+            LabelCompare(left="a", op=CompareOp.LT,
+                        right=LabelTypedLiteral(value=Decimal("10"), data_type="number")),
+        ])
+        assert node.node_type == "AND"
+        assert len(node.children) == 2
+
+    def test_or_node(self):
+        node = LabelOr(children=[
+            LabelIsNull(column="x"),
+            LabelCompare(left="y", op=CompareOp.EQ,
+                        right=LabelTypedLiteral(value=True, data_type="boolean")),
+        ])
+        assert node.node_type == "OR"
+
+    def test_not_node(self):
+        node = LabelNot(child=LabelIsNull(column="x"))
+        assert node.node_type == "NOT"
+
+    def test_nested_and_or(self):
+        """AND(OR(...), COMPARE) 嵌套。"""
+        node = LabelAnd(children=[
+            LabelOr(children=[
+                LabelCompare(left="a", op=CompareOp.EQ,
+                            right=LabelTypedLiteral(value="x", data_type="string")),
+                LabelCompare(left="a", op=CompareOp.EQ,
+                            right=LabelTypedLiteral(value="y", data_type="string")),
+            ]),
+            LabelIsNotNull(column="b"),
+        ])
+        assert node.node_type == "AND"
+
+
+class TestLabelPredicateConditionRootConstraint:
+    """v4-light 最终版: LabelPredicateCondition 仅允许 6 种根节点类型。
+    LITERAL/COLUMN_REF 不可作为 WHEN 根条件。"""
+
+    def test_compare_is_valid_root(self):
+        """COMPARE 是合法根条件。"""
+        from pydantic import TypeAdapter
+        adapter = TypeAdapter(LabelPredicateCondition)
+        node = adapter.validate_python({
+            "node_type": "COMPARE", "left": "col",
+            "op": "=",
+            "right": {"node_type": "LITERAL", "value": "test", "data_type": "string"},
+        })
+        assert node.node_type == "COMPARE"
+
+    def test_is_null_is_valid_root(self):
+        """IS_NULL 是合法根条件。"""
+        from pydantic import TypeAdapter
+        adapter = TypeAdapter(LabelPredicateCondition)
+        node = adapter.validate_python({
+            "node_type": "IS_NULL", "column": "col",
+        })
+        assert node.node_type == "IS_NULL"
+
+    def test_and_is_valid_root(self):
+        """AND 是合法根条件。"""
+        from pydantic import TypeAdapter
+        adapter = TypeAdapter(LabelPredicateCondition)
+        node = adapter.validate_python({
+            "node_type": "AND", "children": [
+                {"node_type": "COMPARE", "left": "a", "op": ">",
+                 "right": {"node_type": "LITERAL", "value": 0, "data_type": "number"}},
+            ],
+        })
+        assert node.node_type == "AND"
+
+    def test_literal_rejected_as_root(self):
+        """LITERAL 不可作根条件——Pydantic discriminator 拒绝。"""
+        from pydantic import TypeAdapter
+        adapter = TypeAdapter(LabelPredicateCondition)
+        with pytest.raises(ValidationError):
+            adapter.validate_python({
+                "node_type": "LITERAL", "value": "short", "data_type": "string",
+            })
+
+    def test_column_ref_rejected_as_root(self):
+        """COLUMN_REF 不可作根条件。"""
+        from pydantic import TypeAdapter
+        adapter = TypeAdapter(LabelPredicateCondition)
+        with pytest.raises(ValidationError):
+            adapter.validate_python({
+                "node_type": "COLUMN_REF", "column_name": "col",
+            })
+
+    def test_label_predicate_node_still_allows_literal(self):
+        """LabelPredicateNode（完整 AST）仍允许 LITERAL/COLUMN_REF——
+        仅 LabelPredicateCondition 限制了根条件。"""
+        from pydantic import TypeAdapter
+        adapter = TypeAdapter(LabelPredicateNode)
+        node = adapter.validate_python({
+            "node_type": "LITERAL", "value": 5, "data_type": "number",
+        })
+        assert node.node_type == "LITERAL"
