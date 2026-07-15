@@ -118,3 +118,193 @@ class TestLabelPromotionArtifact:
         )
         assert len(artifact.rejected_proposals) == 2
         assert artifact.human_review_required
+
+# ================================================
+# v4-light 最终版: LabelRuleValidator v1 六项检查 + 双空通过
+# ================================================
+
+from decimal import Decimal
+
+from tianshu_datadev.developer_spec.models import (
+    ColumnDecl,
+    CompareOp,
+    DatasetType,
+    InputTableDecl,
+    LabelBranchProposal,
+    LabelCompare,
+    LabelDomain,
+    LabelRuleProposal,
+    LabelTypedLiteral,
+    OutputColumnDecl,
+    OutputSpecDecl,
+    ParsedDeveloperSpec,
+)
+from tianshu_datadev.labels.label_rule_validator import LabelRuleValidator
+
+
+def _make_test_spec():
+    """构造测试用 ParsedDeveloperSpec。"""
+    return ParsedDeveloperSpec(
+        spec_id="test", spec_hash="h", title="t", description="d",
+        dataset_type=DatasetType.LABEL_TABLE,
+        input_tables=[
+            InputTableDecl(
+                table_alias="tf", source_table="fact",
+                columns=[
+                    ColumnDecl(column_name="distance_miles",
+                               normalized_name="distance_miles"),
+                    ColumnDecl(column_name="is_distance_outlier",
+                               normalized_name="is_distance_outlier"),
+                ],
+                key_columns=[], business_columns=[],
+            ),
+        ],
+        metrics=[], dimensions=[],
+        output_spec=OutputSpecDecl(columns=[
+            OutputColumnDecl(name="distance_category", type="string"),
+        ], grain=[]),
+        time_range=None,
+    )
+
+
+class TestValidatorV1FieldExists:
+
+    def test_field_exists_passes(self):
+        validator = LabelRuleValidator()
+        proposal = LabelRuleProposal(
+            proposal_id="p1", source_spec_hash="h",
+            output_column="distance_category",
+            branches=[
+                LabelBranchProposal(
+                    condition=LabelCompare(
+                        left="distance_miles", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                    ),
+                    then_label="short", evidence="<=2 -> short",
+                ),
+            ],
+            else_value="long",
+            label_domain=LabelDomain(values=["short", "long"]),
+        )
+        report = validator.validate(proposal, _make_test_spec())
+        field_check = next(c for c in report.checks if c.check_name == "FIELD_EXISTS")
+        assert field_check.passed
+
+    def test_unknown_field_blocks(self):
+        validator = LabelRuleValidator()
+        proposal = LabelRuleProposal(
+            proposal_id="p1", source_spec_hash="h",
+            output_column="distance_category",
+            branches=[
+                LabelBranchProposal(
+                    condition=LabelCompare(
+                        left="nonexistent_col", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                    ),
+                    then_label="short", evidence="<=2 -> short",
+                ),
+            ],
+            else_value="long",
+            label_domain=LabelDomain(values=["short", "long"]),
+        )
+        report = validator.validate(proposal, _make_test_spec())
+        assert not report.passed
+        assert any("nonexistent_col" in e for e in report.blocking_errors)
+
+
+class TestValidatorV1Coverage:
+
+    def test_missing_else_with_empty_evidence_not_passed(self):
+        """无 ELSE + evidence 为空 → HUMAN_REVIEW → passed=False。"""
+        validator = LabelRuleValidator()
+        proposal = LabelRuleProposal(
+            proposal_id="p1", source_spec_hash="h",
+            output_column="distance_category",
+            branches=[
+                LabelBranchProposal(
+                    condition=LabelCompare(
+                        left="distance_miles", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                    ),
+                    then_label="short", evidence="",
+                ),
+            ],
+            else_value="long",
+            label_domain=LabelDomain(values=["short", "long"]),
+        )
+        report = validator.validate(proposal, _make_test_spec())
+        coverage_checks = [c for c in report.checks if c.check_name == "COVERAGE"]
+        if coverage_checks:
+            assert any("evidence" in c.detail.lower() for c in coverage_checks
+                       if not c.passed)
+
+    def test_all_evidence_present_passes(self):
+        """全部 evidence 非空 + ELSE→passed=True。"""
+        validator = LabelRuleValidator()
+        proposal = LabelRuleProposal(
+            proposal_id="p1", source_spec_hash="h",
+            output_column="distance_category",
+            branches=[
+                LabelBranchProposal(
+                    condition=LabelCompare(
+                        left="distance_miles", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                    ),
+                    then_label="short", evidence="<=2 -> short",
+                ),
+            ],
+            else_value="long",
+            label_domain=LabelDomain(values=["short", "long"]),
+        )
+        report = validator.validate(proposal, _make_test_spec())
+        assert report.passed, f"blocking={report.blocking_errors}, review={report.human_review_items}"
+
+
+class TestValidatorV1DoubleEmpty:
+    """v4-light 最终版: passed 要求 blocking_errors 和 human_review_items 均为空。"""
+
+    def test_human_review_causes_fail(self):
+        """human_review_items 非空→即使 blocking 为空也 passed=False。"""
+        validator = LabelRuleValidator()
+        proposal = LabelRuleProposal(
+            proposal_id="p1", source_spec_hash="h",
+            output_column="distance_category",
+            branches=[
+                LabelBranchProposal(
+                    condition=LabelCompare(
+                        left="distance_miles", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                    ),
+                    then_label="short", evidence="",
+                ),
+            ],
+            else_value="long",
+            label_domain=LabelDomain(values=["short", "long"]),
+        )
+        report = validator.validate(proposal, _make_test_spec())
+        assert not report.passed, "human_review_items 非空时 passed 应为 False"
+
+
+class TestValidatorV1LabelDomain:
+
+    def test_label_outside_domain_blocks(self):
+        """then_label 不在 domain 中→BLOCKING。"""
+        validator = LabelRuleValidator()
+        proposal = LabelRuleProposal(
+            proposal_id="p1", source_spec_hash="h",
+            output_column="distance_category",
+            branches=[
+                LabelBranchProposal(
+                    condition=LabelCompare(
+                        left="distance_miles", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                    ),
+                    then_label="ultra_short",  # ← 不在 domain 中
+                    evidence="<=2 -> ultra_short",
+                ),
+            ],
+            else_value="long",
+            label_domain=LabelDomain(values=["short", "medium", "long"]),
+        )
+        report = validator.validate(proposal, _make_test_spec())
+        assert any("ultra_short" in e for e in report.blocking_errors)
