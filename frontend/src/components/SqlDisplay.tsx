@@ -4,14 +4,17 @@ interface Props {
   sql: string;
   sqlSha256: string;
   compilerVersion: string;
-  trace: ExecutionTraceSummary;
-  summary: ResultSummarySummary;
+  trace: ExecutionTraceSummary | null;
+  summary: ResultSummarySummary | null;
   visible: boolean;
 }
 
-/** SQL / SqlProgram 逐语句展示面板——含 SQL 文本、执行追踪和结果摘要 */
+/** SQL / SqlProgram 逐语句展示面板——含 SQL 文本、执行追踪和结果摘要。
+ *  兼容 trace / summary 为 null 的场景（管线执行失败时后端不返回这些字段）。 */
 export function SqlDisplay({ sql, sqlSha256, compilerVersion, trace, summary, visible }: Props) {
   if (!visible) return null;
+
+  const shaSnippet = (sqlSha256 || '').substring(0, 16);
 
   return (
     <div className="panel">
@@ -25,40 +28,44 @@ export function SqlDisplay({ sql, sqlSha256, compilerVersion, trace, summary, vi
 
       {/* SQL 元信息 */}
       <div className="sql-meta">
-        <span>Compiler: {compilerVersion}</span>
-        <span>SHA-256: {sqlSha256.substring(0, 16)}...</span>
+        <span>Compiler: {compilerVersion || '—'}</span>
+        <span>SHA-256: {shaSnippet || '—'}...</span>
       </div>
 
-      {/* 执行追踪 */}
+      {/* 执行追踪——trace 为 null 时展示占位信息 */}
       <div className="section-title">📊 执行追踪</div>
-      <div className="exec-result">
-        <div className="exec-stat">
-          <div className="ex-label">状态</div>
-          <div className="ex-value" style={{
-            color: trace.status === 'RUNTIME_PASS' ? 'var(--green)' :
-                   trace.status === 'RUNTIME_FAIL' ? 'var(--red)' : 'var(--text-muted)'
-          }}>
-            {trace.status}
+      {trace ? (
+        <div className="exec-result">
+          <div className="exec-stat">
+            <div className="ex-label">状态</div>
+            <div className="ex-value" style={{
+              color: trace.status === 'RUNTIME_PASS' ? 'var(--success)' :
+                     trace.status === 'RUNTIME_FAIL' ? 'var(--error)' : 'var(--text-dim)'
+            }}>
+              {trace.status || '—'}
+            </div>
           </div>
-        </div>
-        <div className="exec-stat">
-          <div className="ex-label">返回行数</div>
-          <div className="ex-value">{trace.row_count}</div>
-        </div>
-        <div className="exec-stat">
-          <div className="ex-label">执行耗时</div>
-          <div className="ex-value">{trace.execution_time_ms.toFixed(1)} ms</div>
-        </div>
-        {trace.error_message && (
-          <div className="exec-stat" style={{ gridColumn: '1 / -1' }}>
-            <div className="ex-label" style={{ color: 'var(--red)' }}>错误信息</div>
-            <div className="ex-value" style={{ fontSize: 12 }}>{trace.error_message}</div>
+          <div className="exec-stat">
+            <div className="ex-label">返回行数</div>
+            <div className="ex-value">{trace.row_count}</div>
           </div>
-        )}
-      </div>
+          <div className="exec-stat">
+            <div className="ex-label">执行耗时</div>
+            <div className="ex-value">{trace.execution_time_ms?.toFixed(1) ?? '—'} ms</div>
+          </div>
+          {trace.error_message && (
+            <div className="exec-stat" style={{ gridColumn: '1 / -1' }}>
+              <div className="ex-label" style={{ color: 'var(--error)' }}>错误信息</div>
+              <div className="ex-value" style={{ fontSize: 12 }}>{trace.error_message}</div>
+            </div>
+          )}
+        </div>
+      ) : (
+        <p className="spark-result-note">执行追踪不可用（管线执行失败）</p>
+      )}
 
-      {/* 结果摘要 */}
-      {summary.columns.length > 0 && (
+      {/* 结果摘要——summary 为 null 或 columns 为空时展示占位信息 */}
+      {summary && summary.columns.length > 0 ? (
         <>
           <div className="section-title">📋 结果摘要</div>
           <div className="exec-result">
@@ -98,6 +105,8 @@ export function SqlDisplay({ sql, sqlSha256, compilerVersion, trace, summary, vi
             </div>
           )}
         </>
+      ) : (
+        <p className="spark-result-note">结果摘要不可用</p>
       )}
     </div>
   );

@@ -500,7 +500,7 @@ export default function App() {
       </header>
 
       <div className="app-body">
-        <main className={`app-main${state.executeResult ? ' layout-executed' : ''}`}>
+        <main className={`app-main${state.executeResult?.generated_sql && !state.pipelineError ? ' layout-executed' : ''}`}>
           {/* 工具栏——始终在编辑器上方，不会被内容挡住 */}
           <div className="toolbar">
             <span className="toolbar-label">SQL</span>
@@ -778,6 +778,27 @@ export default function App() {
 
         {/* ── 右侧概览侧栏 ── */}
         <aside className="app-sidebar" id="app-sidebar">
+          {/* 错误信息卡——固定在侧栏顶部，始终可见 */}
+          {state.error && (
+            <div className="sidebar-card sidebar-error-card">
+              <div className="sidebar-card-header sidebar-error-header">
+                <span>❌ 错误</span>
+                <button
+                  className="sidebar-error-dismiss"
+                  onClick={clearError}
+                  title="关闭"
+                >✕</button>
+              </div>
+              <div className="sidebar-card-body sidebar-error-body">
+                <div className="sidebar-error-code">{state.error.error_code}</div>
+                <div className="sidebar-error-msg">{state.error.message}</div>
+                {state.error.field_ref && (
+                  <div className="sidebar-error-field">阶段: {state.error.field_ref}</div>
+                )}
+              </div>
+            </div>
+          )}
+
           <div className="sidebar-card">
             <div className="sidebar-card-header">🗂 解析摘要</div>
             <div className="sidebar-card-body">

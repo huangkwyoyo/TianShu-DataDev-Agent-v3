@@ -24,9 +24,9 @@ export function ErrorDisplay({ error, onDismiss }: Props) {
 
   const isPipelineError = error.error_code.startsWith('PIPELINE_');
 
-  const borderColor = isReject ? 'var(--red)' :
-    isNotFound ? 'var(--yellow)' :
-    isApiUnavailable ? 'var(--red)' : 'var(--border)';
+  const borderColor = isReject ? 'var(--error)' :
+    isNotFound ? 'var(--warning)' :
+    isApiUnavailable ? 'var(--error)' : 'var(--border)';
 
   return (
     <div className="error-display" style={{ borderColor }} data-testid="error-display">
@@ -43,7 +43,7 @@ export function ErrorDisplay({ error, onDismiss }: Props) {
           <div className="error-field">相关字段: {error.field_ref}</div>
         )}
         {isApiUnavailable && (
-          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+          <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 4 }}>
             请确认 API 服务已启动（uvicorn tianshu_datadev.api.app:create_app --reload）
           </div>
         )}
