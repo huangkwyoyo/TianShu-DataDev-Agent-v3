@@ -63,3 +63,51 @@ class TestSpecParse:
         data = resp.json()
         assert "pipeline_error" not in data
         assert "title" in data
+
+
+def test_parse_label_table_type():
+    """验证 YAML type: label_table → DatasetType.LABEL_TABLE。"""
+    from tianshu_datadev.developer_spec.models import DatasetType
+    from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
+
+    yaml_text = """```markdown
+---
+type: label_table
+title: 测试标签表
+description: 测试
+source_tables:
+  - name: test_table
+    alias: t
+    columns:
+      - name: col1
+        type: string
+output_columns:
+  - name: label_col
+    type: string
+---
+```"""
+    spec = DeveloperSpecParser().parse(yaml_text)
+    assert spec.dataset_type == DatasetType.LABEL_TABLE
+
+
+def test_parse_default_unspecified_type():
+    """未声明 type 时 → DatasetType.UNSPECIFIED。"""
+    from tianshu_datadev.developer_spec.models import DatasetType
+    from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
+
+    yaml_text = """```markdown
+---
+title: 测试
+source_tables:
+  - name: test_table
+    alias: t
+    columns:
+      - name: col1
+        type: string
+output_columns:
+  - name: col1
+    type: string
+---
+```"""
+    spec = DeveloperSpecParser().parse(yaml_text)
+    assert spec.dataset_type == DatasetType.UNSPECIFIED

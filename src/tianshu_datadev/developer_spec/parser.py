@@ -33,6 +33,7 @@ from .models import (
     ColumnDecl,
     ComputeStep,
     ComputeStepExpression,
+    DatasetType,
     DimensionDecl,
     FilterDecl,
     InferredComputedMetric,
@@ -244,12 +245,16 @@ class DeveloperSpecParser:
         self._validate_seven_rejections(spec_dict, input_tables, metrics, joins, output_spec)
         parse_warnings.extend(self._validate_six_allowances(spec_dict, input_tables, joins, time_range))
 
+        # 8.5 解析 dataset_type——YAML type 字段映射到 DatasetType 枚举
+        dataset_type = self._parse_dataset_type(spec_dict.get("type"))
+
         # 9. 构建 ParsedDeveloperSpec（spec_id/spec_hash 先占位，步骤 10 计算后回填）
         spec = ParsedDeveloperSpec(
             spec_id="",
             spec_hash="",  # 先占位，计算 hash 后再填入
             title=title,
             description=description,
+            dataset_type=dataset_type,
             input_tables=input_tables,
             metrics=metrics,
             dimensions=dimensions,
@@ -772,6 +777,23 @@ class DeveloperSpecParser:
             relative_range=relative_range,
             fiscal_year=fiscal_year,
         )
+
+    @staticmethod
+    def _parse_dataset_type(raw_type: str | None) -> DatasetType:
+        """将 YAML type 字段映射到 DatasetType 枚举。
+
+        label_table → LABEL_TABLE、aggregate_table → AGGREGATE_TABLE、
+        detail_table → DETAIL_TABLE。未知/缺失 → UNSPECIFIED。
+        """
+        if raw_type is None:
+            return DatasetType.UNSPECIFIED
+        type_str = str(raw_type).strip().lower()
+        type_map = {
+            "label_table": DatasetType.LABEL_TABLE,
+            "aggregate_table": DatasetType.AGGREGATE_TABLE,
+            "detail_table": DatasetType.DETAIL_TABLE,
+        }
+        return type_map.get(type_str, DatasetType.UNSPECIFIED)
 
     def _parse_output_spec(self, spec_dict: dict) -> OutputSpecDecl:
         """解析输出规格。
