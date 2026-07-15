@@ -1,54 +1,82 @@
 /* ═══════════════════════════════════════════════════════════════════════════
    TianShu DataDev Agent — 内部工作台
-   设计语言：终端/IDE 风格 — 全等宽字体、暗色、信息密集、去装饰
+   设计语言：深空仪器面板 — 天枢星导引的管线工程台
    ═══════════════════════════════════════════════════════════════════════════ */
 
 /* ── 设计令牌 ── */
 
 :root {
-  /* 背景层次 */
-  --bg:            #1a1b1e;
-  --bg-surface:    #222327;
-  --bg-elevated:   #2a2b2f;
-  --bg-input:      #1e1f22;
+  /* 背景层次——深空基调，逐层抬升 */
+  --bg:            #121316;
+  --bg-surface:    #1a1c21;
+  --bg-elevated:   #23262d;
+  --bg-active:     #2a2e37;
+  --bg-input:      #181a1e;
 
   /* 边框 */
-  --border:        #333538;
-  --border-focus:  #4d7eb3;
+  --border:        #2e313a;
+  --border-focus:  #6ba9f0;
 
-  /* 文字 */
-  --text:          #c8c8c8;
-  --text-dim:      #6a6a6a;
-  --text-faint:    #4a4a4a;
+  /* 文字——提高对比度，减少视觉疲劳 */
+  --text:          #e1e4ea;
+  --text-dim:      #a0a5b3;
+  --text-faint:    #6b7182;
 
-  /* 语义色 */
+  /* 语义色——保留色相，调整背景衬度 */
   --accent:        #6ba9f0;
-  --accent-bg:     #1a2a3a;
+  --accent-bg:     #1a2740;
   --success:       #7ec99c;
-  --success-bg:    #1a2a20;
+  --success-bg:    #163020;
   --error:         #e0556a;
-  --error-bg:      #2a1a1e;
+  --error-bg:      #2c1822;
   --warning:       #d9b44a;
-  --warning-bg:    #2a2418;
+  --warning-bg:    #2a2218;
 
-  /* 排版 */
+  /* 排版 — 双字体系统：UI 无衬线 + 代码等宽 */
+  --font-ui:       'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   --font-mono:     'Cascadia Code', 'JetBrains Mono', 'Fira Code', 'Consolas', 'SF Mono', monospace;
   --font-size-xs:  10px;
   --font-size-sm:  11px;
   --font-size:     12px;
   --font-size-lg:  13px;
-  --line-height:   1.55;
+  --font-size-xl:  14px;
+  --line-height:   1.6;
 
-  /* 间距 */
+  /* 间距——略微宽松 */
   --space-xs:      4px;
   --space-sm:      6px;
-  --space:         8px;
-  --space-md:      12px;
-  --space-lg:      16px;
+  --space:         10px;
+  --space-md:      14px;
+  --space-lg:      20px;
+  --space-xl:      28px;
 
-  /* 圆角——尽量尖锐，程序员风格 */
-  --radius:        2px;
-  --radius-sm:     1px;
+  /* 圆角——保留程序员风格 */
+  --radius:        3px;
+  --radius-sm:     2px;
+
+  /* 阴影——elevation 高度 */
+  --shadow-sm:     0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-md:     0 2px 8px rgba(0, 0, 0, 0.4);
+  --shadow-lg:     0 4px 16px rgba(0, 0, 0, 0.5);
+}
+
+/* ── 顶部状态条（全宽色条，指示整体状态） ── */
+
+.top-status-bar {
+  height: 3px;
+  flex-shrink: 0;
+  background: var(--border);
+  transition: background 0.3s ease;
+}
+.top-status-bar.status-idle   { background: var(--border); }
+.top-status-bar.status-ok     { background: var(--success); }
+.top-status-bar.status-error  { background: var(--error); }
+.top-status-bar.status-loading { background: var(--accent); animation: topbar-pulse 1.5s ease-in-out infinite; }
+.top-status-bar.status-warning { background: var(--warning); }
+
+@keyframes topbar-pulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
 }
 
 /* ── 重置 & 基础 ── */
@@ -97,13 +125,117 @@ pre, code, textarea, .code-block {
   background: var(--text-dim);
 }
 
-/* ── 布局 ── */
+/* ── 布局：头部 + 主体双栏 + 底栏 ── */
 
 .app {
   display: flex;
   flex-direction: column;
   height: 100vh;
   overflow: hidden;
+}
+
+.app-body {
+  flex: 1;
+  display: flex;
+  flex-direction: row;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.app-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: var(--space-md) var(--space-lg);
+  gap: var(--space);
+  min-width: 0;
+}
+
+/* ── 右侧概览侧栏（宽屏可见，窄屏折叠） ── */
+
+.app-sidebar {
+  width: 280px;
+  min-width: 280px;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  background: var(--bg-surface);
+  border-left: 1px solid var(--border);
+  padding: var(--space-md);
+  gap: var(--space);
+  flex-shrink: 0;
+}
+
+.sidebar-toggle {
+  display: none;  /* 宽屏隐藏 */
+}
+
+@media (max-width: 1200px) {
+  .app-sidebar {
+    display: none;
+  }
+  .sidebar-toggle {
+    display: inline-flex;  /* 窄屏显示切换按钮 */
+  }
+  /* 侧栏展开态——覆盖 */
+  .app-sidebar.sidebar-expanded-mobile {
+    display: flex;
+    position: fixed;
+    top: 0;
+    right: 0;
+    height: 100vh;
+    z-index: 300;
+    box-shadow: var(--shadow-lg);
+  }
+}
+
+/* ── 侧栏卡片 ── */
+
+.sidebar-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.sidebar-card-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  font-family: var(--font-ui);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+
+.sidebar-card-body {
+  padding: var(--space-sm) var(--space-md);
+}
+
+.sidebar-stat {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--space-xs) 0;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-sm);
+  color: var(--text-dim);
+}
+
+.sidebar-stat:not(:last-child) {
+  border-bottom: 1px solid var(--border);
+}
+
+.sidebar-stat-value {
+  color: var(--text);
+  font-weight: 600;
+  font-family: var(--font-mono);
+  font-size: var(--font-size);
 }
 
 /* ── 头部（工具栏风格） ── */
@@ -218,24 +350,6 @@ pre, code, textarea, .code-block {
   flex-shrink: 0;
 }
 
-/* ── 主体 ── */
-
-.app-body {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-
-.app-main {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  overflow-y: auto;
-  overflow-x: hidden;
-  padding: var(--space-md) var(--space-lg);
-  gap: var(--space);
-}
 
 /* ── 编辑区 ── */
 
@@ -396,7 +510,7 @@ pre, code, textarea, .code-block {
   border-color: transparent;
 }
 
-/* ── 面板系统 ── */
+/* ── 面板系统（含 elevation 层级） ── */
 
 .panel {
   background: var(--bg-surface);
@@ -405,22 +519,35 @@ pre, code, textarea, .code-block {
   overflow: hidden;
 }
 
+/* elevate L1→L2：浮起感 */
+.panel.panel-elevated {
+  box-shadow: var(--shadow-sm);
+}
+
+/* elevate L3：突出——当前活动面板 */
+.panel.panel-active {
+  border-left: 2px solid var(--accent);
+  box-shadow: var(--shadow-sm);
+}
+
+/* 普通面板头部 */
 .panel-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: var(--space-sm) var(--space-md);
-  height: 30px;
+  min-height: 32px;
   background: var(--bg);
   border-bottom: 1px solid var(--border);
   user-select: none;
 }
 
 .panel-header h3 {
-  font-family: var(--font-mono);
-  font-size: var(--font-size-sm);
+  font-family: var(--font-ui);
+  font-size: var(--font-size);
   font-weight: 600;
-  color: var(--text-dim);
+  color: var(--text);
+  letter-spacing: 0.01em;
 }
 
 .panel-body {
@@ -908,6 +1035,90 @@ pre, code, textarea, .code-block {
   border-color: var(--text-dim);
 }
 
+/* 管线星图——常驻可见 */
+.pipeline-star-chart {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  margin-right: var(--space-sm);
+}
+
+.pipeline-star-wrapper {
+  display: inline-flex;
+  align-items: center;
+}
+
+.pipeline-star {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border);
+  background: transparent;
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+
+.pipeline-star.star-ok {
+  background: var(--success);
+  border-color: var(--success);
+  box-shadow: 0 0 4px var(--success);
+}
+
+.pipeline-star.star-failed {
+  background: var(--error);
+  border-color: var(--error);
+  box-shadow: 0 0 4px var(--error);
+  animation: star-failed-pulse 1s ease-in-out infinite;
+}
+
+.pipeline-star.star-skipped {
+  border-color: var(--text-faint);
+  opacity: 0.4;
+}
+
+.pipeline-star.star-current {
+  border-color: var(--accent);
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
+  animation: star-current-pulse 1.5s ease-in-out infinite;
+}
+
+.pipeline-star.star-pending {
+  border-color: var(--border);
+  opacity: 0.35;
+}
+
+.pipeline-star-wrapper:hover .pipeline-star {
+  transform: scale(1.4);
+  border-color: var(--text-dim);
+}
+
+/* 星轨连接线 */
+.pipeline-star-connector {
+  display: inline-block;
+  width: 10px;
+  height: 1.5px;
+  background: var(--border);
+  margin: 0 2px;
+  flex-shrink: 0;
+}
+
+.pipeline-star-connector.connector-done {
+  background: var(--success);
+  opacity: 0.5;
+}
+
+@keyframes star-current-pulse {
+  0%, 100% { box-shadow: 0 0 6px var(--accent); opacity: 1; }
+  50% { box-shadow: 0 0 2px var(--accent); opacity: 0.7; }
+}
+
+@keyframes star-failed-pulse {
+  0%, 100% { box-shadow: 0 0 4px var(--error); }
+  50% { box-shadow: 0 0 1px var(--error); }
+}
+
 .pipeline-summary-text {
   font-size: var(--font-size-xs);
 }
@@ -1011,12 +1222,13 @@ pre, code, textarea, .code-block {
 /* ── 分区标题 ── */
 
 .section-title {
+  font-family: var(--font-ui);
   font-size: var(--font-size-xs);
   font-weight: 600;
   color: var(--text-faint);
   margin: var(--space-md) 0 var(--space-sm);
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.06em;
 }
 
 /* ── 加载指示 ── */

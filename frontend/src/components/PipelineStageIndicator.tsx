@@ -54,11 +54,10 @@ function stageIcon(status: string): string {
   }
 }
 
-/** 流水线阶段指示灯——右上角可点击折叠组件。
+/** 流水线阶段指示灯——管线星图风格。
  *
- * 折叠时显示一个圆点 + 简短状态文字（如"执行失败"）。
- * 点击展开显示各阶段详情，再次点击或点击外部收起。
- */
+ * 折叠时以管线/星轨形式展示各阶段状态，始终可见。
+ * 点击展开详情下拉。 */
 export function PipelineStageIndicator({ stages, error, title, testId }: Props) {
   const [expanded, setExpanded] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -81,12 +80,15 @@ export function PipelineStageIndicator({ stages, error, title, testId }: Props) 
   // 计算摘要信息
   const failedStage = stages.find(s => s.status === 'failed');
   const hasFailure = !!failedStage;
-  // 全部完成——所有阶段均为 ok 或 skipped（非失败终态）
   const allDone = stages.length > 0 && stages.every(s => s.status === 'ok' || s.status === 'skipped');
   const allOk = stages.length > 0 && stages.every(s => s.status === 'ok');
   const failedName = failedStage ? (STAGE_CN[failedStage.stage] || failedStage.stage) : '';
 
-  // 状态圆点颜色——skipped 是非失败完成态，应与 ok 同等对待
+  // 星轨状态：找出当前执行中的阶段（last non-ok/non-skipped）
+  const lastCompletedIdx = stages.reduce((max, s, i) =>
+    (s.status === 'ok' || s.status === 'skipped') ? i : max, -1);
+  const currentStageIdx = lastCompletedIdx + 1 < stages.length ? lastCompletedIdx + 1 : -1;
+
   const dotClass = hasFailure ? 'dot-error' : allDone ? 'dot-ok' : 'dot-loading';
   const summaryText = hasFailure ? `${failedName}失败` : allOk ? '全部成功' : allDone ? '已完成' : '处理中';
 
@@ -97,6 +99,24 @@ export function PipelineStageIndicator({ stages, error, title, testId }: Props) 
         onClick={() => setExpanded(!expanded)}
         title="点击查看流水线阶段详情"
       >
+        {/* 管线星轨——常驻可见 */}
+        <span className="pipeline-star-chart">
+          {stages.map((s, i) => (
+            <span key={s.stage} className="pipeline-star-wrapper">
+              {i > 0 && <span className={`pipeline-star-connector ${i <= lastCompletedIdx + 1 && !hasFailure ? 'connector-done' : ''}`} />}
+              <span
+                className={
+                  `pipeline-star ${s.status === 'ok' ? 'star-ok' : ''}` +
+                  `${s.status === 'failed' ? ' star-failed' : ''}` +
+                  `${s.status === 'skipped' ? ' star-skipped' : ''}` +
+                  `${i === currentStageIdx && s.status !== 'ok' && s.status !== 'failed' && s.status !== 'skipped' ? ' star-current' : ''}` +
+                  `${i > lastCompletedIdx + 1 || (i > lastCompletedIdx && hasFailure) ? ' star-pending' : ''}`
+                }
+                title={STAGE_CN[s.stage] || s.stage}
+              />
+            </span>
+          ))}
+        </span>
         <span className={`status-dot ${dotClass}`} />
         <span className="pipeline-summary-text">{summaryText}</span>
         <span className="pipeline-chevron">{expanded ? '▴' : '▾'}</span>

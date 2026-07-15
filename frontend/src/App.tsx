@@ -470,8 +470,17 @@ export default function App() {
 
   const hasContent = state.markdownText.trim().length > 0;
 
+  // ── 顶部状态条颜色 ──
+  const topStatusClass =
+    state.streamError || state.error ? 'status-error' :
+    state.isLoading || state.isStreaming ? 'status-loading' :
+    state.sparkStages.length > 0 && state.sparkStages.every(s => s.status === 'ok') ? 'status-ok' :
+    state.pipelineStages.length > 0 && state.pipelineStages.every(s => s.status === 'ok') && state.sparkStages.length === 0 ? 'status-ok' :
+    'status-idle';
+
   return (
     <div className="app">
+      <div className={`top-status-bar ${topStatusClass}`} />
       <header className="app-header">
         <span className="header-logo"><span>TianShu</span> DataDev</span>
         <TemplateSelector onSelect={handleLoadTemplate} />
@@ -689,6 +698,89 @@ export default function App() {
             )}
           </div>
         </main>
+
+        {/* ── 右侧概览侧栏 ── */}
+        <aside className="app-sidebar" id="app-sidebar">
+          <div className="sidebar-card">
+            <div className="sidebar-card-header">🗂 解析摘要</div>
+            <div className="sidebar-card-body">
+              <div className="sidebar-stat">
+                <span>表</span>
+                <span className="sidebar-stat-value">{state.specResult?.tables.length ?? '-'}</span>
+              </div>
+              <div className="sidebar-stat">
+                <span>指标</span>
+                <span className="sidebar-stat-value">{state.specResult?.metrics.length ?? '-'}</span>
+              </div>
+              <div className="sidebar-stat">
+                <span>维度</span>
+                <span className="sidebar-stat-value">{state.specResult?.dimensions.length ?? '-'}</span>
+              </div>
+              <div className="sidebar-stat">
+                <span>Join</span>
+                <span className="sidebar-stat-value">{state.specResult?.joins.length ?? '-'}</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="sidebar-card">
+            <div className="sidebar-card-header">📋 Plan</div>
+            <div className="sidebar-card-body">
+              <div className="sidebar-stat">
+                <span>步骤数</span>
+                <span className="sidebar-stat-value">{state.planResult?.step_count ?? '-'}</span>
+              </div>
+              <div className="sidebar-stat">
+                <span>验证</span>
+                <span className="sidebar-stat-value">
+                  {state.planResult === null ? '-' : state.planResult.validation_passed ? '✅ 通过' : '❌ 未通过'}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="sidebar-card">
+            <div className="sidebar-card-header">⚡ Spark</div>
+            <div className="sidebar-card-body">
+              <div className="sidebar-stat">
+                <span>阶段</span>
+                <span className="sidebar-stat-value">
+                  {state.sparkStages.length > 0 ? `${state.sparkStages.length}` : '-'}
+                </span>
+              </div>
+              <div className="sidebar-stat">
+                <span>整体状态</span>
+                <span className="sidebar-stat-value">
+                  {state.sparkVerifyResult === null ? '-' :
+                   state.sparkVerifyResult.overall_status === 'ALL_CONSISTENT' ? '✅ 一致' :
+                   state.sparkVerifyResult.overall_status ? state.sparkVerifyResult.overall_status : '-'}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="sidebar-card">
+            <div className="sidebar-card-header">📊 执行</div>
+            <div className="sidebar-card-body">
+              <div className="sidebar-stat">
+                <span>行数</span>
+                <span className="sidebar-stat-value">
+                  {state.executeResult?.execution_trace?.row_count != null
+                    ? state.executeResult.execution_trace.row_count.toLocaleString()
+                    : '-'}
+                </span>
+              </div>
+              <div className="sidebar-stat">
+                <span>耗时</span>
+                <span className="sidebar-stat-value">
+                  {state.executeResult?.execution_trace?.execution_time_ms != null
+                    ? `${(state.executeResult.execution_trace.execution_time_ms / 1000).toFixed(1)}s`
+                    : '-'}
+                </span>
+              </div>
+            </div>
+          </div>
+        </aside>
       </div>
 
       <footer className="status-bar">
