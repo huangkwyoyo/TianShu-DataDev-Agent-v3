@@ -50,6 +50,10 @@ def pytest_configure(config):
         os.makedirs(basetemp, exist_ok=True)
         config.option.basetemp = basetemp
 
+    # 所有 tempfile 调用收口到 D 盘（上限 10GB，超过自动清理旧文件）
+    from tianshu_datadev.temp_manager import ensure_temp_dir
+    ensure_temp_dir()
+
 
 def pytest_collection_modifyitems(config, items):
     """默认跳过 slow 和 harness 测试——除非显式传入对应选项。"""

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -552,8 +553,15 @@ def start_backend(project_root: Path, log_dir: Path) -> subprocess.Popen:
 
     日志写入 log_dir / backend.log。
     """
+    # 确保临时目录在 D 盘而非 C 盘（避免 C 盘空间被运行时文件占用）
+    _temp_dir = Path("D:/ProgramData/Temp")
+    _temp_dir.mkdir(parents=True, exist_ok=True)
+
     log_file = log_dir / "backend.log"
     log_fh = open(log_file, "w", encoding="utf-8")
+    # 继承当前环境变量并注入 TMPDIR——Python tempfile 模块会读取此变量
+    _env = os.environ.copy()
+    _env["TMPDIR"] = str(_temp_dir)
     proc = subprocess.Popen(
         [
             sys.executable, "-m", "uvicorn",
@@ -566,6 +574,7 @@ def start_backend(project_root: Path, log_dir: Path) -> subprocess.Popen:
         cwd=str(project_root),
         stdout=log_fh,
         stderr=subprocess.STDOUT,
+        env=_env,
     )
     log_fh.close()  # 子进程已通过 dup2 获得自己的 fd，可安全关闭父进程句柄
     return proc

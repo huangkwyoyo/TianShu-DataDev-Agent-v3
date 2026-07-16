@@ -159,6 +159,10 @@ def main(argv: list[str] | None = None) -> None:
     Args:
         argv: 命令行参数列表（默认 sys.argv[1:]）
     """
+    # 运行时临时目录收口到 D 盘（上限 10GB，超过自动清理旧文件）
+    from tianshu_datadev.temp_manager import ensure_temp_dir
+    ensure_temp_dir()
+
     parser = argparse.ArgumentParser(
         prog="tianshu",
         description="TianShu DataDev Agent — 内部交互验证 CLI",

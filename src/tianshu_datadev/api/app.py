@@ -137,6 +137,10 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
 
     logger = logging.getLogger(__name__)
 
+    # ── 运行时临时目录收口到 D 盘（上限 10GB，超过自动清理旧文件）──
+    from tianshu_datadev.temp_manager import ensure_temp_dir
+    ensure_temp_dir()
+
     # ── Phase 8: 加载 .env 环境变量 ──
     load_dotenv()
 
