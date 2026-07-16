@@ -2887,7 +2887,18 @@ class Pipeline:
             collector=collector,
         )
         if not parsed["ok"]:
-            return parsed["error_response"]
+            # 补齐前端 PlanRichResponse 所需的全部字段——缺失字段会导致 React 渲染崩溃
+            err = parsed["error_response"]
+            err.setdefault("spec_id", "")
+            err.setdefault("plan_id", "")
+            err.setdefault("step_count", 0)
+            err.setdefault("step_types", [])
+            err.setdefault("steps", [])
+            err.setdefault("multi_table", False)
+            err.setdefault("validation_passed", False)
+            err.setdefault("open_questions", [])
+            err.setdefault("join_evidence", [])
+            return err
         spec = parsed["spec"]
         manifest = parsed["manifest"]
         hypothesis = parsed["hypothesis"]
@@ -2918,6 +2929,13 @@ class Pipeline:
                 "request_id": request_id,
                 "spec_id": spec.spec_id,
                 "plan_id": plan.plan_id if plan is not None else "",
+                "step_count": 0,
+                "step_types": [],
+                "steps": [],
+                "multi_table": False,
+                "validation_passed": False,
+                "open_questions": [],
+                "join_evidence": [],
                 "pipeline_error": error_info,
                 "pipeline_stages": self._build_pipeline_stages("build", error_info),
             }
