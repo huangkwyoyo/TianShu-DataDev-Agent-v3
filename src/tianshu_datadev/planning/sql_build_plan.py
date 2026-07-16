@@ -1571,12 +1571,20 @@ class SqlBuildPlanBuilder:
 
         LabelTypedLiteral.value 类型为 str|Decimal|bool|None——
         Decimal 转换为 float 以兼容 SqlLiteral 类型约束。
+        LLM 可能输出 data_type="number" 但值为 JSON 字符串（如 "2"），
+        此时强制按 data_type 转换为数值——避免 SQL 中出现 '2' 代替 2。
         """
         from decimal import Decimal
 
         raw = lit.value
         if isinstance(raw, Decimal):
             return SqlLiteral(value=float(raw))
+        # LLM 经常输出 data_type="number" 但 value 为 JSON 字符串——强制按 data_type 转换
+        if lit.data_type == "number" and isinstance(raw, str):
+            try:
+                return SqlLiteral(value=float(raw))
+            except (ValueError, TypeError):
+                pass  # 转换失败时保留原始字符串——避免丢失数据
         return SqlLiteral(value=raw)
 
     @staticmethod

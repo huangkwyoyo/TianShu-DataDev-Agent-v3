@@ -206,6 +206,10 @@ class LLMGateway:
             )
 
         # ── 6. Schema 校验 ──
+        # Adapter 层会注入 _token_usage 元数据字段——Schema 校验前需剥离，
+        # 避免 StrictModel（extra="forbid"）因额外字段而拒绝校验。
+        # _token_usage 的值在构造 LlmResponse 时单独提取（见下方 raw_output.get("_token_usage")）。
+        _token_usage = raw_output.pop("_token_usage", {})
         validated, errors = self._validate_against_schema(
             raw_output=raw_output,
             schema_binding=template.schema_binding,
@@ -230,7 +234,7 @@ class LLMGateway:
                 parsed_json_ref=parsed_ref,
                 validation_status="valid",
                 validation_errors=[],
-                token_usage=raw_output.get("_token_usage", {}),
+                token_usage=_token_usage,
                 latency_ms=latency_ms,
             )
         else:
@@ -244,7 +248,7 @@ class LLMGateway:
                 parsed_json_ref=None,
                 validation_status="invalid",
                 validation_errors=errors,
-                token_usage=raw_output.get("_token_usage", {}),
+                token_usage=_token_usage,
                 latency_ms=latency_ms,
             )
 

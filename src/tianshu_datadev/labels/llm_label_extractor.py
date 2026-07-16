@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -20,6 +21,8 @@ from tianshu_datadev.labels.artifacts import LabelExtractionArtifact
 from tianshu_datadev.labels.label_extractor import LabelExtractor
 from tianshu_datadev.llm.gateway import LLMGateway
 from tianshu_datadev.llm.models import ArtifactRef, LlmRequest
+
+logger = logging.getLogger(__name__)
 
 
 class LlmLabelExtractor(LabelExtractor):
@@ -93,6 +96,20 @@ class LlmLabelExtractor(LabelExtractor):
             available_fields=json.dumps(available_fields, ensure_ascii=False),
         )
 
+        # 诊断日志——追踪标签提取失败根因
+        logger.info(
+            "LlmLabelExtractor: response.is_valid=%s, parsed_json_ref=%s, "
+            "validation_errors=%s, raw_response_ref=%s, latency_ms=%s, "
+            "unresolved_columns=%s, available_fields=%s",
+            response.is_valid,
+            response.parsed_json_ref,
+            response.validation_errors,
+            response.raw_response_ref,
+            response.latency_ms,
+            unresolved_columns,
+            available_fields,
+        )
+
         # 4. 从 response_root 读取结构化输出
         raw_proposals: list[LabelRuleProposal] = []
         if response.is_valid and response.parsed_json_ref is not None:
@@ -105,6 +122,20 @@ class LlmLabelExtractor(LabelExtractor):
                 raw_proposals = self._wrap_system_fields(
                     llm_output, spec.spec_hash,
                 )
+            else:
+                logger.warning(
+                    "LlmLabelExtractor: parsed_json_ref 文件不存在——%s", parsed_path,
+                )
+        elif not raw_proposals:
+            logger.warning(
+                "LlmLabelExtractor: raw_proposals 为空——"
+                "is_valid=%s, parsed_json_ref=%s, validation_errors=%s, "
+                "raw_response_ref=%s",
+                response.is_valid,
+                response.parsed_json_ref,
+                response.validation_errors,
+                response.raw_response_ref,
+            )
 
         # 5. 构造溯源 Artifact
         extraction_time = datetime.now(timezone.utc).isoformat()

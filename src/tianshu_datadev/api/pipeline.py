@@ -437,6 +437,16 @@ class Pipeline:
             )
 
         try:
+            # 诊断日志——追踪标签提取失败根因
+            _label_logger = logging.getLogger(__name__)
+            _label_logger.info(
+                "_handle_label_table: spec_id=%s, unresolved=%s, "
+                "description_len=%s, description_head=%s",
+                spec.spec_id,
+                unresolved,
+                len(spec.description),
+                spec.description[:300] if spec.description else "(empty)",
+            )
             proposals, extraction_artifact = self._label_extractor.extract(
                 spec, unresolved,
             )
