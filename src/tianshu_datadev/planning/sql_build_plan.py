@@ -18,7 +18,16 @@ from pydantic import Field
 
 from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer
 from tianshu_datadev.developer_spec.models import (
+    CompareOp,
+    DatasetType,
     InputTableDecl,
+    LabelAnd,
+    LabelCompare,
+    LabelIsNotNull,
+    LabelIsNull,
+    LabelNot,
+    LabelOr,
+    LabelTypedLiteral,
     OpenQuestion,
     ParsedDeveloperSpec,
     StrictModel,
@@ -42,6 +51,22 @@ from .models import (
 )
 from .relationship_hypothesis import RelationshipHypothesis
 from .temp_table import make_temp_name
+
+# ════════════════════════════════════════════
+# 异常类型
+# ════════════════════════════════════════════
+
+
+class DerivedColumnRuleMissingError(Exception):
+    """输出列无解析规则异常——禁止未解析输出列回退成物理 ColumnRef。
+
+    触发条件：output_spec 中的列既不是源表物理列，也不是指标/维度/窗口指标输出，
+    也不是 label_rules 的 output_column。
+
+    此异常为防御性编程——正常情况下，label_table 预处理应已将所有
+    未解析列转换为 label_rules。若此处抛出，说明 Pipeline 门禁未起作用。
+    """
+
 
 # ════════════════════════════════════════════
 # 8 Step 类型（strict Pydantic，extra="forbid"）
@@ -1426,13 +1451,280 @@ class SqlBuildPlanBuilder:
 
     # ── 单表路径 ──
 
+    # ── label_table 支持：CaseWhenStep 生成 ──
+
+    # CompareOp → PredicateOperator 映射表
+    _COMPARE_OP_MAP: dict[CompareOp, PredicateOperator] = {
+        CompareOp.EQ: PredicateOperator.EQ,
+        CompareOp.NEQ: PredicateOperator.NEQ,
+        CompareOp.GT: PredicateOperator.GT,
+        CompareOp.GTE: PredicateOperator.GTE,
+        CompareOp.LT: PredicateOperator.LT,
+        CompareOp.LTE: PredicateOperator.LTE,
+    }
+
+    def _predicate_from_label_node(
+        self, node, table_alias: str,
+    ) -> Predicate:
+        """将 LabelPredicateCondition AST 节点转换为 SQL Predicate。
+
+        递归处理 AND/OR/NOT 复合节点——LabelCompare/IsNull/IsNotNull 为叶子节点。
+
+        Args:
+            node: LabelPredicateCondition 子类实例
+            table_alias: 源表别名——用于 ColumnRef.table_ref
+
+        Returns:
+            Predicate——可放入 WhenBranch.condition 或嵌套 Predicate
+
+        Raises:
+            ValueError: 遇到不支持的节点类型
+        """
+        if isinstance(node, LabelCompare):
+            return self._predicate_from_compare(node, table_alias)
+        elif isinstance(node, LabelIsNull):
+            return self._predicate_from_is_null(node, table_alias)
+        elif isinstance(node, LabelIsNotNull):
+            return self._predicate_from_is_not_null(node, table_alias)
+        elif isinstance(node, LabelAnd):
+            return self._predicate_from_logical(
+                node.children, PredicateOperator.AND, table_alias,
+            )
+        elif isinstance(node, LabelOr):
+            return self._predicate_from_logical(
+                node.children, PredicateOperator.OR, table_alias,
+            )
+        elif isinstance(node, LabelNot):
+            raise ValueError(
+                "label_table v1 暂不支持 LabelNot——"
+                "LabelNot 应在 Validator 阶段被 NO_LABEL_NOT 检查拒绝，"
+                "此处抛出说明门禁未起作用。"
+            )
+        else:
+            raise ValueError(f"不支持的标签谓词节点类型: {type(node).__name__}")
+
+    def _predicate_from_compare(
+        self, node: LabelCompare, table_alias: str,
+    ) -> Predicate:
+        """将 LabelCompare 转换为 Predicate。"""
+        normalized = self._normalizer.normalize(node.left)
+        col_ref = ColumnRef(
+            table_ref=SafeIdentifier(table_alias),
+            column_name=SafeIdentifier(node.left),
+            normalized_name=SafeIdentifier(normalized),
+        )
+        op = self._COMPARE_OP_MAP.get(node.op)
+        if op is None:
+            raise ValueError(f"不支持的比较操作符: {node.op}")
+        sql_lit = self._literal_from_label(node.right)
+        return Predicate(left=col_ref, operator=op, right=sql_lit)
+
+    def _predicate_from_is_null(
+        self, node: LabelIsNull, table_alias: str,
+    ) -> Predicate:
+        """将 LabelIsNull 转换为 Predicate(IS_NULL)。"""
+        normalized = self._normalizer.normalize(node.column)
+        col_ref = ColumnRef(
+            table_ref=SafeIdentifier(table_alias),
+            column_name=SafeIdentifier(node.column),
+            normalized_name=SafeIdentifier(normalized),
+        )
+        return Predicate(left=col_ref, operator=PredicateOperator.IS_NULL)
+
+    def _predicate_from_is_not_null(
+        self, node: LabelIsNotNull, table_alias: str,
+    ) -> Predicate:
+        """将 LabelIsNotNull 转换为 Predicate(IS_NOT_NULL)。"""
+        normalized = self._normalizer.normalize(node.column)
+        col_ref = ColumnRef(
+            table_ref=SafeIdentifier(table_alias),
+            column_name=SafeIdentifier(node.column),
+            normalized_name=SafeIdentifier(normalized),
+        )
+        return Predicate(left=col_ref, operator=PredicateOperator.IS_NOT_NULL)
+
+    def _predicate_from_logical(
+        self,
+        children: list,
+        operator: PredicateOperator,
+        table_alias: str,
+    ) -> Predicate:
+        """将 AND/OR 子节点列表递归折叠为嵌套 Predicate。
+
+        两个子节点时：Predicate(left=left, operator=AND/OR, right=right)
+        超过两个时：左结合折叠——((a AND b) AND c)
+        """
+        if len(children) < 2:
+            raise ValueError(
+                f"{operator.value} 至少需要 2 个子节点，实际 {len(children)}"
+            )
+        preds = [self._predicate_from_label_node(c, table_alias) for c in children]
+        # 左结合折叠
+        result = preds[0]
+        for p in preds[1:]:
+            result = Predicate(left=result, operator=operator, right=p)
+        return result
+
+    @staticmethod
+    def _literal_from_label(lit: LabelTypedLiteral) -> SqlLiteral:
+        """将 LabelTypedLiteral 转换为 SqlLiteral。
+
+        LabelTypedLiteral.value 类型为 str|Decimal|bool|None——
+        Decimal 转换为 float 以兼容 SqlLiteral 类型约束。
+        """
+        from decimal import Decimal
+
+        raw = lit.value
+        if isinstance(raw, Decimal):
+            return SqlLiteral(value=float(raw))
+        return SqlLiteral(value=raw)
+
+    @staticmethod
+    def _collect_label_condition_columns(node, collected: set[str]) -> None:
+        """递归收集 LabelPredicateCondition 树中所有列引用。
+
+        Args:
+            node: LabelPredicateCondition 子类实例
+            collected: 输出集合——收集到的列名加入此集合
+        """
+        if isinstance(node, LabelCompare):
+            collected.add(node.left)
+        elif isinstance(node, (LabelIsNull, LabelIsNotNull)):
+            collected.add(node.column)
+        elif isinstance(node, (LabelAnd, LabelOr)):
+            for child in node.children:
+                SqlBuildPlanBuilder._collect_label_condition_columns(child, collected)
+        elif isinstance(node, LabelNot):
+            SqlBuildPlanBuilder._collect_label_condition_columns(node.child, collected)
+
+    def _build_case_when_steps(self, spec: ParsedDeveloperSpec) -> list:
+        """从 spec.label_rules 生成 CaseWhenStep 列表。
+
+        每一条 CaseWhenDecl 生成一个独立的 CaseWhenStep——
+        放在 AggregateStep（如果有）之后、ProjectStep 之前。
+
+        每个 typed_branch 的 condition（LabelPredicateCondition）被转换为
+        Predicate，then_label 被转换为 SqlLiteral。
+
+        Args:
+            spec: 已解析的 DeveloperSpec——label_rules 非空时才生成步骤
+
+        Returns:
+            CaseWhenStep 列表——label_rules 为空时返回空列表
+        """
+        steps: list = []
+        table_alias = spec.input_tables[0].table_alias
+
+        for rule in spec.label_rules:
+            cases: list[WhenBranch] = []
+            for tb in rule.typed_branches:
+                predicate = self._predicate_from_label_node(
+                    tb.condition, table_alias,
+                )
+                result = SqlLiteral(value=tb.then_label)
+                cases.append(WhenBranch(condition=predicate, result=result))
+
+            else_val = SqlLiteral(value=rule.else_value)
+
+            step_id_content = {
+                "output_column": rule.output_column,
+                "branch_count": len(cases),
+            }
+            step = CaseWhenStep(
+                step_id=SqlBuildPlan.generate_step_id("case_when", step_id_content),
+                cases=cases,
+                else_value=else_val,
+                alias=SafeIdentifier(rule.output_column),
+            )
+            steps.append(step)
+
+        return steps
+
+    # ── 单表路径 ──
+
+    def _assert_all_output_columns_resolved(
+        self,
+        spec: ParsedDeveloperSpec,
+    ) -> None:
+        """防御性检查——label_table 所有输出列必须有解析规则。
+
+        仅对 DatasetType.LABEL_TABLE 执行——其他类型走原有指标/维度/物理列逻辑。
+        复用 _find_unresolved_derived_columns() 避免重复维护六类字段收集逻辑。
+
+        先调 validate_label_table_v1_scope 统一门禁（单表、非聚合、禁止 NOT），
+        再调 resolver 检查是否仍有未解析列。
+
+        Args:
+            spec: 已解析的 DeveloperSpec
+
+        Raises:
+            DerivedColumnRuleMissingError: 存在未解析的输出列或作用域约束违反
+        """
+        if spec.dataset_type != DatasetType.LABEL_TABLE:
+            return
+
+        from tianshu_datadev.labels.label_scope import (
+            LabelScopeError,
+            validate_label_table_v1_scope,
+        )
+        from tianshu_datadev.labels.resolver import _find_unresolved_derived_columns
+
+        # 1. 作用域门禁——单表、非聚合、禁止 NOT
+        try:
+            validate_label_table_v1_scope(spec)
+        except LabelScopeError as exc:
+            raise DerivedColumnRuleMissingError(
+                f"label_table v1 作用域约束违反——{exc}"
+            ) from exc
+
+        # 2. 复用 resolver 检查未解析列（已在 labels/resolver.py 中维护六类来源）
+        unresolved_output = _find_unresolved_derived_columns(spec)
+
+        if unresolved_output:
+            raise DerivedColumnRuleMissingError(
+                f"输出列无解析规则——以下列既不是源表物理列，也不是指标/维度/窗口指标/计算步骤/标签规则输出: "
+                f"{unresolved_output}。"
+                f"label_table 预处理应已将所有未解析列转换为 label_rules——"
+                f"此处抛出说明 Pipeline 门禁未起作用，禁止回退为物理 ColumnRef。"
+            )
+
     def _build_single_table(self, spec: ParsedDeveloperSpec) -> list[StepNode]:
-        """单表构建：Scan → (Filter*) → (Aggregate) → (Window) → Project → (Sort) → (Limit)。"""
+        """单表构建：Scan → (Filter*) → (Aggregate) → (CaseWhen*) → (Window) → Project → (Sort) → (Limit)。
+
+        label_table 类型：CaseWhenStep 在 Aggregate 之后、Window 之前插入——
+        标签列由 CASE WHEN 表达式计算，不从源表直接投影。
+        """
         steps: list[StepNode] = []
         table = spec.input_tables[0]
 
+        # 收集标签输出列名——这些列由 CaseWhenStep 产生，不应出现在 Scan/Project 中
+        label_output_columns: set[str] = {
+            rule.output_column for rule in spec.label_rules
+        }
+        # 收集标签条件中引用的源列——需加入 Scan
+        label_source_columns: set[str] = set()
+        for rule in spec.label_rules:
+            for tb in rule.typed_branches:
+                self._collect_label_condition_columns(tb.condition, label_source_columns)
+
         # 1. ScanStep——构建 required_columns
         scan_cols = self._build_required_columns(table.table_alias, spec)
+        # 排除标签输出列（它们不是物理列）并追加标签源列
+        scan_cols = [
+            c for c in scan_cols
+            if c.column_name not in label_output_columns
+        ]
+        # 追加标签条件引用的源列（如果尚未在列表中）
+        existing_norm = {c.normalized_name for c in scan_cols}
+        for src_col in sorted(label_source_columns):
+            norm = self._normalizer.normalize(src_col)
+            if norm not in existing_norm:
+                existing_norm.add(norm)
+                scan_cols.append(ColumnRef(
+                    table_ref=SafeIdentifier(table.table_alias),
+                    column_name=SafeIdentifier(src_col),
+                    normalized_name=SafeIdentifier(norm),
+                ))
         scan = ScanStep(
             step_id=SqlBuildPlan.generate_step_id("scan", {"table": table.source_table}),
             table_ref=table.table_alias,
@@ -1455,18 +1747,30 @@ class SqlBuildPlanBuilder:
             agg = self._build_aggregate_step(spec, table.table_alias)
             steps.append(agg)
 
-        # 3b. WindowStep——如果有窗口指标（聚合后、投影前）
+        # 3b. CaseWhenSteps——label_table 标签列生成（聚合后、窗口前）
+        case_when_steps = self._build_case_when_steps(spec)
+        steps.extend(case_when_steps)
+
+        # 3c. WindowStep——如果有窗口指标（聚合后、投影前）
         window = self._build_window_step(spec, table.table_alias)
         if window:
             steps.append(window)
 
-        # 4. ProjectStep——输出列（排除窗口函数已产出的别名）
+        # ── 防御性检查：label_table 输出列必须有解析规则——禁止回退成物理 ColumnRef ──
+        self._assert_all_output_columns_resolved(spec)
+
+        # 4. ProjectStep——输出列（排除窗口函数已产出的别名 + 标签列）
         project = self._build_project_step(spec)
+        excluded_aliases: set[str] = set()
         if window:
-            win_aliases = {str(w.alias) for w in window.window_exprs if w.alias}
+            excluded_aliases.update(
+                str(w.alias) for w in window.window_exprs if w.alias
+            )
+        excluded_aliases.update(label_output_columns)
+        if excluded_aliases:
             filtered_cols = [
                 c for c in project.columns
-                if c.alias not in win_aliases
+                if c.alias not in excluded_aliases
             ]
             project = ProjectStep(
                 step_id=project.step_id,

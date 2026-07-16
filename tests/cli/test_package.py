@@ -4,8 +4,6 @@ import json
 import subprocess
 import sys
 
-import pytest
-
 
 class TestCliPackage:
     """tianshu package <request_id>——获取 ReviewPackage 信息。"""

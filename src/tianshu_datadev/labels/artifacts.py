@@ -60,8 +60,9 @@ class LabelPromotionArtifact(StrictModel):
     """
 
     artifact_id: str  # 唯一标识
-    parent_spec_hash: str  # 源 Spec 的哈希
-    new_spec_hash: str  # 提升后的新 Spec 哈希
+    parent_spec_hash: str  # 源 Spec 的哈希——保留不变，用于关联原始 Spec
+    new_spec_hash: str  # 提升后的 Spec 哈希——当前与 parent_spec_hash 相同
+    promoted_rules_hash: str = ""  # 提升规则的独立哈希——从 promoted_rules 列表计算
     promotion_time: str  # ISO 8601 提升时间戳
     extraction_artifact_id: str  # 关联的 LabelExtractionArtifact.artifact_id
     promoted_rules: list[CaseWhenDecl] = []  # 成功提升的 CaseWhenDecl 列表

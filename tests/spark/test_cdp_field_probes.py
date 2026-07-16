@@ -265,7 +265,8 @@ class TestSparkFieldProbes:
 
     def test_builtin_int64_to_string(self):
         """Spark CAST(bigint AS string) 产出 "42"。"""
-        from pyspark.sql import SparkSession, functions as F
+        from pyspark.sql import SparkSession
+        from pyspark.sql import functions as F
 
         spark = SparkSession.builder.master("local[1]").appName("cdp-test").getOrCreate()
         result = (
@@ -277,7 +278,8 @@ class TestSparkFieldProbes:
 
     def test_builtin_boolean_to_string(self):
         """Spark CAST(boolean AS string) 产出 "true"/"false"。"""
-        from pyspark.sql import SparkSession, functions as F
+        from pyspark.sql import SparkSession
+        from pyspark.sql import functions as F
 
         spark = SparkSession.builder.master("local[1]").appName("cdp-test").getOrCreate()
         true_result = (
@@ -294,7 +296,8 @@ class TestSparkFieldProbes:
 
         此差异表明 builder 必须用 CASE WHEN 做小写转换。
         """
-        from pyspark.sql import SparkSession, functions as F
+        from pyspark.sql import SparkSession
+        from pyspark.sql import functions as F
 
         spark = SparkSession.builder.master("local[1]").appName("cdp-test").getOrCreate()
         result = (
@@ -309,7 +312,8 @@ class TestSparkFieldProbes:
 
         CDP v1 要求 "inf"/"-inf"，builder 必须用 CASE WHEN 转换。
         """
-        from pyspark.sql import SparkSession, functions as F
+        from pyspark.sql import SparkSession
+        from pyspark.sql import functions as F
 
         spark = SparkSession.builder.master("local[1]").appName("cdp-test").getOrCreate()
         pos = (
@@ -327,7 +331,8 @@ class TestSparkFieldProbes:
 
     def test_builtin_float_neg_zero_to_string(self):
         """Spark CAST(-0.0 AS string) 产出 "-0.0"——与 CDP v1 一致。"""
-        from pyspark.sql import SparkSession, functions as F
+        from pyspark.sql import SparkSession
+        from pyspark.sql import functions as F
 
         spark = SparkSession.builder.master("local[1]").appName("cdp-test").getOrCreate()
         result = (
@@ -339,7 +344,8 @@ class TestSparkFieldProbes:
 
     def test_builtin_float_pos_zero_to_string(self):
         """Spark CAST(0.0 AS string) 产出 "0.0"——与 CDP v1 一致。"""
-        from pyspark.sql import SparkSession, functions as F
+        from pyspark.sql import SparkSession
+        from pyspark.sql import functions as F
 
         spark = SparkSession.builder.master("local[1]").appName("cdp-test").getOrCreate()
         result = (
@@ -355,7 +361,8 @@ class TestSparkFieldProbes:
         struct.pack(">I", 2) → b'\\x00\\x00\\x00\\x02'。
         此探针证明 Python UDF 能完成 Spark 内置函数无法可靠完成的二进制打包。
         """
-        from pyspark.sql import SparkSession, functions as F
+        from pyspark.sql import SparkSession
+        from pyspark.sql import functions as F
         from pyspark.sql.types import BinaryType
 
         spark = SparkSession.builder.master("local[1]").appName("cdp-test").getOrCreate()
@@ -373,7 +380,8 @@ class TestSparkFieldProbes:
 
     def test_udf_4byte_be_null_prefix(self):
         """Spark UDF 产出 NULL 4B BE 前缀 = b'\\xff\\xff\\xff\\xff'。"""
-        from pyspark.sql import SparkSession, functions as F
+        from pyspark.sql import SparkSession
+        from pyspark.sql import functions as F
         from pyspark.sql.types import BinaryType
 
         spark = SparkSession.builder.master("local[1]").appName("cdp-test").getOrCreate()
@@ -391,7 +399,8 @@ class TestSparkFieldProbes:
 
     def test_udf_field_encode_int64_42(self):
         """Spark UDF 完整字段编码 INT64 42 → G2。"""
-        from pyspark.sql import SparkSession, functions as F
+        from pyspark.sql import SparkSession
+        from pyspark.sql import functions as F
         from pyspark.sql.types import BinaryType
 
         spark = SparkSession.builder.master("local[1]").appName("cdp-test").getOrCreate()
@@ -412,7 +421,8 @@ class TestSparkFieldProbes:
 
     def test_udf_field_encode_null_int64(self):
         """Spark UDF 完整字段编码 NULL INT64 → G3。"""
-        from pyspark.sql import SparkSession, functions as F
+        from pyspark.sql import SparkSession
+        from pyspark.sql import functions as F
         from pyspark.sql.types import BinaryType
 
         spark = SparkSession.builder.master("local[1]").appName("cdp-test").getOrCreate()
@@ -433,7 +443,8 @@ class TestSparkFieldProbes:
 
     def test_udf_field_encode_boolean_true(self):
         """Spark UDF 完整字段编码 BOOLEAN true → G4 true。"""
-        from pyspark.sql import SparkSession, functions as F
+        from pyspark.sql import SparkSession
+        from pyspark.sql import functions as F
         from pyspark.sql.types import BinaryType
 
         spark = SparkSession.builder.master("local[1]").appName("cdp-test").getOrCreate()
@@ -452,7 +463,8 @@ class TestSparkFieldProbes:
 
     def test_udf_field_encode_boolean_false(self):
         """Spark UDF 完整字段编码 BOOLEAN false → G4 false。"""
-        from pyspark.sql import SparkSession, functions as F
+        from pyspark.sql import SparkSession
+        from pyspark.sql import functions as F
         from pyspark.sql.types import BinaryType
 
         spark = SparkSession.builder.master("local[1]").appName("cdp-test").getOrCreate()

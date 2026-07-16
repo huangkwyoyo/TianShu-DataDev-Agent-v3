@@ -142,7 +142,7 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
 
     # ── Phase 8: 创建 SparkDeveloperService（API Key preflight）──
     spark_developer_service = None
-    api_key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
     if api_key:
         try:
             adapter = AnthropicAdapter()
@@ -158,26 +158,31 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
             )
     else:
         logger.info(
-            "未检测到 DEEPSEEK_API_KEY 或 ANTHROPIC_API_KEY——"
+            "未检测到 DEEPSEEK_API_KEY——"
             "SparkDeveloperService 跳过，DEVELOPER 阶段将标记 SKIPPED"
         )
 
     # ── v4-light 最终版: 创建 LlmLabelExtractor（label_table 支持）──
+    # LabelExtractor 与 SparkDeveloperService **独立初始化**——
+    # 两者分别基于 API Key 创建，互不依赖对方成功与否。
     llm_label_extractor = None
-    if api_key and spark_developer_service is not None:
+    if api_key:
         try:
-            from tianshu_datadev.llm.gateway import LLMGateway
             from tianshu_datadev.labels.llm_label_extractor import LlmLabelExtractor
+            from tianshu_datadev.llm.gateway import LLMGateway
+            # 为 LabelExtractor 创建独立的 Adapter 实例——
+            # 不与 SparkDeveloperService 共享 Adapter 状态
+            label_adapter = AnthropicAdapter()
             llm_gateway = LLMGateway(
-                adapter=adapter,
-                prompt_manager=prompt_manager,
+                adapter=label_adapter,
+                prompt_manager=PromptManager(),
                 response_root="llm_responses",
             )
             llm_label_extractor = LlmLabelExtractor(gateway=llm_gateway)
             logger.info("LlmLabelExtractor 初始化成功——label_table 请求将调用 LLM 提取标签")
         except Exception as exc:
             logger.warning("LlmLabelExtractor 创建失败: %s", exc)
-    elif not api_key:
+    else:
         logger.info(
             "未检测到 API Key——label_table 请求将返回 CONFIG_ERROR"
             "（禁止回退 Fake）"
@@ -221,6 +226,7 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
                 default_table_paths=fixture_paths,
                 duckdb_path=db_path,
                 developer_service=spark_developer_service,
+                label_extractor=llm_label_extractor,
             )
             # ── 注入 SnapshotBuilder + SnapshotSourceProvider（仅当存在显式配置时）──
             # 白名单仅来自显式发现的 CSV fixture 文件，禁止自动扫描目录全量加入
@@ -229,11 +235,10 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
             pipeline = Pipeline(
                 duckdb_path=db_path,
                 developer_service=spark_developer_service,
+                label_extractor=llm_label_extractor,
             )
     app.state.pipeline = pipeline
     app.state.spark_developer_service = spark_developer_service
-    # ── v4-light 最终版: 注入 LlmLabelExtractor 到 Pipeline ──
-    pipeline._label_extractor = llm_label_extractor
 
     # 注册异常处理器
     register_error_handlers(app)

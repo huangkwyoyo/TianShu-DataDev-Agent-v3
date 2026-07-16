@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 
+from tests._test_utils import read_fixture
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
 from tianshu_datadev.planning.models import (
     AggregateSpec,
@@ -32,8 +33,6 @@ from tianshu_datadev.planning.sql_build_plan import (
 )
 from tianshu_datadev.sql.models import PerfSeverity
 from tianshu_datadev.sql.perf_validator import PerfValidator
-from tests._test_utils import read_fixture
-
 
 # ── 辅助 ──
 

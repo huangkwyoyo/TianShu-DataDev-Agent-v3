@@ -42,6 +42,9 @@ frontend/test-results/
 # 真实 LLM 回归验证报告输出
 llm_reports/
 
+# LLM 响应文件——测试和生产均不应追踪
+llm_responses/
+
 # dev-reload 启动日志——忽略目录下所有内容，但保留 .gitkeep
 logs/dev/*
 !logs/dev/.gitkeep

@@ -16,19 +16,19 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from tianshu_datadev.cre_models import CreShadowReport
 
+from tianshu_datadev.api.streaming import _sanitize_stream_error
 from tianshu_datadev.api.templates import TEMPLATES
 from tianshu_datadev.artifacts.contract_extractor import DataTransformContractExtractor
 from tianshu_datadev.artifacts.packager import PackageInputs, ReviewPackageBuilder
 from tianshu_datadev.developer_spec.models import (
+    DatasetType,
     ParsedDeveloperSpec,
     StrictModel,
 )
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
-from tianshu_datadev.developer_spec.models import DatasetType
 from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
 from tianshu_datadev.labels.resolver import _find_unresolved_derived_columns
 from tianshu_datadev.llm.models import LlmResponse, LlmTraceNode
-from tianshu_datadev.api.streaming import TeeCollector, _sanitize_stream_error
 from tianshu_datadev.monitor import get_collector
 from tianshu_datadev.planning.cross_validator import cross_validate
 from tianshu_datadev.planning.program_factory import (
@@ -169,6 +169,16 @@ class PipelineArtifactBundle(StrictModel):
     program_cleanup_error: str | None = None     # cleanup 阶段的错误信息（成功时为空）
 
 
+class LabelTableConfigError(Exception):
+    """label_table 配置或提取失败——禁止静默回退，必须返回结构化错误。
+
+    触发条件：
+    - label_extractor 未注入（缺少 API Key）
+    - LLM 调用异常
+    - LLM 未返回任何标签规则候选
+    """
+
+
 class Pipeline:
     """执行流水线——确定性串联全部 6 个组件。
 
@@ -196,6 +206,8 @@ class Pipeline:
         duckdb_path: str | None = None,
         # ── Phase 8: SparkDeveloperService 注入（可选）──
         developer_service=None,  # SparkDeveloperService | None，None → SKIPPED
+        # ── v4-light 最终版: LabelExtractor 注入（label_table 必需）──
+        label_extractor=None,  # LabelExtractor | None——None 时 label_table 请求报错
     ):
         """初始化流水线。
 
@@ -207,6 +219,8 @@ class Pipeline:
                                  table_paths 时使用此回退值。E2E 测试环境用。
             duckdb_path: 外部 DuckDB 数据库文件路径——ATTACH 后自动创建 schema VIEW
                          桥接，使模板引用的 gold/silver 表可直接查询
+            label_extractor: 标签提取器——label_table 类型 Spec 的处理入口。
+                            None 时 label_table 请求返回结构化错误（禁止静默回退）。
         """
         self._base_output_dir = base_output_dir
         self._results: dict[str, dict] = {}  # request_id → 内部产物
@@ -225,10 +239,14 @@ class Pipeline:
         self._duckdb_path = duckdb_path
         # ── Phase 8: SparkDeveloperService 注入 ──
         self._spark_developer_service = developer_service
+        # ── v4-light 最终版: LabelExtractor 注入 ──
+        self._label_extractor = label_extractor
         # ── Spark 阶段独立触发——上下文缓存 ──
         self._spark_contexts: dict[str, SparkStageContext] = {}
         # ── LLM 调用追踪（request-scoped cache）──
         self._llm_traces: dict[str, dict[str, LlmTraceNode]] = {}
+        # ── 标签 Artifact 追踪——独立存储，不被 _store_result 覆盖 ──
+        self._label_artifacts: dict[str, dict] = {}
 
     def inject_snapshot_deps(
         self,
@@ -280,6 +298,7 @@ class Pipeline:
             self._timestamps.pop(rid, None)
             self._llm_traces.pop(rid, None)
             self._spark_contexts.pop(rid, None)
+            self._label_artifacts.pop(rid, None)
         if expired_ids:
             logger.debug("TTL 过期清理完成，移除 %d 条缓存", len(expired_ids))
         return len(expired_ids)
@@ -334,6 +353,21 @@ class Pipeline:
             return None
         return dict(traces)
 
+    def get_label_artifacts(self, request_id: str) -> dict | None:
+        """获取指定 request_id 的标签提取和提升 Artifact。
+
+        供 API 响应追溯用——返回 extraction 和 promotion artifact。
+        仅 label_table 类型 Spec 才有此数据。
+
+        Args:
+            request_id: Pipeline 请求 ID
+
+        Returns:
+            {"extraction": LabelExtractionArtifact, "promotion": LabelPromotionArtifact}
+            或 None（无标签数据时）
+        """
+        return self._label_artifacts.get(request_id)
+
     def _record_trace(
         self,
         request_id: str,
@@ -371,51 +405,150 @@ class Pipeline:
 
         仅处理 dataset_type == LABEL_TABLE 的 Spec。
         其他类型直接返回原 spec。
+
+        Raises:
+            LabelTableConfigError: label_table 缺少配置、提取失败或无候选规则——
+                                   禁止静默回退，必须返回结构化错误
         """
         if spec.dataset_type != DatasetType.LABEL_TABLE:
             return spec
 
-        # 1. 查找未解析的派生列
+        # 1. 查找未解析的派生列——全部已解析（如 compute_steps）则无需标签提取
         unresolved = _find_unresolved_derived_columns(spec)
         if not unresolved:
             return spec
 
-        # 2. 尝试标签提取
-        label_extractor = getattr(self, "_label_extractor", None)
-        if label_extractor is None:
-            return spec
+        # ── 2. label_table v1 作用域门禁——仅标签提取链路需要校验 ──
+        from tianshu_datadev.labels.label_scope import (
+            LabelScopeError,
+            validate_label_table_v1_scope,
+        )
+        try:
+            validate_label_table_v1_scope(spec)
+        except LabelScopeError as exc:
+            raise LabelTableConfigError(str(exc)) from exc
+
+        # 3. 标签提取——缺少配置时禁止静默回退
+        if self._label_extractor is None:
+            raise LabelTableConfigError(
+                "label_table 请求需要 LlmLabelExtractor，但未配置——"
+                "请设置 DEEPSEEK_API_KEY 环境变量，"
+                "或通过 Pipeline(label_extractor=...) 注入"
+            )
 
         try:
-            proposals, extraction_artifact = label_extractor.extract(
+            proposals, extraction_artifact = self._label_extractor.extract(
                 spec, unresolved,
             )
-        except Exception:
-            return spec
+        except LabelTableConfigError:
+            raise
+        except Exception as exc:
+            raise LabelTableConfigError(
+                f"标签提取失败——LLM 调用异常: {exc}"
+            ) from exc
 
         if not proposals:
-            return spec
+            raise LabelTableConfigError(
+                "标签提取失败——LLM 未返回任何标签规则候选，"
+                "请检查项目书正文是否包含标签分类逻辑"
+            )
 
-        # 3. 逐条验证
+        # 4. 逐条验证
         from tianshu_datadev.labels.label_rule_validator import LabelRuleValidator
         validator = LabelRuleValidator()
         reports = [validator.validate(p, spec) for p in proposals]
 
-        # 4. Promotion——双空阻断
+        # 5. Promotion——双空阻断
         from tianshu_datadev.labels.promotion import Promotion
         promoter = Promotion()
         promoted_rules, promotion_artifact = promoter.promote(
             spec.spec_hash, proposals, reports, extraction_artifact,
         )
 
-        # 5. 将 CaseWhenDecl 附加到 spec.label_rules
-        for case_when in promoted_rules:
-            # 找到对应的 Proposal 以获取 proposal_id
-            for proposal in proposals:
-                if proposal.output_column == case_when.output_column:
-                    spec.label_rules.append(proposal)
-                    break
+        # 6. 先保存 artifacts——确保门禁失败时仍可追溯提取和提升过程
+        request_id = self._gen_request_id(spec)
+        self._label_artifacts[request_id] = {
+            "extraction": extraction_artifact,
+            "promotion": promotion_artifact,
+        }
+
+        # 7. 标签规则集合门禁——promoted output 必须与 unresolved 完全一致
+        self._validate_label_rule_set(promoted_rules, unresolved)
+
+        # 8. 将 CaseWhenDecl 直接附加到 spec.label_rules——不追加 Proposal
+        spec.label_rules.extend(promoted_rules)
+
+        # 9. Promotion 后重新运行 resolver——仍有未解析列则结构化阻断
+        unresolved_after = _find_unresolved_derived_columns(spec)
+        if unresolved_after:
+            raise LabelTableConfigError(
+                "标签提升后仍存在未解析输出列——"
+                f"已提升 {len(promoted_rules)} 条规则，"
+                f"但以下列仍未解析: {unresolved_after}。"
+                "请检查 promoted_rules 的 output_column 是否覆盖了所有输出列。"
+            )
 
         return spec
+
+    @staticmethod
+    def _validate_label_rule_set(
+        promoted_rules: list,
+        unresolved: list[str],
+    ) -> None:
+        """验证 promoted 输出列集合与 unresolved 列集合完全一致。
+
+        三项检查：
+        1. 缺失列——unresolved 中有但 promoted 中无 → 阻断
+        2. 额外列——promoted 中有但 unresolved 中无 → 阻断
+        3. 重复列——同一 output_column 出现多次 → 阻断
+
+        Args:
+            promoted_rules: 成功提升的 CaseWhenDecl 列表
+            unresolved: 原始未解析列名列表
+
+        Raises:
+            LabelTableConfigError: 集合门禁失败时
+        """
+        unresolved_set = set(unresolved)
+        promoted_cols: list[str] = [r.output_column for r in promoted_rules]
+        promoted_set = set(promoted_cols)
+
+        errors: list[str] = []
+
+        # 缺失列——unresolved 有要求但 promoted 未覆盖
+        missing = unresolved_set - promoted_set
+        if missing:
+            errors.append(
+                f"缺失标签规则——以下未解析列未被任何 promoted rule 覆盖: "
+                f"{sorted(missing)}"
+            )
+
+        # 额外列——promoted 产出了 unresolved 未要求的列
+        extra = promoted_set - unresolved_set
+        if extra:
+            errors.append(
+                f"额外标签输出列——以下 promoted output_column 不在 unresolved 列表中: "
+                f"{sorted(extra)}"
+            )
+
+        # 重复列——同一输出列被多条规则覆盖
+        seen: set[str] = set()
+        dupes: set[str] = set()
+        for col in promoted_cols:
+            if col in seen:
+                dupes.add(col)
+            seen.add(col)
+        if dupes:
+            errors.append(
+                f"重复标签输出列——以下 output_column 被多条规则覆盖: "
+                f"{sorted(dupes)}"
+            )
+
+        if errors:
+            raise LabelTableConfigError(
+                "标签规则集合门禁失败——"
+                + "；".join(errors)
+            )
 
     @staticmethod
     def _gen_request_id(spec: ParsedDeveloperSpec) -> str:

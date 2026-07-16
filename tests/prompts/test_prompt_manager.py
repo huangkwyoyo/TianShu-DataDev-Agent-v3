@@ -73,14 +73,14 @@ class TestVersionListing:
     """版本列表测试。"""
 
     def test_list_all_tasks(self, manager: PromptManager) -> None:
-        """list_tasks() 返回 5 个已注册的 task。"""
+        """list_tasks() 返回已注册的 task——数量随注册模板增减，仅校验核心 task 存在。"""
         tasks = manager.list_tasks()
-        assert len(tasks) == 5
         assert "developer_spec_parser" in tasks
         assert "relationship_planner" in tasks
         assert "spark_annotator" in tasks
         assert "sql_build_planner" in tasks
         assert "sql_program_planner" in tasks
+        assert "extract_label_rules" in tasks
 
     def test_list_versions_for_task(self, manager: PromptManager) -> None:
         """list_versions() 返回某个 task 的所有版本。"""

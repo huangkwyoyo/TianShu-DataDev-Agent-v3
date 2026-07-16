@@ -1,7 +1,7 @@
 """测试 FakeRelationshipPlanner / RelationshipPlanner + SqlBuildPlanBuilder 集成 + 确定性。"""
 
-import os
 
+from tests._test_utils import read_fixture
 from tianshu_datadev.developer_spec.models import (
     FieldSource,
     ManifestColumn,
@@ -23,8 +23,6 @@ from tianshu_datadev.planning.relationship_planner import (
 from tianshu_datadev.planning.sql_build_plan import (
     SqlBuildPlanBuilder,
 )
-
-from tests._test_utils import read_fixture
 
 # ── 辅助 ──
 

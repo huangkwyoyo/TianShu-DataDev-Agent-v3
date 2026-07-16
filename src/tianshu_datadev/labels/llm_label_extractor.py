@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 from tianshu_datadev.developer_spec.models import (
     LabelBranchProposal,
@@ -97,10 +96,8 @@ class LlmLabelExtractor(LabelExtractor):
         # 4. 从 response_root 读取结构化输出
         raw_proposals: list[LabelRuleProposal] = []
         if response.is_valid and response.parsed_json_ref is not None:
-            # parsed_json_ref 可能是相对路径（相对于 response_root）或绝对路径
-            parsed_path = Path(response.parsed_json_ref)
-            if not parsed_path.is_absolute():
-                parsed_path = self._gateway.response_root / response.parsed_json_ref
+            # parsed_json_ref 是相对于 response_root 的路径
+            parsed_path = self._gateway.response_root / response.parsed_json_ref
 
             if parsed_path.exists():
                 data = json.loads(parsed_path.read_text("utf-8"))

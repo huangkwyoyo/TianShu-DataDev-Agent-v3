@@ -4,13 +4,12 @@ import os
 
 import pytest
 
+from tests._test_utils import read_fixture
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
 from tianshu_datadev.sql.executor import DuckDBExecutor
 from tianshu_datadev.sql.models import ExecutionStatus
-from tests._test_utils import read_fixture
-
 
 # ── 辅助 ──
 
@@ -70,7 +69,7 @@ class TestDuckDBExecutor:
         executor = DuckDBExecutor(table_paths=table_paths)
         try:
             trace, summary = executor.execute(compiled)
-        except Exception as e:
+        except Exception:
             raise
 
         # 验证 ExecutionTrace
@@ -106,7 +105,7 @@ class TestDuckDBExecutor:
         executor = DuckDBExecutor(table_paths=table_paths)
         try:
             trace, summary = executor.execute(compiled)
-        except Exception as e:
+        except Exception:
             raise
 
         # ExecutionTrace 完整性检查

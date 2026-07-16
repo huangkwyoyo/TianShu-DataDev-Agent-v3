@@ -10,7 +10,7 @@ import hashlib
 import math
 import struct
 from datetime import date, datetime
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal
 
 from tianshu_datadev.spark.cdp_spec import CreDigestSpec, TypeFamily, compute_digest_spec_hash
 
@@ -108,7 +108,7 @@ class CdpCanonicalSerializer:
         if isinstance(value, datetime):
             if value.tzinfo is None:
                 raise CdpEncodingError(
-                    f"naive timestamp 不可编码——缺少时区信息，拒绝执行"
+                    "naive timestamp 不可编码——缺少时区信息，拒绝执行"
                 )
             # 注意：完整 DST 检测需要 zoneinfo——当前简化处理，
             # 引擎 builder 侧由引擎原生时区函数处理时区转换

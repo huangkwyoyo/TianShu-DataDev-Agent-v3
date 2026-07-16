@@ -3,22 +3,22 @@ from __future__ import annotations
 
 import pytest
 
-from tianshu_datadev.spark.cdp_spec import CreDigestSpec, TypeFamily
-from tianshu_datadev.spark.cdp_serializer import CdpCanonicalSerializer, CdpEncodingError
 from tests.spark.test_cdp_golden_vectors import (
     G1_FULL_DIGEST_HEX,
     G2_FIELD_BYTES_HEX,
     G2_FULL_DIGEST_HEX,
     G3_FIELD_BYTES_HEX,
-    G4_TRUE_FIELD_BYTES_HEX,
     G4_FALSE_FIELD_BYTES_HEX,
-    G5_NAN_FIELD_BYTES_HEX,
+    G4_TRUE_FIELD_BYTES_HEX,
     G5_INF_FIELD_BYTES_HEX,
+    G5_NAN_FIELD_BYTES_HEX,
     G5_NEG_INF_FIELD_BYTES_HEX,
     G5_NEG_ZERO_FIELD_BYTES_HEX,
     G5_POS_ZERO_FIELD_BYTES_HEX,
     G6_FULL_DIGEST_HEX,
 )
+from tianshu_datadev.spark.cdp_serializer import CdpCanonicalSerializer, CdpEncodingError
+from tianshu_datadev.spark.cdp_spec import CreDigestSpec, TypeFamily
 
 
 class TestOracleVsGoldenVectors:
@@ -101,7 +101,7 @@ class TestOracleVsGoldenVectors:
         )
         # 多重集语义：两行相同 ≠ 单行
         assert result != G2_FULL_DIGEST_HEX, (
-            f"两行相同 digest 不应 == 单行 digest G2"
+            "两行相同 digest 不应 == 单行 digest G2"
         )
 
 

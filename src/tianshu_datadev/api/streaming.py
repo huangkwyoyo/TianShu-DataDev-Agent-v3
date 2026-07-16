@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import queue
 import time
-from typing import Any, Literal
+from typing import Literal
 
 from tianshu_datadev.monitor.collector import StageContext
 

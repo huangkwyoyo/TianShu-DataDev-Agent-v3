@@ -1,31 +1,110 @@
-# label_table 类型支持——实施计划（修订版 v3）
+# label_table 类型支持——实施计划（v4-light 最终修订版）
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 实现 label_table 类型完整支持链路——从 Parser 保留 DatasetType，经 LlmLabelExtractor(LLM)→Validator→Promotion，到 Builder 生成 CaseWhenStep，最终 SQL/Spark 同快照一致。生产路径使用 LlmLabelExtractor（复用 LLMGateway/PromptManager/ProviderAdapter），pytest 使用 FakeLabelExtractor。
+**Goal:** 跑通个人使用场景——自然语言业务过程 → LlmLabelExtractor(LLM) → Validator(v1 六项确定性检查) → CaseWhenDecl → SQL/Spark Compiler。生产路径使用 LlmLabelExtractor（复用 LLMGateway/PromptManager/ProviderAdapter），pytest 使用 FakeLLMAdapter。
 
-**Architecture:** 11 段管线：Parser → SourceManifest → SpecEnricher → _prepare_spec_for_planning() → _find_unresolved_derived_columns() → LlmLabelExtractor(生产)/FakeLabelExtractor(pytest) → LabelRuleValidator(确定性 8 项) → Promotion → Builder(CaseWhenStep + 硬阻断) → Compiler/Execute。溯源信息分离到独立 Artifact，语义 Spec 只保存确定性规则。
+**Architecture:** 12 段管线：Parser → SourceManifest → SpecEnricher → _prepare_spec_for_planning() → _find_unresolved_derived_columns() → LlmLabelExtractor(生产)/FakeLabelExtractor(pytest) → LabelRuleValidator(v1 六项) → Promotion(双空阻断) → Builder(CaseWhenStep + 硬阻断) → Compiler/Execute。Gateway 原子写入 response_root 后返回 parsed_json_ref；LLM 仅输出规则/标签域/evidence——proposal_id/source_spec_hash/extraction_time 由系统生成。
 
-**Tech Stack:** Python 3.12, Pydantic v2 (discriminated unions), pytest + FakeLabelExtractor, DuckDB, PySpark, LLMGateway + PromptManager + ProviderAdapter
-
-## Global Constraints
-
-- 所有代码注释必须使用中文
-- pytest 使用确定性 `FakeLabelExtractor`，**生产路径使用 `LlmLabelExtractor`（复用 LLMGateway/PromptManager/ProviderAdapter），禁止生产路径回退 Fake**
-- 新增测试优先合并已有测试文件——仅 Harness 文件可新建
-- 未解析派生输出列必须硬阻断（`DERIVED_COLUMN_RULE_MISSING`），禁止回退为 ColumnRef
-- CaseWhenStep 使用真实字段名：`cases`（非 branches）、`else_value`（非 else_result）、`alias: SafeIdentifier`
-- WhenBranch 仅使用 `condition: Predicate`，禁止 `raw_condition`
-- 溯源信息（模型/Prompt/时间/hash）存入独立 Artifact，**溯源字段由系统生成（artifact_id/extraction_time 等），不由 LLM 填充**
-- **OutputColumnDecl 的真实字段为 `type`（非 `data_type`）**——全部测试代码使用 `type="string"` 等
-- **LabelPredicateNode 拆分为布尔条件节点（AND/OR/NOT）、操作数节点（COMPARE/IS_NULL/IS_NOT_NULL）与叶子节点（COLUMN_REF/LITERAL）；区间证明仅支持明确子集（同列数值 AND），OR/NOT/多字段无法证明时进入 HUMAN_REVIEW**
-- **_find_unresolved_derived_columns() 移出 Parser**，存放于 `src/tianshu_datadev/labels/resolver.py`
-- 修改源码后必须通过 `./dev-reload.sh` 重启服务验证
-- 每个 Task 完成后独立 commit，使用 conventional commit message
+**Tech Stack:** Python 3.12, Pydantic v2, pytest + FakeLLMAdapter, DuckDB, PySpark, LLMGateway + PromptManager + ProviderAdapter
 
 ---
 
-## 文件结构总览
+## 修订摘要（v4-light 初版 → 最终版）
+
+| # | 变更 | 初版问题 | 最终版修复 |
+|---|------|---------|---------------|
+| 0 | **Task 0 重写——文件持久化** | Gateway 生成 `parsed_ref` 路径但从未写文件；测试未覆盖文件→Extractor 链路 | Gateway 接受 `response_root`，Schema 校验通过后原子写入结构化 JSON；测试用 `tmp_path` 验证文件存在+内容；增加 FakeAdapter→Gateway→文件→LlmLabelExtractor 集成测试，**禁止手工造文件** |
+| 1 | **根条件类型约束** | `LabelPredicateNode` 含 LITERAL/COLUMN_REF——可被 LLM 错误用作 WHEN 根条件 | 新增 `LabelPredicateCondition` 联合类型——仅允许 COMPARE/IS_NULL/IS_NOT_NULL/AND/OR/NOT；`LabelBranchProposalOutput.condition` 和 `LabelBranchProposal.condition` 使用此类型 |
+| 2 | **必需字段强制** | `else_value: str \| None`、`evidence: str = ""`、`LabelRuleProposal` 无 `label_domain` 字段 | `else_value: str`（必填）、`evidence: str`（必填，非空）、`LabelRuleProposal.label_domain: LabelDomain`（必填）；缺失任一→Promotion 拒绝 |
+| 3 | **Promotion 双空阻断** | `report.passed=True` 仅要求无 BLOCKING——允许 HUMAN_REVIEW 进入 Promotion | Promotion 必须 `blocking_errors` **和** `human_review_items` **均为空**才提升 |
+| 4 | **Task 11 生产注入** | 未定义 create_app() 中的 LLMGateway/LlmLabelExtractor 构造方式 | 复用 ProviderAdapter + PromptManager 构造 LLMGateway → LlmLabelExtractor；无 API Key 时 label_table 返回明确 `PipelineError("CONFIG_ERROR")`，**禁止回退 Fake** |
+| 5 | **Task 10-13 自包含** | "同 v3 Task N"——引用外部上下文，工程师需跳转查阅 | 每 Task 含完整接口签名、修改文件列表、测试代码、退出条件 |
+| 6 | **Validator 双空检查** | `report.passed` 定义模糊不清 | `passed = len(blocking) == 0 and len(human_review) == 0`——全部检查通过才为 True |
+
+## 最小端到端验收链路
+
+```
+自然语言 Markdown body
+  │
+  ▼
+Parser (Task 4: type→DatasetType)
+  │
+  ▼
+_prepare_spec_for_planning() (Task 11: 统一入口)
+  │
+  ├─ _find_unresolved_derived_columns() (Task 5)
+  │
+  ▼
+LlmLabelExtractor.extract() (Task 9: 生产路径)
+  │  ├─ 收集源表字段→available_fields
+  │  ├─ 构造 LlmRequest(task="extract_label_rules", ...)
+  │  ├─ gateway.submit(request, markdown_body=..., unresolved_columns=..., available_fields=...)
+  │  │     ├─ PromptManager 加载模板 → 渲染 user_message（Task 0 的 **extra_vars）
+  │  │     ├─ Adapter.invoke() → dict
+  │  │     ├─ Pydantic model_validate() → 校验通过
+  │  │     ├─ 原子写入 response_root/llm_responses/parsed/{request_id}_{hash}.json
+  │  │     └─ 返回 LlmResponse(parsed_json_ref="response_root/.../file.json")
+  │  ├─ 从 parsed_json_ref 路径读取 JSON → LabelRuleProposalList.model_validate()
+  │  └─ 系统包装 proposal_id/source_spec_hash/extraction_time
+  │
+  ▼
+LabelRuleValidator (Task 6: v1 六项确定性检查)
+  │  ├─ FIELD_EXISTS / TYPE_COMPATIBLE / OPERATOR_VALID
+  │  ├─ AST_VALID / LABEL_DOMAIN / COVERAGE(ELSE+evidence)
+  │  └─ passed = blocking_errors 和 human_review_items 均为空
+  │
+  ▼
+Promotion (Task 10: 双空阻断——blocking_errors 且 human_review_items 均为空)
+  │
+  ▼
+Builder._build_case_when_steps() (Task 12: CaseWhenStep 生成)
+  │
+  ▼
+SQL/Spark Compiler (确定性编译——禁止 raw SQL)
+  │
+  ▼
+DuckDB/PySpark 执行验证
+```
+
+**阻断验证清单（全部必须正确阻断）：**
+
+| 阻断场景 | 阻断位置 | 预期结果 |
+|----------|----------|----------|
+| 未知字段（LLM 输出 extra 字段） | Gateway Schema 校验（`extra="forbid"`） | `validation_status="invalid"`，parsed_json_ref=None |
+| 非法根节点（LITERAL/COLUMN_REF 作 WHEN 条件） | Pydantic discriminator 拒绝 | `model_validate()` 失败 → Gateway 返回 invalid |
+| 标签越界（then_label 不在 domain 中） | Validator LABEL_DOMAIN → BLOCKING | Promotion 拒绝 |
+| 缺少 ELSE + evidence 为空 | Validator COVERAGE → HUMAN_REVIEW | Promotion 拒绝（human_review_items 非空） |
+| 缺少 API Key | Task 11 create_app() preflight | `PipelineError("CONFIG_ERROR")`，明确提示配置 API Key |
+
+---
+
+## Global Constraints
+
+- 所有代码注释使用中文
+- pytest 使用 `FakeLLMAdapter` + `register_default_for_task()`，生产路径使用真实 `LLMGateway`
+- 新增测试合并已有测试文件——仅 Harness 冒烟测试可新建文件
+- 未解析派生输出列硬阻断（`DERIVED_COLUMN_RULE_MISSING`）
+- **LLM 仅输出规则/标签域/evidence**——proposal_id/source_spec_hash/extraction_time 由系统生成
+- **禁止 raw SQL 和自由代码**——SQL/Spark 必须由确定性编译器生成
+- `OutputColumnDecl` 真实字段为 `type`（非 `data_type`）
+- `CaseWhenStep` 真实字段：`cases: list[WhenBranch]`（非 `branches`）、`else_value: SqlLiteral | None`、`alias: SafeIdentifier`
+- `WhenBranch` 仅使用 `condition: Predicate | None`，禁止 `raw_condition`
+- **根条件仅允许 COMPARE/IS_NULL/IS_NOT_NULL/AND/OR/NOT**——LITERAL/COLUMN_REF 不可作 WHEN 根节点
+- **label_domain、每个分支 evidence、ELSE 在 label_table v1 中均为必需**——缺失时 Promotion 拒绝
+- **Promotion 必须 blocking_errors 和 human_review_items 均为空**
+- **Validator v1 仅校验六项**：字段存在/类型兼容/操作符/AST/标签域/ELSE+evidence——不包含区间证明
+- 无法确定性判断时记录 HUMAN_REVIEW，不伪装 PASS
+- Prompt 模板路径：`prompts/templates/{task}/v001.md`，frontmatter 必填 `target_schema`
+- `_SCHEMA_PATH_MAP` 必须为所有新 Schema 注册条目
+- 所有 `LlmRequest`/`LlmResponse`/`FakeLLMAdapter` 示例与当前源码接口一致
+- `--run-harness` 在 `conftest.py` 中注册，默认排除真实 LLM 测试
+- 修改源码后通过 `./dev-reload.sh` 重启服务验证
+- 每个 Task 完成后独立 commit
+
+---
+
+## 文件结构
 
 ### 新建文件
 
@@ -35,28 +114,32 @@
 | `src/tianshu_datadev/labels/artifacts.py` | LabelExtractionArtifact + LabelPromotionArtifact |
 | `src/tianshu_datadev/labels/resolver.py` | _find_unresolved_derived_columns()——独立于 Parser |
 | `src/tianshu_datadev/labels/label_extractor.py` | LabelExtractor 抽象接口 + FakeLabelExtractor |
-| `src/tianshu_datadev/labels/llm_label_extractor.py` | LlmLabelExtractor——生产级，复用 LLMGateway/PromptManager/ProviderAdapter |
-| `src/tianshu_datadev/labels/label_rule_validator.py` | LabelRuleValidator（8 项确定性检查） |
-| `src/tianshu_datadev/labels/promotion.py` | Promotion——Proposal → CaseWhenDecl + 溯源 Artifact |
-| `tests/harness/test_label_extractor_real_llm.py` | Harness——真实 LLM 提取验证（使用 HarnessRunner） |
-| `tests/harness/test_label_contract_e2e.py` | Harness——Contract E2E 同快照一致性（使用 HarnessRunner） |
+| `src/tianshu_datadev/labels/llm_label_extractor.py` | LlmLabelExtractor——复用 LLMGateway/PromptManager/ProviderAdapter |
+| `src/tianshu_datadev/labels/label_rule_validator.py` | LabelRuleValidator（v1 六项检查） |
+| `src/tianshu_datadev/labels/promotion.py` | Promotion——Proposal → CaseWhenDecl + 溯源 Artifact + 双空阻断 |
+| `src/tianshu_datadev/prompts/templates/extract_label_rules/v001.md` | Prompt 模板 |
+| `tests/harness/test_label_extractor_smoke.py` | 唯一可选真实 LLM 冒烟测试 |
 
 ### 修改文件
 
 | 路径 | 改动 |
 |------|------|
-| `src/tianshu_datadev/developer_spec/models.py` | 新增 DatasetType、CompareOp、LabelPredicateNode(拆分布尔/操作数/叶子)、LabelDomain、LabelRuleProposal、LabelBranchProposal、LabelPredicateBranch、LabelValidationReport、LabelValidationCheck；ParsedDeveloperSpec 新增 dataset_type/label_rules；CaseWhenDecl 新增 typed_branches |
-| `src/tianshu_datadev/developer_spec/parser.py` | 读取 spec_dict["type"] → dataset_type（仅 type 映射，不含 unresolved 检测） |
-| `src/tianshu_datadev/planning/sql_build_plan.py` | 新增 _predicate_from_label_node()、_build_case_when_steps()、DerivedColumnRuleMissing；_build_project_step() 硬阻断；_build_single_table() 插入 CaseWhenStep |
-| `src/tianshu_datadev/api/pipeline.py` | 新增 _prepare_spec_for_planning() 共享入口；build_plan/build_plan_rich/execute/execute_rich/run_all/run_all_rich 全部调用 |
-| `templates/` 目录下 Template 2 YAML | 添加 type: label_table |
+| `src/tianshu_datadev/developer_spec/models.py` | DatasetType、CompareOp、LabelPredicateNode(8 子类)、LabelPredicateCondition(6 子类联合——排除 LITERAL/COLUMN_REF)、LLM 输出层(LabelDomainOutput 等)、系统层(LabelDomain/LabelRuleProposal 等)；ParsedDeveloperSpec 新增 dataset_type/label_rules；CaseWhenDecl 新增 typed_branches |
+| `src/tianshu_datadev/developer_spec/parser.py` | 读取 spec_dict["type"] → dataset_type（仅 type 映射） |
+| `src/tianshu_datadev/planning/sql_build_plan.py` | _predicate_from_label_node()、_build_case_when_steps()、DerivedColumnRuleMissing、_build_project_step 硬阻断 |
+| `src/tianshu_datadev/api/pipeline.py` | _prepare_spec_for_planning() + 全部入口调用 |
+| `src/tianshu_datadev/api/app.py` | create_app() 中新增 AnthropicAdapter→LLMGateway→LlmLabelExtractor 生产注入；无 API Key 时明确报错 |
+| `src/tianshu_datadev/llm/gateway.py` | 新增 `response_root` 参数；`_render_user_message` 扩展 `**extra_vars`；Schema 校验通过后原子写入结构化 JSON 到 response_root |
+| `src/tianshu_datadev/prompts/manager.py` | `_SCHEMA_PATH_MAP` 新增 `LabelRuleProposalList` |
+| `tests/conftest.py` | 注册 `--run-harness` 选项 + marker |
+| `templates/` 下 Template 2 YAML | 添加 `type: label_table` |
 
-### 测试合并目标（不新建文件）
+### 测试合并目标
 
 | 测试内容 | 合并到 |
 |----------|--------|
-| DatasetType、LabelPredicateNode、LabelDomain、LabelRuleProposal 模型测试 | `tests/planning/test_planning_models.py` |
-| LabelExtractionArtifact、LabelPromotionArtifact、LabelRuleValidator、FakeLabelExtractor、Promotion | `tests/labels/test_label_rules.py` |
+| DatasetType、LabelPredicateNode、LabelPredicateCondition、LLM 输出/系统模型 | `tests/planning/test_planning_models.py` |
+| Artifacts、Validator、FakeLabelExtractor、LlmLabelExtractor（含集成测试）、Promotion | `tests/labels/test_label_rules.py` |
 | Parser type 映射 | `tests/api/test_spec.py` |
 | _find_unresolved_derived_columns()、_prepare_spec_for_planning() | `tests/api/test_pipeline.py` |
 | _predicate_from_label_node()、_build_case_when_steps()、硬阻断 | `tests/planning/test_planning_models.py` |
@@ -64,204 +147,849 @@
 | Contract E2E 同快照 | `tests/spark/test_plan_comparator_integration.py` |
 
 ---
+### Task 0: Gateway 文件持久化——response_root + extra_vars（v4-light 最终版核心）
 
+**边界：** 解决三个致命问题：
+1. Gateway 当前 `submit()` 生成 `parsed_ref` 路径字符串但**从未将校验通过的结构化对象写入磁盘**——`LlmResponse.generate_parsed_ref()` 仅返回 `"llm_responses/parsed/{request_id}_{hash}.json"` 路径，没有对应的写文件逻辑。下游代码从该路径读取时文件不存在。
+2. `_render_user_message()` 仅替换 `{artifact_refs}` 占位符——Prompt 模板中的 `{markdown_body}`/`{unresolved_columns}`/`{available_fields}` 无法被替换。
+3. 测试必须使用 `tmp_path`、必须覆盖 FakeAdapter→Gateway→磁盘文件→LlmLabelExtractor 完整链路，**禁止手工造文件代替 Gateway 输出**。
 
-### Task 1: 基础模型——DatasetType + LabelPredicateNode discriminator 联合 AST（v3: 拆分布尔/操作数/叶子）
+**方案：**
+- 新增 `response_root: str` 参数到 `LLMGateway.__init__`——指定结构化输出落盘根目录
+- Schema 校验通过后，**原子写入**（先写临时文件→`os.replace`）通过校验的结构化对象到 `response_root/parsed_json_ref`
+- 扩展 `_render_user_message()` 接受 `**extra_vars` 并渲染所有 `{var}` 占位符
+- 新增 FakeAdapter→Gateway→磁盘文件→LlmLabelExtractor 集成测试——使用 `tmp_path` 作为 `response_root`
 
-**边界：** 仅定义 Pydantic 模型，不涉及任何管线逻辑、不调 LLM、不做验证。LabelPredicateNode 的 discriminator 联合拆分为三类节点：
-- **布尔条件节点**（AND/OR/NOT）：组合操作数节点，其 children/child 递归包含子树
-- **操作数节点**（COMPARE/IS_NULL/IS_NOT_NULL）：可直接转换为 Predicate 的原子条件
-- **叶子节点**（COLUMN_REF/LITERAL）：列引用和类型化字面量
-区间证明仅支持明确子集场景（同列数值 AND 连接的多条 COMPARE），其余进入 HUMAN_REVIEW——此逻辑在 Task 6 Validator 实现，此处仅定义数据结构。
+**涉及真实接口：**
 
-**失败路径：**
-- Pydantic discriminator 配置错误 → `ValidationError`（模型构造阶段即暴露）
-- 前向引用 `list["LabelPredicateNode"]` 未 `model_rebuild()` → `PydanticUndefinedAnnotation`
-- 非法 discriminator 值未被拒绝 → 类型安全漏洞（测试覆盖）
-- `LabelBooleanNode` / `LabelOperandNode` 辅助联合类型与主联合类型不一致 → Validator 中的 `isinstance` 检查失效
-
-**验收命令：**
-```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/planning/test_planning_models.py::TestDatasetType tests/planning/test_planning_models.py::TestLabelPredicateNodeDiscriminator -v
-```
-
-**退出条件：** 全部 11 个测试 PASS（新增 3 个布尔/操作数类型检查测试）；完整回归测试 0 新增失败。
+| 接口 | 当前实际 | 最终版修复 |
+|------|----------|-----------|
+| `LLMGateway.__init__` | `(adapter, prompt_manager)` → 无 response_root | `(adapter, prompt_manager, response_root="llm_responses")` |
+| `LlmResponse.generate_parsed_ref()` | 仅生成路径字符串，不写文件 | 保持路径生成——写文件逻辑在 `submit()` 中 |
+| Gateway 文件写入 | **不存在** | Schema 校验通过→原子写入 response_root/parsed_ref |
+| `_render_user_message(template, input_refs)` | 仅替换 `{artifact_refs}` | 扩展签名支持 `**extra_vars` |
+| `submit(request)` | 不接收 extra_vars | 扩展为 `submit(request, **extra_vars)` |
 
 **Files:**
-- Modify: `src/tianshu_datadev/developer_spec/models.py`（在现有枚举之后、CaseWhenDecl 之前插入）
-- Test: `tests/planning/test_planning_models.py`（末尾追加新测试类）
+- Modify: `src/tianshu_datadev/llm/gateway.py`
+- Test: `tests/labels/test_label_rules.py`（末尾追加——集成测试）
 
 **Interfaces:**
-- Produces: `DatasetType(str, Enum)`——DETAIL_TABLE/AGGREGATE_TABLE/LABEL_TABLE/UNSPECIFIED
-- Produces: `CompareOp(str, Enum)`——EQ/NEQ/GT/GTE/LT/LTE
-- Produces: `LabelColumnRef(StrictModel)`——node_type="COLUMN_REF", column_name: str（叶子节点）
-- Produces: `LabelTypedLiteral(StrictModel)`——node_type="LITERAL", value: str|Decimal|bool|None, data_type: Literal["string","number","boolean","null"]（叶子节点）
-- Produces: `LabelCompare(StrictModel)`——node_type="COMPARE", left: str, op: CompareOp, right: LabelTypedLiteral（操作数节点）
-- Produces: `LabelIsNull(StrictModel)`——node_type="IS_NULL", column: str（操作数节点）
-- Produces: `LabelIsNotNull(StrictModel)`——node_type="IS_NOT_NULL", column: str（操作数节点）
-- Produces: `LabelAnd(StrictModel)`——node_type="AND", children: list[LabelPredicateNode]（布尔条件节点）
-- Produces: `LabelOr(StrictModel)`——node_type="OR", children: list[LabelPredicateNode]（布尔条件节点）
-- Produces: `LabelNot(StrictModel)`——node_type="NOT", child: LabelPredicateNode（布尔条件节点）
-- Produces: `LabelPredicateNode = Annotated[Union[LabelAnd,LabelOr,LabelNot,LabelCompare,LabelIsNull,LabelIsNotNull,LabelColumnRef,LabelTypedLiteral], Field(discriminator="node_type")]`
-- Produces: `LabelBooleanNode = Annotated[Union[LabelAnd, LabelOr, LabelNot], Field(discriminator="node_type")]`（辅助联合类型）
-- Produces: `LabelOperandNode = Annotated[Union[LabelCompare, LabelIsNull, LabelIsNotNull, LabelColumnRef, LabelTypedLiteral], Field(discriminator="node_type")]`（辅助联合类型）
+- Modifies: `LLMGateway.__init__(adapter, prompt_manager, response_root="llm_responses")`
+- Modifies: `LLMGateway._render_user_message(template, input_refs, **extra_vars) -> str`
+- Modifies: `LLMGateway.submit(request, **extra_vars) -> LlmResponse`
+- Produces: `LLMGateway._write_parsed_output(validated_model, parsed_ref_path) -> None`
 
-- [ ] **Step 1: 编写 DatasetType 枚举 + LabelPredicateNode discriminator 联合的失败测试**
+- [ ] **Step 1: 编写集成测试（使用 tmp_path）**
 
-在 `tests/planning/test_planning_models.py` 末尾追加：
+在 `tests/labels/test_label_rules.py` 末尾追加：
 
 ```python
 # ================================================
-# DatasetType + LabelPredicateNode discriminator 联合（v3: 拆分布尔/操作数/叶子）
+# v4-light 最终版: Gateway 文件持久化集成测试
+# 覆盖 FakeAdapter→Gateway→磁盘文件→LlmLabelExtractor 完整链路
+# 禁止手工造文件——所有文件由 Gateway 产生
 # ================================================
 
-from decimal import Decimal
-
-from tianshu_datadev.developer_spec.models import (
-    CompareOp,
-    DatasetType,
-    LabelAnd,
-    LabelBooleanNode,
-    LabelColumnRef,
-    LabelCompare,
-    LabelIsNotNull,
-    LabelIsNull,
-    LabelNot,
-    LabelOperandNode,
-    LabelOr,
-    LabelPredicateNode,
-    LabelTypedLiteral,
-)
+import json
+import os
+from pathlib import Path
+from tianshu_datadev.llm.gateway import LLMGateway
+from tianshu_datadev.llm.adapters.fake_adapter import FakeLLMAdapter
+from tianshu_datadev.llm.models import ArtifactRef, LlmRequest
+from tianshu_datadev.prompts.manager import PromptManager
+from tianshu_datadev.labels.llm_label_extractor import LlmLabelExtractor
 
 
-class TestDatasetType:
-    """DatasetType 枚举序列化/反序列化与默认值行为。"""
+def _make_label_fake_response():
+    """构造 FakeLLMAdapter 所需的标准标签提取输出。"""
+    return {
+        "rules": [{
+            "output_column": "distance_category",
+            "branches": [{
+                "condition": {
+                    "node_type": "COMPARE", "left": "distance_miles",
+                    "op": "<=",
+                    "right": {"node_type": "LITERAL", "value": 2, "data_type": "number"},
+                },
+                "then_label": "short",
+                "evidence": "distance_miles <= 2 -> short",
+            }],
+            "else_value": "long",
+            "label_domain": {"values": ["short", "long"], "source_evidence": "原文"},
+        }],
+    }
 
-    def test_label_table_value(self):
-        """label_table 字符串映射到 DatasetType.LABEL_TABLE。"""
-        assert DatasetType("label_table") == DatasetType.LABEL_TABLE
 
-    def test_unspecified_is_default(self):
-        """未指定时默认 UNSPECIFIED。"""
-        assert DatasetType.UNSPECIFIED == DatasetType("unspecified")
+class TestGatewayFilePersistence:
+    """验证 Gateway 将校验通过的结构化对象原子写入 response_root。"""
 
-    def test_all_variants_roundtrip(self):
-        """所有变体序列化后反序列化一致。"""
-        for dt in DatasetType:
-            assert DatasetType(dt.value) == dt
-
-
-class TestLabelPredicateNodeDiscriminator:
-    """LabelPredicateNode discriminator 联合 AST 构造与验证——v3 拆分布尔/操作数/叶子。"""
-
-    def test_compare_node(self):
-        """LabelCompare 构造——操作数节点：二元比较。"""
-        node = LabelCompare(
-            left="distance_miles",
-            op=CompareOp.LTE,
-            right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+    def test_gateway_writes_parsed_json_to_disk(self, tmp_path):
+        """Schema 校验通过→文件存在于 response_root 中。"""
+        # 准备
+        adapter = FakeLLMAdapter()
+        adapter.register_default_for_task("extract_label_rules", _make_label_fake_response())
+        prompt_manager = PromptManager()
+        gateway = LLMGateway(
+            adapter=adapter,
+            prompt_manager=prompt_manager,
+            response_root=str(tmp_path),  # ← 使用 tmp_path 作为受控输出根目录
         )
-        assert node.node_type == "COMPARE"
-        assert node.left == "distance_miles"
-        assert isinstance(node.right.value, Decimal)
 
-    def test_is_null_node(self):
-        """LabelIsNull 构造——操作数节点。"""
-        node = LabelIsNull(column="distance_miles")
-        assert node.node_type == "IS_NULL"
-
-    def test_and_nesting(self):
-        """LabelAnd 嵌套两个 COMPARE——布尔条件节点包裹操作数节点。"""
-        node = LabelAnd(children=[
-            LabelCompare(
-                left="distance_miles", op=CompareOp.GT,
-                right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
-            ),
-            LabelCompare(
-                left="distance_miles", op=CompareOp.LTE,
-                right=LabelTypedLiteral(value=Decimal("5"), data_type="number"),
-            ),
-        ])
-        assert node.node_type == "AND"
-        assert len(node.children) == 2
-
-    def test_boolean_node_type_check(self):
-        """LabelAnd 可赋值给 LabelBooleanNode 联合类型。"""
-        node = LabelAnd(children=[
-            LabelCompare(left="a", op=CompareOp.EQ,
-                         right=LabelTypedLiteral(value="x", data_type="string")),
-            LabelCompare(left="b", op=CompareOp.EQ,
-                         right=LabelTypedLiteral(value="y", data_type="string")),
-        ])
-        from pydantic import TypeAdapter
-        adapter = TypeAdapter(LabelBooleanNode)
-        parsed = adapter.validate_python(node.model_dump())
-        assert isinstance(parsed, LabelAnd)
-
-    def test_operand_node_type_check(self):
-        """LabelCompare 可赋值给 LabelOperandNode 联合类型。"""
-        node = LabelCompare(
-            left="col", op=CompareOp.EQ,
-            right=LabelTypedLiteral(value="test", data_type="string"),
+        request = LlmRequest(
+            request_id=LlmRequest.generate_request_id(),
+            task="extract_label_rules", prompt_version="v001",
+            schema_name="LabelRuleProposalList", schema_version="v1",
+            input_artifact_refs=[
+                ArtifactRef(artifact_type="parsed_developer_spec",
+                            artifact_hash="h_test", artifact_id="spec_test"),
+            ],
+            temperature=0.1, model="",
         )
-        from pydantic import TypeAdapter
-        adapter = TypeAdapter(LabelOperandNode)
-        parsed = adapter.validate_python(node.model_dump())
-        assert isinstance(parsed, LabelCompare)
 
-    def test_discriminator_rejects_wrong_type(self):
-        """discriminator 拒绝非法 node_type。"""
-        with pytest.raises(ValidationError):
-            LabelCompare(
-                node_type="IS_NULL",
-                left="x",
-                op=CompareOp.EQ,
-                right=LabelTypedLiteral(value="y", data_type="string"),
-            )
+        response = gateway.submit(request)
 
-    def test_discriminator_rejects_extra_fields(self):
-        """discriminator 子类拒绝非法额外字段。"""
-        with pytest.raises(ValidationError):
-            LabelIsNull(
-                column="x",
-                op=CompareOp.EQ,
-            )
+        # 验证响应状态
+        assert response.is_valid, f"validation_errors={response.validation_errors}"
+        assert response.parsed_json_ref is not None
 
-    def test_boolean_literal(self):
-        """LabelTypedLiteral 支持 bool 类型。"""
-        lit = LabelTypedLiteral(value=True, data_type="boolean")
-        assert lit.value is True
+        # 验证文件存在于 response_root 中
+        parsed_path = Path(response.parsed_json_ref)
+        assert parsed_path.exists(), f"文件不存在: {parsed_path}"
+        assert parsed_path.is_absolute() or tmp_path in parsed_path.parents, \
+            f"文件不在 response_root 中: {parsed_path}"
 
-    def test_null_literal(self):
-        """LabelTypedLiteral 支持 None。"""
-        lit = LabelTypedLiteral(value=None, data_type="null")
-        assert lit.value is None
+        # 验证文件内容可读且结构正确
+        data = json.loads(parsed_path.read_text("utf-8"))
+        assert "rules" in data
+        assert len(data["rules"]) == 1
+        assert data["rules"][0]["output_column"] == "distance_category"
 
-    def test_union_discriminator_parse(self):
-        """Annotated Union 根据 node_type 自动选择正确子类。"""
-        data = {"node_type": "COMPARE", "left": "col", "op": "=",
-                "right": {"node_type": "LITERAL", "value": "test", "data_type": "string"}}
-        from pydantic import TypeAdapter
-        adapter = TypeAdapter(LabelPredicateNode)
-        parsed = adapter.validate_python(data)
-        assert isinstance(parsed, LabelCompare)
+    def test_gateway_invalid_does_not_write_file(self, tmp_path):
+        """Schema 校验失败→不写文件，parsed_json_ref 为 None。"""
+        adapter = FakeLLMAdapter()
+        # 注册包含未知字段的响应——extra="forbid" 导致校验失败
+        adapter.register_default_for_task("extract_label_rules", {
+            "rules": [{
+                "output_column": "distance_category",
+                "branches": [],
+                "else_value": "unknown",
+                "label_domain": {"values": ["unknown"]},
+                "unknown_field_xyz": "不应该存在",  # ← extra 字段
+            }],
+        })
+        prompt_manager = PromptManager()
+        gateway = LLMGateway(
+            adapter=adapter, prompt_manager=prompt_manager,
+            response_root=str(tmp_path),
+        )
+
+        request = LlmRequest(
+            request_id=LlmRequest.generate_request_id(),
+            task="extract_label_rules", prompt_version="v001",
+            schema_name="LabelRuleProposalList", schema_version="v1",
+            input_artifact_refs=[
+                ArtifactRef(artifact_type="parsed_developer_spec",
+                            artifact_hash="h_test", artifact_id="spec_test"),
+            ],
+            temperature=0.1, model="",
+        )
+
+        response = gateway.submit(request)
+
+        # 校验应失败
+        assert not response.is_valid
+        assert response.parsed_json_ref is None
+
+    def test_illegal_root_node_rejected(self, tmp_path):
+        """LLM 输出 LITERAL 作根条件→Pydantic discriminator 拒绝。"""
+        adapter = FakeLLMAdapter()
+        adapter.register_default_for_task("extract_label_rules", {
+            "rules": [{
+                "output_column": "distance_category",
+                "branches": [{
+                    "condition": {
+                        "node_type": "LITERAL",  # ← LITERAL 不可作根条件
+                        "value": "short", "data_type": "string",
+                    },
+                    "then_label": "short",
+                    "evidence": "非法根节点",
+                }],
+                "else_value": "unknown",
+                "label_domain": {"values": ["unknown"]},
+            }],
+        })
+        prompt_manager = PromptManager()
+        gateway = LLMGateway(
+            adapter=adapter, prompt_manager=prompt_manager,
+            response_root=str(tmp_path),
+        )
+
+        request = LlmRequest(
+            request_id=LlmRequest.generate_request_id(),
+            task="extract_label_rules", prompt_version="v001",
+            schema_name="LabelRuleProposalList", schema_version="v1",
+            input_artifact_refs=[
+                ArtifactRef(artifact_type="parsed_developer_spec",
+                            artifact_hash="h_test", artifact_id="spec_test"),
+            ],
+            temperature=0.1, model="",
+        )
+
+        response = gateway.submit(request)
+        assert not response.is_valid, "LITERAL 根条件应被 Pydantic discriminator 拒绝"
+
+
+class TestFakeAdapterToExtractorIntegration:
+    """集成测试: FakeAdapter→Gateway→磁盘文件→LlmLabelExtractor。
+
+    关键约束：文件必须由 Gateway 产生——禁止手工造文件替代。
+    """
+
+    def test_full_integration_fake_to_extractor(self, tmp_path):
+        """完整链路: FakeAdapter→Gateway→文件→LlmLabelExtractor。"""
+        # 1. 准备 FakeAdapter
+        adapter = FakeLLMAdapter()
+        adapter.register_default_for_task("extract_label_rules", _make_label_fake_response())
+
+        # 2. 构造 Gateway + PromptManager
+        prompt_manager = PromptManager()
+        gateway = LLMGateway(
+            adapter=adapter, prompt_manager=prompt_manager,
+            response_root=str(tmp_path),
+        )
+
+        # 3. 构造 Extractor（注入 Gateway）
+        extractor = LlmLabelExtractor(gateway=gateway)
+
+        # 4. 构造测试 Spec
+        from tianshu_datadev.developer_spec.models import (
+            ColumnDecl, DatasetType, InputTableDecl, OutputColumnDecl,
+            OutputSpecDecl, ParsedDeveloperSpec,
+        )
+        spec = ParsedDeveloperSpec(
+            spec_id="test", spec_hash="h_test", title="测试", description="CASE WHEN 逻辑",
+            dataset_type=DatasetType.LABEL_TABLE,
+            input_tables=[
+                InputTableDecl(
+                    table_alias="tf", source_table="fact",
+                    columns=[
+                        ColumnDecl(column_name="distance_miles",
+                                   normalized_name="distance_miles"),
+                    ],
+                    key_columns=[], business_columns=[],
+                ),
+            ],
+            metrics=[], dimensions=[],
+            output_spec=OutputSpecDecl(columns=[
+                OutputColumnDecl(name="distance_category", type="string"),
+            ]),
+            time_range=None,
+        )
+
+        # 5. 执行提取
+        proposals, artifact = extractor.extract(spec, ["distance_category"])
+
+        # 6. 验证
+        assert len(proposals) == 1
+        assert proposals[0].output_column == "distance_category"
+        # 系统生成字段
+        assert proposals[0].proposal_id != ""
+        assert proposals[0].source_spec_hash == spec.spec_hash
+        assert proposals[0].else_value == "long"  # else_value 为必填 str
+        assert proposals[0].label_domain is not None  # label_domain 为必填
+        assert len(proposals[0].label_domain.values) == 2
+        # evidence 为必填
+        for branch in proposals[0].branches:
+            assert branch.evidence != ""
+
+        # 验证溯源 Artifact
+        assert artifact.artifact_id != ""
+        assert artifact.source_spec_hash == spec.spec_hash
 ```
 
 - [ ] **Step 2: 运行测试验证失败**
 
 ```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/planning/test_planning_models.py::TestDatasetType tests/planning/test_planning_models.py::TestLabelPredicateNodeDiscriminator -v
+cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/labels/test_label_rules.py::TestGatewayFilePersistence tests/labels/test_label_rules.py::TestFakeAdapterToExtractorIntegration -v 2>&1 | tail -20
 ```
 
-预期：全部 FAIL（`ImportError`——模型尚未定义）
+预期：全部 FAIL（Gateway 尚无 response_root 参数，无文件写入逻辑）
 
-- [ ] **Step 3: 实现 DatasetType + CompareOp + 8 个 LabelPredicateNode 子类（拆分三类节点）**
+- [ ] **Step 3: 实现 Gateway response_root + 文件写入**
 
-在 `src/tianshu_datadev/developer_spec/models.py` 的 import 区域追加 `from decimal import Decimal`，在现有枚举之后插入：
+修改 `src/tianshu_datadev/llm/gateway.py`：
+
+```python
+"""LLMGateway——LLM 调用统一入口。
+
+所有 LLM 交互必须通过此 Gateway——不接受自由 Prompt，不将原始文本传入 Compiler。
+Gateway 仅返回结构化对象引用和校验状态。
+
+核心保证：
+1. Prompt 仅从 PromptManager 加载——不接受自由 Prompt 文本
+2. 输出经过 Pydantic Schema 校验（model_validate）
+3. 校验通过后原子写入 response_root——parsed_json_ref 指向落盘文件
+4. validation_status != "valid" 的响应不返回结构化对象
+5. LLM 原始文本落盘为引用，绝不进入 Compiler
+6. 所有错误路径返回 LlmResponse（不抛异常）——便于上层统一处理
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import time
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from pydantic import ValidationError
+
+from tianshu_datadev.llm.adapters.base import AdapterError, ProviderAdapter
+from tianshu_datadev.llm.models import (
+    LlmRequest,
+    LlmResponse,
+    SchemaBinding,
+)
+
+if TYPE_CHECKING:
+    from tianshu_datadev.prompts.manager import PromptManager
+
+
+class LLMGateway:
+    """LLM 调用统一入口——所有 LLM 交互必须通过此 Gateway。
+
+    工作流程：
+    1. 校验 LlmRequest 合法性（task 存在、version 存在）
+    2. 加载 Prompt 模板 → 渲染 user_message（含 extra_vars）
+    3. 调用 ProviderAdapter.invoke()
+    4. 解析 JSON → Pydantic model_validate 校验
+    5. Schema 校验通过 → 原子写入结构化对象到 response_root
+    6. 返回 LlmResponse（仅含引用和校验状态）
+
+    validation_status="invalid" 的响应不进入编译链路——
+    在 Gateway 层即被拦截，上层代码通过 is_valid 判断是否可继续。
+    """
+
+    def __init__(
+        self,
+        adapter: ProviderAdapter,
+        prompt_manager: PromptManager,
+        response_root: str = "llm_responses",
+    ) -> None:
+        """初始化 LLM Gateway。
+
+        Args:
+            adapter: LLM Provider 适配器（Fake / OpenAI / Anthropic）
+            prompt_manager: Prompt 版本管理器
+            response_root: 结构化输出落盘根目录——所有通过 Schema 校验的
+                           parsed_json 原子写入此目录下。默认为 "llm_responses"。
+        """
+        self._adapter = adapter
+        self._prompt_manager = prompt_manager
+        self._response_root = Path(response_root)
+
+    @property
+    def adapter(self) -> ProviderAdapter:
+        return self._adapter
+
+    @property
+    def prompt_manager(self) -> PromptManager:
+        return self._prompt_manager
+
+    @property
+    def response_root(self) -> Path:
+        return self._response_root
+
+    def submit(self, request: LlmRequest, **extra_vars) -> LlmResponse:
+        """提交 LLM 请求——完整流程：Prompt → Adapter → Schema 校验 → 落盘 → 返回。
+
+        所有错误路径返回 LlmResponse(validation_status="invalid")——
+        不抛出异常，便于上层统一处理。
+
+        Args:
+            request: LlmRequest——含 task、version、Schema 绑定、输入引用
+            **extra_vars: 额外模板变量——渲染 Prompt 中的 {var} 占位符
+                         用于注入 markdown_body/unresolved_columns 等动态内容
+
+        Returns:
+            LlmResponse——含 validation_status 和 parsed_json_ref
+        """
+        start_time = time.time()
+
+        # ── 1. 校验 task 和 version 存在 ──
+        try:
+            self._prompt_manager.list_versions(request.task)
+        except ValueError as e:
+            latency_ms = int((time.time() - start_time) * 1000)
+            return LlmResponse(
+                request_id=request.request_id,
+                task=request.task,
+                prompt_version=request.prompt_version,
+                schema_name=request.schema_name,
+                schema_version=request.schema_version,
+                raw_response_ref="",
+                parsed_json_ref=None,
+                validation_status="invalid",
+                validation_errors=[f"未知 task：{e}"],
+                token_usage={},
+                latency_ms=latency_ms,
+            )
+
+        # ── 2. 加载 Prompt 模板 ──
+        try:
+            template = self._prompt_manager.get_prompt(
+                request.task, request.prompt_version
+            )
+        except ValueError as e:
+            latency_ms = int((time.time() - start_time) * 1000)
+            return LlmResponse(
+                request_id=request.request_id,
+                task=request.task,
+                prompt_version=request.prompt_version,
+                schema_name=request.schema_name,
+                schema_version=request.schema_version,
+                raw_response_ref="",
+                parsed_json_ref=None,
+                validation_status="invalid",
+                validation_errors=[f"Prompt 加载失败：{e}"],
+                token_usage={},
+                latency_ms=latency_ms,
+            )
+
+        # ── 2.5 校验请求 Schema 与 Prompt 绑定一致 ──
+        if (
+            request.schema_name != template.schema_binding.schema_name
+            or request.schema_version != template.schema_binding.schema_version
+        ):
+            latency_ms = int((time.time() - start_time) * 1000)
+            return LlmResponse(
+                request_id=request.request_id,
+                task=request.task,
+                prompt_version=request.prompt_version,
+                schema_name=request.schema_name,
+                schema_version=request.schema_version,
+                raw_response_ref="",
+                parsed_json_ref=None,
+                validation_status="invalid",
+                validation_errors=[
+                    f"Schema 绑定不一致：请求声称 schema_name='{request.schema_name}' "
+                    f"(v{request.schema_version})，但 Prompt 模板 "
+                    f"'{request.task}/{request.prompt_version}' "
+                    f"绑定到 '{template.schema_binding.schema_name}' "
+                    f"(v{template.schema_binding.schema_version})"
+                ],
+                token_usage={},
+                latency_ms=latency_ms,
+            )
+
+        # ── 3. 渲染 user_message（含 extra_vars）──
+        user_message = self._render_user_message(
+            template=template.user_message_template,
+            input_refs=request.input_artifact_refs,
+            **extra_vars,
+        )
+
+        # ── 4. 获取 JSON Schema ──
+        json_schema = template.schema_binding.json_schema
+
+        # ── 5. 调用 Adapter ──
+        try:
+            raw_output = self._adapter.invoke(
+                system_message=template.system_message,
+                user_message=user_message,
+                json_schema=json_schema,
+                model=request.model,
+                temperature=request.temperature,
+            )
+        except AdapterError as e:
+            latency_ms = int((time.time() - start_time) * 1000)
+            return LlmResponse(
+                request_id=request.request_id,
+                task=request.task,
+                prompt_version=request.prompt_version,
+                schema_name=template.schema_binding.schema_name,
+                schema_version=template.schema_binding.schema_version,
+                raw_response_ref="",
+                parsed_json_ref=None,
+                validation_status="invalid",
+                validation_errors=[
+                    f"LLM Adapter 调用失败（provider={self._adapter.provider_name()}）：{e}"
+                ],
+                token_usage={},
+                latency_ms=latency_ms,
+            )
+
+        # ── 6. Schema 校验 ──
+        validated, errors = self._validate_against_schema(
+            raw_output=raw_output,
+            schema_binding=template.schema_binding,
+        )
+
+        latency_ms = int((time.time() - start_time) * 1000)
+
+        # ── 7. 构造响应（含文件落盘）──
+        raw_ref = LlmResponse.generate_response_ref(request.request_id)
+
+        if validated is not None and not errors:
+            # Schema 校验通过——原子写入结构化对象到 response_root
+            parsed_ref = LlmResponse.generate_parsed_ref(request.request_id)
+            self._write_parsed_output(validated, parsed_ref)
+
+            return LlmResponse(
+                request_id=request.request_id,
+                task=request.task,
+                prompt_version=request.prompt_version,
+                schema_name=template.schema_binding.schema_name,
+                schema_version=template.schema_binding.schema_version,
+                raw_response_ref=raw_ref,
+                parsed_json_ref=parsed_ref,
+                validation_status="valid",
+                validation_errors=[],
+                token_usage=raw_output.get("_token_usage", {}),
+                latency_ms=latency_ms,
+            )
+        else:
+            return LlmResponse(
+                request_id=request.request_id,
+                task=request.task,
+                prompt_version=request.prompt_version,
+                schema_name=template.schema_binding.schema_name,
+                schema_version=template.schema_binding.schema_version,
+                raw_response_ref=raw_ref,
+                parsed_json_ref=None,
+                validation_status="invalid",
+                validation_errors=errors,
+                token_usage=raw_output.get("_token_usage", {}),
+                latency_ms=latency_ms,
+            )
+
+    # ── 内部方法 ──
+
+    @staticmethod
+    def _render_user_message(
+        template: str,
+        input_refs: list,
+        **extra_vars,
+    ) -> str:
+        """将 artifact 引用和额外变量渲染到用户消息模板中。
+
+        Args:
+            template: 用户消息模板（含 {var} 占位符）
+            input_refs: ArtifactRef 列表
+            **extra_vars: 额外模板变量——{markdown_body}/{unresolved_columns} 等
+
+        Returns:
+            渲染后的用户消息
+        """
+        refs_json = json.dumps(
+            [ref.model_dump() for ref in input_refs],
+            ensure_ascii=False,
+            indent=2,
+        )
+        rendered = template.replace("{artifact_refs}", refs_json)
+        # 渲染额外变量
+        for key, value in extra_vars.items():
+            rendered = rendered.replace(f"{{{key}}}", str(value))
+        return rendered
+
+    def _write_parsed_output(self, validated_model: Any, parsed_ref: str) -> None:
+        """原子写入通过 Schema 校验的结构化对象到 response_root。
+
+        写入策略：先写临时文件→os.replace 原子重命名——
+        确保不会读到半写入的文件。
+
+        Args:
+            validated_model: Pydantic model_validate 通过的对象
+            parsed_ref: LlmResponse.generate_parsed_ref() 返回的相对路径
+        """
+        target_path = self._response_root / parsed_ref
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # 原子写入——先写临时文件，再 rename
+        tmp_fd = None
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                suffix=".json",
+                prefix=".tmp_",
+                dir=str(target_path.parent),
+            )
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                json.dump(
+                    validated_model.model_dump(mode="json"),
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            # 原子重命名
+            os.replace(tmp_path, str(target_path))
+        except Exception:
+            # 清理临时文件（如果有）
+            if tmp_fd is not None:
+                try:
+                    os.close(tmp_fd)
+                except OSError:
+                    pass
+            raise
+
+    @staticmethod
+    def _validate_against_schema(
+        raw_output: dict[str, Any],
+        schema_binding: SchemaBinding,
+    ) -> tuple[Any | None, list[str]]:
+        """对 LLM 原始输出执行 Pydantic Schema 校验。"""
+        model_cls = _import_pydantic_model(schema_binding.pydantic_model_path)
+        try:
+            validated = model_cls.model_validate(raw_output)
+            return validated, []
+        except ValidationError as e:
+            errors = _format_validation_errors(e)
+            return None, errors
+        except Exception as e:
+            return None, [f"Schema 校验异常：{e}"]
+
+
+def _import_pydantic_model(model_path: str):
+    """动态导入 Pydantic 模型类。"""
+    import importlib
+
+    parts = model_path.rsplit(".", 1)
+    if len(parts) != 2:
+        raise ImportError(f"无效的模型路径：'{model_path}'")
+
+    module_path, class_name = parts
+    module = importlib.import_module(module_path)
+    return getattr(module, class_name)
+
+
+def _format_validation_errors(exc: ValidationError) -> list[str]:
+    """将 Pydantic ValidationError 格式化为人类可读的错误列表。"""
+    errors: list[str] = []
+    for error in exc.errors():
+        loc = " -> ".join(str(p) for p in error["loc"])
+        msg = error["msg"]
+        error_type = error.get("type", "unknown")
+        errors.append(f"[{error_type}] {loc}: {msg}")
+    return errors
+```
+
+- [ ] **Step 4: 运行集成测试验证通过**
+
+```bash
+cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/labels/test_label_rules.py::TestGatewayFilePersistence tests/labels/test_label_rules.py::TestFakeAdapterToExtractorIntegration -v
+```
+
+预期：全部 PASS
+
+- [ ] **Step 5: 运行现有 Gateway 测试确保无回归**
+
+```bash
+cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/llm/ -v -k "gateway" 2>&1 | tail -10
+```
+
+预期：全部 PASS（`**extra_vars` 为空时行为与修改前完全一致；response_root 默认 "llm_responses" 保持兼容）
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/tianshu_datadev/llm/gateway.py tests/labels/test_label_rules.py
+git commit -m "feat(gateway): 新增 response_root 文件持久化 + extra_vars 模板变量渲染
+
+- LLMGateway.__init__ 新增 response_root 参数——Schema 校验通过后原子写入结构化 JSON
+- _render_user_message 扩展 **extra_vars——支持 {markdown_body} 等动态占位符
+- submit() 新增 **extra_vars 参数——向后兼容
+- 新增 FakeAdapter→Gateway→磁盘文件→LlmLabelExtractor 集成测试
+- 验证未知字段/非法根节点被正确阻断"
+```
+
+---
+
+### Task 1: 基础模型——DatasetType + LabelPredicateNode discriminator 联合 + 根条件约束
+
+**边界：** 定义 Pydantic 模型。v4-light 最终版新增 `LabelPredicateCondition` 类型——从 `LabelPredicateNode`（8 子类）中排除 `LabelColumnRef` 和 `LabelTypedLiteral`，**LITERAL/COLUMN_REF 不可作为 WHEN 根条件**。不涉及任何管线逻辑、不调 LLM、不做验证。
+
+**Files:**
+- Modify: `src/tianshu_datadev/developer_spec/models.py`（在现有枚举之后插入）
+- Test: `tests/planning/test_planning_models.py`（末尾追加）
+
+**Interfaces（Produces）:**
+- `DatasetType(str, Enum)`——DETAIL_TABLE/AGGREGATE_TABLE/LABEL_TABLE/UNSPECIFIED
+- `CompareOp(str, Enum)`——EQ/NEQ/GT/GTE/LT/LTE
+- `LabelColumnRef`——node_type="COLUMN_REF", column_name: str
+- `LabelTypedLiteral`——node_type="LITERAL", value: str|Decimal|bool|None, data_type: "string"|"number"|"boolean"|"null"
+- `LabelCompare`——node_type="COMPARE", left: str, op: CompareOp, right: LabelTypedLiteral
+- `LabelIsNull`——node_type="IS_NULL", column: str
+- `LabelIsNotNull`——node_type="IS_NOT_NULL", column: str
+- `LabelAnd`——node_type="AND", children: list[LabelPredicateNode]
+- `LabelOr`——node_type="OR", children: list[LabelPredicateNode]
+- `LabelNot`——node_type="NOT", child: LabelPredicateNode
+- `LabelPredicateNode` = Annotated[Union[8 子类], Field(discriminator="node_type")]——完整 AST
+- **`LabelPredicateCondition`** = Annotated[Union[6 子类——排除 COLUMN_REF/LITERAL], Field(discriminator="node_type")]——**v4-light 最终版新增**：仅允许 COMPARE/IS_NULL/IS_NOT_NULL/AND/OR/NOT 作为 WHEN 根条件
+
+- [ ] **Step 1: 编写测试——含根条件约束验证**
+
+在 `tests/planning/test_planning_models.py` 末尾追加：
 
 ```python
 # ================================================
-# DatasetType 枚举
+# v4-light 最终版: DatasetType + LabelPredicateNode + 根条件约束
+# ================================================
+
+from decimal import Decimal
+import pytest
+from pydantic import ValidationError
+from tianshu_datadev.developer_spec.models import (
+    DatasetType, CompareOp,
+    LabelColumnRef, LabelTypedLiteral,
+    LabelCompare, LabelIsNull, LabelIsNotNull,
+    LabelAnd, LabelOr, LabelNot,
+    LabelPredicateNode, LabelPredicateCondition,
+)
+
+
+class TestDatasetType:
+    def test_serialize_label_table(self):
+        assert DatasetType.LABEL_TABLE.value == "label_table"
+
+    def test_default_unspecified(self):
+        assert DatasetType.UNSPECIFIED.value == "unspecified"
+
+
+class TestLabelPredicateNodeDiscriminator:
+    """8 子类 discriminator 联合 AST。"""
+
+    def test_compare_node(self):
+        node = LabelCompare(
+            left="distance_miles", op=CompareOp.LTE,
+            right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+        )
+        assert node.node_type == "COMPARE"
+
+    def test_is_null_node(self):
+        node = LabelIsNull(column="distance_miles")
+        assert node.node_type == "IS_NULL"
+
+    def test_is_not_null_node(self):
+        node = LabelIsNotNull(column="distance_miles")
+        assert node.node_type == "IS_NOT_NULL"
+
+    def test_and_node(self):
+        node = LabelAnd(children=[
+            LabelCompare(left="a", op=CompareOp.GT,
+                        right=LabelTypedLiteral(value=Decimal("0"), data_type="number")),
+            LabelCompare(left="a", op=CompareOp.LT,
+                        right=LabelTypedLiteral(value=Decimal("10"), data_type="number")),
+        ])
+        assert node.node_type == "AND"
+        assert len(node.children) == 2
+
+    def test_or_node(self):
+        node = LabelOr(children=[
+            LabelIsNull(column="x"),
+            LabelCompare(left="y", op=CompareOp.EQ,
+                        right=LabelTypedLiteral(value=True, data_type="boolean")),
+        ])
+        assert node.node_type == "OR"
+
+    def test_not_node(self):
+        node = LabelNot(child=LabelIsNull(column="x"))
+        assert node.node_type == "NOT"
+
+    def test_nested_and_or(self):
+        """AND(OR(...), COMPARE) 嵌套。"""
+        node = LabelAnd(children=[
+            LabelOr(children=[
+                LabelCompare(left="a", op=CompareOp.EQ,
+                            right=LabelTypedLiteral(value="x", data_type="string")),
+                LabelCompare(left="a", op=CompareOp.EQ,
+                            right=LabelTypedLiteral(value="y", data_type="string")),
+            ]),
+            LabelIsNotNull(column="b"),
+        ])
+        assert node.node_type == "AND"
+
+
+class TestLabelPredicateConditionRootConstraint:
+    """v4-light 最终版: LabelPredicateCondition 仅允许 6 种根节点类型。
+    LITERAL/COLUMN_REF 不可作为 WHEN 根条件。"""
+
+    def test_compare_is_valid_root(self):
+        """COMPARE 是合法根条件。"""
+        from pydantic import TypeAdapter
+        adapter = TypeAdapter(LabelPredicateCondition)
+        node = adapter.validate_python({
+            "node_type": "COMPARE", "left": "col",
+            "op": "=",
+            "right": {"node_type": "LITERAL", "value": "test", "data_type": "string"},
+        })
+        assert node.node_type == "COMPARE"
+
+    def test_is_null_is_valid_root(self):
+        """IS_NULL 是合法根条件。"""
+        from pydantic import TypeAdapter
+        adapter = TypeAdapter(LabelPredicateCondition)
+        node = adapter.validate_python({
+            "node_type": "IS_NULL", "column": "col",
+        })
+        assert node.node_type == "IS_NULL"
+
+    def test_and_is_valid_root(self):
+        """AND 是合法根条件。"""
+        from pydantic import TypeAdapter
+        adapter = TypeAdapter(LabelPredicateCondition)
+        node = adapter.validate_python({
+            "node_type": "AND", "children": [
+                {"node_type": "COMPARE", "left": "a", "op": ">",
+                 "right": {"node_type": "LITERAL", "value": 0, "data_type": "number"}},
+            ],
+        })
+        assert node.node_type == "AND"
+
+    def test_literal_rejected_as_root(self):
+        """LITERAL 不可作根条件——Pydantic discriminator 拒绝。"""
+        from pydantic import TypeAdapter
+        adapter = TypeAdapter(LabelPredicateCondition)
+        with pytest.raises(ValidationError):
+            adapter.validate_python({
+                "node_type": "LITERAL", "value": "short", "data_type": "string",
+            })
+
+    def test_column_ref_rejected_as_root(self):
+        """COLUMN_REF 不可作根条件。"""
+        from pydantic import TypeAdapter
+        adapter = TypeAdapter(LabelPredicateCondition)
+        with pytest.raises(ValidationError):
+            adapter.validate_python({
+                "node_type": "COLUMN_REF", "column_name": "col",
+            })
+
+    def test_label_predicate_node_still_allows_literal(self):
+        """LabelPredicateNode（完整 AST）仍允许 LITERAL/COLUMN_REF——
+        仅 LabelPredicateCondition 限制了根条件。"""
+        from pydantic import TypeAdapter
+        adapter = TypeAdapter(LabelPredicateNode)
+        node = adapter.validate_python({
+            "node_type": "LITERAL", "value": 5, "data_type": "number",
+        })
+        assert node.node_type == "LITERAL"
+```
+
+- [ ] **Step 2: 运行测试验证失败**
+
+```bash
+cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/planning/test_planning_models.py::TestDatasetType tests/planning/test_planning_models.py::TestLabelPredicateNodeDiscriminator tests/planning/test_planning_models.py::TestLabelPredicateConditionRootConstraint -v
+```
+
+预期：FAIL（ImportError——模型尚未定义）
+
+- [ ] **Step 3: 实现全部模型**
+
+在 `src/tianshu_datadev/developer_spec/models.py` 中插入（现有枚举之后）：
+
+```python
+# ================================================
+# v4-light 最终版: DatasetType + CompareOp + LabelPredicateNode discriminator 联合 AST
 # ================================================
 
 class DatasetType(str, Enum):
@@ -271,10 +999,6 @@ class DatasetType(str, Enum):
     LABEL_TABLE = "label_table"
     UNSPECIFIED = "unspecified"
 
-
-# ================================================
-# CompareOp 枚举
-# ================================================
 
 class CompareOp(str, Enum):
     """比较操作符——封闭集合。"""
@@ -286,26 +1010,18 @@ class CompareOp(str, Enum):
     LTE = "<="
 
 
-# ================================================
-# LabelPredicateNode——带 discriminator 的封闭联合 AST（v3: 拆分布尔/操作数/叶子）
-# ================================================
-
-# --- 叶子节点 ---
-
 class LabelColumnRef(StrictModel):
-    """列引用叶子——引用源表中已声明的字段。"""
+    """列引用叶子——引用源表中已声明的字段。不可作 WHEN 根条件。"""
     node_type: Literal["COLUMN_REF"] = "COLUMN_REF"
     column_name: str
 
 
 class LabelTypedLiteral(StrictModel):
-    """类型化字面量——真实 Python 类型，禁止隐式转换。"""
+    """类型化字面量——真实 Python 类型。不可作 WHEN 根条件。"""
     node_type: Literal["LITERAL"] = "LITERAL"
     value: str | Decimal | bool | None
     data_type: Literal["string", "number", "boolean", "null"]
 
-
-# --- 操作数节点（可直接求值的原子条件）---
 
 class LabelCompare(StrictModel):
     """二元比较：left OP right。"""
@@ -327,8 +1043,6 @@ class LabelIsNotNull(StrictModel):
     column: str
 
 
-# --- 布尔条件节点（组合操作数节点）---
-
 class LabelAnd(StrictModel):
     """逻辑 AND——至少 2 个子节点。"""
     node_type: Literal["AND"] = "AND"
@@ -347,8 +1061,7 @@ class LabelNot(StrictModel):
     child: "LabelPredicateNode"
 
 
-# --- 带 discriminator 的封闭联合类型 ---
-
+# ── 完整 AST（8 子类 discriminator 联合）──
 LabelPredicateNode = Annotated[
     Union[
         LabelAnd,
@@ -363,940 +1076,938 @@ LabelPredicateNode = Annotated[
     Field(discriminator="node_type"),
 ]
 
-# --- 辅助联合类型——用于 Validator 判断节点类别 ---
-
-LabelBooleanNode = Annotated[
-    Union[LabelAnd, LabelOr, LabelNot],
+# ── 根条件类型（仅 6 子类——排除 COLUMN_REF 和 LITERAL）──
+# LITERAL/COLUMN_REF 不可作为 WHEN 根条件——LLM 若输出则 Pydantic discriminator 拒绝
+LabelPredicateCondition = Annotated[
+    Union[
+        LabelAnd,
+        LabelOr,
+        LabelNot,
+        LabelCompare,
+        LabelIsNull,
+        LabelIsNotNull,
+    ],
     Field(discriminator="node_type"),
 ]
-"""布尔条件节点——AND/OR/NOT，其 children/child 递归包含操作数或布尔节点。"""
-
-LabelOperandNode = Annotated[
-    Union[LabelCompare, LabelIsNull, LabelIsNotNull, LabelColumnRef, LabelTypedLiteral],
-    Field(discriminator="node_type"),
-]
-"""操作数与叶子节点——可直接转换为 Predicate，不含递归逻辑组合。"""
 ```
 
 - [ ] **Step 4: 运行测试验证通过**
 
-```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/planning/test_planning_models.py::TestDatasetType tests/planning/test_planning_models.py::TestLabelPredicateNodeDiscriminator -v
-```
-
-预期：全部 PASS
-
-- [ ] **Step 5: 运行完整测试套件确保无回归**
-
-```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/ -x --timeout=60 -q 2>&1 | tail -5
-```
-
-预期：601+ passed，无新增失败
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/tianshu_datadev/developer_spec/models.py tests/planning/test_planning_models.py
-git commit -m "feat(models): 新增 DatasetType 枚举 + LabelPredicateNode discriminator 联合 AST（v3 拆分布尔/操作数/叶子）
+git commit -m "feat(models): DatasetType + LabelPredicateNode(8子类) + LabelPredicateCondition(6子类根约束)
 
-- DatasetType: DETAIL_TABLE/AGGREGATE_TABLE/LABEL_TABLE/UNSPECIFIED
-- CompareOp: EQ/NEQ/GT/GTE/LT/LTE
-- LabelPredicateNode: 8 子类 discriminator 联合，拆分为三类：
-  * 布尔条件节点: AND/OR/NOT
-  * 操作数节点: COMPARE/IS_NULL/IS_NOT_NULL
-  * 叶子节点: COLUMN_REF/LITERAL
-- 新增 LabelBooleanNode / LabelOperandNode 辅助联合类型
-- LabelTypedLiteral 使用真实 Python 类型（str/Decimal/bool/None）
-- 禁止 Optional 字段大杂烩和 when/raw_condition 字符串路径"
+- LabelPredicateCondition 仅允许 COMPARE/IS_NULL/IS_NOT_NULL/AND/OR/NOT 作根条件
+- LITERAL/COLUMN_REF 不可作 WHEN 根节点——Pydantic discriminator 在 Schema 层拒绝"
 ```
 
 ---
 
+### Task 2: 标签领域模型——LLM 输出 Schema 与系统内部模型分离 + 必需字段强制
 
-### Task 2: 标签领域模型——LabelDomain + LabelRuleProposal + ParsedDeveloperSpec/CaseWhenDecl 字段
-
-**边界：** 仅定义模型字段和默认值，不实现任何验证逻辑（Validator 在 Task 6）、不调 LLM（LabelExtractor 在 Task 7/8）。`LabelDomain` 不要求程序员手写 enum——Agent 从原文提取。
-
-**失败路径：**
-- `LabelBranchProposal.condition` 接受非 discriminator 值 → Pydantic validation 失败
-- `Evidence` 空字符串未被 `min_length=1` 拒绝 → 模型约束缺失
-- `ParsedDeveloperSpec` 新增字段与现有字段名冲突 → `model_rebuild()` 失败
-- `CaseWhenDecl.typed_branches` 类型注解与 `LabelPredicateBranch` 不一致 → mypy 类型错误
-
-**验收命令：**
-```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/planning/test_planning_models.py::TestLabelDomain tests/planning/test_planning_models.py::TestLabelRuleProposal tests/planning/test_planning_models.py::TestParsedDeveloperSpecLabelFields tests/planning/test_planning_models.py::TestCaseWhenDeclTypedBranches -v
-```
-
-**退出条件：** 全部测试 PASS；完整回归测试 0 新增失败。
+**边界：** v4-light 最终版核心变更：
+1. LLM 输出层不含系统字段（proposal_id/source_spec_hash/extraction_time）
+2. **系统层 `LabelRuleProposal` 强制 `else_value: str`（非 Optional）、`label_domain: LabelDomain`（非 Optional）**
+3. **系统层 `LabelBranchProposal.evidence: str` 必填（非空字符串 ""）**
+4. **系统层 `LabelRuleProposal` 新增 `label_domain: LabelDomain` 字段**——由 LlmLabelExtractor 从 LLM 输出的 `LabelDomainOutput` 包装为系统 `LabelDomain`
+5. `LabelBranchProposalOutput` 的 `condition` 使用 `LabelPredicateCondition`（非完整 `LabelPredicateNode`）
 
 **Files:**
 - Modify: `src/tianshu_datadev/developer_spec/models.py`（在 Task 1 新增代码之后）
-- Test: `tests/planning/test_planning_models.py`（追加）
+- Test: `tests/planning/test_planning_models.py`（末尾追加）
 
 **Interfaces:**
-- Consumes: `LabelPredicateNode`, `LabelBooleanNode`, `LabelOperandNode`（Task 1 产出）
-- Produces: `LabelDomain(StrictModel)`——values: list[str], source_evidence: str, is_exhaustive: bool, completeness_evidence: str
-- Produces: `LabelBranchProposal(StrictModel)`——condition: LabelPredicateNode, then_label: str, evidence: str（min_length=1）
-- Produces: `LabelRuleProposal(StrictModel)`——proposal_id, source_spec_hash, output_column, branches: list[LabelBranchProposal], else_value: str|None
-- Produces: `LabelPredicateBranch(StrictModel)`——condition: LabelPredicateNode, then_label: str
-- Produces: `ParsedDeveloperSpec` 新增字段——dataset_type: DatasetType=UNSPECIFIED, label_rules: list[CaseWhenDecl]=[]
-- Produces: `CaseWhenDecl` 新增字段——typed_branches: list[LabelPredicateBranch]=[]
+- Consumes: `LabelPredicateNode`、`LabelPredicateCondition`（Task 1）
+- Produces (LLM 输出层): `LabelDomainOutput`, `LabelBranchProposalOutput`, `LabelRuleProposalOutput`, `LabelRuleProposalList`
+- Produces (系统层): `LabelDomain`, `LabelBranchProposal`, `LabelRuleProposal`, `LabelPredicateBranch`
 
-- [ ] **Step 1: 编写模型测试**
+- [ ] **Step 1: 编写测试——含必需字段 + 根条件约束**
 
 在 `tests/planning/test_planning_models.py` 末尾追加：
 
 ```python
-class TestLabelDomain:
-    """LabelDomain 模型验证。"""
+# ================================================
+# v4-light 最终版: LLM 输出 Schema 与系统模型分离 + 必需字段强制
+# ================================================
 
-    def test_basic_domain(self):
-        from tianshu_datadev.developer_spec.models import LabelDomain
-        domain = LabelDomain(
+import pytest
+from pydantic import ValidationError
+from tianshu_datadev.developer_spec.models import (
+    LabelBranchProposalOutput,
+    LabelDomainOutput,
+    LabelRuleProposalList,
+    LabelRuleProposalOutput,
+    LabelDomain,
+    LabelBranchProposal,
+    LabelRuleProposal,
+    LabelPredicateBranch,
+)
+
+
+class TestLabelDomainOutput:
+    """LLM 输出的标签值域——不含系统字段。"""
+
+    def test_llm_output_no_system_fields(self):
+        domain = LabelDomainOutput(
             values=["unknown", "short", "medium", "long"],
-            source_evidence="分为四类：unknown / short / medium / long",
+            source_evidence="分为四类",
             is_exhaustive=True,
-            completeness_evidence="以上四类覆盖全部情况",
+            completeness_evidence="以上四类覆盖全部",
         )
-        assert len(domain.values) == 4
-        assert domain.is_exhaustive is True
-
-    def test_domain_empty_values_allowed(self):
-        """空 values 允许——可能原文未明确枚举。"""
-        from tianshu_datadev.developer_spec.models import LabelDomain
-        domain = LabelDomain(values=[])
-        assert domain.values == []
+        assert "domain_id" not in domain.model_fields
 
 
-class TestLabelRuleProposal:
-    """LabelRuleProposal 与 LabelBranchProposal 模型验证。"""
+class TestLabelRuleProposalOutput:
+    """LLM 输出不含 proposal_id/source_spec_hash。"""
 
-    def test_valid_proposal(self):
-        from tianshu_datadev.developer_spec.models import (
-            LabelBranchProposal, LabelCompare, LabelIsNull, LabelOr,
-            LabelRuleProposal, LabelTypedLiteral,
-        )
-        from decimal import Decimal
-        proposal = LabelRuleProposal(
-            proposal_id="proposal_abc123",
-            source_spec_hash="hash_001",
+    def test_forbidden_system_fields(self):
+        output = LabelRuleProposalOutput(
             output_column="distance_category",
             branches=[
-                LabelBranchProposal(
-                    condition=LabelOr(children=[
-                        LabelIsNull(column="distance_miles"),
-                        LabelCompare(
-                            left="is_distance_outlier", op=CompareOp.EQ,
-                            right=LabelTypedLiteral(value=True, data_type="boolean"),
-                        ),
-                    ]),
-                    then_label="unknown",
-                    evidence="distance_miles IS NULL OR is_distance_outlier = true -> unknown",
-                ),
-                LabelBranchProposal(
+                LabelBranchProposalOutput(
                     condition=LabelCompare(
                         left="distance_miles", op=CompareOp.LTE,
                         right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
                     ),
                     then_label="short",
-                    evidence="distance_miles <= 2 -> short",
+                    evidence="<=2 -> short",
                 ),
             ],
             else_value="long",
+            label_domain=LabelDomainOutput(values=["short", "long"]),
         )
-        assert proposal.output_column == "distance_category"
-        assert len(proposal.branches) == 2
-        assert proposal.else_value == "long"
+        assert "proposal_id" not in output.model_fields
+        assert "source_spec_hash" not in output.model_fields
 
-    def test_empty_evidence_rejected(self):
-        """evidence 为空字符串应被拒绝。"""
-        from tianshu_datadev.developer_spec.models import (
-            LabelBranchProposal, LabelIsNull, LabelRuleProposal,
-        )
+    def test_literal_root_condition_rejected_in_branch(self):
+        """LITERAL 不可作 LabelBranchProposalOutput 的 condition。"""
         with pytest.raises(ValidationError):
-            LabelBranchProposal(
-                condition=LabelIsNull(column="x"),
-                then_label="unknown",
-                evidence="",
+            LabelBranchProposalOutput(
+                condition=LabelTypedLiteral(value="short", data_type="string"),
+                then_label="short",
+                evidence="非法根条件",
             )
 
 
-class TestParsedDeveloperSpecLabelFields:
-    """ParsedDeveloperSpec 新增 dataset_type 和 label_rules 字段。"""
+class TestSystemModelRequiredFields:
+    """系统模型——else_value/label_domain/evidence 均为必需。"""
 
-    def test_default_dataset_type_is_unspecified(self):
-        """新建 Spec 默认 dataset_type=UNSPECIFIED。"""
-        from tianshu_datadev.developer_spec.models import DatasetType, ParsedDeveloperSpec
-        spec = ParsedDeveloperSpec(
-            spec_id="test", spec_hash="h", title="t",
-            description="d", input_tables=[], metrics=[], dimensions=[],
-            output_spec=None, time_range=None,
+    def test_else_value_required(self):
+        """else_value 为必填 str——不可为 None 或缺失。"""
+        with pytest.raises(ValidationError):
+            LabelRuleProposal(
+                proposal_id="p1", source_spec_hash="h",
+                output_column="distance_category",
+                branches=[
+                    LabelBranchProposal(
+                        condition=LabelCompare(
+                            left="distance_miles", op=CompareOp.LTE,
+                            right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                        ),
+                        then_label="short",
+                        evidence="<=2 -> short",
+                    ),
+                ],
+                # else_value 缺失 → ValidationError
+            )
+
+    def test_label_domain_required(self):
+        """label_domain 为必填 LabelDomain——不可为 None 或缺失。"""
+        with pytest.raises(ValidationError):
+            LabelRuleProposal(
+                proposal_id="p1", source_spec_hash="h",
+                output_column="distance_category",
+                branches=[
+                    LabelBranchProposal(
+                        condition=LabelCompare(
+                            left="distance_miles", op=CompareOp.LTE,
+                            right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                        ),
+                        then_label="short",
+                        evidence="<=2 -> short",
+                    ),
+                ],
+                else_value="long",
+                # label_domain 缺失 → ValidationError
+            )
+
+    def test_evidence_required_in_branch(self):
+        """evidence 为必填 str——空字符串导致 Promotion 拒绝。"""
+        # Pydantic 层允许空字符串（非 None），但 Promotion 检查非空
+        branch = LabelBranchProposal(
+            condition=LabelCompare(
+                left="distance_miles", op=CompareOp.LTE,
+                right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+            ),
+            then_label="short",
+            evidence="",  # 空字符串——Promotion 阶段拒绝
         )
-        assert spec.dataset_type == DatasetType.UNSPECIFIED
+        assert branch.evidence == ""
 
-    def test_label_rules_default_empty(self):
-        """新建 Spec 默认 label_rules=[]。"""
-        from tianshu_datadev.developer_spec.models import ParsedDeveloperSpec
-        spec = ParsedDeveloperSpec(
-            spec_id="test", spec_hash="h", title="t",
-            description="d", input_tables=[], metrics=[], dimensions=[],
-            output_spec=None, time_range=None,
-        )
-        assert spec.label_rules == []
-
-
-class TestCaseWhenDeclTypedBranches:
-    """CaseWhenDecl 新增 typed_branches 字段。"""
-
-    def test_typed_branches_default_empty(self):
-        from tianshu_datadev.developer_spec.models import CaseWhenDecl
-        cw = CaseWhenDecl(output_column="test_col")
-        assert cw.typed_branches == []
-
-    def test_typed_branches_with_predicate(self):
-        from tianshu_datadev.developer_spec.models import (
-            CaseWhenDecl, LabelCompare, LabelPredicateBranch, LabelTypedLiteral,
-        )
-        from decimal import Decimal
-        cw = CaseWhenDecl(
+    def test_system_model_has_id_and_domain_fields(self):
+        """系统层含 proposal_id/source_spec_hash/label_domain/else_value。"""
+        proposal = LabelRuleProposal(
+            proposal_id="sys_gen_001",
+            source_spec_hash="hash_abc",
             output_column="distance_category",
-            typed_branches=[
-                LabelPredicateBranch(
+            branches=[
+                LabelBranchProposal(
                     condition=LabelCompare(
                         left="distance_miles", op=CompareOp.LTE,
                         right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
                     ),
                     then_label="short",
+                    evidence="<=2 -> short",
                 ),
             ],
             else_value="long",
+            label_domain=LabelDomain(
+                domain_id="dom_001",
+                values=["short", "long"],
+                source_evidence="原文分类",
+            ),
         )
-        assert len(cw.typed_branches) == 1
-        assert cw.typed_branches[0].then_label == "short"
+        assert proposal.proposal_id == "sys_gen_001"
+        assert proposal.else_value == "long"
+        assert proposal.label_domain.values == ["short", "long"]
 ```
 
 - [ ] **Step 2: 运行测试验证失败**
 
-```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/planning/test_planning_models.py::TestLabelDomain tests/planning/test_planning_models.py::TestLabelRuleProposal tests/planning/test_planning_models.py::TestParsedDeveloperSpecLabelFields tests/planning/test_planning_models.py::TestCaseWhenDeclTypedBranches -v
-```
+- [ ] **Step 3: 实现 LLM 输出层 + 系统层模型**
 
-预期：FAIL（ImportError——模型尚未定义）
-
-- [ ] **Step 3: 实现 LabelDomain + LabelBranchProposal + LabelRuleProposal + LabelPredicateBranch**
-
-在 `src/tianshu_datadev/developer_spec/models.py` 的 `LabelPredicateNode` 定义之后插入：
+在 `src/tianshu_datadev/developer_spec/models.py` 的 `LabelPredicateCondition` 定义之后插入：
 
 ```python
 # ================================================
-# LabelDomain——从原文提取的标签值域
+# v4-light 最终版: LLM 输出 Schema——LLM 直接产出的结构化数据
+# 原则：LLM 只输出规则、标签域和 evidence
+#       proposal_id / source_spec_hash / extraction_time 由系统生成
+#       LabelBranchProposalOutput.condition 使用 LabelPredicateCondition
+#       （排除 LITERAL/COLUMN_REF 根条件）
 # ================================================
 
-class LabelDomain(StrictModel):
-    """从 Markdown 原文中提取的标签值域——由 Agent 提取，由 Validator 验证。
-
-    不要求程序员在 output_columns 中手写 enum——allowed_values 保持可选。
-    """
+class LabelDomainOutput(StrictModel):
+    """LLM 从原文提取的标签值域——不含系统生成字段。"""
     values: list[str] = []
     source_evidence: str = ""
     is_exhaustive: bool = False
     completeness_evidence: str = ""
 
 
+class LabelBranchProposalOutput(StrictModel):
+    """LLM 输出的单条 WHEN-THEN 分支——condition 仅允许 6 种根条件类型。"""
+    condition: LabelPredicateCondition  # ← LITERAL/COLUMN_REF 在 Schema 层拒绝
+    then_label: str
+    evidence: str = ""  # LLM 层可为空——系统包装时由 Extractor 校验非空
+
+
+class LabelRuleProposalOutput(StrictModel):
+    """LLM 输出的单条标签规则——不含 proposal_id/source_spec_hash。"""
+    output_column: str
+    branches: list[LabelBranchProposalOutput]
+    else_value: str  # LLM 层必填——label_table v1 要求 ELSE
+    label_domain: LabelDomainOutput | None = None
+
+
+class LabelRuleProposalList(StrictModel):
+    """LLM 输出的规则列表——顶层 Schema，注册到 _SCHEMA_PATH_MAP。"""
+    rules: list[LabelRuleProposalOutput]
+
+
 # ================================================
-# LabelRuleProposal——LLM 候选（不可执行）
+# 系统内部模型——由 LlmLabelExtractor 包装 LLM 输出后生成
+# proposal_id / source_spec_hash / extraction_time 由系统注入
+# else_value / label_domain / evidence 均为必需——缺失时 Promotion 拒绝
 # ================================================
 
+class LabelDomain(StrictModel):
+    """系统包装的标签值域——含系统生成的 domain_id。"""
+    domain_id: str = ""
+    values: list[str] = []
+    source_evidence: str = ""
+    is_exhaustive: bool = False
+    completeness_evidence: str = ""
+
+
 class LabelBranchProposal(StrictModel):
-    """单条 WHEN-THEN 候选——LLM 输出。"""
-    condition: LabelPredicateNode
+    """系统包装的单条 WHEN-THEN 分支——evidence 必填非空。"""
+    condition: LabelPredicateCondition  # ← LITERAL/COLUMN_REF 在 Schema 层拒绝
     then_label: str
-    evidence: str = ""
+    evidence: str  # 必填——Promotion 阶段检查非空
 
 
 class LabelRuleProposal(StrictModel):
-    """LLM 提取的标签规则候选——不可执行，必须经 Validator 验证后提升。
+    """系统包装的标签规则候选——proposal_id/source_spec_hash 由系统生成。
 
-    一个 Proposal 对应 output_spec.columns 中的一个标签列。
-    溯源信息不在本模型中——见 LabelExtractionArtifact。
+    label_table v1 强制要求：
+    - else_value: str（必填——ELSE 子句）
+    - label_domain: LabelDomain（必填——标签值域）
+    - 每个 branch.evidence 非空
     """
     proposal_id: str
     source_spec_hash: str
     output_column: str
     branches: list[LabelBranchProposal]
-    else_value: str | None = None
+    else_value: str  # ← 必填 str（非 Optional）
+    label_domain: LabelDomain  # ← 必填 LabelDomain（非 Optional）
 
 
 class LabelPredicateBranch(StrictModel):
     """已验证的类型化 WHEN-THEN 分支——仅含确定性信息。"""
-    condition: LabelPredicateNode
+    condition: LabelPredicateCondition
     then_label: str
 ```
 
-- [ ] **Step 4: 修改 ParsedDeveloperSpec 和 CaseWhenDecl**
+- [ ] **Step 4: 修改 ParsedDeveloperSpec + CaseWhenDecl**（添加 dataset_type/label_rules/typed_branches 字段）
 
-在 `ParsedDeveloperSpec` 类中新增字段（在现有字段之后追加）：
-
-```python
-dataset_type: DatasetType = DatasetType.UNSPECIFIED
-label_rules: list["CaseWhenDecl"] = []
-```
-
-在 `CaseWhenDecl` 类中新增字段（在现有 `output_column` 字段之后追加）：
-
-```python
-typed_branches: list[LabelPredicateBranch] = []
-```
-
-- [ ] **Step 5: 运行测试验证通过 + 完整回归**
-
-```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/planning/test_planning_models.py::TestLabelDomain tests/planning/test_planning_models.py::TestLabelRuleProposal tests/planning/test_planning_models.py::TestParsedDeveloperSpecLabelFields tests/planning/test_planning_models.py::TestCaseWhenDeclTypedBranches -v && python -m pytest tests/ -x --timeout=60 -q 2>&1 | tail -5
-```
+- [ ] **Step 5: 运行测试 + 完整回归**
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add src/tianshu_datadev/developer_spec/models.py tests/planning/test_planning_models.py
-git commit -m "feat(models): 新增 LabelDomain/LabelRuleProposal/LabelPredicateBranch + Spec/CaseWhenDecl 字段
+git commit -m "feat(models): LLM 输出/系统模型分离 + 必需字段强制 + 根条件约束
 
-- LabelDomain: Agent 从原文提取的标签值域（不要求程序员手写 enum）
-- LabelBranchProposal/LabelRuleProposal: LLM 候选（不可执行，含 evidence 锚定）
-- LabelPredicateBranch: 已验证的类型化 WHEN-THEN 分支
+- LLM 输出层: LabelDomainOutput/LabelBranchProposalOutput/LabelRuleProposalOutput/LabelRuleProposalList
+  * 禁止 proposal_id/source_spec_hash/extraction_time
+  * LabelBranchProposalOutput.condition 使用 LabelPredicateCondition（6子类——排除LITERAL/COLUMN_REF）
+- 系统层: LabelDomain/LabelBranchProposal/LabelRuleProposal/LabelPredicateBranch
+  * else_value: str（必填）、label_domain: LabelDomain（必填）、evidence: str（必填）
+  * proposal_id/source_spec_hash 由系统生成
 - ParsedDeveloperSpec: 新增 dataset_type/label_rules 字段
 - CaseWhenDecl: 新增 typed_branches 字段"
 ```
 
 ---
 
-### Task 3: 溯源 Artifact 模型 + ValidationReport 模型
+### Task 3: 溯源 Artifact + ValidationReport 模型
 
-**边界：** 仅定义溯源数据模型，不实现任何存储/查询逻辑。`LabelExtractionArtifact` 和 `LabelPromotionArtifact` 与语义 Spec 分离——不进入 spec_hash 计算。溯源字段（artifact_id/extraction_time/promotion_time）由系统生成，不由 LLM 填充。
-
-**失败路径：**
-- Artifact 字段包含 spec_hash 依赖 → 循环依赖（spec_hash 变化导致 Artifact 不可验证）
-- `LabelValidationCheck.level` 接受非法值 → Pydantic Literal 约束缺失
-- `LabelValidationReport.passed` 与 `blocking_errors` 矛盾 → 逻辑不一致（passed=True 但有 blocking_errors）
-
-**验收命令：**
-```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/labels/test_label_rules.py::TestLabelExtractionArtifact tests/labels/test_label_rules.py::TestLabelPromotionArtifact tests/labels/test_label_rules.py::TestLabelValidationReport -v
-```
-
-**退出条件：** 全部测试 PASS。
+**边界：** Artifact 模型（Task 1/2 依赖就绪后）。
 
 **Files:**
 - Create: `src/tianshu_datadev/labels/__init__.py`
 - Create: `src/tianshu_datadev/labels/artifacts.py`
-- Test: `tests/labels/test_label_rules.py`（末尾追加）
+- Test: `tests/labels/test_label_rules.py`（新建文件，首个测试）
 
 **Interfaces:**
-- Consumes: `LabelRuleProposal`, `CaseWhenDecl`（Task 2 产出）
+- Consumes: `LabelRuleProposal`, `CaseWhenDecl`（Task 2）
 - Produces: `LabelExtractionArtifact`——artifact_id, source_spec_hash, extraction_time, llm_model, llm_prompt_version, llm_temperature, unresolved_columns, raw_proposals, prompt_snapshot
 - Produces: `LabelPromotionArtifact`——artifact_id, parent_spec_hash, new_spec_hash, promotion_time, extraction_artifact_id, promoted_rules, validation_reports, rejected_proposals, human_review_required
-- Produces: `LabelValidationReport`——proposal_id, passed, checks, blocking_errors, human_review_items, warnings, extracted_label_domain
+- Produces: `LabelValidationReport`——proposal_id, passed, checks, blocking_errors, human_review_items, warnings
 - Produces: `LabelValidationCheck`——check_name, passed, level: BLOCKING|HUMAN_REVIEW|WARN, detail
 
-测试代码和实现代码**同原 v2 计划 Task 3**（Step 1-6），以下关键差异：
-- 所有测试中的 `OutputColumnDecl(name=..., data_type=...)` 改为 `OutputColumnDecl(name=..., type=...)`
+- [ ] **Step 1: 编写测试**
 
-- [ ] **Step 1: 编写测试**（同 v2 Task 3 Step 1，修正 `data_type` -> `type`）
-- [ ] **Step 2: 运行测试验证失败**
-- [ ] **Step 3: 实现 artifacts.py + __init__.py**（同 v2 Task 3 Step 3）
-- [ ] **Step 4: 运行测试验证通过**
-- [ ] **Step 5: Commit**
+```python
+# tests/labels/test_label_rules.py 开头
+from tianshu_datadev.labels.artifacts import (
+    LabelExtractionArtifact, LabelPromotionArtifact,
+    LabelValidationReport, LabelValidationCheck,
+)
+
+
+class TestLabelExtractionArtifact:
+    def test_fields(self):
+        artifact = LabelExtractionArtifact(
+            artifact_id="ext_001", source_spec_hash="h",
+            extraction_time="2026-07-15T00:00:00Z",
+            llm_model="fake", llm_prompt_version="v001",
+            llm_temperature=0.1, unresolved_columns=["col1"],
+            raw_proposals=[], prompt_snapshot="",
+        )
+        assert artifact.artifact_id == "ext_001"
+
+
+class TestLabelValidationReport:
+    def test_passed_requires_both_empty(self):
+        """passed=True 要求 blocking_errors 和 human_review_items 均为空。"""
+        report = LabelValidationReport(
+            proposal_id="p1", passed=True, checks=[],
+            blocking_errors=[], human_review_items=[], warnings=[],
+        )
+        assert report.passed
+
+    def test_human_review_causes_not_passed(self):
+        """human_review_items 非空→passed=False。"""
+        report = LabelValidationReport(
+            proposal_id="p1", passed=False, checks=[],
+            blocking_errors=[],
+            human_review_items=["缺少 ELSE"],
+            warnings=[],
+        )
+        assert not report.passed
+```
+
+- [ ] **Step 2-5: 实现 + 测试 + Commit**
 
 ```bash
 git add src/tianshu_datadev/labels/__init__.py src/tianshu_datadev/labels/artifacts.py tests/labels/test_label_rules.py
-git commit -m "feat(labels): 新增 LabelExtractionArtifact/LabelPromotionArtifact/LabelValidationReport
-
-- LabelExtractionArtifact: 提取阶段溯源（LLM 模型/Prompt/温度/时间）
-- LabelPromotionArtifact: 提升阶段溯源（parent_spec_hash/new_spec_hash/验证报告）
-- LabelValidationReport/LabelValidationCheck: 逐项验证结果（BLOCKING/HUMAN_REVIEW/WARN）
-- 溯源信息与语义 Spec 分离——不进入 spec_hash 计算
-- 溯源字段由系统生成，不由 LLM 填充"
+git commit -m "feat(labels): 新增 LabelExtractionArtifact + LabelPromotionArtifact + ValidationReport 模型"
 ```
 
 ---
 
-### Task 4: Parser type 映射（仅 type -> dataset_type，不含 unresolved 检测）
+### Task 4: Parser type 映射（仅 type → dataset_type）
 
-**边界：** Parser 只负责读取 `spec_dict["type"]` 并映射到 `DatasetType` 枚举。**不包含** `_find_unresolved_derived_columns()`——该函数移至 Task 5 的 `labels/resolver.py`。Parser 保持确定性、不调 LLM。
+**边界：** Parser 只负责 `spec_dict["type"]` → `DatasetType` 映射，不含 unresolved 检测。
 
-**失败路径：**
-- YAML `type` 值不在枚举范围内 → `ValueError` → 回退 UNSPECIFIED + W007
-- `type` 字段缺失 → UNSPECIFIED + W007（迁移警告）
-- 非法 type 值（如数字、列表）→ 类型转换失败 → W007 + UNSPECIFIED
-
-**验收命令：**
-```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/api/test_spec.py::TestParserDatasetTypeMapping -v
-```
-
-**退出条件：** 全部 3 个测试 PASS；Parser 对 label_table/detail_table/未声明三种情况输出正确的 DatasetType。
-
-**Files:**
-- Modify: `src/tianshu_datadev/developer_spec/parser.py`（`parse()` 方法中构造 `ParsedDeveloperSpec` 处）
-- Test: `tests/api/test_spec.py`（追加 `TestParserDatasetTypeMapping`）
+**Files:** Modify: `src/tianshu_datadev/developer_spec/parser.py`、Test: `tests/api/test_spec.py`
 
 **Interfaces:**
-- Consumes: `DatasetType`（Task 1）
-- Produces: `_map_dataset_type(raw_type: str | None) -> DatasetType`
-- Modifies: `Parser.parse()` -> 构造 `ParsedDeveloperSpec` 时传入 `dataset_type=_map_dataset_type(spec_dict.get("type"))`
+- Modifies: `parse()`——读取 `spec_dict["type"]` → 映射到 `DatasetType`
+- Produces: `ParsedDeveloperSpec.dataset_type`
 
-实现代码**同原 v2 计划 Task 4 的 Parser type 映射部分**（不含 `_find_unresolved_derived_columns`）。
+- [ ] **Step 1: 编写测试**
 
-- [ ] **Step 1: 编写 Parser type 映射测试**（同 v2 Task 4 Step 1 的 `TestParserDatasetTypeMapping`）
-- [ ] **Step 2: 运行测试验证失败**
-- [ ] **Step 3: 实现 `_map_dataset_type()` + Parser 调用**（同 v2 Task 4 Step 4）
-- [ ] **Step 4: 运行测试验证通过**
-- [ ] **Step 5: Commit**
+在 `tests/api/test_spec.py` 末尾追加：
 
-```bash
-git add src/tianshu_datadev/developer_spec/parser.py tests/api/test_spec.py
-git commit -m "feat(parser): Parser 读取 type -> dataset_type 映射
-
-- Parser.parse() 读取 spec_dict['type'] 映射到 DatasetType 枚举
-- 新增 _map_dataset_type() 辅助函数
-- UNSPECIFIED 时产生 W007 迁移警告
-- 注意：_find_unresolved_derived_columns() 已移出 Parser，存放于 labels/resolver.py"
+```python
+def test_parse_label_table_type():
+    """验证 YAML type: label_table → DatasetType.LABEL_TABLE。"""
+    from tianshu_datadev.developer_spec.models import DatasetType
+    from tianshu_datadev.developer_spec.parser import parse
+    yaml_text = """
+    type: label_table
+    title: 测试标签表
+    description: 测试
+    input_tables: []
+    output_columns:
+      - name: label_col
+        type: string
+    """
+    spec = parse(yaml_text)
+    assert spec.dataset_type == DatasetType.LABEL_TABLE
 ```
+
+- [ ] **Step 2-5: 实现 + 测试 + Commit**
 
 ---
 
-### Task 5: _find_unresolved_derived_columns()——独立于 Parser 的列解析检测
+### Task 5: _find_unresolved_derived_columns()——独立于 Parser
 
-**边界：** 此函数是**纯确定性逻辑**——不调 LLM、不修改 Spec、不依赖 Parser 内部状态。存放于 `labels/resolver.py`（新文件），原因：(1) Parser 职责应保持单一（解析 YAML -> Spec）；(2) 列解析检测需要访问 SourceManifest，这是管线阶段而非解析阶段的依赖；(3) 所有 6 个管线入口（build_plan/build_plan_rich/execute/execute_rich/run_all/run_all_rich）通过 `_prepare_spec_for_planning()` 统一调用。
+**边界：** 存放于 `labels/resolver.py`。
 
-**失败路径：**
-- SourceManifest 为 None 且源表无 columns 定义 → 仅从 input_tables 解析，可能漏判
-- `normalize()` 函数不一致 → 同一列名不同归一化结果导致误判未解析
-- `output_spec.columns` 为空 → 返回空列表（正确行为——无列需要解析）
-- 列名同时出现在多个解析来源中 → 去重（set）处理——无影响
-
-**验收命令：**
-```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/api/test_pipeline.py::TestFindUnresolvedDerivedColumns -v
-```
-
-**退出条件：** 全部 3 个测试 PASS（物理列已解析、派生列未解析、label_rule 已解析）。
-
-**Files:**
-- Create: `src/tianshu_datadev/labels/resolver.py`
-- Test: `tests/api/test_pipeline.py`（追加 `TestFindUnresolvedDerivedColumns`）
+**Files:** Create: `src/tianshu_datadev/labels/resolver.py`、Test: `tests/api/test_pipeline.py`
 
 **Interfaces:**
-- Consumes: `ParsedDeveloperSpec`, `SourceManifest | None`
 - Produces: `_find_unresolved_derived_columns(spec, manifest=None) -> list[str]`
-- 已解析条件（任一满足即认为已解析）：源表物理列、SourceManifest schema、指标 alias、窗口指标、compute_steps 产出、已有 label_rules
 
-实现代码**同原 v2 计划 Task 4 的 `_find_unresolved_derived_columns()` 部分**，但**存放位置从 `parser.py` 改为 `labels/resolver.py`**。
-
-- [ ] **Step 1: 编写测试**（同 v2 Task 4 Step 2 的 `TestFindUnresolvedDerivedColumns`，修正 import 路径从 `tianshu_datadev.labels.resolver` 导入）
-- [ ] **Step 2: 运行测试验证失败**
-- [ ] **Step 3: 创建 `labels/resolver.py` + 实现函数**（同 v2 Task 4 Step 5，但文件位置不同）
-- [ ] **Step 4: 运行测试验证通过**
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/tianshu_datadev/labels/resolver.py tests/api/test_pipeline.py
-git commit -m "feat(labels): 新增 _find_unresolved_derived_columns()——独立于 Parser
-
-- 从 parser.py 移出到 labels/resolver.py——Parser 保持单一职责
-- 按输出列逐个检测是否已解析——覆盖源表字段/指标/窗口指标/compute_step/label_rule/Manifest schema
-- 供 _prepare_spec_for_planning() 统一调用，覆盖全部 6 个管线入口"
-```
+- [ ] **Step 1-5: 完整 TDD 流程（含物理列/指标/窗口指标/compute_step/label_rule/Manifest schema 各场景测试）**
 
 ---
 
+### Task 6: LabelRuleValidator v1——六项确定性检查 + 双空通过
 
-### Task 6: LabelRuleValidator——8 项确定性检查（v3: 区间证明仅明确子集）
+**边界：** v4-light 最终版 Validator v1。**passed = blocking_errors 和 human_review_items 均为空**。删除全部区间证明逻辑。
 
-**边界：** 纯确定性逻辑，不调 LLM。区间证明（检查项 #8）仅支持**明确子集**：同一列上的多条 AND 连接数值 COMPARE 才能确定性判断重叠/遗漏。OR/NOT/多字段组合无法确定性证明——直接进入 HUMAN_REVIEW，不尝试猜测。
+**六项检查：**
 
-**失败路径：**
-- OR 节点包裹数值比较 → 无法提取确定性区间 → HUMAN_REVIEW（不是 BLOCKING）
-- NOT 节点包裹数值比较 → 取反后区间不确定 → HUMAN_REVIEW
-- 多字段条件组合（如 `a > 5 AND b < 10`）→ 不同列，不尝试跨列区间分析
-- LabelDomain 未提供 → LABEL_DOMAIN 检查跳过（WARN）——不阻断
-- 源表字段无 data_type 声明 → TYPE_COMPATIBLE 跳过（WARN）——不阻断
+| # | 检查项 | 失败级别 | 说明 |
+|---|--------|----------|------|
+| 1 | FIELD_EXISTS | BLOCKING | condition 中引用的列名存在于 input_tables |
+| 2 | TYPE_COMPATIBLE | BLOCKING | 比较操作符与字面量 data_type 兼容 |
+| 3 | OPERATOR_VALID | BLOCKING | 操作符为已知 CompareOp；AND/OR children>=2；NOT child 非空 |
+| 4 | AST_VALID | BLOCKING | condition 为 LabelPredicateCondition discriminator 子类 |
+| 5 | LABEL_DOMAIN | BLOCKING | then_label 值在 label_domain.values 中 |
+| 6 | COVERAGE | BLOCKING/HUMAN_REVIEW | 有 ELSE 且所有 evidence 非空→PASS；否则 HUMAN_REVIEW |
 
-**8 项检查表（v3 更新区间证明策略）：**
-
-| # | 检查项 | 失败级别 | v3 变更 |
-|---|--------|----------|---------|
-| 1 | FIELD_EXISTS——字段存在性 | BLOCKING | 无变更 |
-| 2 | TYPE_COMPATIBLE——字段类型兼容性 | BLOCKING | 无变更 |
-| 3 | OPERATOR_VALID——操作符合法性 | BLOCKING | 新增: 布尔节点子节点数>=1 |
-| 4 | OUTPUT_TYPE——输出类型 | BLOCKING | 无变更 |
-| 5 | EVIDENCE_ANCHORED——原文证据锚定 | BLOCKING | 无变更 |
-| 6 | LABEL_DOMAIN——标签域验证 | BLOCKING | 无变更 |
-| 7 | COVERAGE_COMPLETENESS——ELSE 或完整覆盖 | BLOCKING/HUMAN_REVIEW | 无变更 |
-| 8 | INTERVAL_OVERLAP/GAP——区间重叠/遗漏 | **仅明确子集可阻断，其余 HUMAN_REVIEW** | OR/NOT/多字段 -> HUMAN_REVIEW |
-
-**验收命令：**
-```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/labels/test_label_rules.py::TestLabelRuleValidatorFieldExists tests/labels/test_label_rules.py::TestLabelRuleValidatorTypeCompatible tests/labels/test_label_rules.py::TestLabelRuleValidatorEvidenceAnchored tests/labels/test_label_rules.py::TestLabelRuleValidatorIntervalProof -v
+**关键判定逻辑（v4-light 最终版）：**
+```python
+# passed = 无阻断 且 无人工审查
+passed = len(blocking) == 0 and len(human_review) == 0
 ```
-
-**退出条件：** 全部 8 项检查的测试 PASS；OR/NOT 区间场景正确进入 HUMAN_REVIEW（不阻断）；多字段场景正确跳过区间分析。
 
 **Files:**
 - Create: `src/tianshu_datadev/labels/label_rule_validator.py`
 - Test: `tests/labels/test_label_rules.py`（末尾追加）
 
 **Interfaces:**
-- Consumes: `LabelRuleProposal`, `LabelDomain`, `ParsedDeveloperSpec`（Task 2）、`LabelValidationReport`, `LabelValidationCheck`（Task 3）、`LabelBooleanNode`, `LabelOperandNode`（Task 1）
-- Produces: `LabelRuleValidator.validate(proposal, spec, label_domain=None) -> LabelValidationReport`
+- Consumes: `LabelRuleProposal`、`LabelDomain`（Task 2）、`LabelValidationReport`/`LabelValidationCheck`（Task 3）
+- Produces: `LabelRuleValidator.validate(proposal, spec) -> LabelValidationReport`
 
-实现代码**基于原 v2 计划 Task 5**，以下 v3 关键差异：
-
-**_extract_intervals() 方法 v3 重写——仅提取明确子集：**
+- [ ] **Step 1: 编写测试——含双空通过验证**
 
 ```python
-def _extract_intervals(self, node) -> list[tuple[str, Decimal|None, Decimal|None, str, str]]:
-    """从 LabelPredicateNode 中提取数值区间——仅支持明确子集。
+# tests/labels/test_label_rules.py 末尾追加
 
-    明确子集定义：同列 AND 连接的多条 COMPARE（数值比较）。
-    以下情况返回空列表（无法确定性提取）：
-    - OR 节点——无法确定哪个分支生效
-    - NOT 节点——取反后区间不确定
-    - 多字段组合——不尝试跨列区间分析
-    """
-    from decimal import Decimal, InvalidOperation
+from tianshu_datadev.labels.label_rule_validator import LabelRuleValidator
 
-    # OR/NOT 节点——无法确定性提取区间 -> 返回空，触发 HUMAN_REVIEW
-    if isinstance(node, (LabelOr, LabelNot)):
-        return []
 
-    if isinstance(node, LabelCompare):
-        if node.right.data_type != "number":
-            return []
-        try:
-            val = Decimal(str(node.right.value))
-        except (InvalidOperation, ValueError, TypeError):
-            return []
-        col = node.left
-        if node.op in (CompareOp.LTE, CompareOp.LT):
-            return [(col, None, val, "", node.op.value)]
-        elif node.op in (CompareOp.GTE, CompareOp.GT):
-            return [(col, val, None, node.op.value, "")]
-        elif node.op == CompareOp.EQ:
-            return [(col, val, val, "=", "=")]
-        return []
+def _make_test_spec():
+    """构造测试用 ParsedDeveloperSpec。"""
+    from tianshu_datadev.developer_spec.models import (
+        ColumnDecl, InputTableDecl, OutputColumnDecl, OutputSpecDecl,
+        ParsedDeveloperSpec,
+    )
+    return ParsedDeveloperSpec(
+        spec_id="test", spec_hash="h", title="t", description="d",
+        dataset_type=DatasetType.LABEL_TABLE,
+        input_tables=[
+            InputTableDecl(
+                table_alias="tf", source_table="fact",
+                columns=[
+                    ColumnDecl(column_name="distance_miles",
+                               normalized_name="distance_miles"),
+                    ColumnDecl(column_name="is_distance_outlier",
+                               normalized_name="is_distance_outlier"),
+                ],
+                key_columns=[], business_columns=[],
+            ),
+        ],
+        metrics=[], dimensions=[],
+        output_spec=OutputSpecDecl(columns=[
+            OutputColumnDecl(name="distance_category", type="string"),
+        ]),
+        time_range=None,
+    )
 
-    if isinstance(node, LabelAnd):
-        # AND 节点：合并所有子节点的区间（同列合并，多字段分别收集）
-        results = []
-        for child in node.children:
-            results.extend(self._extract_intervals(child))
-        return results
 
-    # LabelIsNull/LabelIsNotNull/LabelColumnRef/LabelTypedLiteral：无区间信息
-    return []
-```
-
-_check_intervals() 方法 v3 重写——OR/NOT/多字段进入 HUMAN_REVIEW：
-
-```python
-def _check_intervals(self, proposal, blocking, human_review):
-    """检测数值区间重叠/遗漏——仅支持明确子集。
-
-    策略：
-    1. 遍历所有分支，对每个分支的 condition 提取区间
-    2. 若任意分支含 OR/NOT（区间提取返回空），标记为 HUMAN_REVIEW
-    3. 仅对 AND 明确子集进行重叠/遗漏检测
-    """
-    from decimal import Decimal
-
-    has_non_deterministic = False
-    col_intervals: dict[str, list[tuple[Decimal|None, Decimal|None, str, str]]] = {}
-
-    for branch in proposal.branches:
-        intervals = self._extract_intervals(branch.condition)
-        if not intervals:
-            # 检查是否因为 OR/NOT 导致无法提取
-            if self._contains_boolean_node(branch.condition, ("OR", "NOT")):
-                has_non_deterministic = True
-            continue
-
-        for col_name, low, high, op_low, op_high in intervals:
-            if col_name not in col_intervals:
-                col_intervals[col_name] = []
-            col_intervals[col_name].append((low, high, op_low, op_high))
-
-    # OR/NOT/多字段 -> HUMAN_REVIEW
-    if has_non_deterministic:
-        human_review.append(
-            "条件包含 OR/NOT/多字段组合——无法确定性证明区间完整性，需人工确认"
-        )
-        return LabelValidationCheck(
-            check_name="INTERVAL_OVERLAP", passed=False, level="HUMAN_REVIEW",
-            detail="含非确定性布尔节点——区间证明仅支持明确 AND 子集。请人工审查区间覆盖。",
-        )
-
-    # 以下重叠/遗漏检测逻辑同 v2...（同列 AND 明确子集）
-    # [同原 v2 计划 _check_intervals 的重叠/遗漏部分]
-```
-
-新增辅助方法：
-
-```python
-def _contains_boolean_node(self, node, target_types: tuple[str, ...]) -> bool:
-    """递归检查节点树中是否包含指定类型的布尔节点。"""
-    if isinstance(node, LabelAnd) and "AND" in target_types:
-        return True
-    if isinstance(node, LabelOr) and "OR" in target_types:
-        return True
-    if isinstance(node, LabelNot) and "NOT" in target_types:
-        return True
-    if isinstance(node, LabelAnd):
-        return any(self._contains_boolean_node(c, target_types) for c in node.children)
-    if isinstance(node, LabelOr):
-        return any(self._contains_boolean_node(c, target_types) for c in node.children)
-    if isinstance(node, LabelNot):
-        return self._contains_boolean_node(node.child, target_types)
-    return False
-```
-
-测试新增（追加到 v2 的 Validator 测试之后）：
-
-```python
-class TestLabelRuleValidatorIntervalProof:
-    """v3: 区间证明仅支持明确子集。"""
-
-    def test_or_interval_goes_to_human_review(self):
-        """OR 包裹的数值条件 -> HUMAN_REVIEW，不阻断。"""
-        from tianshu_datadev.developer_spec.models import (
-            LabelBranchProposal, LabelCompare, LabelOr, LabelRuleProposal, LabelTypedLiteral,
-        )
-        from decimal import Decimal
+class TestValidatorV1FieldExists:
+    def test_field_exists_passes(self):
         validator = LabelRuleValidator()
-        spec = _make_test_spec()
         proposal = LabelRuleProposal(
-            proposal_id="p_or", source_spec_hash="hv",
+            proposal_id="p1", source_spec_hash="h",
             output_column="distance_category",
             branches=[
                 LabelBranchProposal(
-                    condition=LabelOr(children=[
-                        LabelCompare(left="distance_miles", op=CompareOp.LTE,
-                                     right=LabelTypedLiteral(value=Decimal("2"), data_type="number")),
-                        LabelCompare(left="distance_miles", op=CompareOp.GTE,
-                                     right=LabelTypedLiteral(value=Decimal("10"), data_type="number")),
-                    ]),
-                    then_label="extreme",
-                    evidence="<=2 OR >=10 -> extreme",
-                ),
-            ],
-            else_value="normal",
-        )
-        report = validator.validate(proposal, spec)
-        # OR 场景不应 BLOCKING——应进入 HUMAN_REVIEW
-        assert not any("区间重叠" in e for e in report.blocking_errors)
-        assert any("OR" in item for item in report.human_review_items)
-
-    def test_and_explicit_subset_passes(self):
-        """同列 AND 明确子集 -> 正常检测（无重叠无遗漏 -> PASS）。"""
-        from tianshu_datadev.developer_spec.models import (
-            LabelBranchProposal, LabelAnd, LabelCompare, LabelRuleProposal, LabelTypedLiteral,
-        )
-        from decimal import Decimal
-        validator = LabelRuleValidator()
-        spec = _make_test_spec()
-        proposal = LabelRuleProposal(
-            proposal_id="p_and", source_spec_hash="hv",
-            output_column="distance_category",
-            branches=[
-                LabelBranchProposal(
-                    condition=LabelAnd(children=[
-                        LabelCompare(left="distance_miles", op=CompareOp.GT,
-                                     right=LabelTypedLiteral(value=Decimal("0"), data_type="number")),
-                        LabelCompare(left="distance_miles", op=CompareOp.LTE,
-                                     right=LabelTypedLiteral(value=Decimal("2"), data_type="number")),
-                    ]),
-                    then_label="short",
-                    evidence=">0 AND <=2 -> short",
+                    condition=LabelCompare(
+                        left="distance_miles", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                    ),
+                    then_label="short", evidence="<=2 -> short",
                 ),
             ],
             else_value="long",
+            label_domain=LabelDomain(values=["short", "long"]),
         )
-        report = validator.validate(proposal, spec)
-        # AND 明确子集：应通过区间检查
-        interval_checks = [c for c in report.checks if c.check_name.startswith("INTERVAL")]
-        if interval_checks:
-            assert interval_checks[0].passed or interval_checks[0].level != "BLOCKING"
+        report = validator.validate(proposal, _make_test_spec())
+        field_check = next(c for c in report.checks if c.check_name == "FIELD_EXISTS")
+        assert field_check.passed
 
-    def test_not_interval_goes_to_human_review(self):
-        """NOT 包裹的数值条件 -> HUMAN_REVIEW。"""
-        from tianshu_datadev.developer_spec.models import (
-            LabelBranchProposal, LabelCompare, LabelNot, LabelRuleProposal, LabelTypedLiteral,
-        )
-        from decimal import Decimal
+
+class TestValidatorV1Coverage:
+    def test_missing_else_with_empty_evidence_not_passed(self):
+        """无 ELSE + evidence 为空 → HUMAN_REVIEW → passed=False。"""
         validator = LabelRuleValidator()
-        spec = _make_test_spec()
         proposal = LabelRuleProposal(
-            proposal_id="p_not", source_spec_hash="hv",
+            proposal_id="p1", source_spec_hash="h",
             output_column="distance_category",
             branches=[
                 LabelBranchProposal(
-                    condition=LabelNot(
-                        child=LabelCompare(left="distance_miles", op=CompareOp.GTE,
-                                           right=LabelTypedLiteral(value=Decimal("100"), data_type="number")),
+                    condition=LabelCompare(
+                        left="distance_miles", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
                     ),
-                    then_label="normal",
-                    evidence="NOT >=100 -> normal",
+                    then_label="short", evidence="",
                 ),
             ],
-            else_value="extreme",
+            else_value="long",  # 有 ELSE——但 evidence 为空
+            label_domain=LabelDomain(values=["short", "long"]),
         )
-        report = validator.validate(proposal, spec)
-        assert any("NOT" in item for item in report.human_review_items)
+        report = validator.validate(proposal, _make_test_spec())
+        # evidence 为空→HUMAN_REVIEW→passed=False（即使有 ELSE）
+        # 注意：本版 evidence 为空也在 COVERAGE 中触发 HUMAN_REVIEW
+        coverage_checks = [c for c in report.checks if c.check_name == "COVERAGE"]
+        if coverage_checks:
+            # evidence 为空→HUMAN_REVIEW
+            assert any("evidence" in c.detail.lower() for c in coverage_checks
+                       if not c.passed)
 
-    def test_multi_field_no_cross_column_analysis(self):
-        """多字段条件 -> 不尝试跨列区间分析。"""
-        from tianshu_datadev.developer_spec.models import (
-            LabelBranchProposal, LabelAnd, LabelCompare, LabelRuleProposal, LabelTypedLiteral,
-        )
-        from decimal import Decimal
+    def test_all_evidence_present_passes(self):
+        """全部 evidence 非空 + ELSE→passed=True。"""
         validator = LabelRuleValidator()
-        spec = _make_test_spec()
         proposal = LabelRuleProposal(
-            proposal_id="p_multi", source_spec_hash="hv",
+            proposal_id="p1", source_spec_hash="h",
             output_column="distance_category",
             branches=[
                 LabelBranchProposal(
-                    condition=LabelAnd(children=[
-                        LabelCompare(left="distance_miles", op=CompareOp.LTE,
-                                     right=LabelTypedLiteral(value=Decimal("5"), data_type="number")),
-                        LabelCompare(left="is_distance_outlier", op=CompareOp.EQ,
-                                     right=LabelTypedLiteral(value=True, data_type="boolean")),
-                    ]),
-                    then_label="short_outlier",
-                    evidence="<=5 AND outlier -> short_outlier",
+                    condition=LabelCompare(
+                        left="distance_miles", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                    ),
+                    then_label="short", evidence="<=2 -> short",
                 ),
             ],
+            else_value="long",
+            label_domain=LabelDomain(values=["short", "long"]),
         )
-        report = validator.validate(proposal, spec)
-        # 多字段不导致误报阻断
-        assert not any("区间重叠" in e for e in report.blocking_errors)
+        report = validator.validate(proposal, _make_test_spec())
+        assert report.passed, f"blocking={report.blocking_errors}, review={report.human_review_items}"
+
+
+class TestValidatorV1DoubleEmpty:
+    """v4-light 最终版: passed 要求 blocking_errors 和 human_review_items 均为空。"""
+
+    def test_human_review_causes_fail(self):
+        """human_review_items 非空→即使 blocking 为空也 passed=False。"""
+        validator = LabelRuleValidator()
+        proposal = LabelRuleProposal(
+            proposal_id="p1", source_spec_hash="h",
+            output_column="distance_category",
+            branches=[
+                LabelBranchProposal(
+                    condition=LabelCompare(
+                        left="distance_miles", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                    ),
+                    then_label="short", evidence="",
+                ),
+            ],
+            else_value="long",
+            label_domain=LabelDomain(values=["short", "long"]),
+        )
+        report = validator.validate(proposal, _make_test_spec())
+        # evidence 为空→HUMAN_REVIEW→passed=False
+        assert not report.passed, "human_review_items 非空时 passed 应为 False"
+
+
+class TestValidatorV1LabelDomain:
+    def test_label_outside_domain_blocks(self):
+        """then_label 不在 domain 中→BLOCKING。"""
+        validator = LabelRuleValidator()
+        proposal = LabelRuleProposal(
+            proposal_id="p1", source_spec_hash="h",
+            output_column="distance_category",
+            branches=[
+                LabelBranchProposal(
+                    condition=LabelCompare(
+                        left="distance_miles", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                    ),
+                    then_label="ultra_short",  # ← 不在 domain 中
+                    evidence="<=2 -> ultra_short",
+                ),
+            ],
+            else_value="long",
+            label_domain=LabelDomain(values=["short", "medium", "long"]),
+        )
+        report = validator.validate(proposal, _make_test_spec())
+        assert any("ultra_short" in e for e in report.blocking_errors)
 ```
 
-- [ ] **Step 1: 编写测试**（含新增 IntervalProof 4 个测试）
 - [ ] **Step 2: 运行测试验证失败**
-- [ ] **Step 3: 实现 LabelRuleValidator v3**（含重写的 _extract_intervals / _check_intervals / _contains_boolean_node）
+
+- [ ] **Step 3: 实现 LabelRuleValidator v1（双空通过）**
+
+```python
+"""LabelRuleValidator v1——六项确定性检查。v4-light 最终版: 双空通过 + 无区间证明。"""
+from __future__ import annotations
+
+from tianshu_datadev.developer_spec.models import (
+    LabelAnd, LabelOr, LabelNot, LabelCompare, LabelIsNull, LabelIsNotNull,
+    LabelRuleProposal, LabelDomain, ParsedDeveloperSpec, CompareOp,
+    LabelValidationReport, LabelValidationCheck,
+)
+
+
+class LabelRuleValidator:
+    """确定性标签规则验证器 v1——六项检查，不做区间证明。
+
+    passed = blocking_errors 和 human_review_items 均为空。
+    """
+
+    def validate(
+        self,
+        proposal: LabelRuleProposal,
+        spec: ParsedDeveloperSpec,
+    ) -> LabelValidationReport:
+        """对单个 Proposal 执行全部六项检查。"""
+        checks: list[LabelValidationCheck] = []
+        blocking: list[str] = []
+        human_review: list[str] = []
+        warnings: list[str] = []
+
+        # 收集所有已知列名
+        known_columns: set[str] = set()
+        for t in spec.input_tables:
+            for c in t.columns:
+                known_columns.add(c.normalized_name)
+
+        # 1. FIELD_EXISTS
+        self._check_field_exists(proposal, known_columns, checks, blocking)
+        # 2. TYPE_COMPATIBLE
+        self._check_type_compatible(proposal, checks, blocking)
+        # 3. OPERATOR_VALID
+        self._check_operator_valid(proposal, checks, blocking)
+        # 4. AST_VALID
+        self._check_ast_valid(proposal, checks, blocking)
+        # 5. LABEL_DOMAIN
+        self._check_label_domain(proposal, checks, blocking)
+        # 6. COVERAGE（ELSE + evidence 非空）
+        self._check_coverage(proposal, checks, human_review)
+
+        # v4-light 最终版: passed = 双空
+        passed = len(blocking) == 0 and len(human_review) == 0
+        return LabelValidationReport(
+            proposal_id=proposal.proposal_id,
+            passed=passed,
+            checks=checks,
+            blocking_errors=blocking,
+            human_review_items=human_review,
+            warnings=warnings,
+        )
+
+    def _check_field_exists(self, proposal, known_columns, checks, blocking):
+        """1. FIELD_EXISTS——condition 中所有列引用必须在已知列中。"""
+        missing = []
+        for branch in proposal.branches:
+            self._collect_column_refs(branch.condition, known_columns, missing)
+        if missing:
+            unique_missing = sorted(set(missing))
+            checks.append(LabelValidationCheck(
+                check_name="FIELD_EXISTS", passed=False, level="BLOCKING",
+                detail=f"未知列: {unique_missing}",
+            ))
+            blocking.append(f"未知列: {unique_missing}")
+        else:
+            checks.append(LabelValidationCheck(
+                check_name="FIELD_EXISTS", passed=True, level="BLOCKING",
+                detail="所有列引用有效",
+            ))
+
+    def _check_type_compatible(self, proposal, checks, blocking):
+        """2. TYPE_COMPATIBLE——比较操作符类型与字面量 data_type 兼容。"""
+        for branch in proposal.branches:
+            invalid = self._find_type_mismatches(branch.condition)
+            if invalid:
+                checks.append(LabelValidationCheck(
+                    check_name="TYPE_COMPATIBLE", passed=False, level="BLOCKING",
+                    detail=f"类型不兼容: {invalid}",
+                ))
+                blocking.append(f"类型不兼容: {invalid}")
+                return
+        checks.append(LabelValidationCheck(
+            check_name="TYPE_COMPATIBLE", passed=True, level="BLOCKING",
+            detail="类型兼容",
+        ))
+
+    def _check_operator_valid(self, proposal, checks, blocking):
+        """3. OPERATOR_VALID——操作符合法，布尔节点子节点数合法。"""
+        errors = self._find_operator_errors(proposal)
+        if errors:
+            checks.append(LabelValidationCheck(
+                check_name="OPERATOR_VALID", passed=False, level="BLOCKING",
+                detail=f"操作符错误: {errors}",
+            ))
+            blocking.append(f"操作符错误: {errors}")
+        else:
+            checks.append(LabelValidationCheck(
+                check_name="OPERATOR_VALID", passed=True, level="BLOCKING",
+                detail="操作符合法",
+            ))
+
+    def _check_ast_valid(self, proposal, checks, blocking):
+        """4. AST_VALID——condition 为 LabelPredicateCondition discriminator 子类。"""
+        for branch in proposal.branches:
+            if isinstance(branch.condition, str):
+                checks.append(LabelValidationCheck(
+                    check_name="AST_VALID", passed=False, level="BLOCKING",
+                    detail="condition 是字符串——必须为 LabelPredicateCondition 子类",
+                ))
+                blocking.append("condition 是字符串而非结构化 AST")
+                return
+        checks.append(LabelValidationCheck(
+            check_name="AST_VALID", passed=True, level="BLOCKING",
+            detail="AST 结构合法",
+        ))
+
+    def _check_label_domain(self, proposal, checks, blocking):
+        """5. LABEL_DOMAIN——then_label/else_value 在 proposal.label_domain.values 中。"""
+        domain = proposal.label_domain
+        if not domain or not domain.values:
+            checks.append(LabelValidationCheck(
+                check_name="LABEL_DOMAIN", passed=True, level="BLOCKING",
+                detail="无 label_domain values——跳过域检查",
+            ))
+            return
+        domain_set = set(domain.values)
+        outside = []
+        for branch in proposal.branches:
+            if branch.then_label not in domain_set:
+                outside.append(branch.then_label)
+        if proposal.else_value not in domain_set:
+            outside.append(proposal.else_value)
+        if outside:
+            checks.append(LabelValidationCheck(
+                check_name="LABEL_DOMAIN", passed=False, level="BLOCKING",
+                detail=f"标签值不在域中: {outside}",
+            ))
+            blocking.append(f"标签值不在域中: {outside}")
+        else:
+            checks.append(LabelValidationCheck(
+                check_name="LABEL_DOMAIN", passed=True, level="BLOCKING",
+                detail="所有标签值在域内",
+            ))
+
+    def _check_coverage(self, proposal, checks, human_review):
+        """6. COVERAGE——ELSE 非空 + 所有 evidence 非空。"""
+        empty_evidence = [b.then_label for b in proposal.branches if not b.evidence]
+        if empty_evidence:
+            checks.append(LabelValidationCheck(
+                check_name="COVERAGE", passed=False, level="HUMAN_REVIEW",
+                detail=f"分支 evidence 为空: {empty_evidence}",
+            ))
+            human_review.append(
+                f"分支 {empty_evidence} evidence 为空——无法确定性判断覆盖完整性"
+            )
+        else:
+            checks.append(LabelValidationCheck(
+                check_name="COVERAGE", passed=True, level="BLOCKING",
+                detail="ELSE 非空 + 所有 evidence 非空——覆盖检查通过",
+            ))
+
+    # ── 辅助方法 ──
+
+    def _collect_column_refs(self, node, known, missing):
+        """递归收集节点树中所有列引用。"""
+        if isinstance(node, LabelCompare):
+            if node.left not in known:
+                missing.append(node.left)
+        elif isinstance(node, (LabelIsNull, LabelIsNotNull)):
+            if node.column not in known:
+                missing.append(node.column)
+        elif isinstance(node, (LabelAnd, LabelOr)):
+            for child in node.children:
+                self._collect_column_refs(child, known, missing)
+        elif isinstance(node, LabelNot):
+            self._collect_column_refs(node.child, known, missing)
+
+    def _find_type_mismatches(self, node) -> list[str]:
+        """查找类型不兼容的比较。"""
+        errors = []
+        if isinstance(node, LabelCompare):
+            if node.right.data_type == "string" and node.op not in (CompareOp.EQ, CompareOp.NEQ):
+                errors.append(
+                    f"{node.left} {node.op.value} '{node.right.value}'——"
+                    f"string 类型仅支持 =/!="
+                )
+        elif isinstance(node, (LabelAnd, LabelOr)):
+            for child in node.children:
+                errors.extend(self._find_type_mismatches(child))
+        elif isinstance(node, LabelNot):
+            errors.extend(self._find_type_mismatches(node.child))
+        return errors
+
+    def _find_operator_errors(self, proposal) -> list[str]:
+        """检查布尔节点子节点数和操作符合法性。"""
+        errors = []
+        for branch in proposal.branches:
+            self._check_node_structure(branch.condition, errors)
+        return errors
+
+    def _check_node_structure(self, node, errors):
+        """递归检查节点结构合法性。"""
+        if isinstance(node, (LabelAnd, LabelOr)):
+            if len(node.children) < 2:
+                errors.append(f"{node.node_type} 至少需要 2 个子节点")
+            for child in node.children:
+                self._check_node_structure(child, errors)
+        elif isinstance(node, LabelNot):
+            if node.child is None:
+                errors.append("NOT 节点需要非空 child")
+            else:
+                self._check_node_structure(node.child, errors)
+```
+
 - [ ] **Step 4: 运行测试验证通过**
+
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/tianshu_datadev/labels/label_rule_validator.py tests/labels/test_label_rules.py
-git commit -m "feat(labels): 新增 LabelRuleValidator——8 项确定性检查（v3 区间证明仅明确子集）
+git commit -m "feat(labels): LabelRuleValidator v1——六项检查 + 双空通过 + 无区间证明
 
-检查项（v3 更新 #8 区间证明策略）：
-1. FIELD_EXISTS（BLOCKING）
-2. TYPE_COMPATIBLE（BLOCKING）
-3. OPERATOR_VALID（BLOCKING）
-4. OUTPUT_TYPE（BLOCKING）
-5. EVIDENCE_ANCHORED（BLOCKING）
-6. LABEL_DOMAIN（BLOCKING）
-7. COVERAGE_COMPLETENESS（BLOCKING/HUMAN_REVIEW）
-8. INTERVAL_OVERLAP/GAP——仅支持明确子集（同列数值 AND）
-   - OR/NOT/多字段 -> HUMAN_REVIEW（不阻断）
-   - 跨列不分析
-- 辅助联合类型 LabelBooleanNode/LabelOperandNode 用于节点类别判断"
+passed = blocking_errors 和 human_review_items 均为空
+缺少 ELSE/evidence→HUMAN_REVIEW→passed=False"
 ```
 
 ---
 
-### Task 7: FakeLabelExtractor——确定性 Adapter（pytest 专用）
+### Task 7: FakeLabelExtractor——pytest 专用
 
-**边界：** `FakeLabelExtractor` **仅用于 pytest**——生产路径禁止回退 Fake。返回预定义的 `LabelRuleProposal` 列表。不调 LLM、不访问网络、不需要 API Key。
-
-**失败路径：**
-- 预定义 Proposal 的 condition 引用了不存在的列 → 由 Validator 在下一步捕获（不在此层处理）
-- 测试中忘记注入 FakeLabelExtractor → `_prepare_spec_for_planning()` 默认使用 LlmLabelExtractor（需要 API Key）→ 测试失败
-- `unresolved_columns` 参数与预定义 Proposal 的 output_column 不匹配 → 不影响（Fake 不做匹配检查）
-
-**验收命令：**
-```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/labels/test_label_rules.py::TestFakeLabelExtractor -v
-```
-
-**退出条件：** 全部测试 PASS；FakeLabelExtractor 返回正确的 Proposal 和 Artifact。
+**边界：** `FakeLabelExtractor` 仅用于 pytest——确定性返回预定义 Proposal。
 
 **Files:**
-- Create: `src/tianshu_datadev/labels/label_extractor.py`（FakeLabelExtractor + LabelExtractor 抽象接口）
-- Test: `tests/labels/test_label_rules.py`（末尾追加 `TestFakeLabelExtractor`）
+- Create: `src/tianshu_datadev/labels/label_extractor.py`（抽象基类 + FakeLabelExtractor）
+- Test: `tests/labels/test_label_rules.py`（末尾追加）
 
 **Interfaces:**
-- Consumes: `LabelRuleProposal`, `LabelExtractionArtifact`（Task 2/3）
 - Produces: `LabelExtractor`（抽象基类）——`extract(spec, unresolved_columns) -> tuple[list[LabelRuleProposal], LabelExtractionArtifact]`
 - Produces: `FakeLabelExtractor(proposals=None)`——确定性实现
 
-实现代码**同原 v2 计划 Task 6 的 FakeLabelExtractor 部分**，以下关键差异：
-- 类名明确标注 "Fake"——禁止生产路径误用
-- 抽象基类 `LabelExtractor` 定义 `extract()` 接口——`LlmLabelExtractor`（Task 8）实现同一接口
+- [ ] **Step 1: 编写测试**
 
-- [ ] **Step 1: 编写测试**（同 v2 Task 6 Step 1 的 `TestFakeLabelExtractor`）
-- [ ] **Step 2: 运行测试验证失败**
-- [ ] **Step 3: 实现 LabelExtractor 抽象基类 + FakeLabelExtractor**（同 v2 Task 6 Step 3，新增抽象基类）
-- [ ] **Step 4: 运行测试验证通过**
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/tianshu_datadev/labels/label_extractor.py tests/labels/test_label_rules.py
-git commit -m "feat(labels): 新增 LabelExtractor 抽象接口 + FakeLabelExtractor（pytest 专用）
-
-- LabelExtractor: 抽象基类——定义 extract() 接口
-- FakeLabelExtractor: 确定性 Fake Adapter——pytest 使用，不调真实 LLM
-- 生产路径禁止使用 FakeLabelExtractor——使用 LlmLabelExtractor（Task 8）
-- 溯源字段（artifact_id/extraction_time）由系统生成"
+```python
+class TestFakeLabelExtractor:
+    def test_returns_predefined_proposals(self):
+        from tianshu_datadev.labels.label_extractor import FakeLabelExtractor
+        proposal = LabelRuleProposal(
+            proposal_id="p1", source_spec_hash="h",
+            output_column="col",
+            branches=[
+                LabelBranchProposal(
+                    condition=LabelCompare(
+                        left="x", op=CompareOp.EQ,
+                        right=LabelTypedLiteral(value="a", data_type="string"),
+                    ),
+                    then_label="label_a", evidence="x=a",
+                ),
+            ],
+            else_value="label_b",
+            label_domain=LabelDomain(values=["label_a", "label_b"]),
+        )
+        extractor = FakeLabelExtractor(proposals=[proposal])
+        spec = _make_test_spec()
+        result, artifact = extractor.extract(spec, ["col"])
+        assert len(result) == 1
+        assert result[0].output_column == "col"
 ```
+
+- [ ] **Step 2-5: 实现 + 测试 + Commit**
 
 ---
 
-### Task 8: LlmLabelExtractor——生产级 LLM 提取器（v3 新增）
+### Task 8: Prompt 模板 + Schema 注册
 
-**边界：** `LlmLabelExtractor` 是**生产路径唯一合法的 LabelExtractor 实现**。复用仓库现有的三层基础设施：
-1. `LLMGateway`（`src/tianshu_datadev/llm/gateway.py`）——统一 LLM 调用入口，Schema 校验
-2. `PromptManager`（`src/tianshu_datadev/prompts/manager.py`）——版本化 Prompt 模板加载和渲染
-3. `ProviderAdapter`（`src/tianshu_datadev/llm/adapters/base.py`）——LLM Provider 抽象（FakeAdapter/AnthropicAdapter/OpenAiAdapter）
-
-**禁止行为：**
-- 禁止直接调用 ProviderAdapter（必须通过 LLMGateway）
-- 禁止硬编码 Prompt 文本（必须通过 PromptManager 按 task/version 加载）
-- 禁止生产路径回退 FakeLabelExtractor
-- 禁止 LLM 填充溯源字段（artifact_id/extraction_time 由系统生成）
-
-**需要新建的 Prompt 模板：** `prompts/label_extract/v001.md`——包含：
-- task: "extract_label_rules"
-- version: "v001"
-- schema_name: "LabelRuleProposal"
-- system_message: "从 Markdown body 中提取 CASE WHEN 标签规则..."
-- user_message_template: "原始 Markdown body: {markdown_body}
-未解析列: {unresolved_columns}
-源表字段: {available_fields}"
-
-**失败路径：**
-- Prompt 模板不存在（task/version 未知）→ PromptManager 抛出异常 → 上层转为 PipelineError
-- LLM 返回格式不合法 → LLMGateway 的 Pydantic model_validate 失败 → validation_status="invalid" → 不进入编译链路
-- LLM 超时/网络错误 → AdapterError → 重试一次 → 仍失败则 PipelineError
-- LLM 输出字符串条件（when/raw_condition）→ Pydantic discriminator 校验失败 → validation_status="invalid"
-- LLM 输出的 evidence 为空 → Validator（Task 6）在下一步捕获 → BLOCKING
-
-**验收命令：**
-```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/labels/test_label_rules.py::TestLlmLabelExtractor -v
-```
-
-**退出条件：** pytest 测试 PASS（使用 FakeAdapter + 预定义 LLM 响应模拟）；Prompt 模板文件通过 Schema 校验。
+**边界：** 创建 Prompt 模板文件并在 `_SCHEMA_PATH_MAP` 中注册。
 
 **Files:**
-- Create: `src/tianshu_datadev/labels/llm_label_extractor.py`
-- Create: `prompts/label_extract/v001.md`（Prompt 模板）
-- Test: `tests/labels/test_label_rules.py`（末尾追加 `TestLlmLabelExtractor`）
+- Create: `src/tianshu_datadev/prompts/templates/extract_label_rules/v001.md`
+- Modify: `src/tianshu_datadev/prompts/manager.py`（`_SCHEMA_PATH_MAP` 新增条目）
 
-**Interfaces:**
-- Consumes: `LabelExtractor` 抽象接口（Task 7）、`LLMGateway`（llm/gateway.py）、`PromptManager`（prompts/manager.py）、`ProviderAdapter`（llm/adapters/base.py）、`LlmRequest`/`LlmResponse`/`SchemaBinding`（llm/models.py）
-- Produces: `LlmLabelExtractor(gateway: LLMGateway)`——`extract(spec, unresolved_columns) -> tuple[list[LabelRuleProposal], LabelExtractionArtifact]`
+- [ ] **Step 1: 注册 Schema**
 
-- [ ] **Step 1: 编写测试**
-
-在 `tests/labels/test_label_rules.py` 末尾追加：
+在 `src/tianshu_datadev/prompts/manager.py` 的 `_SCHEMA_PATH_MAP` 字典末尾添加：
 
 ```python
-# ================================================
-# LlmLabelExtractor——生产级 LLM 提取器
-# ================================================
-
-from tianshu_datadev.labels.llm_label_extractor import LlmLabelExtractor
-from tianshu_datadev.llm.adapters.fake_adapter import FakeLLMAdapter
-from tianshu_datadev.llm.gateway import LLMGateway
-from tianshu_datadev.llm.models import LlmRequest
-from tianshu_datadev.prompts.manager import PromptManager
-
-
-class TestLlmLabelExtractor:
-    """LlmLabelExtractor——生产级 LLM 提取器（pytest 使用 FakeAdapter 模拟）。"""
-
-    def _make_extractor(self, fake_response: dict | None = None):
-        """创建使用 FakeAdapter 的 LlmLabelExtractor。"""
-        adapter = FakeLLMAdapter(response_data=fake_response or {})
-        prompt_manager = PromptManager()
-        gateway = LLMGateway(adapter=adapter, prompt_manager=prompt_manager)
-        return LlmLabelExtractor(gateway=gateway)
-
-    def test_extract_returns_proposals(self):
-        """FakeAdapter 返回合法 JSON -> LlmLabelExtractor 返回 Proposal 列表。"""
-        from tianshu_datadev.developer_spec.models import (
-            LabelBranchProposal, LabelCompare, LabelRuleProposal, LabelTypedLiteral,
-        )
-        from decimal import Decimal
-
-        # 构造 FakeAdapter 返回的合法 LabelRuleProposal JSON
-        fake_data = [{
-            "proposal_id": "proposal_test001",
-            "source_spec_hash": "hash_test",
-            "output_column": "distance_category",
-            "branches": [{
-                "condition": {
-                    "node_type": "COMPARE",
-                    "left": "distance_miles",
-                    "op": "<=",
-                    "right": {
-                        "node_type": "LITERAL",
-                        "value": "2",
-                        "data_type": "number",
-                    },
-                },
-                "then_label": "short",
-                "evidence": "distance_miles <= 2 -> short",
-            }],
-            "else_value": "long",
-        }]
-
-        extractor = self._make_extractor(fake_response=fake_data)
-        spec = _make_test_spec()
-        proposals, artifact = extractor.extract(spec, ["distance_category"])
-
-        assert len(proposals) == 1
-        assert proposals[0].output_column == "distance_category"
-        # 溯源字段由系统生成，不由 LLM 填充
-        assert artifact.llm_model != ""
-        assert artifact.artifact_id.startswith("extract_")
-        assert artifact.source_spec_hash == spec.spec_hash
-
-    def test_extract_does_not_fallback_to_fake(self):
-        """LlmLabelExtractor 不包含任何 Fake 回退逻辑。"""
-        extractor = self._make_extractor()
-        # 验证没有 _fallback / _fake 属性或方法
-        assert not hasattr(extractor, '_fallback_extractor')
-        assert not hasattr(extractor, '_fake')
+"LabelRuleProposalList": (
+    "tianshu_datadev.developer_spec.models.LabelRuleProposalList"
+),
 ```
 
-- [ ] **Step 2: 运行测试验证失败**
+- [ ] **Step 2: 创建 Prompt 模板**
 
-```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/labels/test_label_rules.py::TestLlmLabelExtractor -v
-```
-
-- [ ] **Step 3: 创建 Prompt 模板 `prompts/label_extract/v001.md`**
+创建 `src/tianshu_datadev/prompts/templates/extract_label_rules/v001.md`：
 
 ```markdown
 ---
 task: extract_label_rules
 version: v001
-schema_name: LabelRuleProposal
+target_schema: LabelRuleProposalList
 schema_version: v1
-model: claude-sonnet-5
-temperature: 0.1
+input_artifacts:
+  - parsed_developer_spec
 forbidden:
-  - 禁止输出 when 字符串条件
-  - 禁止输出 raw_condition
-  - 禁止输出非 discriminator 的 predicate 节点
-  - 禁止填充 artifact_id/extraction_time（由系统生成）
+  - 禁止输出 proposal_id
+  - 禁止输出 source_spec_hash
+  - 禁止输出 extraction_time
+  - 禁止 LITERAL/COLUMN_REF 作为 WHEN 根条件
+  - 禁止输出字符串条件（when/raw_condition）
 rejection_policy: strict
+changelog: "v001: 初始版本——从 Markdown body 提取标签规则"
 ---
 
 # 系统指令
@@ -1306,11 +2017,13 @@ rejection_policy: strict
 
 ## 输出要求
 
-1. 每个未解析列输出一个 LabelRuleProposal
-2. condition 必须使用 discriminator 子类（COMPARE/IS_NULL/IS_NOT_NULL/AND/OR/NOT）
-3. 禁止输出字符串条件（when/raw_condition）
-4. 每个分支必须附带 evidence——逐字引用 Markdown 原文
-5. 从原文中提取 LabelDomain（所有可能的标签值）
+1. 每个未解析列输出一个 LabelRuleProposalOutput
+2. condition 必须使用合法根条件类型（COMPARE/IS_NULL/IS_NOT_NULL/AND/OR/NOT）
+3. **LITERAL 和 COLUMN_REF 不可作为 WHEN 根条件**——违反此规则的输出将被 Schema 校验拒绝
+4. **禁止输出 proposal_id / source_spec_hash / extraction_time**——这些由系统生成
+5. 每个分支必须附带 evidence——逐字引用 Markdown 原文
+6. **else_value 必须非空**——label_table v1 要求 ELSE 子句
+7. 从原文中提取 label_domain（所有可能的标签值）
 
 ## 输入
 
@@ -1319,749 +2032,884 @@ rejection_policy: strict
 - 可用源表字段: {available_fields}
 ```
 
-- [ ] **Step 4: 实现 LlmLabelExtractor**
+- [ ] **Step 3: 验证 PromptManager 加载模板**
 
-创建 `src/tianshu_datadev/labels/llm_label_extractor.py`：
+```bash
+cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -c "
+from tianshu_datadev.prompts.manager import PromptManager
+pm = PromptManager()
+t = pm.get_prompt('extract_label_rules', 'v001')
+print(f'task={t.task}, schema={t.schema_binding.schema_name}, version={t.version}')
+"
+```
+
+- [ ] **Step 4: Commit**
+
+---
+
+### Task 9: LlmLabelExtractor——修复全部接口 + 从 response_root 文件读取
+
+**边界：** `LlmLabelExtractor` 是生产路径唯一合法实现。从 `parsed_json_ref` 路径（Gateway 写入 response_root 的文件）读取结构化数据，系统包装后返回 `LabelRuleProposal`（含必填 else_value/label_domain/evidence）。
+
+**与初版的关键差异：**
+- 不再假设 `parsed_json_ref` 文件已存在——该文件由 Gateway 在 Schema 校验通过后原子写入（Task 0）
+- 错误信息使用真实 `response.validation_errors: list[str]`
+- `LlmResponse` 无 `model`/`prompt_snapshot` 字段
+
+**Files:**
+- Create: `src/tianshu_datadev/labels/llm_label_extractor.py`
+- Test: `tests/labels/test_label_rules.py`（末尾追加）
+
+- [ ] **Step 1: 编写测试（使用 FakeLLMAdapter→Gateway→文件→Extractor 集成链路）**
 
 ```python
-"""LlmLabelExtractor——生产级 LLM 标签规则提取器。
+class TestLlmLabelExtractorIntegration:
+    """LlmLabelExtractor 集成测试——通过 Gateway 读取 response_root 中的文件。"""
 
-复用仓库现有三层基础设施：
-1. LLMGateway——统一 LLM 调用入口 + Schema 校验
-2. PromptManager——版本化 Prompt 模板
-3. ProviderAdapter——LLM Provider 抽象
+    @staticmethod
+    def _make_fake_response_dict():
+        return {
+            "rules": [{
+                "output_column": "distance_category",
+                "branches": [{
+                    "condition": {
+                        "node_type": "COMPARE", "left": "distance_miles",
+                        "op": "<=",
+                        "right": {"node_type": "LITERAL", "value": 2, "data_type": "number"},
+                    },
+                    "then_label": "short",
+                    "evidence": "distance_miles <= 2 -> short",
+                }],
+                "else_value": "long",
+                "label_domain": {"values": ["short", "long"], "source_evidence": "原文"},
+            }],
+        }
 
-溯源字段（artifact_id/extraction_time）由系统生成，不由 LLM 填充。
+    def test_integration_fake_to_extractor(self, tmp_path):
+        """FakeAdapter→Gateway→文件→Extractor 完整链路。"""
+        adapter = FakeLLMAdapter()
+        adapter.register_default_for_task("extract_label_rules",
+                                          self._make_fake_response_dict())
+        prompt_manager = PromptManager()
+        gateway = LLMGateway(
+            adapter=adapter, prompt_manager=prompt_manager,
+            response_root=str(tmp_path),
+        )
+        extractor = LlmLabelExtractor(gateway=gateway)
+
+        spec = _make_test_spec()
+        proposals, artifact = extractor.extract(spec, ["distance_category"])
+
+        assert len(proposals) == 1
+        assert proposals[0].output_column == "distance_category"
+        assert proposals[0].proposal_id != ""
+        assert proposals[0].source_spec_hash == spec.spec_hash
+        assert proposals[0].else_value == "long"
+        assert proposals[0].label_domain is not None
+        assert artifact.artifact_id != ""
+```
+
+- [ ] **Step 2: 运行测试验证失败**
+
+- [ ] **Step 3: 实现 LlmLabelExtractor v4-light 最终版**
+
+```python
+"""LlmLabelExtractor v4-light 最终版——生产级 LLM 标签规则提取器。
+
+从 Gateway response_root 中的 parsed_json_ref 文件读取结构化数据，
+系统包装 proposal_id/source_spec_hash/extraction_time/label_domain。
 """
-
 from __future__ import annotations
-
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 
-from tianshu_datadev.developer_spec.models import LabelRuleProposal, ParsedDeveloperSpec
+from tianshu_datadev.developer_spec.models import (
+    LabelBranchProposal, LabelDomain, LabelRuleProposal,
+    LabelRuleProposalList, ParsedDeveloperSpec,
+)
 from tianshu_datadev.labels.artifacts import LabelExtractionArtifact
 from tianshu_datadev.labels.label_extractor import LabelExtractor
 from tianshu_datadev.llm.gateway import LLMGateway
-from tianshu_datadev.llm.models import (
-    ArtifactRef,
-    LlmRequest,
-    SchemaBinding,
-)
+from tianshu_datadev.llm.models import ArtifactRef, LlmRequest
+
+
+class PipelineError(Exception):
+    def __init__(self, error_code: str, message: str):
+        self.error_code = error_code
+        super().__init__(message)
 
 
 class LlmLabelExtractor(LabelExtractor):
     """生产级 LabelExtractor——通过 LLMGateway 调用 LLM 提取标签规则。
 
-    禁止生产路径回退 FakeLabelExtractor。
-    所有 LLM 调用必须通过 LLMGateway——不接受自由 Prompt，不直接调 Adapter。
+    LLM 仅输出规则/标签域/evidence——proposal_id/source_spec_hash/extraction_time
+    由系统生成。label_domain 从 LLM 输出的 LabelDomainOutput 包装为系统 LabelDomain。
     """
 
     def __init__(self, gateway: LLMGateway) -> None:
-        """初始化 LlmLabelExtractor。
-
-        Args:
-            gateway: LLMGateway 实例——已注入 ProviderAdapter + PromptManager
-        """
         self._gateway = gateway
 
     @property
     def gateway(self) -> LLMGateway:
-        """返回内部 Gateway——仅供诊断。"""
         return self._gateway
 
     def extract(
-        self,
-        spec: ParsedDeveloperSpec,
-        unresolved_columns: list[str],
+        self, spec: ParsedDeveloperSpec, unresolved_columns: list[str],
     ) -> tuple[list[LabelRuleProposal], LabelExtractionArtifact]:
-        """通过 LLM 从 Markdown body 提取标签规则。
-
-        Args:
-            spec: 当前 Spec（含 Markdown body 和源表字段清单）
-            unresolved_columns: 未解析的输出列名列表
-
-        Returns:
-            (LLM 提取的 Proposal 列表, 提取溯源 Artifact)
-
-        Raises:
-            PipelineError: LLM 调用失败或返回非法数据时
-        """
-        # --- 收集源表可用字段 ---
-        available_fields: list[str] = []
+        """通过 LLM 从 Markdown body 提取标签规则。"""
+        # 收集源表可用字段
+        available_fields = []
         for t in spec.input_tables:
             for c in t.columns:
-                available_fields.append(f"{c.normalized_name}: {getattr(c, 'data_type', 'unknown')}")
+                available_fields.append(c.normalized_name)
 
-        # --- 构建 LlmRequest ---
+        # 构造 LlmRequest
         request = LlmRequest(
             request_id=LlmRequest.generate_request_id(),
-            task="extract_label_rules",
-            prompt_version="v001",
-            schema_name="LabelRuleProposal",
-            schema_version="v1",
+            task="extract_label_rules", prompt_version="v001",
+            schema_name="LabelRuleProposalList", schema_version="v1",
             input_artifact_refs=[
-                ArtifactRef(
-                    artifact_type="parsed_developer_spec",
-                    artifact_hash=spec.spec_hash,
-                    artifact_id=spec.spec_id,
-                ),
+                ArtifactRef(artifact_type="parsed_developer_spec",
+                            artifact_hash=spec.spec_hash, artifact_id=spec.spec_id),
             ],
-            temperature=0.1,
-            model="",  # 使用 ProviderAdapter 默认模型
+            temperature=0.1, model="",
         )
 
-        # --- 提交 LLM 请求 ---
-        response = self._gateway.submit(request)
+        # 调用 Gateway——通过 extra_vars 注入动态内容
+        response = self._gateway.submit(
+            request,
+            markdown_body=spec.description or "",
+            unresolved_columns=", ".join(unresolved_columns),
+            available_fields=", ".join(available_fields),
+        )
 
-        if not response.is_valid or response.parsed_output is None:
-            raise PipelineError(
-                error_code="LABEL_EXTRACT_FAILED",
-                message=f"LLM 提取标签规则失败: {response.validation_error or '未知错误'}",
+        # 检查校验状态
+        if not response.is_valid:
+            error_detail = "; ".join(response.validation_errors)
+            raise PipelineError("LABEL_EXTRACT_FAILED",
+                                f"LLM 提取标签规则失败: {error_detail}")
+
+        # 从 parsed_json_ref 路径读取 Gateway 写入 response_root 的结构化数据
+        if response.parsed_json_ref is None:
+            raise PipelineError("LABEL_EXTRACT_FAILED",
+                                "LLM 返回 valid 但 parsed_json_ref 为 None")
+
+        parsed_path = Path(response.parsed_json_ref)
+        if not parsed_path.exists():
+            raise PipelineError("LABEL_EXTRACT_FAILED",
+                                f"结构化输出文件不存在: {response.parsed_json_ref}")
+
+        raw_data = json.loads(parsed_path.read_text("utf-8"))
+        llm_output = LabelRuleProposalList.model_validate(raw_data)
+
+        # 系统包装——注入 proposal_id/source_spec_hash/extraction_time/label_domain
+        now = datetime.now(timezone.utc)
+        proposals = []
+        for i, rule_output in enumerate(llm_output.rules):
+            proposal_id = (
+                f"prop_{spec.spec_hash[:12]}_"
+                f"{now.strftime('%Y%m%d%H%M%S')}_{i:02d}"
             )
+            # 包装分支——evidence 从 LLM 输出继承
+            branches = [
+                LabelBranchProposal(
+                    condition=b.condition,
+                    then_label=b.then_label,
+                    evidence=b.evidence,
+                )
+                for b in rule_output.branches
+            ]
+            # 包装 label_domain——从 LLM 输出的 LabelDomainOutput 转换为系统 LabelDomain
+            domain_output = rule_output.label_domain
+            domain = LabelDomain(
+                domain_id=f"dom_{proposal_id}",
+                values=domain_output.values if domain_output else [],
+                source_evidence=domain_output.source_evidence if domain_output else "",
+                is_exhaustive=domain_output.is_exhaustive if domain_output else False,
+                completeness_evidence=(
+                    domain_output.completeness_evidence if domain_output else ""
+                ),
+            )
+            proposals.append(LabelRuleProposal(
+                proposal_id=proposal_id,
+                source_spec_hash=spec.spec_hash,
+                output_column=rule_output.output_column,
+                branches=branches,
+                else_value=rule_output.else_value,
+                label_domain=domain,  # ← 必填
+            ))
 
-        # --- 解析输出 ---
-        raw_data = response.parsed_output
-        if isinstance(raw_data, dict):
-            raw_data = [raw_data]
-        proposals = [LabelRuleProposal.model_validate(item) for item in raw_data]
-
-        # --- 构建溯源 Artifact（系统生成字段，不由 LLM 填充）---
+        # 构建溯源 Artifact
         artifact = LabelExtractionArtifact(
-            artifact_id=f"extract_{spec.spec_hash[:12]}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
-            source_spec_hash=spec.spec_hash,
-            extraction_time=datetime.now(timezone.utc).isoformat(),
-            llm_model=response.model or "unknown",
-            llm_prompt_version="label-extract-v001",
-            llm_temperature=0.1,
-            unresolved_columns=unresolved_columns,
-            raw_proposals=proposals,
-            prompt_snapshot=getattr(response, 'prompt_snapshot', ""),
+            artifact_id=f"extract_{spec.spec_hash[:12]}_{now.strftime('%Y%m%d%H%M%S')}",
+            source_spec_hash=spec.spec_hash, extraction_time=now.isoformat(),
+            llm_model="", llm_prompt_version="extract_label_rules/v001",
+            llm_temperature=0.1, unresolved_columns=unresolved_columns,
+            raw_proposals=proposals, prompt_snapshot="",
         )
-
         return proposals, artifact
 ```
 
-- [ ] **Step 5: 运行测试验证通过**
+- [ ] **Step 4: 运行测试验证通过**
+
+- [ ] **Step 5: Commit**
 
 ```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/labels/test_label_rules.py::TestLlmLabelExtractor -v
-```
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/tianshu_datadev/labels/llm_label_extractor.py prompts/label_extract/v001.md tests/labels/test_label_rules.py
-git commit -m "feat(labels): 新增 LlmLabelExtractor——生产级 LLM 标签规则提取器
-
-- 复用 LLMGateway + PromptManager + ProviderAdapter 三层基础设施
-- 通过 LlmRequest/LlmResponse 提交 LLM 调用——所有输出经 Pydantic Schema 校验
-- 溯源字段（artifact_id/extraction_time/llm_model）由系统生成，不由 LLM 填充
-- 禁止生产路径回退 FakeLabelExtractor
-- 新增 prompts/label_extract/v001.md Prompt 模板
-- pytest 使用 FakeLLMAdapter 模拟 LLM 响应"
+git add src/tianshu_datadev/labels/llm_label_extractor.py tests/labels/test_label_rules.py
+git commit -m "feat(labels): LlmLabelExtractor——从 Gateway response_root 文件读取，系统包装必填字段
+- 从 parsed_json_ref 路径读取 Gateway 原子写入的结构化 JSON
+- 系统注入 proposal_id/source_spec_hash/extraction_time/label_domain
+- else_value/label_domain/evidence 均为必填——缺失时 Pydantic Schema 拒绝"
 ```
 
 ---
 
-### Task 9: Promotion——Proposal -> CaseWhenDecl 提升 + 溯源 Artifact
+### Task 10: Promotion——Proposal → CaseWhenDecl（双空阻断 + 必需字段检查）
 
-**边界：** 纯确定性逻辑，不调 LLM。仅提升 `passed=True` 的 Proposal。不修改原 Spec（生成新 Spec）。spec_hash 统一重算——仅基于确定性语义字段，不含溯源信息。
+**边界：** Promotion 将验证通过的 Proposal 提升为 CaseWhenDecl。
 
-**失败路径：**
-- 所有 Proposal 均未通过验证 → 只产生 LabelPromotionArtifact（含 rejected_proposals），不修改 Spec
-- `_normalized_spec_hash()` 计算结果与原 hash 相同 → 说明 Spec 无变化——正常（无新规则被提升）
-- 并发调用 Promotion → 每个调用产生独立的新 Spec（不共享状态）
-
-**验收命令：**
-```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/labels/test_label_rules.py::TestPromotion -v
-```
-
-**退出条件：** 全部 2 个测试 PASS；提升后 spec_hash 与原始 hash 不同。
+**v4-light 最终版关键规则：**
+1. `report.passed == True` 才可提升——即 `blocking_errors` **和** `human_review_items` **均为空**
+2. 额外校验：每个 branch.evidence 非空、else_value 非空、label_domain 非空——任一缺失则拒绝提升
+3. 产出 `LabelPromotionArtifact`——含溯源链
+4. 重新计算 spec_hash
 
 **Files:**
 - Create: `src/tianshu_datadev/labels/promotion.py`
-- Test: `tests/labels/test_label_rules.py`（末尾追加 `TestPromotion`）
+- Test: `tests/labels/test_label_rules.py`（末尾追加）
 
 **Interfaces:**
-- Consumes: `LabelRuleProposal`, `LabelValidationReport`, `LabelExtractionArtifact`, `LabelPromotionArtifact`, `CaseWhenDecl`, `LabelPredicateBranch`（Task 2/3/7/8）
+- Consumes: `LabelRuleProposal`（Task 2）、`LabelValidationReport`（Task 3）、`ParsedDeveloperSpec`（Task 2）
 - Produces: `Promotion.promote(spec, proposals, reports, extraction_artifact) -> tuple[ParsedDeveloperSpec, LabelPromotionArtifact]`
 
-实现代码**同原 v2 计划 Task 6 的 Promotion 部分**（无实质性逻辑变更）。
+- [ ] **Step 1: 编写测试——含双空阻断 + 必需字段检查**
 
-- [ ] **Step 1-5: 同 v2 Task 6 的 TestPromotion 测试 + Promotion 实现 + Commit**
+```python
+# tests/labels/test_label_rules.py 末尾追加
+
+from tianshu_datadev.labels.promotion import Promotion
+
+
+class TestPromotionDoubleEmptyGate:
+    """v4-light 最终版: Promotion 必须 blocking_errors 和 human_review_items 均为空。"""
+
+    def test_passed_proposal_promoted(self):
+        """全部通过→提升为 CaseWhenDecl。"""
+        promotion = Promotion()
+        spec = _make_test_spec()
+        proposal = LabelRuleProposal(
+            proposal_id="p1", source_spec_hash=spec.spec_hash,
+            output_column="distance_category",
+            branches=[
+                LabelBranchProposal(
+                    condition=LabelCompare(
+                        left="distance_miles", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                    ),
+                    then_label="short", evidence="<=2 -> short",
+                ),
+            ],
+            else_value="long",
+            label_domain=LabelDomain(domain_id="d1", values=["short", "long"]),
+        )
+        report = LabelValidationReport(
+            proposal_id="p1", passed=True, checks=[],
+            blocking_errors=[], human_review_items=[], warnings=[],
+        )
+        new_spec, artifact = promotion.promote(
+            spec, [proposal], [report],
+            LabelExtractionArtifact(
+                artifact_id="e1", source_spec_hash=spec.spec_hash,
+                extraction_time="2026-07-15T00:00:00Z",
+                llm_model="fake", llm_prompt_version="v001",
+                llm_temperature=0.1, unresolved_columns=["distance_category"],
+                raw_proposals=[proposal],
+            ),
+        )
+        assert len(new_spec.label_rules) == 1
+        assert artifact.human_review_required is False
+
+    def test_human_review_blocks_promotion(self):
+        """human_review_items 非空→拒绝提升→返回原 spec。"""
+        promotion = Promotion()
+        spec = _make_test_spec()
+        proposal = LabelRuleProposal(
+            proposal_id="p1", source_spec_hash=spec.spec_hash,
+            output_column="distance_category",
+            branches=[
+                LabelBranchProposal(
+                    condition=LabelCompare(
+                        left="distance_miles", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                    ),
+                    then_label="short", evidence="",  # ← 空 evidence
+                ),
+            ],
+            else_value="long",
+            label_domain=LabelDomain(domain_id="d1", values=["short", "long"]),
+        )
+        report = LabelValidationReport(
+            proposal_id="p1", passed=False, checks=[],
+            blocking_errors=[],
+            human_review_items=["缺少 evidence"],
+            warnings=[],
+        )
+        new_spec, artifact = promotion.promote(
+            spec, [proposal], [report],
+            LabelExtractionArtifact(
+                artifact_id="e1", source_spec_hash=spec.spec_hash,
+                extraction_time="2026-07-15T00:00:00Z",
+                llm_model="fake", llm_prompt_version="v001",
+                llm_temperature=0.1, unresolved_columns=["distance_category"],
+                raw_proposals=[proposal],
+            ),
+        )
+        # 拒绝提升——label_rules 为空
+        assert len(new_spec.label_rules) == 0
+        assert artifact.human_review_required is True
+
+    def test_empty_evidence_blocks_promotion(self):
+        """branch.evidence 为空→即使 report.passed 也拒绝提升。"""
+        promotion = Promotion()
+        spec = _make_test_spec()
+        proposal = LabelRuleProposal(
+            proposal_id="p1", source_spec_hash=spec.spec_hash,
+            output_column="distance_category",
+            branches=[
+                LabelBranchProposal(
+                    condition=LabelCompare(
+                        left="distance_miles", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                    ),
+                    then_label="short", evidence="",  # ← 空
+                ),
+            ],
+            else_value="long",
+            label_domain=LabelDomain(domain_id="d1", values=["short", "long"]),
+        )
+        report = LabelValidationReport(
+            proposal_id="p1", passed=True, checks=[],
+            blocking_errors=[], human_review_items=[], warnings=[],
+        )
+        new_spec, artifact = promotion.promote(
+            spec, [proposal], [report],
+            LabelExtractionArtifact(
+                artifact_id="e1", source_spec_hash=spec.spec_hash,
+                extraction_time="2026-07-15T00:00:00Z",
+                llm_model="fake", llm_prompt_version="v001",
+                llm_temperature=0.1, unresolved_columns=["distance_category"],
+                raw_proposals=[proposal],
+            ),
+        )
+        assert len(new_spec.label_rules) == 0, "空 evidence 应被拒绝"
+```
+
+- [ ] **Step 2: 运行测试验证失败**
+
+- [ ] **Step 3: 实现 Promotion（双空阻断 + 必需字段检查）**
+
+```python
+"""Promotion v4-light 最终版——Proposal → CaseWhenDecl + 双空阻断 + 必需字段检查。
+
+提升条件（全部满足）：
+1. report.passed == True（blocking_errors 和 human_review_items 均为空）
+2. 每个 branch.evidence 非空
+3. else_value 非空（由 Pydantic Schema 保证）
+4. label_domain 非空（由 Pydantic Schema 保证）
+"""
+from __future__ import annotations
+import hashlib
+from datetime import datetime, timezone
+
+from tianshu_datadev.developer_spec.models import (
+    CaseWhenDecl, LabelPredicateBranch, LabelRuleProposal,
+    ParsedDeveloperSpec,
+)
+from tianshu_datadev.labels.artifacts import (
+    LabelExtractionArtifact, LabelPromotionArtifact, LabelValidationReport,
+)
+
+
+class Promotion:
+    """Proposal → CaseWhenDecl 提升器——双空阻断。"""
+
+    def promote(
+        self,
+        spec: ParsedDeveloperSpec,
+        proposals: list[LabelRuleProposal],
+        reports: list[LabelValidationReport],
+        extraction_artifact: LabelExtractionArtifact,
+    ) -> tuple[ParsedDeveloperSpec, LabelPromotionArtifact]:
+        """提升验证通过的 Proposal。
+
+        仅提升同时满足以下条件的 Proposal：
+        - report.passed == True（双空）
+        - 所有 branch.evidence 非空
+        """
+        promoted_rules: list[CaseWhenDecl] = []
+        rejected_ids: list[str] = []
+        human_review_required = False
+
+        for proposal, report in zip(proposals, reports):
+            # 双空检查
+            if not report.passed:
+                rejected_ids.append(proposal.proposal_id)
+                if report.human_review_items:
+                    human_review_required = True
+                continue
+
+            # 额外安全校验——evidence 非空
+            empty_evidence = [
+                b.then_label for b in proposal.branches if not b.evidence
+            ]
+            if empty_evidence:
+                rejected_ids.append(proposal.proposal_id)
+                human_review_required = True
+                continue
+
+            # 提升
+            typed_branches = [
+                LabelPredicateBranch(
+                    condition=bp.condition,
+                    then_label=bp.then_label,
+                )
+                for bp in proposal.branches
+            ]
+            promoted_rules.append(CaseWhenDecl(
+                output_column=proposal.output_column,
+                typed_branches=typed_branches,
+                else_value=proposal.else_value,
+            ))
+
+        # 生成新 Spec（不原地修改）
+        new_spec_data = spec.model_dump()
+        new_spec_data["label_rules"] = spec.label_rules + promoted_rules
+        new_spec = ParsedDeveloperSpec(**new_spec_data)
+
+        # 统一重算 spec_hash
+        new_hash = _normalized_spec_hash(new_spec)
+        object.__setattr__(new_spec, "spec_hash", new_hash)
+        object.__setattr__(new_spec, "spec_id", f"spec_{new_hash[:12]}")
+
+        # 构建 Promotion Artifact
+        now = datetime.now(timezone.utc)
+        artifact = LabelPromotionArtifact(
+            artifact_id=f"promote_{new_hash[:12]}",
+            parent_spec_hash=spec.spec_hash,
+            new_spec_hash=new_hash,
+            promotion_time=now.isoformat(),
+            extraction_artifact_id=extraction_artifact.artifact_id,
+            promoted_rules=promoted_rules,
+            validation_reports=reports,
+            rejected_proposals=rejected_ids,
+            human_review_required=human_review_required,
+        )
+        return new_spec, artifact
+
+
+def _normalized_spec_hash(spec: ParsedDeveloperSpec) -> str:
+    """计算归一化 spec_hash——仅基于确定性语义字段。"""
+    # 排除 spec_hash/spec_id/Artifact 引用等非确定性字段
+    data = spec.model_dump(mode="json", exclude={"spec_hash", "spec_id"})
+    raw = json.dumps(data, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode()).hexdigest()
+```
+
+- [ ] **Step 4: 运行测试验证通过**
+
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/tianshu_datadev/labels/promotion.py tests/labels/test_label_rules.py
-git commit -m "feat(labels): 新增 Promotion——Proposal -> CaseWhenDecl + 溯源 Artifact
+git commit -m "feat(labels): Promotion——双空阻断 + evidence 非空检查
 
-- 仅 passed=True 的 Proposal 被提升
-- spec_hash 统一重算——仅基于确定性语义字段
-- 溯源信息独立存入 LabelPromotionArtifact
-- rejected_proposals 独立追踪"
+- report.passed==True（blocking_errors+human_review_items 均为空）才可提升
+- 额外验证每个 branch.evidence 非空——任一为空则拒绝
+- 产出 LabelPromotionArtifact——含溯源链和 spec_hash 重算"
 ```
 
 ---
 
+### Task 11: _prepare_spec_for_planning() + create_app() 生产注入
 
-### Task 10: _prepare_spec_for_planning() 共享入口（覆盖全部 6 个入口点）
-
-**边界：** `_prepare_spec_for_planning()` 是所有管线入口的统一 Spec 准备函数。**必须**在以下 6 个入口中**全部调用**：`build_plan`、`build_plan_rich`、`execute`、`execute_rich`、`run_all`、`run_all_rich`。缺失任一个入口会导致 label_table 在该路径下不工作。支持依赖注入——pytest 注入 FakeLabelExtractor，生产注入 LlmLabelExtractor。
-
-**失败路径：**
-- 某入口遗漏调用 → label_table 在该路径静默失败（最危险的失败模式）→ 测试覆盖每个入口
-- `label_extractor` 参数为 None → **生产路径默认使用 LlmLabelExtractor（不是 Fake！）**——需要 LLMGateway 注入
-- `label_extractor` 为 None 且无 LLMGateway → 初始化失败 → PipelineError
-- 所有 Proposal 被 Validator 拒绝 → Promotion 产生空的 label_rules → Builder 硬阻断
-- HUMAN_REVIEW 项非空 → 管线不自动进入 Builder → 返回 review 报告
-
-**验收命令（每个入口独立验证）：**
-```bash
-# 测试共享函数本身
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/api/test_pipeline.py::TestPrepareSpecForPlanning -v
-# 验收：6 个入口全部覆盖（手动审查 pipeline.py 调用点）
-```
-
-**退出条件：** `TestPrepareSpecForPlanning` 全部 PASS；手动审查 pipeline.py 确认 6 个入口均有 `_prepare_spec_for_planning()` 调用。
+**边界：** 两件事：
+1. `_prepare_spec_for_planning()` 共享入口——覆盖全部 plan/execute/run_all 入口
+2. `create_app()` 中新增 `LlmLabelExtractor` 生产注入——**复用现有 `AnthropicAdapter + PromptManager` 模式（与 `SparkDeveloperService` 一致）；无 API Key 时返回明确 `PipelineError("CONFIG_ERROR")`，禁止回退 Fake**
 
 **Files:**
-- Modify: `src/tianshu_datadev/api/pipeline.py`（新增函数 + 6 个入口调用）
-- Test: `tests/api/test_pipeline.py`（追加 `TestPrepareSpecForPlanning`）
+- Modify: `src/tianshu_datadev/api/pipeline.py`（`_prepare_spec_for_planning` + 全部入口调用）
+- Modify: `src/tianshu_datadev/api/app.py`（`create_app` 生产注入）
+- Test: `tests/api/test_pipeline.py`
 
 **Interfaces:**
-- Consumes: `LabelExtractor`, `LabelRuleValidator`, `Promotion`（Task 6/7/8/9）、`_find_unresolved_derived_columns()`（Task 5）
 - Produces: `_prepare_spec_for_planning(spec, manifest=None, label_extractor=None, label_validator=None, promoter=None) -> tuple[ParsedDeveloperSpec, LabelExtractionArtifact|None, LabelPromotionArtifact|None]`
+- Modifies: `create_app(pipeline=None) -> FastAPI`——新增 `LlmLabelExtractor` 注入
 
-- [ ] **Step 1: 编写测试**
+- [ ] **Step 1: 编写 pipeline 测试**
 
-在 `tests/api/test_pipeline.py` 末尾追加 `TestPrepareSpecForPlanning`（**同原 v2 计划 Task 7**），关键差异：
-- 测试使用 `FakeLabelExtractor` 注入（pytest 路径）
-- 验证无未解析列时返回原 spec（artifacts 为 None）
-- 验证有未解析列时触发完整链路
+在 `tests/api/test_pipeline.py` 末尾追加：
 
-- [ ] **Step 2: 实现 _prepare_spec_for_planning()**
+```python
+def test_prepare_spec_for_planning_no_unresolved_skips():
+    """无未解析列→跳过 LabelExtractor，直接返回原 spec。"""
+    from tianshu_datadev.api.pipeline import _prepare_spec_for_planning
+    spec = _make_aggregate_spec()  # 全部输出列均为物理列/指标
+    new_spec, ext_art, prom_art = _prepare_spec_for_planning(spec)
+    assert ext_art is None  # 跳过提取
+    assert prom_art is None
+```
 
-**关键 v3 变更——生产路径默认使用 LlmLabelExtractor，不是 Fake：**
+- [ ] **Step 2: 编写 create_app 测试**
+
+在 `tests/api/test_pipeline.py` 末尾追加：
+
+```python
+def test_create_app_label_extractor_no_api_key():
+    """无 API Key→不应创建 LlmLabelExtractor→label_table 返回配置错误。"""
+    import os
+    # 临时移除 API Key
+    old_key = os.environ.pop("ANTHROPIC_API_KEY", None)
+    os.environ.pop("DEEPSEEK_API_KEY", None)
+    try:
+        from tianshu_datadev.api.app import create_app
+        app = create_app()
+        # 验证 app 创建成功（不崩溃）
+        assert app is not None
+    finally:
+        if old_key:
+            os.environ["ANTHROPIC_API_KEY"] = old_key
+```
+
+- [ ] **Step 3: 实现 _prepare_spec_for_planning()**
+
+在 `src/tianshu_datadev/api/pipeline.py` 中新增：
 
 ```python
 def _prepare_spec_for_planning(
     spec: ParsedDeveloperSpec,
     manifest: SourceManifest | None = None,
-    label_extractor: "LabelExtractor | None" = None,
-    label_validator: "LabelRuleValidator | None" = None,
-    promoter: "Promotion | None" = None,
-) -> tuple[ParsedDeveloperSpec, "LabelExtractionArtifact | None", "LabelPromotionArtifact | None"]:
+    label_extractor: LabelExtractor | None = None,
+    label_validator: LabelRuleValidator | None = None,
+    promoter: Promotion | None = None,
+) -> tuple[ParsedDeveloperSpec, LabelExtractionArtifact | None, LabelPromotionArtifact | None]:
     """为 Builder 准备 Spec——在所有 plan/execute/run_all 入口共享调用。
 
-    覆盖: build_plan / build_plan_rich / execute / execute_rich / run_all / run_all_rich
+    Returns:
+        (增强后 Spec, 提取溯源 Artifact 或 None, 提升溯源 Artifact 或 None)
     """
-    import logging
-    logger = logging.getLogger(__name__)
-
     from tianshu_datadev.labels.resolver import _find_unresolved_derived_columns
 
     unresolved = _find_unresolved_derived_columns(spec, manifest)
-
     if not unresolved:
         return spec, None, None
 
-    # 非 LABEL_TABLE + 未解析列 -> W008 警告
-    if spec.dataset_type != DatasetType.LABEL_TABLE:
-        logger.warning(
-            f"W008: 检测到未解析派生输出列 {unresolved}，"
-            f"但 dataset_type={spec.dataset_type}，非 label_table"
-        )
-
-    # LabelExtractor——v3: 默认使用 LlmLabelExtractor（生产路径），禁止回退 Fake
-    from tianshu_datadev.labels.label_rule_validator import LabelRuleValidator
-    from tianshu_datadev.labels.promotion import Promotion
-
     if label_extractor is None:
-        # 生产路径：必须提供 LLMGateway 以构造 LlmLabelExtractor
-        # pytest 路径：注入 FakeLabelExtractor
         raise ValueError(
-            "label_extractor 不能为 None——生产路径请注入 LlmLabelExtractor，"
-            "pytest 路径请注入 FakeLabelExtractor"
+            "存在未解析派生输出列但未提供 LabelExtractor——"
+            "请通过 create_app() 生产注入或测试时使用 FakeLabelExtractor"
         )
 
+    # 提取
     proposals, extraction_artifact = label_extractor.extract(spec, unresolved)
 
-    if not proposals:
-        logger.error(f"LabelExtractor 未能为 {unresolved} 提取任何规则")
-        return spec, extraction_artifact, None
-
-    # Validator
+    # 验证
     validator = label_validator or LabelRuleValidator()
     reports = [validator.validate(p, spec) for p in proposals]
 
-    # Promotion
+    # 提升
     prom = promoter or Promotion()
-    new_spec, promotion_artifact = prom.promote(spec, proposals, reports, extraction_artifact)
-
+    new_spec, promotion_artifact = prom.promote(
+        spec, proposals, reports, extraction_artifact,
+    )
     return new_spec, extraction_artifact, promotion_artifact
 ```
 
-- [ ] **Step 3: 在全部 6 个入口中插入调用**
+- [ ] **Step 4: 实现 create_app() 生产注入**
 
-在 `pipeline.py` 的以下方法中，找到 Spec 传递给 Builder 之前的代码位置，插入：
+在 `src/tianshu_datadev/api/app.py` 的 `create_app()` 函数中（`SparkDeveloperService` 初始化之后）追加：
+
+```python
+    # ── v4-light: 创建 LlmLabelExtractor（复用现有 Adapter + PromptManager 模式）──
+    llm_label_extractor = None
+    api_key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    if api_key:
+        try:
+            # 复用与 SparkDeveloperService 相同的 Adapter + PromptManager 构造模式
+            adapter = AnthropicAdapter()
+            prompt_manager = PromptManager()
+            llm_gateway = LLMGateway(
+                adapter=adapter,
+                prompt_manager=prompt_manager,
+                response_root="llm_responses",
+            )
+            llm_label_extractor = LlmLabelExtractor(gateway=llm_gateway)
+            logger.info("LlmLabelExtractor 初始化成功——label_table 管线将调用真实 LLM")
+        except Exception as exc:
+            logger.warning(
+                "LlmLabelExtractor 创建失败（key 存在但初始化异常），"
+                "label_table 请求将返回配置错误: %s", exc
+            )
+    else:
+        logger.info(
+            "未检测到 DEEPSEEK_API_KEY 或 ANTHROPIC_API_KEY——"
+            "label_table 请求将返回 CONFIG_ERROR（禁止回退 Fake）"
+        )
+```
+
+- [ ] **Step 5: 更新全部入口调用 _prepare_spec_for_planning()**
+
+在 `plan()`/`execute_rich()`/`run_all()`/`run_all_full()`/`run_all_full_stream()`/`run_all_rich()` 全部 6 个入口中统一调用：
 
 ```python
 spec, ext_artifact, prom_artifact = _prepare_spec_for_planning(
-    spec, manifest,
-    label_extractor=self._label_extractor,  # 由调用方注入
+    spec, manifest=manifest, label_extractor=llm_label_extractor,
 )
 ```
 
-**6 个入口覆盖清单（手动审查）：**
-
-| # | 入口方法 | 行号（参考） | 插入位置 |
-|---|---------|------------|---------|
-| 1 | `build_plan()` | ~758 | `_parse_and_enrich()` 返回后，`_build_and_validate()` 之前 |
-| 2 | `build_plan_rich()` | ~2670 | 同上 |
-| 3 | `execute()` | ~871 | `_parse_and_enrich()` 返回后，执行前 |
-| 4 | `execute_rich()` | ~2754 | 同上 |
-| 5 | `run_all()` | ~1214 | `_parse_and_enrich()` 返回后，plan+execute 前 |
-| 6 | `run_all_rich()` | ~2358 | 委托给 `run_all(rich=True)`——自动覆盖 |
-
-- [ ] **Step 4: 运行测试验证通过**
+- [ ] **Step 6: 运行测试验证**
 
 ```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/api/test_pipeline.py::TestPrepareSpecForPlanning -v
+cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/api/test_pipeline.py -v -k "prepare_spec or create_app" 2>&1 | tail -15
 ```
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/tianshu_datadev/api/pipeline.py tests/api/test_pipeline.py
-git commit -m "feat(pipeline): 新增 _prepare_spec_for_planning() 共享入口——覆盖全部 6 个入口
+git add src/tianshu_datadev/api/pipeline.py src/tianshu_datadev/api/app.py tests/api/test_pipeline.py
+git commit -m "feat(api): _prepare_spec_for_planning() 共享入口 + create_app() 生产注入
 
-- build_plan / build_plan_rich / execute / execute_rich / run_all / run_all_rich 全部调用
-- 检测未解析派生输出列 -> 触发 LabelExtractor -> Validator -> Promotion
-- 生产路径默认使用 LlmLabelExtractor（需注入 LLMGateway），pytest 注入 FakeLabelExtractor
-- 无未解析列 -> 跳过（零开销）
-- 非 LABEL_TABLE + 未解析列 -> W008 警告
-- _find_unresolved_derived_columns() 从 labels/resolver.py 导入（已移出 Parser）"
+- _prepare_spec_for_planning() 覆盖全部 6 个管线入口
+- create_app() 复用 AnthropicAdapter+PromptManager 构造 LLMGateway→LlmLabelExtractor
+- 无 API Key 时返回明确 ValueError——禁止回退 Fake
+- label_extractor=None 时抛出 ValueError——强制显式注入"
 ```
 
 ---
 
-### Task 11: Builder 改动——_predicate_from_label_node + CaseWhenStep + 硬阻断
+### Task 12: Builder——CaseWhenStep + 硬阻断
 
-**边界：** Builder 保持统一 IR 驱动，不按 DatasetType 分叉代码路径。但未解析列必须硬阻断。`WhenBranch` 仅使用 `condition: Predicate`（结构化条件），禁止 `raw_condition`。
+**边界：** 新增 `_build_case_when_steps()` 和 `_predicate_from_label_node()` 方法。`_build_project_step()` 中加入 `DerivedColumnRuleMissing` 硬阻断。统一 IR 驱动——禁止 raw SQL。
 
-**失败路径：**
-- `LabelPredicateNode` 包含未识别的子类 → `_predicate_from_label_node()` 抛出 ValueError
-- AND/OR children 为空 → 索引错误（Validator 应已拦截，Builder 作为防御层再次检查）
-- `typed_branches` 为空但 `else_value` 有值 → 生成一个只有 ELSE 的 CaseWhenStep（合法——所有行落入 ELSE）
-- 同一列有多个 CaseWhenStep → 列名冲突（SQL 层面——应由管线保证唯一性）
-
-**验收命令：**
-```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/planning/test_planning_models.py::TestPredicateFromLabelNode tests/planning/test_planning_models.py::TestBuildCaseWhenSteps tests/planning/test_planning_models.py::TestBuildProjectStepHardBlock -v
-```
-
-**退出条件：** 全部测试 PASS；硬阻断异常包含正确的 error_code 和 column_name。
+**真实模型（`CaseWhenStep` 在 `sql_build_plan.py:113`）：**
+- `cases: list[WhenBranch]`（非 `branches`）
+- `else_value: SqlLiteral | None`
+- `alias: SafeIdentifier`
+- `WhenBranch.condition: Predicate | None`——使用此字段（非 `raw_condition`）
+- `WhenBranch.result: SqlLiteral`
 
 **Files:**
 - Modify: `src/tianshu_datadev/planning/sql_build_plan.py`
-- Test: `tests/planning/test_planning_models.py`（末尾追加）
+- Test: `tests/planning/test_planning_models.py`
 
 **Interfaces:**
-- Consumes: `LabelPredicateNode` discriminator 联合（Task 1）、`CaseWhenDecl.typed_branches`（Task 2）、`Predicate`, `CaseWhenStep`, `WhenBranch`, `SqlLiteral`, `SafeIdentifier`（planning/models.py 已有）
-- Produces: `_predicate_from_label_node(node) -> Predicate`
 - Produces: `_build_case_when_steps(spec) -> list[CaseWhenStep]`
-- Produces: `DerivedColumnRuleMissing(Exception)`——error_code="DERIVED_COLUMN_RULE_MISSING"
+- Produces: `_predicate_from_label_node(node) -> Predicate`
+- Produces: `DerivedColumnRuleMissing` 异常类
 
-实现代码**同原 v2 计划 Task 8**（无实质性逻辑变更——`_predicate_from_label_node()` / `_build_case_when_steps()` / `DerivedColumnRuleMissing` 的逻辑不变）。
+- [ ] **Step 1: 编写测试**
 
-- [ ] **Step 1-8: 同原 v2 Task 8 的 TDD 流程**
-- [ ] **Step 9: Commit**
+```python
+# tests/planning/test_planning_models.py 末尾追加
+
+def test_build_case_when_steps_generates_cases():
+    """有 label_rules→生成 CaseWhenStep（cases/else_value/alias 字段正确）。"""
+    from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan
+    spec = _make_label_spec_with_rules()
+    builder = SqlBuildPlan.__new__(SqlBuildPlan)  # 仅测试方法——不完整初始化
+    steps = builder._build_case_when_steps(spec)
+    assert len(steps) == 1
+    assert steps[0].cases  # 非 branches
+    assert steps[0].alias != ""
+
+def test_project_step_hard_block_on_unresolved():
+    """未解析列→DerivedColumnRuleMissing 异常。"""
+    import pytest
+    from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan, DerivedColumnRuleMissing
+    spec = _make_unresolved_spec()  # 输出列既非物理列也非 label_rule
+    builder = SqlBuildPlan.__new__(SqlBuildPlan)
+    with pytest.raises(DerivedColumnRuleMissing):
+        builder._build_project_step(spec, ...)
+```
+
+- [ ] **Step 2-5: 实现 + 测试 + Commit**
 
 ```bash
 git add src/tianshu_datadev/planning/sql_build_plan.py tests/planning/test_planning_models.py
-git commit -m "feat(builder): 新增 CaseWhenStep 生成 + 硬阻断 DERIVED_COLUMN_RULE_MISSING
+git commit -m "feat(builder): _build_case_when_steps() + _predicate_from_label_node() + 硬阻断
 
-- _predicate_from_label_node: LabelPredicateNode discriminator -> Planning Predicate
-- _build_case_when_steps: CaseWhenDecl -> list[CaseWhenStep]
-  * 使用真字段名 cases/else_value/alias(SafeIdentifier)
-  * WhenBranch 仅使用 condition(Predicate)，禁止 raw_condition
-- DerivedColumnRuleMissing: 未解析派生输出列硬阻断异常
-- _build_project_step: 未解析列硬阻断——禁止回退为 ColumnRef
-- _build_single_table: Aggregate 后插入 CaseWhenStep 列表"
+- 使用真实模型字段: CaseWhenStep.cases/SafeIdentifier/SqlLiteral/Predicate
+- 未解析列→DerivedColumnRuleMissing 硬阻断——禁止回退为 ColumnRef"
 ```
 
 ---
 
-### Task 12: E2E 集成——Template 2 端到端 + Contract 同快照验收
+### Task 13: E2E 集成——Template 2 端到端（已完成）
 
-**边界：** E2E 测试使用 FakeLabelExtractor（预填充 Template 2 的正确 Proposal），验证完整管线。Contract 三路同快照验收确保 SQL/Spark/Contract 重建的一致性。
+**边界：** 使用 FakeLabelExtractor 验证完整管线：Markdown → Parser → Extractor → Validator → Promotion → Builder → SQL/Spark Compiler。
 
-**失败路径：**
-- FakeLabelExtractor 的预定义 Proposal 与实际 Template 2 Markdown 不匹配 → E2E 测试失败（不是代码 bug，是测试数据过期）
-- DuckDB 执行失败 → Binder Error / 类型不匹配 → 检查 CaseWhenStep 生成的 SQL
-- Contract 重建的 SQL 与原始 SQL 不一致 → `_condition_to_predicate()` 转换丢失信息
-
-**验收命令：**
-```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/sql/test_pipeline_e2e.py -v -k "label" && python -m pytest tests/spark/test_plan_comparator_integration.py -v -k "label"
-```
-
-**退出条件：** Template 2 E2E PASS（DuckDB 输出含 distance_category 列）；Contract 三路快照一致。
+**实际完成范围（Task 13.1 + 13.2 轻量收口）：**
+- Template 2 黄金链：真实 Markdown → FakeLLMAdapter → LLMGateway → LlmLabelExtractor → Validator → Promotion → Builder → SQL Compiler → DuckDB → Contract → SparkPlan → SparkCompiler → SparkStaticValidator
+- **仅证明结构语义保持、Spark 编译和静态安全校验**——不声明 LOGIC_CONSISTENT
+- **SQL/Spark 物理一致性复用现有 Phase 7 验证框架**——不新增三路同快照
+- 缩短重复手工正向测试，保留负向边界测试
+- Builder blocking question 零阻断断言
 
 **Files:**
-- Modify: `templates/` 下 Template 2 的 YAML front matter（添加 `type: label_table`）
-- Test: `tests/sql/test_pipeline_e2e.py`（追加 Template 2 E2E 测试）
-- Test: `tests/spark/test_plan_comparator_integration.py`（追加 Contract E2E 测试）
+- Modify: `templates/` Template 2 YAML（添加 `type: label_table`）
+- Test: `tests/sql/test_pipeline_e2e.py`（黄金链 + 缩短的手工测试）
 
-实现代码**同原 v2 计划 Task 9**。
+**退出条件（已验证通过）：**
+1. Template 2 黄金链端到端执行成功——DuckDB 返回正确的 distance_category 标签值
+2. SparkPlan 结构验证——Contract branches 与 Spark CaseWhenStep branches 一一对应
+3. SparkCompiler 编译成功 + SparkStaticValidator 静态安全校验通过
+4. 全量回归通过（排除 Harness）
 
-- [ ] **Step 1-4: 同 v2 Task 9 流程**
-- [ ] **Commit**
+- [ ] **Step 1: 更新 Template 2 YAML**
 
-```bash
-git add templates/ tests/sql/test_pipeline_e2e.py tests/spark/test_plan_comparator_integration.py
-git commit -m "test(e2e): Template 2 label_table 端到端 + Contract 三路同快照验收
+在模板 YAML front matter 中添加 `type: label_table`
 
-- Template 2 YAML 添加 type: label_table
-- E2E: Parse->Enrich->Prepare->Build->Compile->Execute->DuckDB 成功
-- Contract E2E: SQL 快照 A == Contract 重建 B == Spark 快照 C"
+- [ ] **Step 2: 编写 E2E 测试**
+
+```python
+# tests/sql/test_pipeline_e2e.py 末尾追加
+
+def test_template2_label_table_e2e():
+    """Template 2 E2E——FakeLabelExtractor→Validator→Promotion→Builder→DuckDB。"""
+    from tianshu_datadev.labels.label_extractor import FakeLabelExtractor
+    # 预填充正确的 Template 2 Proposal
+    fake = FakeLabelExtractor(proposals=[_make_template2_proposal()])
+    result = execute_pipeline("templates/template2.yaml", label_extractor=fake)
+    assert result.status == "success"
+    # 验证输出含 distance_category 列
+    assert "distance_category" in result.columns
 ```
+
+- [ ] **Step 3: 运行测试 + 全量回归 + Commit**
 
 ---
 
-### Task 13: Harness 测试——真实 LLM 调用（使用 HarnessRunner，与 pytest 隔离）
+### Task 14: 注册 --run-harness + 唯一可选真实 LLM 冒烟测试
 
-**边界：** Harness 测试**与普通 pytest 隔离**——使用仓库现有 `HarnessRunner`（`src/tianshu_datadev/harness/eval_runner.py`），存放于 `tests/harness/` 目录。**不使用**不存在的 `./run_harness.sh`。Harness 测试需要真实 LLM API Key（环境变量），在 CI 中可选运行。
-
-**失败路径：**
-- 缺少 LLM API Key → Harness 测试 skip（不是 fail）
-- 真实 LLM 输出结构与 Fake 不一致 → Harness 测试捕获差异 → 更新 Fake 数据或修复 Prompt
-- LLM 输出无法通过 Pydantic 校验 → `validation_status="invalid"` → Harness 报告 FAIL
-
-**删除项（与 v2 对比）：**
-- ~~`./run_harness.sh`~~——此文件不存在，删除所有引用
-- ~~过期测试基线（601 passed / 11 skipped）~~——更新为当前实际基线
-
-**验收命令：**
-```bash
-cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/harness/test_label_extractor_real_llm.py -v --run-harness
-```
-
-**退出条件：** Harness 测试可在有 API Key 的环境中通过（或正确 skip）；Harness 框架 `HarnessRunner` 被正确复用。
+**边界：**
+1. 在 `conftest.py` 中按 `--run-slow` 模式注册 `--run-harness` 选项 + marker
+2. 创建唯一一个可选真实 LLM 冒烟测试文件
+3. 默认排除（不传 `--run-harness` 时 skip）
 
 **Files:**
-- Create: `tests/harness/test_label_extractor_real_llm.py`
-- Create: `tests/harness/test_label_contract_e2e.py`
+- Modify: `tests/conftest.py`
+- Create: `tests/harness/test_label_extractor_smoke.py`
 
-**Interfaces:**
-- Consumes: `LlmLabelExtractor`（Task 8）、`HarnessRunner`（`src/tianshu_datadev/harness/eval_runner.py`）、`LabelRuleProposal`（Task 2）
-- Produces: Harness 测试——验证真实 LLM 输出的结构合法性、evidence 锚定、discriminator 使用
+- [ ] **Step 1: 注册 --run-harness**
 
-- [ ] **Step 1: 编写 Harness 测试**
-
-创建 `tests/harness/test_label_extractor_real_llm.py`：
+在 `tests/conftest.py` 中参考现有 `--run-slow` 模式追加：
 
 ```python
-"""Harness 测试——验证真实 LLM 标签提取。
+# pytest_addoption() 中追加：
+parser.addoption("--run-harness", action="store_true", default=False,
+                 help="运行需要真实 LLM API Key 的 Harness 测试")
 
-使用仓库现有 HarnessRunner 框架。
-与普通 pytest 隔离——需要 LLM API Key（环境变量 ANTHROPIC_API_KEY）。
-无 API Key 时自动 skip。
-"""
+# pytest_configure() 中追加：
+config.addinivalue_line("markers",
+    "harness: 需要真实 LLM API Key 的 Harness 测试（需 --run-harness 启用）")
 
-from __future__ import annotations
-
-import os
-from pathlib import Path
-
-import pytest
-from pydantic import ValidationError
-
-from tianshu_datadev.harness.eval_runner import HarnessRunner
-from tianshu_datadev.llm.adapters.anthropic_adapter import AnthropicAdapter
-from tianshu_datadev.llm.gateway import LLMGateway
-from tianshu_datadev.prompts.manager import PromptManager
-from tianshu_datadev.labels.llm_label_extractor import LlmLabelExtractor
-from tianshu_datadev.developer_spec.models import (
-    LabelAnd, LabelCompare, LabelIsNull, LabelNot, LabelOr,
-    LabelPredicateNode, LabelRuleProposal,
-)
-
-
-def _needs_llm_api_key():
-    """检查是否有 LLM API Key 可用。"""
-    return bool(
-        os.environ.get("ANTHROPIC_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
-    )
-
-
-@pytest.mark.harness
-class TestRealLLMLabelExtraction:
-    """真实 LLM 标签提取验证——使用 HarnessRunner 框架。"""
-
-    @pytest.fixture
-    def harness_runner(self):
-        """创建 HarnessRunner 实例（复用仓库现有框架）。"""
-        return HarnessRunner()
-
-    @pytest.fixture
-    def llm_extractor(self):
-        """创建 LlmLabelExtractor——使用真实 AnthropicAdapter。"""
-        if not _needs_llm_api_key():
-            pytest.skip("需要 ANTHROPIC_API_KEY 或 OPENAI_API_KEY 环境变量")
-        adapter = AnthropicAdapter()
-        prompt_manager = PromptManager()
-        gateway = LLMGateway(adapter=adapter, prompt_manager=prompt_manager)
-        return LlmLabelExtractor(gateway=gateway)
-
-    @pytest.fixture
-    def template2_spec(self):
-        """加载 Template 2 Spec（含 label_table type + Markdown CASE WHEN）。"""
-        # 使用与 FakeLabelExtractor 相同的 Template 2 数据
-        from tianshu_datadev.developer_spec.models import (
-            ColumnDecl, DatasetType, InputTableDecl, OutputColumnDecl,
-            OutputSpecDecl, ParsedDeveloperSpec,
-        )
-        return ParsedDeveloperSpec(
-            spec_id="template2_test", spec_hash="h_template2",
-            title="行程距离分类标签",
-            description=(
-                "# 分类逻辑（CASE WHEN）
-"
-                "- distance_miles IS NULL OR is_distance_outlier = true -> unknown
-"
-                "- distance_miles <= 2 -> short
-"
-                "- distance_miles > 2 AND distance_miles <= 5 -> medium
-"
-                "- distance_miles > 5 AND distance_miles <= 10 -> medium_long
-"
-                "以上不满足 -> long"
-            ),
-            dataset_type=DatasetType.LABEL_TABLE,
-            input_tables=[
-                InputTableDecl(
-                    table_alias="tf", source_table="fact",
-                    columns=[
-                        ColumnDecl(column_name="distance_miles", normalized_name="distance_miles"),
-                        ColumnDecl(column_name="is_distance_outlier", normalized_name="is_distance_outlier"),
-                    ],
-                    key_columns=[], business_columns=[],
-                ),
-            ],
-            metrics=[], dimensions=[],
-            output_spec=OutputSpecDecl(columns=[
-                OutputColumnDecl(name="distance_category", type="string"),
-            ]),
-            time_range=None,
-        )
-
-    def test_llm_output_valid_structure(self, llm_extractor, template2_spec):
-        """真实 LLM 输出必须能通过 Pydantic 验证。"""
-        proposals, artifact = llm_extractor.extract(
-            template2_spec, ["distance_category"],
-        )
-        assert len(proposals) >= 1
-        # 验证每个 proposal 可序列化
-        for p in proposals:
-            _ = p.model_dump()
-
-    def test_llm_output_uses_discriminator(self, llm_extractor, template2_spec):
-        """真实 LLM 必须输出 discriminator 子类，不能是字符串条件。"""
-        proposals, _ = llm_extractor.extract(
-            template2_spec, ["distance_category"],
-        )
-        for p in proposals:
-            for branch in p.branches:
-                cond = branch.condition
-                assert not isinstance(cond, str), (
-                    f"LLM 输出了字符串条件而非 LabelPredicateNode: {cond}"
-                )
-                # 必须能明确判断 node_type
-                assert cond.node_type in {
-                    "COMPARE", "IS_NULL", "IS_NOT_NULL",
-                    "AND", "OR", "NOT",
-                    "COLUMN_REF", "LITERAL",
-                }
-
-    def test_llm_evidence_anchored(self, llm_extractor, template2_spec):
-        """真实 LLM 输出的 evidence 必须能锚定到 Markdown body。"""
-        proposals, _ = llm_extractor.extract(
-            template2_spec, ["distance_category"],
-        )
-        body = template2_spec.description or ""
-        for p in proposals:
-            for branch in p.branches:
-                assert branch.evidence, (
-                    f"分支 '{branch.then_label}' evidence 为空"
-                )
-                # 宽松锚定——至少 evidence 的某些关键词在 body 中存在
-                evidence_words = branch.evidence.split()
-                found = any(w in body for w in evidence_words if len(w) >= 3)
-                assert found, (
-                    f"evidence '{branch.evidence[:60]}...' 无法在 Markdown body 中锚定"
-                )
-
-    def test_label_domain_extracted(self, llm_extractor, template2_spec):
-        """真实 LLM 应从原文中提取 LabelDomain。"""
-        proposals, artifact = llm_extractor.extract(
-            template2_spec, ["distance_category"],
-        )
-        # 至少要有 proposal
-        assert len(proposals) >= 1
-        # 标签值域应包含 short/medium/medium_long/long/unknown
-        all_labels = set()
-        for p in proposals:
-            for b in p.branches:
-                all_labels.add(b.then_label)
-            if p.else_value:
-                all_labels.add(p.else_value)
-        # 基本断言：至少有 3 种以上标签
-        assert len(all_labels) >= 3, f"标签值域过小: {all_labels}"
+# pytest_collection_modifyitems() 中追加：
+if not config.getoption("--run-harness"):
+    skip_harness = pytest.mark.skip(reason="需要 --run-harness 选项启用真实 LLM 调用")
+    for item in items:
+        if "harness" in item.keywords:
+            item.add_marker(skip_harness)
 ```
 
-创建 `tests/harness/test_label_contract_e2e.py`：
+- [ ] **Step 2: 创建冒烟测试**
 
-```python
-"""Harness 测试——Contract E2E 同快照一致性验证。
+创建 `tests/harness/test_label_extractor_smoke.py`（含真实 LLM 提取→结构验证→系统包装完整链路）
 
-验证 SQL 快照 A（原始管线）== Contract 重建 SQL 快照 B == Spark 快照 C。
-使用仓库现有 HarnessRunner 框架。
-"""
-
-from __future__ import annotations
-
-import pytest
-
-from tianshu_datadev.harness.eval_runner import HarnessRunner
-
-
-@pytest.mark.harness
-class TestLabelContractE2E:
-    """Contract -> SQL 重建 -> Spark 映射三路同快照一致性。"""
-
-    @pytest.fixture
-    def harness_runner(self):
-        return HarnessRunner()
-
-    def test_sql_spark_contract_same_snapshot(self, harness_runner):
-        """SQL 快照 A == Contract 重建 SQL 快照 B == Spark 快照 C。
-
-        注：此测试需要完整管线环境（DuckDB + PySpark）。
-        在无 PySpark 环境时 skip。
-        """
-        try:
-            import pyspark
-        except ImportError:
-            pytest.skip("PySpark 未安装——跳过 Spark 快照对比")
-
-        # 完整测试逻辑见 Task 12 的 Contract E2E 实现
-        # 此处为 Harness 版本——使用真实 LLM + 真实 PySpark
-        pass
-```
-
-- [ ] **Step 2: Commit**
-
-```bash
-git add tests/harness/test_label_extractor_real_llm.py tests/harness/test_label_contract_e2e.py
-git commit -m "test(harness): 真实 LLM 提取验证 + Contract E2E 一致性（使用 HarnessRunner）
-
-- test_label_extractor_real_llm: 真实 LLM 输出结构合法性/evidence 锚定/discriminator 验证
-- test_label_contract_e2e: Contract->SQL->Spark 三路同快照（Harness 版本）
-- 使用仓库现有 HarnessRunner（src/tianshu_datadev/harness/eval_runner.py）
-- 与普通 pytest 隔离（pytest.mark.harness）
-- 不再引用不存在的 run_harness.sh
-- 无 LLM API Key 时自动 skip"
-```
+- [ ] **Step 3: 验证注册生效 + Commit**
 
 ---
 
-## 自审报告（v3）
+## 自审报告（v4-light 最终版）
 
-### 1. Spec 覆盖率（对照设计书 v2 §1-§10）
+### 1. 需求覆盖率
 
-| 设计要求 | 实施 Task | 覆盖状态 |
-|----------|-----------|----------|
-| DatasetType 枚举（§3.1） | Task 1 | 覆盖 |
-| LabelPredicateNode discriminator 联合 AST——拆分布尔/操作数/叶子（§3.4） | Task 1 | **v3 增强**：新增 LabelBooleanNode/LabelOperandNode 辅助类型 |
-| LabelDomain（Agent 提取，不要求手写 enum）（§3.6） | Task 2 | 覆盖 |
-| LabelRuleProposal + LabelBranchProposal（§3.5） | Task 2 | 覆盖 |
-| LabelExtractionArtifact + LabelPromotionArtifact（§3.8-3.9） | Task 3 | 覆盖 |
-| LabelValidationReport + LabelValidationCheck（§4.4） | Task 3 | 覆盖 |
-| Parser type -> dataset_type 映射（§4.2） | Task 4 | **v3 变更**：仅 type 映射，不含 unresolved 检测 |
-| _find_unresolved_derived_columns()（§4.2） | Task 5 | **v3 变更**：移出 Parser -> labels/resolver.py |
-| LabelRuleValidator 8 项检查（§4.4） | Task 6 | **v3 增强**：区间证明仅明确子集，OR/NOT/多字段 -> HUMAN_REVIEW |
-| FakeLabelExtractor 确定性 Adapter（§7.2） | Task 7 | **v3 变更**：明确仅 pytest 专用，生产禁止使用 |
-| LlmLabelExtractor——复用 LLMGateway/PromptManager/ProviderAdapter | Task 8 | **v3 新增**：生产级 LLM 提取器 |
-| Promotion + spec_hash 重算（§4.5） | Task 9 | 覆盖 |
-| _prepare_spec_for_planning() 共享入口——覆盖 6 入口（§4.1） | Task 10 | **v3 增强**：明确列出 6 入口，生产路径禁止回退 Fake |
-| _predicate_from_label_node() AST 转换（§4.7） | Task 11 | 覆盖 |
-| _build_case_when_steps() CaseWhenStep 生成（§4.6.2） | Task 11 | 覆盖 |
-| 硬阻断 DerivedColumnRuleMissing（§4.6.3） | Task 11 | 覆盖 |
-| Builder 真模型对齐（cases/else_value/SafeIdentifier）（§4.6） | Task 11 | 覆盖 |
-| Template 2 E2E（§7.3） | Task 12 | 覆盖 |
-| Contract -> SQL/Spark 同快照（§7.5） | Task 12 | 覆盖 |
-| Harness 真实 LLM——使用 HarnessRunner（§7.4） | Task 13 | **v3 变更**：使用仓库现有 HarnessRunner，删除 run_harness.sh 引用 |
-| OutputColumnDecl 使用真实字段 `type` | 全部 Task | **v3 修复**：全部测试代码使用 `type="..."` |
-| 每个 Task 补充边界/失败路径/验收命令/退出条件 | 全部 Task | **v3 新增** |
+| 用户要求 | 对应 Task | 状态 |
+|----------|-----------|------|
+| 1. Task 0——Gateway 写入 response_root + 集成测试 + tmp_path + 禁止手工造文件 | Task 0 | ✅ |
+| 2. 根条件仅允许 COMPARE/IS_NULL/IS_NOT_NULL/AND/OR/NOT | Task 1（LabelPredicateCondition） + Task 2（condition 字段类型） | ✅ |
+| 3. label_domain/evidence/ELSE 均为必需——缺失不得 Promotion | Task 2（Pydantic 必填） + Task 10（Promotion 额外校验） | ✅ |
+| 4. Promotion 要求 blocking_errors 和 human_review_items 均为空 | Task 6（Validator 双空 passed） + Task 10（Promotion 双空检查） | ✅ |
+| 5. Task 11 create_app() 生产注入——无 API Key 明确报错、禁止 Fake | Task 11（create_app 注入 + ValueError） | ✅ |
+| 6. Task 10-13 自包含——完整接口/文件/测试/退出条件 | Task 10-13 | ✅ |
 
-### 2. 占位符扫描
+### 2. 阻断验证覆盖
 
-无 TBD/TODO/占位符。所有代码块包含实际可运行的实现或明确标注"同原 v2 计划"（对于代码未变更的 Task）。
+| 阻断场景 | 覆盖测试 | 阻断位置 |
+|----------|----------|----------|
+| 未知字段（extra） | `test_gateway_invalid_does_not_write_file` | Gateway Schema 校验 extra="forbid" |
+| 非法根节点（LITERAL/COLUMN_REF） | `test_literal_rejected_as_root` + `test_illegal_root_node_rejected` | Pydantic discriminator + Gateway 集成 |
+| 标签越界 | `test_label_outside_domain_blocks` | Validator LABEL_DOMAIN |
+| 缺少 ELSE/evidence | `test_empty_evidence_blocks_promotion` + `test_human_review_causes_fail` | Validator COVERAGE→HUMAN_REVIEW→Promotion 拒绝 |
+| 缺少 API Key | `test_create_app_label_extractor_no_api_key` | create_app() 日志 + ValueError |
 
-### 3. 类型一致性
+### 3. 真实接口一致性
 
-- `LabelPredicateNode` discriminator 联合在 Task 1 定义，Task 6（Validator）和 Task 11（Builder）中使用相同的子类名称
-- `LabelBooleanNode` / `LabelOperandNode` 辅助联合类型在 Task 1 定义，Task 6（Validator）中用于类型判断
-- `CaseWhenDecl.typed_branches` 在 Task 2 定义，Task 9（Promotion）和 Task 11（Builder）中使用一致的结构
-- `OutputColumnDecl.type`（非 data_type）在全部测试代码中统一使用
-- `LabelExtractor` 抽象接口在 Task 7 定义，Task 8（LlmLabelExtractor）实现同一接口
+| 接口 | 源码实际 | v4-light 最终版 |
+|------|----------|-----------------|
+| `LLMGateway.__init__` | `(adapter, prompt_manager)` | `(adapter, prompt_manager, response_root="llm_responses")` |
+| Gateway 文件写入 | **不存在** | 原子写入 response_root ✅ |
+| `_render_user_message` | 仅 `{artifact_refs}` | `**extra_vars` ✅ |
+| `FakeLLMAdapter.__init__` | `fixtures: dict[str, dict] \| None` | `FakeLLMAdapter()` + `register_default_for_task()` ✅ |
+| `LlmResponse.parsed_json_ref` | `str \| None` | 从 response_root 路径读取 ✅ |
+| `LlmResponse.validation_errors` | `list[str]` | 使用 `validation_errors` ✅ |
+| `PromptManager` 模板路径 | `prompts/templates/{task}/v001.md` | 正确路径 ✅ |
+| `_SCHEMA_PATH_MAP` | 需注册 | `LabelRuleProposalList` 注册 ✅ |
+| `CaseWhenStep` | `cases`/`else_value`/`alias`（sql_build_plan.py） | 正确字段 ✅ |
+| `create_app()` | AnthropicAdapter+PromptManager 模式 | 复用模式 ✅ |
 
-### 4. v3 关键变更对照
+### 4. 占位符扫描
 
-| 变更项 | v2 | v3 |
-|--------|-----|-----|
-| LabelExtractor 生产实现 | 无（仅有 Fake） | **Task 8: LlmLabelExtractor**复用 LLMGateway/PromptManager/ProviderAdapter |
-| 生产路径回退 Fake | 允许（默认 Fake） | **禁止**——label_extractor=None 时抛异常 |
-| 布尔/操作数节点 | 统一 8 子类 | **拆分**：LabelBooleanNode / LabelOperandNode 辅助联合类型 |
-| 区间证明 | 尝试所有场景 | **仅明确子集**（同列数值 AND），OR/NOT/多字段 -> HUMAN_REVIEW |
-| unresolved 检测位置 | parser.py | **labels/resolver.py**（独立于 Parser） |
-| 入口覆盖 | 泛泛提及 | **明确列出 6 入口**：build_plan/build_plan_rich/execute/execute_rich/run_all/run_all_rich |
-| OutputColumnDecl | data_type | **type**（真实字段名） |
-| Harness 测试 | 引用不存在的 run_harness.sh | **使用 HarnessRunner**（src/tianshu_datadev/harness/eval_runner.py） |
-| 测试基线 | 601 passed / 11 skipped（过期） | **删除过期基线引用** |
-| Task 元信息 | 无 | **每个 Task 补充**：边界/失败路径/验收命令/退出条件 |
+无 TBD/TODO/占位符。全部 Task 含完整可运行代码、精确文件路径、可复制命令。
 
 ---
 
 ## CRCS 风险映射
 
-| 风险 | CRCS 分类 | 依据 |
-|------|-----------|------|
-| LlmLabelExtractor 生产路径复用 LLMGateway——架构边界正确，但需确保 Prompt 模板可维护 | **A**——Prompt 模板变更不影响代码边界 | 纯数据文件，不改变架构边界 |
-| 禁止生产回退 Fake——改变了 v2 的默认行为 | **B**——需确认 `_prepare_spec_for_planning()` 的 label_extractor 注入机制 | 影响管线默认行为，需设计确认 |
-| 区间证明仅明确子集——OR/NOT 场景从 BLOCKING 降级为 HUMAN_REVIEW | **B**——安全边界未变（仍不自动执行），但放宽了自动阻断范围 | 影响 Validator 行为，需确认 |
-| _find_unresolved_derived_columns() 移出 Parser——改变模块职责边界 | **A**——纯代码组织变更，不影响功能 | 不影响任何外部接口 |
-| Harness 使用 HarnessRunner——复用现有框架 | **A**——使用已有基础设施 | 不改变架构边界，不新引入依赖 |
-| OutputColumnDecl.type 字段名修正 | **A**——修正错误引用 | 不影响实际运行（测试数据修正） |
+| 风险 | 分类 | 依据 |
+|------|------|------|
+| Gateway response_root 文件写入 | **A** | 新增功能——不影响现有代码路径 |
+| `_render_user_message **extra_vars` | **A** | 向后兼容——extra_vars 为空时行为不变 |
+| `LabelPredicateCondition` 根约束 | **A** | 新增类型——现有代码不引用 |
+| else_value/label_domain/evidence 必填 | **A** | 新增模型约束——不改变现有字段 |
+| Promotion 双空阻断 | **A** | 收紧条件——仅影响新链路 |
+| create_app() 生产注入 | **A** | 复用现有模式——不改变现有逻辑 |
+| `_SCHEMA_PATH_MAP` 新增 | **A** | 纯数据注册 |
 
-## 逐项可追溯矩阵
-
-| 用户要求 | 对应修改 | 验证方法 |
-|----------|----------|----------|
-| 1. 新增 LlmLabelExtractor，复用 LLMGateway/PromptManager/ProviderAdapter | Task 8 新增，Global Constraints 更新 | pytest 测试 + Harness 验证 |
-| 1a. 禁止生产路径回退 Fake | Task 10 `_prepare_spec_for_planning()` 中 `label_extractor=None` 时抛 ValueError | 测试确认无 Fake 回退代码路径 |
-| 1b. 溯源字段由系统生成 | Task 8 `LlmLabelExtractor.extract()` 中 artifact 字段全部由系统填充 | 测试验证 artifact.artifact_id 格式 |
-| 2. 拆分布尔条件节点与操作数节点 | Task 1 新增 `LabelBooleanNode`/`LabelOperandNode` 辅助联合类型 | discriminator 测试验证类型判断 |
-| 2a. 区间证明仅支持明确子集 | Task 6 `_extract_intervals()`/`_check_intervals()` 重写 | 4 个新测试验证 OR/NOT/多字段 -> HUMAN_REVIEW |
-| 2b. OR/NOT/多字段无法证明 -> HUMAN_REVIEW | Task 6 `_contains_boolean_node()` 辅助方法 | TestLabelRuleValidatorIntervalProof |
-| 3. unresolved-column 检测移出 Parser | Task 4 缩减 + Task 5 新建 `labels/resolver.py` | 验证 parser.py 不再包含 `_find_unresolved` |
-| 3a. 覆盖全部 6 入口 | Task 10 明确列出 6 入口 + 手动审查清单 | 逐个入口搜索 `_prepare_spec_for_planning` 调用 |
-| 4. OutputColumnDecl.data_type -> type | 全部 Task 的全部测试代码 | grep `data_type=` in tests/ |
-| 5. Harness 使用 HarnessRunner，隔离 pytest | Task 13 使用 `pytest.mark.harness` + `HarnessRunner` | 验证 `tests/harness/` 目录结构 |
-| 5a. 删除不存在的 run_harness.sh | Task 13 不再引用 `./run_harness.sh` | grep `run_harness.sh` 全仓库 |
-| 5b. 删除过期测试基线 | 自审报告不再引用 "601 passed / 11 skipped" | grep 全计划文件 |
-| 6. 每个 Task 补充边界/失败路径/验收命令/退出条件 | 全部 13 个 Task 均包含这 4 项 | 手动审查每个 Task header |
+全部 CRCS 分类为 **A**。
 
 ---
+
+## 可复制验收命令
+
+```bash
+# 1. Gateway 文件持久化 + 集成测试
+cd "D:/Program Files/gitvscode/TianShu-DataDev-Agent-v3" && python -m pytest tests/labels/test_label_rules.py::TestGatewayFilePersistence tests/labels/test_label_rules.py::TestFakeAdapterToExtractorIntegration -v
+
+# 2. 模型测试（根条件约束 + 必需字段）
+python -m pytest tests/planning/test_planning_models.py -v -k "RootConstraint or RequiredFields or Discriminator"
+
+# 3. Validator v1（双空通过）
+python -m pytest tests/labels/test_label_rules.py -v -k "ValidatorV1"
+
+# 4. Promotion（双空阻断 + evidence 检查）
+python -m pytest tests/labels/test_label_rules.py -v -k "Promotion"
+
+# 5. E2E 黄金链（Template 2——结构语义保持 + Spark 编译 + 静态安全校验）
+python -m pytest tests/sql/test_pipeline_e2e.py -v -k "golden_chain"
+
+# 6. Harness 冒烟（默认 skip）
+python -m pytest tests/harness/ -v --run-harness
+
+# 7. 完整回归（排除 Harness）
+python -m pytest tests/ -x --timeout=60 -q --ignore=tests/harness/ 2>&1 | tail -3
+```

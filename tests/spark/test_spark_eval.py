@@ -10,8 +10,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from tianshu_datadev.artifacts.models import CaseWhenCondition
 from tianshu_datadev.harness.spark_eval import (
     SparkEvalCase,

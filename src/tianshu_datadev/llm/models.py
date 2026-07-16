@@ -109,19 +109,19 @@ class LlmResponse(StrictModel):
 
     @staticmethod
     def generate_response_ref(request_id: str) -> str:
-        """生成原始响应落盘引用路径。"""
+        """生成原始响应落盘引用路径——相对于 response_root。"""
         hash_hex = hashlib.sha256(
             f"raw_response:{request_id}".encode()
         ).hexdigest()[:12]
-        return f"llm_responses/raw/{request_id}_{hash_hex}.json"
+        return f"raw/{request_id}_{hash_hex}.json"
 
     @staticmethod
     def generate_parsed_ref(request_id: str) -> str:
-        """生成结构化输出落盘引用路径。"""
+        """生成结构化输出落盘引用路径——相对于 response_root。"""
         hash_hex = hashlib.sha256(
             f"parsed_output:{request_id}".encode()
         ).hexdigest()[:12]
-        return f"llm_responses/parsed/{request_id}_{hash_hex}.json"
+        return f"parsed/{request_id}_{hash_hex}.json"
 
 
 class LlmTraceNode(StrictModel):

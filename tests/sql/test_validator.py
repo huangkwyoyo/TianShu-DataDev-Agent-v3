@@ -2,6 +2,7 @@
 
 import os
 
+from tests._test_utils import read_fixture
 from tianshu_datadev.developer_spec.models import (
     FieldSource,
     ManifestColumn,
@@ -22,8 +23,6 @@ from tianshu_datadev.planning.sql_build_plan import (
     SqlBuildPlanBuilder,
 )
 from tianshu_datadev.sql.validator import SqlBuildPlanValidator
-from tests._test_utils import read_fixture
-
 
 # ── 辅助 ──
 

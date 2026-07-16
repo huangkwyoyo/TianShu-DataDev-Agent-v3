@@ -173,16 +173,16 @@ class TestLlmResponse:
             )
 
     def test_generate_response_ref(self) -> None:
-        """generate_response_ref() 生成有效引用路径。"""
+        """generate_response_ref() 生成有效引用路径——相对于 response_root。"""
         ref = LlmResponse.generate_response_ref("test_req_001")
-        assert ref.startswith("llm_responses/raw/")
+        assert ref.startswith("raw/")
         assert "test_req_001" in ref
         assert ref.endswith(".json")
 
     def test_generate_parsed_ref(self) -> None:
-        """generate_parsed_ref() 生成有效引用路径。"""
+        """generate_parsed_ref() 生成有效引用路径——相对于 response_root。"""
         ref = LlmResponse.generate_parsed_ref("test_req_001")
-        assert ref.startswith("llm_responses/parsed/")
+        assert ref.startswith("parsed/")
         assert "test_req_001" in ref
         assert ref.endswith(".json")
 

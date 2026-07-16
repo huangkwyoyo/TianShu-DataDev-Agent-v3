@@ -3,14 +3,13 @@
 from decimal import Decimal
 
 from tianshu_datadev.developer_spec.models import (
+    CaseWhenDecl,
     ColumnDecl,
     CompareOp,
     DatasetType,
     InputTableDecl,
-    LabelBranchProposal,
     LabelCompare,
-    LabelDomain,
-    LabelRuleProposal,
+    LabelPredicateBranch,
     LabelTypedLiteral,
     OutputColumnDecl,
     OutputSpecDecl,
@@ -58,18 +57,18 @@ class TestFindUnresolvedDerivedColumns:
 
     def test_label_rule_output_excluded(self):
         spec = _make_spec(["distance_category"], source_cols=["distance_miles"])
-        spec.label_rules.append(LabelRuleProposal(
-            proposal_id="p1", source_spec_hash="h",
+        spec.label_rules.append(CaseWhenDecl(
             output_column="distance_category",
-            branches=[LabelBranchProposal(
-                condition=LabelCompare(
-                    left="distance_miles", op=CompareOp.LTE,
-                    right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
-                ),
-                then_label="short", evidence="<=2",
-            )],
             else_value="long",
-            label_domain=LabelDomain(domain_id="d1", values=["short", "long"]),
+            typed_branches=[
+                LabelPredicateBranch(
+                    condition=LabelCompare(
+                        left="distance_miles", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                    ),
+                    then_label="short",
+                ),
+            ],
         ))
         unresolved = _find_unresolved_derived_columns(spec)
         assert "distance_category" not in unresolved

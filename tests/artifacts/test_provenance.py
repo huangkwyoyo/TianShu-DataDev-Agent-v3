@@ -7,13 +7,12 @@
 
 import os
 
+from tests._test_utils import read_fixture
 from tianshu_datadev.artifacts.models import PackageInputs
 from tianshu_datadev.artifacts.provenance import generate_provenance
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan, SqlBuildPlanBuilder
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
-from tests._test_utils import read_fixture
-
 
 # ── 辅助 ──
 

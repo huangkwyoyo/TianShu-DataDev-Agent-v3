@@ -1388,8 +1388,6 @@ class TestComputeStepsPipelineE2E:
         """
         import os
 
-        import pytest
-
         from tianshu_datadev.api.pipeline import Pipeline
 
         # 线性链 compute_steps spec——列名匹配 test_fact.csv
@@ -1466,7 +1464,7 @@ spec:
                 table_mapping={"tf": "test_fact"},
                 table_paths={"test_fact": csv_path},
             )
-        except Exception as e:
+        except Exception:
             raise
 
         # 断言结构化输出
@@ -1496,8 +1494,6 @@ spec:
         的确定性契约对 compute_steps 路径同样成立。
         """
         import os
-
-        import pytest
 
         from tianshu_datadev.api.pipeline import Pipeline
 
@@ -1580,7 +1576,7 @@ spec:
                 table_mapping={"tf": "test_fact"},
                 table_paths={"test_fact": csv_path},
             )
-        except Exception as e:
+        except Exception:
             raise
 
         # 容忍执行阶段阻断（_temp 表别名已知问题）

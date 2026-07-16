@@ -11,6 +11,7 @@
 
 import os
 
+from tests._test_utils import read_fixture
 from tianshu_datadev.developer_spec.models import (
     FieldSource,
     ManifestColumn,
@@ -31,8 +32,6 @@ from tianshu_datadev.planning.sql_build_plan import (
     SqlBuildPlan,
 )
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
-from tests._test_utils import read_fixture
-
 
 # ── 辅助 ──
 

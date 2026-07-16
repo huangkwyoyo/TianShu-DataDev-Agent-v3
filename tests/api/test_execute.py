@@ -1,6 +1,5 @@
 """tests/api/test_execute.py——POST /api/execute 测试。"""
 
-import pytest
 
 class TestExecute:
     """POST /api/execute——编译+执行(dry_run) → ExecuteResponse 摘要。"""

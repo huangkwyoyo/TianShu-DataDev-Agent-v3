@@ -17,6 +17,7 @@ import json
 import os
 import tempfile
 
+from tests._test_utils import read_fixture
 from tianshu_datadev.artifacts.finalizer import (
     ReviewPackageFinalizer,
 )
@@ -33,8 +34,6 @@ from tianshu_datadev.harness import (
 )
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan, SqlBuildPlanBuilder
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
-from tests._test_utils import read_fixture
-
 
 # ════════════════════════════════════════════
 # 辅助函数

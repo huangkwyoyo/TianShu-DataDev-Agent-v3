@@ -1,12 +1,12 @@
-"""Anthropic/DeepSeek Adapter——通过 Anthropic Messages API 调用 LLM。
+"""DeepSeek Adapter——通过 Anthropic Messages API 调用 DeepSeek LLM。
 
-支持 DeepSeek（base_url=https://api.deepseek.com/anthropic）及标准 Anthropic API。
+通过 DeepSeek 的 Anthropic 兼容端点（base_url=https://api.deepseek.com/anthropic）调用。
 所有调用通过 httpx 同步请求实现——无需额外安装 anthropic SDK。
 
 设计原则：
 - invoke() 返回未经 Schema 校验的原始 JSON dict
 - Schema 校验由 Gateway 的 _validate_against_schema() 统一完成
-- API key 通过环境变量 DEEPSEEK_API_KEY 或 ANTHROPIC_API_KEY 获取
+- API key 仅通过环境变量 DEEPSEEK_API_KEY 获取——不支持 ANTHROPIC_API_KEY
 """
 
 from __future__ import annotations
@@ -20,10 +20,10 @@ from tianshu_datadev.llm.adapters.base import AdapterError, ProviderAdapter
 
 
 class AnthropicAdapter(ProviderAdapter):
-    """Anthropic Messages API 适配器——兼容 DeepSeek Anthropic 端点。
+    """DeepSeek Anthropic Messages API 适配器。
 
     配置优先级：
-    1. 构造参数 api_key > 环境变量 DEEPSEEK_API_KEY > ANTHROPIC_API_KEY
+    1. 构造参数 api_key > 环境变量 DEEPSEEK_API_KEY
     2. 构造参数 base_url > 环境变量 DEEPSEEK_BASE_URL > 默认 DeepSeek 端点
     3. 构造参数 model > 环境变量 DEEPSEEK_MODEL > 默认 deepseek-v4-pro
 
@@ -60,7 +60,6 @@ class AnthropicAdapter(ProviderAdapter):
         self._api_key = (
             api_key
             or os.environ.get("DEEPSEEK_API_KEY")
-            or os.environ.get("ANTHROPIC_API_KEY")
             or ""
         )
         self._base_url = (
@@ -105,8 +104,7 @@ class AnthropicAdapter(ProviderAdapter):
         if not self._api_key:
             raise AdapterError(
                 "AnthropicAdapter API key 未配置——请设置环境变量 "
-                "DEEPSEEK_API_KEY 或 ANTHROPIC_API_KEY，"
-                "或通过构造参数 api_key 传入",
+                "DEEPSEEK_API_KEY，或通过构造参数 api_key 传入",
                 provider=self.provider_name(),
             )
 

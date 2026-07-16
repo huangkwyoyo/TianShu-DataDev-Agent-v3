@@ -2,6 +2,7 @@
 
 import os
 
+from tests._test_utils import read_fixture
 from tianshu_datadev.developer_spec.models import (
     AggregationType,
     InferredWindowMetric,
@@ -15,8 +16,6 @@ from tianshu_datadev.planning.relationship_planner import RelationshipPlanner
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder, WindowStep
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
 from tianshu_datadev.sql.models import SqlArtifact
-from tests._test_utils import read_fixture
-
 
 # ── 辅助 ──
 

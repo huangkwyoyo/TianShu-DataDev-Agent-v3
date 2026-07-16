@@ -8,13 +8,12 @@
 
 import os
 
+from tests._test_utils import read_fixture
 from tianshu_datadev.artifacts.models import HumanReviewItem, PackageInputs
 from tianshu_datadev.artifacts.review_md import _render_predicate_display, generate_review_md
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan, SqlBuildPlanBuilder
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
-from tests._test_utils import read_fixture
-
 
 # ── 辅助 ──
 

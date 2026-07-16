@@ -14,12 +14,18 @@ import pytest
 
 
 def pytest_addoption(parser):
-    """注册 --run-slow 命令行选项。"""
+    """注册 --run-slow 和 --run-harness 命令行选项。"""
     parser.addoption(
         "--run-slow",
         action="store_true",
         default=False,
         help="运行需要真实 PySpark 子进程的慢速集成测试",
+    )
+    parser.addoption(
+        "--run-harness",
+        action="store_true",
+        default=False,
+        help="运行需要真实 LLM API Key 的 Harness 冒烟测试",
     )
 
 
@@ -28,6 +34,10 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "slow: 需要真实 PySpark 子进程执行的慢速集成测试",
+    )
+    config.addinivalue_line(
+        "markers",
+        "harness: 需要真实 LLM API Key 的 Harness 冒烟测试（需 --run-harness 启用）",
     )
 
     # Windows 下使用项目本地临时目录，避免系统 Temp 目录被锁
@@ -42,10 +52,17 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(config, items):
-    """默认跳过 slow 测试——除非显式传入 --run-slow。"""
-    if config.getoption("--run-slow"):
-        return
-    skip_slow = pytest.mark.skip(reason="需要 --run-slow 选项启用真实 PySpark 执行")
-    for item in items:
-        if "slow" in item.keywords:
-            item.add_marker(skip_slow)
+    """默认跳过 slow 和 harness 测试——除非显式传入对应选项。"""
+    # --run-slow 门控
+    if not config.getoption("--run-slow"):
+        skip_slow = pytest.mark.skip(reason="需要 --run-slow 选项启用真实 PySpark 执行")
+        for item in items:
+            if "slow" in item.keywords:
+                item.add_marker(skip_slow)
+
+    # --run-harness 门控——默认跳过真实 LLM 冒烟测试
+    if not config.getoption("--run-harness"):
+        skip_harness = pytest.mark.skip(reason="需要 --run-harness 选项启用真实 LLM 调用")
+        for item in items:
+            if "harness" in item.keywords:
+                item.add_marker(skip_harness)

@@ -193,21 +193,27 @@ class TestPredicateAdvanced:
 # ================================================
 
 from decimal import Decimal
+
 from tianshu_datadev.developer_spec.models import (
-    DatasetType, CompareOp,
-    LabelColumnRef, LabelTypedLiteral,
-    LabelCompare, LabelIsNull, LabelIsNotNull,
-    LabelAnd, LabelOr, LabelNot,
-    LabelPredicateNode, LabelPredicateCondition,
+    CompareOp,
+    DatasetType,
+    LabelAnd,
+    LabelBranchProposal,
+    LabelBranchProposalOutput,
+    LabelCompare,
+    LabelDomain,
     # v4-light 最终版: LLM 输出层 + 系统层标签模型
     LabelDomainOutput,
-    LabelBranchProposalOutput,
-    LabelRuleProposalOutput,
-    LabelRuleProposalList,
-    LabelDomain,
-    LabelBranchProposal,
-    LabelRuleProposal,
+    LabelIsNotNull,
+    LabelIsNull,
+    LabelNot,
+    LabelOr,
     LabelPredicateBranch,
+    LabelPredicateCondition,
+    LabelPredicateNode,
+    LabelRuleProposal,
+    LabelRuleProposalOutput,
+    LabelTypedLiteral,
 )
 
 
@@ -469,3 +475,365 @@ class TestSystemModelRequiredFields:
         assert proposal.proposal_id == "sys_gen_001"
         assert proposal.else_value == "long"
         assert proposal.label_domain.values == ["short", "long"]
+
+
+# ================================================
+# Task 12: Builder——_predicate_from_label_node() + _build_case_when_steps()
+# ================================================
+
+
+class TestPredicateFromLabelNode:
+    """验证 LabelPredicateCondition AST → Predicate 转换。"""
+
+    def test_compare_to_predicate(self):
+        """LabelCompare(LTE)→Predicate。"""
+        from decimal import Decimal
+
+        from tianshu_datadev.developer_spec.models import (
+            CompareOp,
+            LabelCompare,
+            LabelTypedLiteral,
+        )
+        from tianshu_datadev.planning.models import PredicateOperator
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        builder = SqlBuildPlanBuilder()
+        node = LabelCompare(
+            left="distance_miles", op=CompareOp.LTE,
+            right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+        )
+        pred = builder._predicate_from_label_node(node, "tf")
+        assert pred.operator == PredicateOperator.LTE
+        assert pred.left.column_name == "distance_miles"
+        assert pred.right.value == 2.0  # Decimal→float
+
+    def test_is_null_to_predicate(self):
+        """LabelIsNull→Predicate(IS_NULL)。"""
+        from tianshu_datadev.developer_spec.models import LabelIsNull
+        from tianshu_datadev.planning.models import PredicateOperator
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        builder = SqlBuildPlanBuilder()
+        node = LabelIsNull(column="distance_miles")
+        pred = builder._predicate_from_label_node(node, "tf")
+        assert pred.operator == PredicateOperator.IS_NULL
+        assert pred.left.column_name == "distance_miles"
+
+    def test_and_nested_to_predicate(self):
+        """LabelAnd(COMPARE, IS_NULL)→嵌套 Predicate。"""
+        from decimal import Decimal
+
+        from tianshu_datadev.developer_spec.models import (
+            CompareOp,
+            LabelAnd,
+            LabelCompare,
+            LabelIsNull,
+            LabelTypedLiteral,
+        )
+        from tianshu_datadev.planning.models import PredicateOperator
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        builder = SqlBuildPlanBuilder()
+        node = LabelAnd(children=[
+            LabelCompare(
+                left="distance_miles", op=CompareOp.GT,
+                right=LabelTypedLiteral(value=Decimal("0"), data_type="number"),
+            ),
+            LabelIsNull(column="flag"),
+        ])
+        pred = builder._predicate_from_label_node(node, "tf")
+        assert pred.operator == PredicateOperator.AND
+        # 左结合折叠：left 是第一个 Compare，right 是 IS_NULL
+        assert pred.left.operator == PredicateOperator.GT
+        assert pred.right.operator == PredicateOperator.IS_NULL
+
+    def test_not_to_predicate(self):
+        """LabelNot → ValueError——label_table v1 暂不支持 LabelNot。"""
+        import pytest
+
+        from tianshu_datadev.developer_spec.models import LabelIsNull, LabelNot
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        builder = SqlBuildPlanBuilder()
+        node = LabelNot(child=LabelIsNull(column="flag"))
+        with pytest.raises(ValueError, match="LabelNot"):
+            builder._predicate_from_label_node(node, "tf")
+
+
+class TestBuildCaseWhenSteps:
+    """验证 spec.label_rules → CaseWhenStep 列表生成。"""
+
+    def test_single_rule_generates_one_step(self):
+        """一条 CaseWhenDecl→一个 CaseWhenStep。"""
+        from decimal import Decimal
+
+        from tianshu_datadev.developer_spec.models import (
+            CaseWhenDecl,
+            ColumnDecl,
+            CompareOp,
+            DatasetType,
+            InputTableDecl,
+            LabelCompare,
+            LabelTypedLiteral,
+            OutputColumnDecl,
+            OutputSpecDecl,
+            ParsedDeveloperSpec,
+        )
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = ParsedDeveloperSpec(
+            spec_id="test", spec_hash="h", title="t", description="",
+            dataset_type=DatasetType.LABEL_TABLE,
+            input_tables=[
+                InputTableDecl(
+                    table_alias="tf", source_table="fact",
+                    columns=[
+                        ColumnDecl(column_name="distance_miles",
+                                   normalized_name="distance_miles",
+                                   data_type="double"),
+                    ],
+                    key_columns=[], business_columns=[],
+                ),
+            ],
+            metrics=[], dimensions=[],
+            output_spec=OutputSpecDecl(
+                columns=[OutputColumnDecl(name="distance_category", type="string")],
+                grain=[],
+            ),
+            time_range=None,
+        )
+        spec.label_rules.append(CaseWhenDecl(
+            output_column="distance_category",
+            else_value="long",
+            typed_branches=[
+                LabelPredicateBranch(
+                    condition=LabelCompare(
+                        left="distance_miles", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                    ),
+                    then_label="short",
+                ),
+            ],
+        ))
+
+        builder = SqlBuildPlanBuilder()
+        steps = builder._build_case_when_steps(spec)
+        assert len(steps) == 1
+        step = steps[0]
+        assert step.step_type == "case_when"
+        assert step.alias == "distance_category"
+        assert len(step.cases) == 1
+        assert step.cases[0].result.value == "short"
+        assert step.else_value.value == "long"
+
+    def test_build_single_table_includes_case_when(self):
+        """_build_single_table 为 label_table spec 生成 CaseWhenStep。"""
+        from decimal import Decimal
+
+        from tianshu_datadev.developer_spec.models import (
+            CaseWhenDecl,
+            ColumnDecl,
+            CompareOp,
+            DatasetType,
+            InputTableDecl,
+            LabelCompare,
+            LabelTypedLiteral,
+            OutputColumnDecl,
+            OutputSpecDecl,
+            ParsedDeveloperSpec,
+        )
+        from tianshu_datadev.planning.sql_build_plan import CaseWhenStep, SqlBuildPlanBuilder
+
+        spec = ParsedDeveloperSpec(
+            spec_id="test", spec_hash="h", title="t", description="",
+            dataset_type=DatasetType.LABEL_TABLE,
+            input_tables=[
+                InputTableDecl(
+                    table_alias="tf", source_table="fact",
+                    columns=[
+                        ColumnDecl(column_name="distance_miles",
+                                   normalized_name="distance_miles",
+                                   data_type="double"),
+                    ],
+                    key_columns=[], business_columns=[],
+                ),
+            ],
+            metrics=[], dimensions=[],
+            output_spec=OutputSpecDecl(
+                columns=[OutputColumnDecl(name="distance_category", type="string")],
+                grain=[],
+            ),
+            time_range=None,
+        )
+        spec.label_rules.append(CaseWhenDecl(
+            output_column="distance_category",
+            else_value="unknown",
+            typed_branches=[
+                LabelPredicateBranch(
+                    condition=LabelCompare(
+                        left="distance_miles", op=CompareOp.LTE,
+                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
+                    ),
+                    then_label="short",
+                ),
+            ],
+        ))
+
+        builder = SqlBuildPlanBuilder()
+        steps = builder._build_single_table(spec)
+        case_when_steps = [s for s in steps if isinstance(s, CaseWhenStep)]
+        assert len(case_when_steps) == 1, (
+            f"应有 1 个 CaseWhenStep，实际 step_types={[s.step_type for s in steps]}"
+        )
+        # 验证 Scan 不包含标签列
+        from tianshu_datadev.planning.sql_build_plan import ScanStep
+        scan = next(s for s in steps if isinstance(s, ScanStep))
+        scan_col_names = [c.column_name for c in scan.required_columns]
+        assert "distance_category" not in scan_col_names, (
+            f"标签输出列不应出现在 Scan 中: {scan_col_names}"
+        )
+        assert "distance_miles" in scan_col_names, (
+            f"标签条件源列应在 Scan 中: {scan_col_names}"
+        )
+
+
+# ================================================
+# Task 12.1-2: DerivedColumnRuleMissingError 防御性检查
+# ================================================
+
+
+class TestDerivedColumnRuleMissingError:
+    """label_table 输出列无解析规则 → DerivedColumnRuleMissingError——禁止回退为物理 ColumnRef。"""
+
+    def test_unresolved_output_column_raises_error(self):
+        """LABEL_TABLE 输出列无解析规则 → DerivedColumnRuleMissingError。"""
+        import pytest
+
+        from tianshu_datadev.developer_spec.models import (
+            ColumnDecl,
+            DatasetType,
+            InputTableDecl,
+            OutputColumnDecl,
+            OutputSpecDecl,
+            ParsedDeveloperSpec,
+        )
+        from tianshu_datadev.planning.sql_build_plan import (
+            DerivedColumnRuleMissingError,
+            SqlBuildPlanBuilder,
+        )
+
+        # 构造 LABEL_TABLE spec，输出列 "unknown_col" 不是物理列也没有 label_rules
+        spec = ParsedDeveloperSpec(
+            spec_id="test", spec_hash="h", title="t", description="",
+            dataset_type=DatasetType.LABEL_TABLE,
+            input_tables=[
+                InputTableDecl(
+                    table_alias="tf", source_table="fact",
+                    columns=[
+                        ColumnDecl(column_name="col1", normalized_name="col1",
+                                   data_type="double"),
+                    ],
+                    key_columns=[], business_columns=[],
+                ),
+            ],
+            metrics=[], dimensions=[],
+            output_spec=OutputSpecDecl(
+                columns=[OutputColumnDecl(name="unknown_col", type="string")],
+                grain=[],
+            ),
+            time_range=None,
+        )
+
+        builder = SqlBuildPlanBuilder()
+        with pytest.raises(DerivedColumnRuleMissingError, match="unknown_col"):
+            builder._build_single_table(spec)
+
+    def test_detail_table_skips_defense_check(self):
+        """DETAIL_TABLE 不触发输出列防御检查——仅 LABEL_TABLE 有此门禁。"""
+        from tianshu_datadev.developer_spec.models import (
+            ColumnDecl,
+            DatasetType,
+            InputTableDecl,
+            OutputColumnDecl,
+            OutputSpecDecl,
+            ParsedDeveloperSpec,
+        )
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        # 构造 DETAIL_TABLE spec——输出列 unknown_col 无解析规则
+        spec = ParsedDeveloperSpec(
+            spec_id="test", spec_hash="h2", title="t", description="",
+            dataset_type=DatasetType.DETAIL_TABLE,
+            input_tables=[
+                InputTableDecl(
+                    table_alias="tf", source_table="fact",
+                    columns=[
+                        ColumnDecl(column_name="col1", normalized_name="col1",
+                                   data_type="double"),
+                    ],
+                    key_columns=[], business_columns=[],
+                ),
+            ],
+            metrics=[], dimensions=[],
+            output_spec=OutputSpecDecl(
+                columns=[OutputColumnDecl(name="unknown_col", type="string")],
+                grain=[],
+            ),
+            time_range=None,
+        )
+
+        builder = SqlBuildPlanBuilder()
+        # DETAIL_TABLE 不触发防御检查——会正常构建（将 unknown_col 当物理列引用）
+        plan = builder._build_single_table(spec)
+        assert plan is not None
+
+    def test_builder_bypass_multi_table_raises_error(self):
+        """Builder 直接调用绕过 Pipeline——多表 LABEL_TABLE → scope 检查抛异常。"""
+        import pytest
+
+        from tianshu_datadev.developer_spec.models import (
+            ColumnDecl,
+            DatasetType,
+            InputTableDecl,
+            OutputColumnDecl,
+            OutputSpecDecl,
+            ParsedDeveloperSpec,
+        )
+        from tianshu_datadev.planning.sql_build_plan import (
+            DerivedColumnRuleMissingError,
+            SqlBuildPlanBuilder,
+        )
+
+        # 构造多表 LABEL_TABLE spec——绕过 Pipeline 直接调 Builder
+        spec = ParsedDeveloperSpec(
+            spec_id="test", spec_hash="h3", title="t", description="",
+            dataset_type=DatasetType.LABEL_TABLE,
+            input_tables=[
+                InputTableDecl(
+                    table_alias="t1", source_table="fact",
+                    columns=[
+                        ColumnDecl(column_name="col1", normalized_name="col1",
+                                   data_type="double"),
+                    ],
+                    key_columns=[], business_columns=[],
+                ),
+                InputTableDecl(
+                    table_alias="t2", source_table="dim",
+                    columns=[
+                        ColumnDecl(column_name="col2", normalized_name="col2",
+                                   data_type="string"),
+                    ],
+                    key_columns=[], business_columns=[],
+                ),
+            ],
+            metrics=[], dimensions=[],
+            output_spec=OutputSpecDecl(
+                columns=[OutputColumnDecl(name="col1", type="double")],
+                grain=[],
+            ),
+            time_range=None,
+        )
+
+        builder = SqlBuildPlanBuilder()
+        with pytest.raises(DerivedColumnRuleMissingError, match="单表"):
+            builder._build_single_table(spec)

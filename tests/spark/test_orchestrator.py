@@ -9,8 +9,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from tianshu_datadev.spark.orchestrator import (
     SparkOrchestrator,
     SparkPipelineStage,

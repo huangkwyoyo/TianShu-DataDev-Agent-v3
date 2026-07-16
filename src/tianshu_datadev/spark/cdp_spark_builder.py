@@ -120,36 +120,36 @@ from decimal import Decimal'''
     def _build_float_udf(self, idx: int, tag_escaped: str, fp: int | None) -> str:
         """生成 FLOAT32/FLOAT64 UDF——含特殊值处理和可选 ROUND_HALF_UP。"""
         lines = [
-            f"@F.udf(BinaryType())",
+            "@F.udf(BinaryType())",
             f"def _enc_{idx}(v):",
             f"    tag = b'{tag_escaped}'",
-            f"    if v is None:",
-            f"        return tag + b'\\xff\\xff\\xff\\xff'",
-            f"    if math.isnan(v):",
-            f"        return tag + struct.pack('>I', 3) + b'nan'",
-            f"    if math.isinf(v):",
-            f"        value = b'inf' if v > 0 else b'-inf'",
-            f"        return tag + struct.pack('>I', len(value)) + value",
+            "    if v is None:",
+            "        return tag + b'\\xff\\xff\\xff\\xff'",
+            "    if math.isnan(v):",
+            "        return tag + struct.pack('>I', 3) + b'nan'",
+            "    if math.isinf(v):",
+            "        value = b'inf' if v > 0 else b'-inf'",
+            "        return tag + struct.pack('>I', len(value)) + value",
         ]
         if fp is not None:
             # ROUND_HALF_UP 精度归一化（在栈上修改 v）
             multiplier = 10**fp
             lines.extend([
-                f"    # ROUND_HALF_UP 精度归一化",
+                "    # ROUND_HALF_UP 精度归一化",
                 f"    _mul_fp = {multiplier}",
-                f"    _scaled = v * _mul_fp",
-                f"    if _scaled >= 0:",
-                f"        v = float(int(_scaled + 0.5)) / _mul_fp",
-                f"    else:",
-                f"        v = float(int(_scaled - 0.5)) / _mul_fp",
+                "    _scaled = v * _mul_fp",
+                "    if _scaled >= 0:",
+                "        v = float(int(_scaled + 0.5)) / _mul_fp",
+                "    else:",
+                "        v = float(int(_scaled - 0.5)) / _mul_fp",
             ])
         lines.extend([
-            f"    if v == 0.0 and math.copysign(1.0, v) < 0:",
-            f"        return tag + struct.pack('>I', 4) + b'-0.0'",
-            f"    if v == 0.0:",
-            f"        return tag + struct.pack('>I', 3) + b'0.0'",
-            f"    vb = str(v).encode('utf-8')",
-            f"    return tag + struct.pack('>I', len(vb)) + vb",
+            "    if v == 0.0 and math.copysign(1.0, v) < 0:",
+            "        return tag + struct.pack('>I', 4) + b'-0.0'",
+            "    if v == 0.0:",
+            "        return tag + struct.pack('>I', 3) + b'0.0'",
+            "    vb = str(v).encode('utf-8')",
+            "    return tag + struct.pack('>I', len(vb)) + vb",
         ])
         return "\n".join(lines)
 

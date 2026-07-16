@@ -11,6 +11,7 @@
 
 import os
 
+from tests._test_utils import read_fixture
 from tianshu_datadev.artifacts.contract_extractor import DataTransformContractExtractor
 from tianshu_datadev.artifacts.models import (
     DataTransformContractV1,
@@ -47,8 +48,6 @@ from tianshu_datadev.planning.sql_program import (
     StatementKind,
 )
 from tianshu_datadev.planning.temp_table import TempTableSpec
-from tests._test_utils import read_fixture
-
 
 # ── 辅助 ──
 

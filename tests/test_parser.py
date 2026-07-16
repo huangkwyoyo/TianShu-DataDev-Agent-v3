@@ -2,9 +2,8 @@
 
 import pytest
 
-from tianshu_datadev.developer_spec.parser import DeveloperSpecParser, ParseError, ParseErrorCode
 from tests._test_utils import read_fixture
-
+from tianshu_datadev.developer_spec.parser import DeveloperSpecParser, ParseError, ParseErrorCode
 
 # ── 辅助函数：读取 fixture 文件 ──
 

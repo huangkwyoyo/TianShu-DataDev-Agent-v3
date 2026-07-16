@@ -9,8 +9,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 # 用于 run_all DuckDB 执行的 CSV fixture 路径
 
 class TestSparkVerifySuccess:

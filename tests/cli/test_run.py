@@ -4,8 +4,6 @@ import json
 import subprocess
 import sys
 
-import pytest
-
 
 class TestCliRun:
     """tianshu run <file>——全流程执行+打包。"""

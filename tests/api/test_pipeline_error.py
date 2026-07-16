@@ -8,7 +8,6 @@
   5. RUNTIME_FAIL 执行阻断——不返回 execution_trace，不含 package_id
 """
 
-import pytest
 
 from tianshu_datadev.sql.models import ExecutionStatus, ExecutionTrace, ResultSummary
 

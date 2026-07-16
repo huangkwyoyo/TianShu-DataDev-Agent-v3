@@ -1,6 +1,5 @@
 """tests/api/test_run_all.py——POST /api/run-all 测试。"""
 
-import pytest
 
 class TestRunAll:
     """POST /api/run-all——全流程+打包 → RunAllResponse 摘要。"""

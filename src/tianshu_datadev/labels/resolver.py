@@ -44,20 +44,25 @@ def _find_unresolved_derived_columns(
 
     # 2. 指标输出名
     for metric in spec.metrics:
-        known.add(metric.name)
+        known.add(metric.alias)
 
     # 3. 维度输出名
     for dim in spec.dimensions:
-        known.add(dim.name)
+        known.add(dim.dimension_name)
 
     # 4. 窗口指标
     for wm in spec.inferred_window_metrics:
         known.add(wm.name)
 
-    # 5. compute_steps 输出列名
+    # 5. compute_steps 输出列名——从 metrics/expressions/case_when 收集
     if spec.compute_steps:
         for step in spec.compute_steps:
-            known.add(step.output_column)
+            for m in step.metrics:
+                known.add(m.alias)
+            for expr in step.expressions:
+                known.add(expr.name)
+            if step.case_when is not None:
+                known.add(step.case_when.output_column)
 
     # 6. 已有 label_rules 的输出列名
     for rule in spec.label_rules:

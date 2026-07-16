@@ -122,12 +122,11 @@ class TestAnthropicAdapterErrorHandling:
     def test_missing_api_key_raises_on_invoke(self, monkeypatch):
         """API key 为空时 invoke() 抛出 AdapterError——隔离本机环境变量。
 
-        使用 monkeypatch.delenv 清除 DEEPSEEK_API_KEY 和 ANTHROPIC_API_KEY，
+        使用 monkeypatch.delenv 清除 DEEPSEEK_API_KEY，
         避免本机已配置的 key 干扰测试。构造参数 api_key="" 为 falsy，
-        AnthropicAdapter.__init__ 将回退到环境变量——需确保两者均为空。
+        AnthropicAdapter.__init__ 将回退到环境变量——需确保其为空。
         """
         monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         adapter = AnthropicAdapter(api_key="")
         with pytest.raises(AdapterError, match="API key"):
             adapter.invoke(

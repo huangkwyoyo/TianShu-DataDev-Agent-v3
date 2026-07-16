@@ -17,8 +17,8 @@ import os
 import shutil
 
 import pytest
-from tests._test_utils import read_fixture
 
+from tests._test_utils import read_fixture
 from tianshu_datadev.api.pipeline import Pipeline
 from tianshu_datadev.spark.snapshot import (
     SamplingSpec,
@@ -772,7 +772,9 @@ class TestSnapshotBuilderAliases:
         tmpdir = tempfile.mkdtemp(prefix="tianshu_dw_index_")
         try:
             from tianshu_datadev.spark.snapshot import (
-                SnapshotBuilder, SnapshotSourceProvider, SnapshotSourceType,
+                SnapshotBuilder,
+                SnapshotSourceProvider,
+                SnapshotSourceType,
             )
             builder = SnapshotBuilder(output_dir=tmpdir)
             provider = SnapshotSourceProvider(

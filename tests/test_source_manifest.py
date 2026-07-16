@@ -1,14 +1,13 @@
 """测试 SourceManifestBuilder——冲突检测 + 来源标记 + 不静默覆盖。"""
 
 
+from tests._test_utils import read_fixture
 from tianshu_datadev.developer_spec.models import (
     FieldSource,
     ManifestColumn,
 )
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
 from tianshu_datadev.developer_spec.source_manifest import SourceManifestBuilder
-from tests._test_utils import read_fixture
-
 
 # ── 辅助函数 ──
 
