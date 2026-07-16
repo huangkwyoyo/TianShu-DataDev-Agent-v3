@@ -1,5 +1,102 @@
 """tests/api/test_run_all.py——POST /api/run-all 测试。"""
 
+# 两表 LEFT JOIN 但 dim 表联结键未声明 unique: true——
+# 触发 Q-JOIN-SAFETY blocking OpenQuestion（LEFT JOIN 唯一性安全门禁）
+_SPEC_LEFT_JOIN_NO_UNIQUE = """# 门禁泄漏回归用例
+
+```markdown
+---
+spec:
+  type: detail_table
+  target_table: ads.gate_leak_regression
+  target_grain: [order_id]
+  summary: "两表 LEFT JOIN 无 unique 声明——应在 validate 阶段阻断"
+
+  source_tables:
+    - name: fact_orders
+      alias: fo
+      row_count: 1000
+      role: fact
+      key_columns:
+        - name: order_id
+          type: bigint
+          nullable: false
+      business_columns:
+        - name: product_code
+          type: varchar
+          nullable: false
+        - name: amount
+          type: decimal(12,2)
+          nullable: true
+
+    - name: dim_product
+      alias: dp
+      row_count: 50
+      role: dim
+      key_columns:
+        - name: product_code
+          type: varchar
+          nullable: false
+      business_columns:
+        - name: product_name
+          type: varchar
+          nullable: true
+
+  metrics: []
+  limit: 100
+
+  dimensions:
+    - dimension_name: order_id
+      column_ref: order_id
+
+  joins:
+    - left_table: fo
+      right_table: dp
+      left_key: product_code
+      right_key: product_code
+      join_type: LEFT
+
+  output_columns:
+    - name: order_id
+      type: bigint
+    - name: product_name
+      type: varchar
+---
+
+# 门禁泄漏回归用例
+```
+"""
+
+
+class TestRunAllBlockingQuestionGate:
+    """run_all 对 enrich 阶段 blocking OpenQuestion 的门禁——
+
+    回归背景：LEFT JOIN 唯一性门禁产生 blocking Q-JOIN-SAFETY 后，
+    候选被丢弃但流水线未阻断，静默退化为单表计划，
+    最终在 execute 阶段以晦涩的 Binder Error 暴露（NYC Case03/04 存量失败根因）。
+    """
+
+    def test_blocking_extra_question_blocks_at_validate(self, pipeline):
+        """blocking extra_questions 应在 validate 阶段阻断，不得进入 compile/execute。"""
+        result = pipeline.run_all(_SPEC_LEFT_JOIN_NO_UNIQUE)
+
+        # 阻断：validation_passed=False + ValidationBlocked
+        assert result["validation_passed"] is False
+        assert "pipeline_error" in result
+        assert result["pipeline_error"]["stage"] == "validate"
+        assert result["pipeline_error"]["error_type"] == "ValidationBlocked"
+
+        # blocking 问题必须出现在 open_questions 中（用户可见的真实原因）
+        blocking_qs = [q for q in result["open_questions"] if q["blocking"]]
+        assert len(blocking_qs) >= 1
+        assert any("unique" in q["description"] for q in blocking_qs)
+
+        # 阶段状态：validate failed，后续全部 skipped
+        stages = {s["stage"]: s["status"] for s in result["pipeline_stages"]}
+        assert stages["validate"] == "failed"
+        assert stages["compile"] == "skipped"
+        assert stages["execute"] == "skipped"
+
 
 class TestRunAll:
     """POST /api/run-all——全流程+打包 → RunAllResponse 摘要。"""

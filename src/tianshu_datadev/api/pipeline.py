@@ -793,7 +793,7 @@ class Pipeline:
         Args:
             spec: 已解析的 DeveloperSpec
             manifest: 事实源清单
-            plan: 已构建的 SqlBuildPlan
+            plan: 已构建的 SqlBuildPlan（enrich 阶段 blocking 门禁触发时为 None——尚未构建）
             all_questions: 全部 OpenQuestion（含 blocking 和非 blocking）
             table_mapping: 表名映射
             all_stages: 完整阶段列表（run_all 传 8 阶段，其余默认 6 阶段）
@@ -830,7 +830,7 @@ class Pipeline:
         return {
             "request_id": request_id,
             "spec_id": spec.spec_id,
-            "plan_id": plan.plan_id,
+            "plan_id": plan.plan_id if plan else "",
             "validation_passed": False,
             "open_questions": _summarize_open_questions(all_questions),
             "pipeline_error": error_info,
@@ -1453,6 +1453,25 @@ class Pipeline:
         extra_questions = parsed["extra_questions"]
         table_mapping = parsed["table_mapping"]
         request_id = self._gen_request_id(spec)
+
+        # ── blocking extra_questions 门禁——先于 build 阻断 ──
+        # enrich 阶段（如 LEFT JOIN 唯一性安全门禁）产生的 blocking 问题必须阻断流水线，
+        # 否则 Join 候选被丢弃后计划静默退化为单表，最终在 execute 阶段以晦涩的
+        # Binder Error 暴露（NYC Case03/04 存量失败根因）。
+        # 必须在 build 之前拦截——builder 对空候选 + 跨表输出列会抛 ValueError，
+        # 若放行到 build 会以异常形式掩盖真实原因（blocking OpenQuestion）
+        has_blocking_extra = any(q.blocking for q in extra_questions)
+        if has_blocking_extra:
+            blocked = self._build_validation_blocked_response(
+                spec, manifest, None, list(extra_questions),
+                table_mapping=table_mapping, all_stages=_run_all_stages,
+            )
+            blocked.update({
+                "execution_status": "not_executed",
+                "row_count": 0,
+                "elapsed_ms": 0,
+            })
+            return blocked
 
         # ── Stage 3-7: Build → Compile → Execute → Contract → Package ──
         plan = None

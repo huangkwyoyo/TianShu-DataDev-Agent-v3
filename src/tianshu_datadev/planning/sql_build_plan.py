@@ -1815,6 +1815,47 @@ class SqlBuildPlanBuilder:
         """
         return f"{table_alias}_self_left", f"{table_alias}_self_right"
 
+    @staticmethod
+    def _assert_degradation_safe(spec: ParsedDeveloperSpec) -> None:
+        """校验空 candidates 退化为单表是否安全。
+
+        退化只保留首表扫描——若 output_columns 中存在仅在其他输入表声明的列，
+        退化计划必然在运行期 Binder Error，应在构建期显式失败并给出真实原因
+        （通常是 Join 候选被安全门禁丢弃，如 dim 表联结键未声明 unique: true）。
+
+        Raises:
+            ValueError: 输出列依赖非首表专属列时。
+        """
+        if len(spec.input_tables) <= 1:
+            return
+        output_columns = spec.output_spec.columns if spec.output_spec else []
+        if not output_columns:
+            return
+
+        def _decl_names(table) -> set[str]:
+            # 输入表列模型为 ColumnDecl——名称字段是 column_name（区别于输出列的 name）
+            return {
+                c.column_name
+                for c in (table.columns + table.key_columns + table.business_columns)
+            }
+
+        first_cols = _decl_names(spec.input_tables[0])
+        other_cols: set[str] = set()
+        for t in spec.input_tables[1:]:
+            other_cols |= _decl_names(t)
+
+        # 仅在其他表声明的输出列——退化后必然找不到（指标别名/计算列不在此列）
+        offending = [
+            oc.name for oc in output_columns
+            if oc.name not in first_cols and oc.name in other_cols
+        ]
+        if offending:
+            raise ValueError(
+                f"多表 spec 无可用 Join 候选，无法退化为单表：输出列 {offending} "
+                f"仅在非首表中声明。请检查 Join 声明是否被安全门禁丢弃"
+                f"（如 dim 表联结键需声明 unique: true）"
+            )
+
     def _build_multi_table(
         self,
         spec: ParsedDeveloperSpec,
@@ -1829,7 +1870,10 @@ class SqlBuildPlanBuilder:
         table_map = {t.table_alias: t for t in spec.input_tables}
 
         if not hypothesis.candidates:
-            # 无候选 Join——退化为单表处理（取第一个表）
+            # 无候选 Join——退化为单表前必须确认输出不依赖其他表，
+            # 否则退化计划会把 dim 表专属列当作首表列扫描，
+            # 编译出的 SQL 在运行期以晦涩的 Binder Error 失败
+            self._assert_degradation_safe(spec)
             return self._build_single_table(spec)
 
         join_candidate = hypothesis.candidates[0]

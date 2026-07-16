@@ -50,6 +50,7 @@ spec:
         - name: violation_code
           type: varchar
           nullable: false
+          unique: true
       business_columns:
         - name: violation_description
           type: varchar

@@ -54,6 +54,7 @@ spec:
         - name: location_id
           type: integer
           nullable: false
+          unique: true
       business_columns:
         - name: borough
           type: varchar

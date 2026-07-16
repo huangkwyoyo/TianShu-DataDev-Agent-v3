@@ -159,6 +159,42 @@ class TestExplicitJoinIntegration:
 
 
 # ════════════════════════════════════════════
+# 空 candidates 退化保护
+# ════════════════════════════════════════════
+
+
+class TestEmptyCandidatesDegradationGuard:
+    """空 candidates 退化保护——防止静默产出运行期必败的单表计划。
+
+    回归背景：Join 候选被安全门禁丢弃后，_build_multi_table 静默退化为
+    单表扫描，但 output_columns 仍含 dim 表专属列，编译出的 SQL 在
+    execute 阶段以晦涩的 Binder Error 失败（NYC Case03/04 存量失败根因）。
+    """
+
+    def test_empty_candidates_with_cross_table_columns_raises(self):
+        """输出列引用非首表专属列 + 空 candidates → 应显式失败而非静默退化。"""
+        import pytest
+
+        parser = DeveloperSpecParser()
+        text = read_fixture("fixtures/relationship/explicit_join_spec.md")
+        spec = parser.parse(text)
+
+        # 构造空 candidates 的 hypothesis——模拟候选被安全门禁全部丢弃
+        empty_hypothesis = RelationshipHypothesis(
+            hypothesis_id=RelationshipHypothesis.generate_hypothesis_id(spec.spec_hash),
+            spec_hash=spec.spec_hash,
+            source_manifest_hash=None,
+            candidates=[],
+            multi_table=True,
+        )
+
+        builder = SqlBuildPlanBuilder()
+        # dim_name 仅在 td 表声明——退化单表后必然 Binder Error，应在构建期显式失败
+        with pytest.raises(ValueError, match="dim_name"):
+            builder.build(spec, empty_hypothesis)
+
+
+# ════════════════════════════════════════════
 # 确定性
 # ════════════════════════════════════════════
 
