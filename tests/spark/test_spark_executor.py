@@ -162,11 +162,12 @@ class TestOutputParsing:
             "===SPARK_EXECUTOR_OUTPUT_END===\n"
             "more logs\n"
         )
-        rows, cleaned = _parse_output_rows(stdout)
+        rows, cleaned, overflow = _parse_output_rows(stdout)
 
         assert len(rows) == 2
         assert rows[0] == {"order_id": "1", "amount": 100}
         assert rows[1] == {"order_id": "2", "amount": 200}
+        assert not overflow
         # 清理后不含标记行
         assert "SPARK_EXECUTOR_OUTPUT_START" not in cleaned
 
@@ -176,14 +177,16 @@ class TestOutputParsing:
             "===SPARK_EXECUTOR_OUTPUT_START===\n"
             "===SPARK_EXECUTOR_OUTPUT_END===\n"
         )
-        rows, _ = _parse_output_rows(stdout)
+        rows, _, overflow = _parse_output_rows(stdout)
         assert len(rows) == 0
+        assert not overflow
 
     def test_parse_no_markers(self):
         """无标记——无 JSON 行。"""
         stdout = "some output without markers"
-        rows, _ = _parse_output_rows(stdout)
+        rows, _, overflow = _parse_output_rows(stdout)
         assert len(rows) == 0
+        assert not overflow
 
     def test_parse_malformed_json(self):
         """畸形 JSON 行——跳过，不影响后续。"""
@@ -193,9 +196,35 @@ class TestOutputParsing:
             '{"valid": "row"}\n'
             "===SPARK_EXECUTOR_OUTPUT_END===\n"
         )
-        rows, _ = _parse_output_rows(stdout)
+        rows, _, overflow = _parse_output_rows(stdout)
         assert len(rows) == 1
         assert rows[0] == {"valid": "row"}
+        assert not overflow
+
+    def test_parse_overflow_sentinel(self):
+        """溢出哨兵——overflow=True 且不产出任何业务行。"""
+        stdout = (
+            "some log\n"
+            "===SPARK_EXECUTOR_OUTPUT_START===\n"
+            '{"_tianshu_overflow": true}\n'
+            "===SPARK_EXECUTOR_OUTPUT_END===\n"
+        )
+        rows, cleaned, overflow = _parse_output_rows(stdout)
+        assert overflow
+        assert rows == []
+        assert "some log" in cleaned
+
+    def test_parse_overflow_sentinel_not_in_rows(self):
+        """哨兵行与业务行混排——哨兵不进入 rows，业务行正常解析。"""
+        stdout = (
+            "===SPARK_EXECUTOR_OUTPUT_START===\n"
+            '{"_tianshu_overflow": true}\n'
+            '{"order_id": "1"}\n'
+            "===SPARK_EXECUTOR_OUTPUT_END===\n"
+        )
+        rows, _, overflow = _parse_output_rows(stdout)
+        assert overflow
+        assert rows == [{"order_id": "1"}]
 
 
 # ════════════════════════════════════════════
@@ -348,6 +377,26 @@ class TestExecutorBehavior:
         assert "result_df = transform(inputs)" in _OUTPUT_COLLECTOR_TEMPLATE
         # 不应再有 {output_var} 占位符——transform 调用已固定
         assert "{output_var}" not in _OUTPUT_COLLECTOR_TEMPLATE
+
+    def test_output_collector_uses_limit_single_execution(self):
+        """OOM 门禁——收集器用 limit(MAX+1) 单次执行，禁止 count()+collect() 双执行。"""
+        from tianshu_datadev.spark.executor import (
+            _MAX_RESULT_ROWS,
+            _OUTPUT_COLLECTOR_TEMPLATE,
+        )
+
+        injected = _inject_output_collector("result = 1")
+        # limit(MAX+1) 单次执行——溢出通过行数判断，不用 count()
+        assert f".limit({_MAX_RESULT_ROWS} + 1)" in injected
+        assert ".count()" not in _OUTPUT_COLLECTOR_TEMPLATE
+        # 溢出哨兵存在
+        assert "_tianshu_overflow" in injected
+
+    def test_output_collector_generates_valid_python(self):
+        """注入后的收集器代码必须是合法 Python——防止 JSON true 混入 Python 代码。"""
+        injected = _inject_output_collector("result = 1")
+        # compile 失败即模板生成了非法 Python（如 true 而非 True）
+        compile(injected, "<collector_check>", "exec")
 
     def test_instrumentation_order_correct(self):
         """验证注入顺序——prologue（inputs）在用户代码之前，collector 在之后。"""

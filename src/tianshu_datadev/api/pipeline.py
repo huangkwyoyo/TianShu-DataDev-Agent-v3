@@ -1359,7 +1359,8 @@ class Pipeline:
                     if c.evidence:
                         evidence_map_sp[c.candidate_id] = c.evidence
             extractor = DataTransformContractExtractor()
-            contract = extractor.extract(plan, evidence_map_sp)
+            sql_program = build_sql_program(plan, spec.spec_hash)
+            contract = extractor.extract_v1(sql_program, evidence_map=evidence_map_sp)
         except Exception as contract_err:
             logger.warning("Contract 抽取失败（非阻断）：%s", contract_err)
 
@@ -1880,10 +1881,7 @@ class Pipeline:
                         evidence_map[c.candidate_id] = c.evidence
             contract_extractor = DataTransformContractExtractor()
             with collector.stage("contract_extractor", request_id) as ctx:
-                if len(sql_program.statements) > 1:
-                    contract = contract_extractor.extract_v1(sql_program, evidence_map=evidence_map)
-                else:
-                    contract = contract_extractor.extract(plan, evidence_map)
+                contract = contract_extractor.extract_v1(sql_program, evidence_map=evidence_map)
                 if contract:
                     ctx.set_result(artifact_path=f"contract/{contract.contract_id[:12]}")
 
@@ -2760,7 +2758,7 @@ class Pipeline:
         elif stype == "limit":
             desc_parts.append(f"限制行数: {step.limit_count}")
         elif stype == "case_when":
-            desc_parts.append(f"CASE WHEN 分支数: {len(step.branches)}")
+            desc_parts.append(f"CASE WHEN 分支数: {len(step.cases)}")
         else:
             desc_parts.append(f"步骤类型: {stype}")
         return {
@@ -3124,7 +3122,8 @@ class Pipeline:
                     if c.evidence:
                         evidence_map_d[c.candidate_id] = c.evidence
             extractor = DataTransformContractExtractor()
-            contract = extractor.extract(plan, evidence_map_d)
+            sql_program = build_sql_program(plan, spec.spec_hash)
+            contract = extractor.extract_v1(sql_program, evidence_map=evidence_map_d)
         except Exception as contract_err:
             logger.warning("Contract 抽取失败（非阻断）：%s", contract_err)
 

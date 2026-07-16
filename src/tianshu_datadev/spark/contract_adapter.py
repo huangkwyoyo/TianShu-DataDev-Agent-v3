@@ -17,8 +17,15 @@ from tianshu_datadev.artifacts.models import (
 )
 
 
-def adapt_lite_to_v1(lite: DataTransformContractLite) -> DataTransformContractV1:
+def adapt_lite_to_v1(
+    lite: DataTransformContractLite | DataTransformContractV1,
+) -> DataTransformContractV1:
     """将 DataTransformContractLite 确定性升级为 DataTransformContractV1。
+
+    幂等：输入已是 DataTransformContractV1 时直接透传——生产路径已统一
+    build_sql_program() + extract_v1() 产出 V1，本适配器仅作向后兼容安全网。
+    若在 V1 上重建默认字段，会把 extract_v1 抽取的 case_when_labels /
+    window_specs 清空，重新引入 CaseWhen 丢失缺陷。
 
     Lite 和 V1 共享 14 个业务字段（input_tables / filters / aggregations 等）。
     适配直接复制这些字段，并为 V1 独有的 5 个字段填入安全默认值：
@@ -34,7 +41,7 @@ def adapt_lite_to_v1(lite: DataTransformContractLite) -> DataTransformContractV1
 
     Args:
         lite: DataTransformContractLite 实例——来自 Pipeline.export_artifacts() 的
-              data_transform_contract 字段。
+              data_transform_contract 字段；或已是 V1 实例（直接透传）。
 
     Returns:
         DataTransformContractV1——可直接传入 Mapper（map_contract_to_spark_plan）和
@@ -44,7 +51,12 @@ def adapt_lite_to_v1(lite: DataTransformContractLite) -> DataTransformContractV1
         adapt_lite_to_v1(lite).{field} == lite.{field}  # 对所有公共字段
         adapt_lite_to_v1(lite).version == "v1"
         adapt_lite_to_v1(lite).source_phase == "phase-3"
+        adapt_lite_to_v1(v1) is v1  # 幂等透传
     """
+    # 幂等透传——已是 V1 时不得重建（会清空 case_when_labels/window_specs）
+    if isinstance(lite, DataTransformContractV1):
+        return lite
+
     # 用 Lite 的 source_sqlbuildplan_hash 作为 V1 的 source_sqlprogram_hash
     program_id = lite.source_sqlbuildplan_hash
     contract_id = DataTransformContractV1.generate_contract_id(program_id)

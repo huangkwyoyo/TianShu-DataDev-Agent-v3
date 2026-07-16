@@ -627,6 +627,43 @@ class PhysicalVerifier:
             )
 
         try:
+            # 结果溢出检测——超阈值时不得判定 SQL/Spark 一致，返回 NOT_EXECUTED
+            if getattr(spark_result, 'result_overflow', False):
+                # 复用模块级 logging——函数内 import 会遮蔽模块级名字导致 UnboundLocalError
+                logging.getLogger(__name__).warning(
+                    "Spark 结果行数超过上限（%s），跳过逐行对比，返回 NOT_EXECUTED。"
+                    "contract_hash=%s, snapshot_id=%s",
+                    getattr(spark_result, 'error_message', ''),
+                    contract_hash,
+                    snapshot_id,
+                )
+                return PhysicalVerificationReport(
+                    report_id=self._generate_report_id(contract_hash, snapshot_id),
+                    contract_hash=contract_hash,
+                    snapshot_id=snapshot_id,
+                    status=PhysicalVerificationStatus.NOT_EXECUTED,
+                    duckdb_result=EngineExecutionResult(
+                        engine="duckdb",
+                        success=True,
+                        execution_time_ms=duckdb_result.execution_time_ms,
+                        raw_row_count=duckdb_result.output_rows.__len__(),
+                        canonical_row_count=len(duckdb_rows),
+                        sample_rows=duckdb_rows[:5],
+                    ),
+                    spark_result=EngineExecutionResult(
+                        engine="spark",
+                        success=False,
+                        execution_time_ms=spark_result.execution_time_ms,
+                        error_message=spark_result.error_message,
+                    ),
+                    uncovered_step_types=uncovered,
+                    error_message=(
+                        f"Spark 结果行数超过收集上限，"
+                        f"无法进行逐行对比。需通过 CDP 摘要验证（后续功能）。"
+                        f"详情：{spark_result.error_message}"
+                    ),
+                )
+
             if spark_result.status == SparkExecutionStatus.SUCCESS:
                 spark_rows = self._canonicalizer.canonicalize(
                     spark_result.output_rows,

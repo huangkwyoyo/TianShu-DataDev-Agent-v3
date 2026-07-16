@@ -57,6 +57,9 @@ class SparkExecutionResult:
     # 进行逐行对比——CDP 摘要替代全量数据回传。该字段在 Shadow 阶段保留。
     output_rows: list[dict] = field(default_factory=list)
     error_message: str = ""
+    # 结果行数是否超过 _MAX_RESULT_ROWS 阈值——超阈值时 output_rows 为空，
+    # 调用方应返回 NOT_EXECUTED 或 HUMAN_REVIEW，不得判定 SQL/Spark 一致
+    result_overflow: bool = False
     # 资源使用记录（可观测性）
     resource_usage: dict = field(default_factory=lambda: {
         "stdout_bytes": 0,
@@ -301,18 +304,26 @@ def scan_pyspark_code(code: str) -> list[str]:
 _OUTPUT_START_MARKER = "===SPARK_EXECUTOR_OUTPUT_START==="
 _OUTPUT_END_MARKER = "===SPARK_EXECUTOR_OUTPUT_END==="
 
+# 物理验证结果行数上限——超阈值不收集全量行，避免 Driver 端 Java heap OOM
+_MAX_RESULT_ROWS = 100_000
+
 # 注入到 PySpark 代码末尾的输出收集片段
 # 将最终 DataFrame 转为 JSON 行格式输出到 stdout
+# 使用 limit(MAX+1) 单次执行检测溢出——避免 count() + collect() 导致管线执行两次
 _OUTPUT_COLLECTOR_TEMPLATE = """
 # ── Executor 注入：结果收集 ──
 import json, sys as _exec_sys
 
 # 调用编译器产出的 transform 函数——传入 executor prologue 构造的 inputs 字典
 result_df = transform(inputs)
-_rows = result_df.toJSON().collect()
+_rows = result_df.limit({max_rows} + 1).toJSON().collect()
 _exec_sys.stdout.write("{start_marker}\\n")
-for _row_json in _rows:
-    _exec_sys.stdout.write(_row_json + "\\n")
+if len(_rows) > {max_rows}:
+    # 超阈值——不返回业务行，仅输出溢出哨兵
+    _exec_sys.stdout.write(json.dumps({{"_tianshu_overflow": True}}) + "\\n")
+else:
+    for _row_json in _rows:
+        _exec_sys.stdout.write(_row_json + "\\n")
 _exec_sys.stdout.write("{end_marker}\\n")
 _exec_sys.stdout.flush()
 """
@@ -331,20 +342,21 @@ def _inject_output_collector(code: str, output_var: str = "result_df") -> str:
     collector = _OUTPUT_COLLECTOR_TEMPLATE.format(
         start_marker=_OUTPUT_START_MARKER,
         end_marker=_OUTPUT_END_MARKER,
+        max_rows=_MAX_RESULT_ROWS,
     )
     return code.rstrip() + "\n" + collector
 
 
-def _parse_output_rows(stdout: str) -> tuple[list[dict], str]:
+def _parse_output_rows(stdout: str) -> tuple[list[dict], str, bool]:
     """从 stdout 中解析 DataFrame JSON 行输出。
 
-    返回 (输出行列表, 清洗后的 stdout——移除标记行和 JSON 行)。
+    返回 (输出行列表, 清洗后的 stdout, 是否溢出)。
 
     Args:
         stdout: 子进程 stdout 原始输出
 
     Returns:
-        (output_rows, cleaned_stdout)
+        (output_rows, cleaned_stdout, overflow)
     """
     import json
 
@@ -352,6 +364,7 @@ def _parse_output_rows(stdout: str) -> tuple[list[dict], str]:
     rows: list[dict] = []
     cleaned_lines: list[str] = []
     in_output = False
+    overflow = False
 
     for line in lines:
         if line.strip() == _OUTPUT_START_MARKER:
@@ -362,14 +375,18 @@ def _parse_output_rows(stdout: str) -> tuple[list[dict], str]:
             continue
         if in_output:
             try:
-                rows.append(json.loads(line))
+                parsed = json.loads(line)
+                if parsed.get("_tianshu_overflow"):
+                    overflow = True
+                    continue  # 溢出行不进入业务数据
+                rows.append(parsed)
             except json.JSONDecodeError:
                 pass
         else:
             # 非输出区域的文本保留在清洗后的 stdout 中
             cleaned_lines.append(line)
 
-    return rows, "\n".join(cleaned_lines)
+    return rows, "\n".join(cleaned_lines), overflow
 
 
 # ════════════════════════════════════════════
@@ -798,9 +815,31 @@ class LocalSparkExecutor:
         stderr_bytes = len(stderr.encode("utf-8"))
 
         # Step 9：解析输出
-        output_rows, cleaned_stdout = _parse_output_rows(stdout)
+        output_rows, cleaned_stdout, overflow = _parse_output_rows(stdout)
 
         # Step 10：判断执行结果
+        # 结果溢出检测——优先于其他状态判断，避免将溢出误判为成功
+        if overflow:
+            return SparkExecutionResult(
+                status=SparkExecutionStatus.SUCCESS,
+                stdout=cleaned_stdout,
+                stderr=stderr,
+                return_code=return_code,
+                execution_time_ms=elapsed_ms,
+                output_rows=[],
+                result_overflow=True,
+                error_message=(
+                    f"结果行数超过上限（{_MAX_RESULT_ROWS}），"
+                    f"不收集全量行以避免 Java heap OOM。"
+                    f"需通过 CDP 摘要验证（后续功能）。"
+                ),
+                resource_usage={
+                    "stdout_bytes": stdout_bytes,
+                    "stderr_bytes": stderr_bytes,
+                    "output_truncated": False,
+                    "env_keys_used": env_keys_used,
+                },
+            )
         # 资源耗尽检测——Unix signal 或 Windows Job Object kill
         if return_code in (-9, -15, 0xC000013A):  # SIGKILL, SIGTERM, STATUS_STACK_BUFFER_OVERRUN
             return SparkExecutionResult(

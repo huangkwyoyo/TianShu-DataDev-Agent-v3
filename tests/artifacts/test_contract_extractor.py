@@ -34,6 +34,7 @@ from tianshu_datadev.planning.relationship_planner import RelationshipPlanner
 from tianshu_datadev.planning.sql_build_plan import (
     AggregateStep,
     CaseWhenStep,
+    FilterStep,
     LimitStep,
     ProjectStep,
     ScanStep,
@@ -955,3 +956,214 @@ class TestPipelineStep2:
         assert "case_when_labels" not in data
         assert "window_specs" not in data
         assert "write_spec" not in data
+
+
+# ════════════════════════════════════════════
+# 回归测试——单语句生产路径统一走 v1（CaseWhen/Window 不再丢失）
+# ════════════════════════════════════════════
+
+
+class TestSingleStatementV1Regression:
+    """回归：pipeline 生产路径统一 build_sql_program() + extract_v1()。
+
+    历史缺陷：单语句走 lite extract()，CaseWhenStep/WindowStep 被静默丢弃，
+    adapt_lite_to_v1() 硬编码 case_when_labels=[]，导致 Spark 侧缺失
+    CASE WHEN 步骤，逻辑对比报 case_when 不等价 + 步骤顺序不等价。
+    """
+
+    @staticmethod
+    def _make_case_when_full_chain_plan() -> SqlBuildPlan:
+        """构建模板 2 形态的单语句 plan：scan → filter ×2 → case_when → project → sort。
+
+        表别名用 trips（非 tN/fN 模式）——Mapper 别名校验禁止旧式代码变量名。
+        """
+        return SqlBuildPlan(
+            plan_id="plan_cw_chain",
+            spec_hash="hash_cw_chain",
+            steps=[
+                ScanStep(
+                    step_id="scan_trips",
+                    table_ref="trips",
+                    required_columns=[
+                        ColumnRef(
+                            table_ref="trips",
+                            column_name="amount",
+                            normalized_name="amount",
+                        ),
+                        ColumnRef(
+                            table_ref="trips",
+                            column_name="category",
+                            normalized_name="category",
+                        ),
+                    ],
+                ),
+                FilterStep(
+                    step_id="filter_1",
+                    predicate=Predicate(
+                        left=ColumnRef(
+                            table_ref="trips",
+                            column_name="amount",
+                            normalized_name="amount",
+                        ),
+                        operator=PredicateOperator.GT,
+                        right=SqlLiteral(value=0),
+                    ),
+                ),
+                FilterStep(
+                    step_id="filter_2",
+                    predicate=Predicate(
+                        left=ColumnRef(
+                            table_ref="trips",
+                            column_name="amount",
+                            normalized_name="amount",
+                        ),
+                        operator=PredicateOperator.LT,
+                        right=SqlLiteral(value=100000),
+                    ),
+                ),
+                CaseWhenStep(
+                    step_id="case_1",
+                    cases=[
+                        WhenBranch(
+                            condition=Predicate(
+                                left=ColumnRef(
+                                    table_ref="trips",
+                                    column_name="amount",
+                                    normalized_name="amount",
+                                ),
+                                operator=PredicateOperator.GTE,
+                                right=SqlLiteral(value=10000),
+                            ),
+                            result=SqlLiteral(value="高价值"),
+                        ),
+                        WhenBranch(
+                            condition=Predicate(
+                                left=ColumnRef(
+                                    table_ref="trips",
+                                    column_name="amount",
+                                    normalized_name="amount",
+                                ),
+                                operator=PredicateOperator.GTE,
+                                right=SqlLiteral(value=1000),
+                            ),
+                            result=SqlLiteral(value="中价值"),
+                        ),
+                    ],
+                    else_value=SqlLiteral(value="低价值"),
+                    alias="value_level",
+                ),
+                ProjectStep(
+                    step_id="proj_1",
+                    columns=[
+                        AliasExpr(
+                            expression=ColumnRef(
+                                table_ref="trips",
+                                column_name="category",
+                                normalized_name="category",
+                            ),
+                            alias="category",
+                        ),
+                        AliasExpr(
+                            expression=ColumnRef(
+                                table_ref="trips",
+                                column_name="value_level",
+                                normalized_name="value_level",
+                            ),
+                            alias="value_level",
+                        ),
+                    ],
+                ),
+                SortStep(
+                    step_id="sort_1",
+                    order_by=[SortSpec(column="category", direction="ASC")],
+                ),
+            ],
+        )
+
+    def test_case_when_full_chain_step_sequence_identical(self):
+        """CaseWhen 全链路：plan → build_sql_program → extract_v1 → Mapper → SparkPlan，
+        规范化步骤序列必须完全一致（不只是数量相同）。"""
+        from tianshu_datadev.planning.program_factory import build_sql_program
+        from tianshu_datadev.spark.mapper import map_contract_to_spark_plan
+
+        plan = self._make_case_when_full_chain_plan()
+
+        # ── 生产路径：单 plan 包装为 SqlProgram → v1 抽取 ──
+        sql_program = build_sql_program(plan, "spec_hash_cw_chain")
+        assert len(sql_program.statements) == 1
+
+        extractor = DataTransformContractExtractor()
+        contract = extractor.extract_v1(sql_program)
+
+        # v1 路径必须捕获 CaseWhenStep（历史缺陷：lite 路径静默丢弃）
+        assert contract.version == "v1"
+        assert len(contract.case_when_labels) == 1
+        cw = contract.case_when_labels[0]
+        assert cw.labels == ["高价值", "中价值"]
+        assert cw.else_label == "低价值"
+        assert cw.output_alias == "value_level"
+        # 结构化分支条件必须存在——Spark 编译依赖
+        assert len(cw.branches) == 2
+        assert all(b.condition is not None for b in cw.branches)
+
+        # ── Contract → SparkPlan 映射 ──
+        result = map_contract_to_spark_plan(contract)
+        assert result.success, f"映射失败：gaps={result.gaps}, unsupported={result.unsupported}"
+        spark_plan = result.spark_plan
+        assert spark_plan is not None
+
+        # ── 核心断言：规范化步骤序列完全一致（read → scan 归一化后逐位对比） ──
+        expected_sequence = ["scan", "filter", "filter", "case_when", "project", "sort"]
+        sql_sequence = [s.step_type for s in plan.steps]
+        spark_sequence = [
+            "scan" if s.step_type == "read" else s.step_type
+            for s in spark_plan.steps
+        ]
+        assert sql_sequence == expected_sequence
+        assert spark_sequence == expected_sequence, (
+            f"SQL/Spark 步骤序列不一致：SQL={sql_sequence}, Spark={spark_sequence}"
+        )
+
+        # Spark 侧 case_when 步骤的分支与 ELSE 完整传递
+        spark_cw = [s for s in spark_plan.steps if s.step_type == "case_when"][0]
+        assert len(spark_cw.branches) == 2
+        assert all(b.condition is not None for b in spark_cw.branches)
+        assert spark_cw.else_value == "低价值"
+
+    def test_window_step_single_statement_v1_path(self):
+        """WindowStep 单语句：build_sql_program + extract_v1 必须捕获 window_specs。"""
+        from tianshu_datadev.planning.program_factory import build_sql_program
+
+        plan = _make_minimal_plan("plan_win_single", extra_steps=[_make_window_step()])
+        sql_program = build_sql_program(plan, "spec_hash_win_single")
+        assert len(sql_program.statements) == 1
+
+        extractor = DataTransformContractExtractor()
+        contract = extractor.extract_v1(sql_program)
+
+        # v1 路径必须捕获 WindowStep（历史缺陷：lite 路径静默丢弃）
+        assert contract.version == "v1"
+        assert len(contract.window_specs) == 2
+        functions = {ws.function for ws in contract.window_specs}
+        assert functions == {"ROW_NUMBER", "LAG"}
+
+    def test_adapt_lite_to_v1_idempotent_passthrough(self):
+        """adapt_lite_to_v1 对 V1 输入幂等透传——不得清空 case_when_labels/window_specs。
+
+        历史风险：生产路径统一产出 V1 后，下游遗留的 adapt_lite_to_v1 调用点
+        若在 V1 上重建默认字段，会重新引入 CaseWhen 丢失缺陷。
+        """
+        from tianshu_datadev.planning.program_factory import build_sql_program
+        from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+
+        plan = self._make_case_when_full_chain_plan()
+        sql_program = build_sql_program(plan, "spec_hash_adapter")
+
+        extractor = DataTransformContractExtractor()
+        v1_contract = extractor.extract_v1(sql_program)
+        assert len(v1_contract.case_when_labels) == 1
+
+        adapted = adapt_lite_to_v1(v1_contract)
+        # 同一对象透传——V1 字段原样保留
+        assert adapted is v1_contract
+        assert len(adapted.case_when_labels) == 1
