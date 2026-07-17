@@ -113,4 +113,4 @@
 
 - `docs/roadmap/`：各 Phase 实施路线图（Phase 0-8 全部完成，历史参考）
 - `docs/superpowers/`：完整设计（specs）+ 实施计划（plans）
-- `docs/risks/phase-6-8-known-risks.md`：C1-C4 风险详细登记
+- `docs/risks/phase-6-8-known-risks.md`：**Phase 6-8 历史风险与验收证据**（已冻结），当前风险以 `current-state-and-verification-status.md` §3、§3.5 为准

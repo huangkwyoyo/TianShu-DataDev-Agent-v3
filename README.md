@@ -23,7 +23,7 @@ Phase 6-8 的 roadmap 文件已从占位更新为设计摘要，完整设计见 
 | 6 | `phase-6-controlled-pyspark-dsl.md` | ✅ 已完成（2026-07-04） |
 | 7 | `phase-7-sql-spark-cross-validation.md` | ✅ 已完成（2026-07-04） |
 | 8 | `phase-8-spark-first-orchestration-hardening.md` | ✅ 已完成（2026-07-04） |
-| C1-C4 | `docs/risks/phase-6-8-known-risks.md` | ✅ 桥接级全部点亮（2026-07-04） |
+| C1-C4 | `docs/risks/phase-6-8-known-risks.md` | ✅ Phase 6-8 历史验收记录——已冻结，当前风险以 current-state §3/§3.5 为准 |
 
 **实施状态**：Phase 0-9 已完成。C1-C4 业务集成全部点亮，前端 E2E 6/6 通过。详见 `docs/current-state-and-verification-status.md`。
 
