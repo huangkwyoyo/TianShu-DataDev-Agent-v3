@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     from tianshu_datadev.sql.models import CompiledSql, ExecutionTrace, ResultSummary
 
 from tianshu_datadev.spark.orchestrator import SparkPipelineStage
+from tianshu_datadev.spark.physical_verifier import PhysicalVerificationStatus
 
 logger = logging.getLogger(__name__)
 
@@ -2526,9 +2527,13 @@ class Pipeline:
                     "standalone_pyspark": standalone_pyspark,
                     "llm_traces": all_llm_traces,
                     # COMPARATOR 细粒度状态与审核标记
-                    "comparator_status": comparator_status,
-                    "requires_human_review": comparator_status != "LOGIC_EQUIVALENT" if comparator_status else True,
-                    "review_ready": comparator_status == "LOGIC_EQUIVALENT" if comparator_status else False,
+                "comparator_status": comparator_status,
+                "requires_human_review": (
+                    comparator_status != "LOGIC_EQUIVALENT" if comparator_status else True
+                ),
+                "review_ready": (
+                    comparator_status == "LOGIC_EQUIVALENT" if comparator_status else False
+                ),
                 }
 
                 event_queue.put({"event": "done", "result": full_result})
@@ -3479,10 +3484,13 @@ class Pipeline:
 
         # PHYSICAL_VERIFIER 特殊处理：物理不一致时标记 failed
         if stage == SparkPipelineStage.PHYSICAL_VERIFIER and current_status == "ok":
-            from tianshu_datadev.spark.physical_verifier import PhysicalVerificationStatus
             report = context.physical_verify_report
             if report is not None and report.status != PhysicalVerificationStatus.RESULT_CONSISTENT:
                 current_status = "failed"
+                # 同步更新 spark_stages 中的阶段状态——确保 run_spark_stage 响应内部一致
+                for s in spark_stages:
+                    if s["stage"] == stage_val:
+                        s["status"] = current_status
 
         # ── 构建阶段特有结果内容（供前端面板渲染）──
         result: dict | None = None
@@ -3595,8 +3603,23 @@ class Pipeline:
                         "spark": (report.spark_result.sample_rows or [])[:5],
                     } if report else None,
                 }
+            elif current_status == "failed":
+                # 物理执行成功但结果不一致——返回有界摘要供人工审核诊断
+                report = context.physical_verify_report
+                result = {
+                    "type": "physical_verify",
+                    "status": "failed",
+                    "skipped": False,
+                    "row_count_match": report.row_count_match if report else None,
+                    "schema_match": report.schema_match if report else None,
+                    "total_diff_count": report.total_diff_count if report else None,
+                    "sample_rows": {
+                        "duckdb": (report.duckdb_result.sample_rows or [])[:5],
+                        "spark": (report.spark_result.sample_rows or [])[:5],
+                    } if report else None,
+                }
             else:
-                # 收集跳过/失败原因
+                # skipped——门禁未通过或 PySpark 不可用
                 verify_errors = [
                     e.split("] ", 1)[1] if "] " in e else e
                     for e in context.errors
@@ -3606,7 +3629,7 @@ class Pipeline:
                 result = {
                     "type": "physical_verify",
                     "message": reason,
-                    "skipped": current_status == "skipped",
+                    "skipped": True,
                     "errors": verify_errors,
                 }
 
