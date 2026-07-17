@@ -655,7 +655,8 @@ class _MockSparkExecutor:
         self._call_count = 0
 
     def execute(self, pyspark_code: str, data_dir: str | None = None,
-                output_var: str = "result_df") -> SparkExecutionResult:
+                output_var: str = "result_df",
+                sample_keys: list[str] | None = None) -> SparkExecutionResult:
         self._call_count += 1
         if self._success:
             return SparkExecutionResult(
@@ -668,6 +669,152 @@ class _MockSparkExecutor:
                 status=SparkExecutionStatus.RUNTIME_ERROR,
                 error_message="Mock Spark error",
             )
+
+
+class _MockOverflowSparkExecutor:
+    """Mock 溢出执行器——模拟结果超收集上限的降级收集（count + 抽样）。"""
+
+    def __init__(
+        self,
+        total_row_count: int | None,
+        sample_rows: list[dict] | None = None,
+    ) -> None:
+        self._total = total_row_count
+        self._sample = sample_rows or []
+        self.received_sample_keys: list[str] | None = None
+
+    def execute(self, pyspark_code: str, data_dir: str | None = None,
+                output_var: str = "result_df",
+                sample_keys: list[str] | None = None) -> SparkExecutionResult:
+        self.received_sample_keys = sample_keys
+        return SparkExecutionResult(
+            status=SparkExecutionStatus.SUCCESS,
+            output_rows=list(self._sample),
+            result_overflow=True,
+            total_row_count=self._total,
+            execution_time_ms=10.0,
+            error_message="结果行数超过上限（100000）——mock 降级收集",
+        )
+
+
+class TestOverflowDegradedVerification:
+    """溢出降级验证——行数对比 + 键对齐抽样对比，替代直接 NOT_EXECUTED。"""
+
+    def test_count_and_sample_match_returns_sampled_consistent(self, temp_parquet_dir):
+        """行数一致 + 抽样逐列一致 → SAMPLED_CONSISTENT（抽样一致，非全量一致）。"""
+        # DuckDB 侧 3 行；mock Spark 引擎内计数 3，抽样返回其中 2 行（与 DuckDB 同值）
+        mock_spark = _MockOverflowSparkExecutor(
+            total_row_count=3,
+            sample_rows=[
+                {"order_id": "1", "amount": 100, "region": "east"},
+                {"order_id": "3", "amount": 150, "region": "east"},
+            ],
+        )
+        verifier = PhysicalVerifier(spark_executor=mock_spark)
+
+        report = verifier.verify(
+            sql_query='SELECT * FROM "order_info" ORDER BY "order_id"',
+            pyspark_code='result_df = input_df.orderBy("order_id")',
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_hash_overflow",
+            snapshot_id="snap_overflow_001",
+            order_keys=["order_id"],
+        )
+
+        assert report.status == PhysicalVerificationStatus.SAMPLED_CONSISTENT
+        assert report.row_count_match
+        assert report.total_diff_count == 0
+        # 引擎内总行数进入报告——Spark 侧 raw_row_count 为 count() 结果
+        assert report.spark_result is not None
+        assert report.spark_result.raw_row_count == 3
+
+    def test_count_mismatch_returns_result_mismatch(self, temp_parquet_dir):
+        """引擎内行数不一致 → RESULT_MISMATCH（确定性差异，无需抽样）。"""
+        mock_spark = _MockOverflowSparkExecutor(total_row_count=5, sample_rows=[])
+        verifier = PhysicalVerifier(spark_executor=mock_spark)
+
+        report = verifier.verify(
+            sql_query='SELECT * FROM "order_info" ORDER BY "order_id"',
+            pyspark_code='result_df = input_df.orderBy("order_id")',
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_hash_overflow",
+            snapshot_id="snap_overflow_002",
+            order_keys=["order_id"],
+        )
+
+        assert report.status == PhysicalVerificationStatus.RESULT_MISMATCH
+        assert not report.row_count_match
+        assert "行数" in report.error_message
+
+    def test_sample_value_mismatch_returns_result_mismatch(self, temp_parquet_dir):
+        """行数一致但抽样值不一致 → RESULT_MISMATCH 且携带差异明细。"""
+        mock_spark = _MockOverflowSparkExecutor(
+            total_row_count=3,
+            sample_rows=[
+                {"order_id": "1", "amount": 999, "region": "east"},  # amount 不同
+            ],
+        )
+        verifier = PhysicalVerifier(spark_executor=mock_spark)
+
+        report = verifier.verify(
+            sql_query='SELECT * FROM "order_info" ORDER BY "order_id"',
+            pyspark_code='result_df = input_df.orderBy("order_id")',
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_hash_overflow",
+            snapshot_id="snap_overflow_003",
+            order_keys=["order_id"],
+        )
+
+        assert report.status == PhysicalVerificationStatus.RESULT_MISMATCH
+        assert report.row_count_match
+        assert len(report.diffs) > 0
+
+    def test_legacy_overflow_without_count_returns_not_executed(self, temp_parquet_dir):
+        """旧版溢出（无引擎内计数、无抽样）→ 保留 NOT_EXECUTED，消息附带 DuckDB 行数。"""
+        mock_spark = _MockOverflowSparkExecutor(total_row_count=None, sample_rows=[])
+        verifier = PhysicalVerifier(spark_executor=mock_spark)
+
+        report = verifier.verify(
+            sql_query='SELECT * FROM "order_info" ORDER BY "order_id"',
+            pyspark_code='result_df = input_df.orderBy("order_id")',
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_hash_overflow",
+            snapshot_id="snap_overflow_004",
+            order_keys=["order_id"],
+        )
+
+        assert report.status == PhysicalVerificationStatus.NOT_EXECUTED
+        assert "3" in report.error_message  # DuckDB 侧行数可见
+
+    def test_verify_passes_sample_keys_to_spark_executor(self, temp_parquet_dir):
+        """verify 将有效排序键传给 Spark 执行器——溢出时才能做键排序抽样。"""
+        mock_spark = _MockOverflowSparkExecutor(total_row_count=3, sample_rows=[])
+        verifier = PhysicalVerifier(spark_executor=mock_spark)
+
+        verifier.verify(
+            sql_query='SELECT * FROM "order_info" ORDER BY "order_id"',
+            pyspark_code='result_df = input_df.orderBy("order_id")',
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_hash_overflow",
+            snapshot_id="snap_overflow_005",
+            order_keys=["order_id"],
+        )
+
+        assert mock_spark.received_sample_keys == ["order_id"]
+
+    def test_sampled_consistent_derives_all_consistent(self):
+        """derive_overall_status：SAMPLED_CONSISTENT 门禁语义等同通过，不落兜底 NOT_EXECUTED。"""
+        from tianshu_datadev.spark.plan_comparator import ComparisonStatus
+        from tianshu_datadev.spark.verification_report import (
+            UnifiedVerificationReport,
+            VerificationOverallStatus,
+        )
+
+        overall = UnifiedVerificationReport.derive_overall_status(
+            logic_status=ComparisonStatus.LOGIC_EQUIVALENT,
+            physical_status=PhysicalVerificationStatus.SAMPLED_CONSISTENT,
+        )
+        assert overall == VerificationOverallStatus.ALL_CONSISTENT
 
 
 class TestPhysicalVerifierWithMock:

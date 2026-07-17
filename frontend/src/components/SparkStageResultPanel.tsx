@@ -28,6 +28,9 @@ const VERDICT_CN: Record<string, string> = {
   'EQUIVALENT': '等价',
   'NOT_EQUIVALENT': '不等价',
   'UNSUPPORTED_COMPARISON': '不支持对比',
+  'RESULT_CONSISTENT': '结果一致',
+  'SAMPLED_CONSISTENT': '抽样一致',
+  'RESULT_MISMATCH': '结果不一致',
 };
 
 /** 状态图标 */

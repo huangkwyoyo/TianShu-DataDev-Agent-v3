@@ -50,7 +50,8 @@ class _MockSparkExecutor:
         self._rows = rows or []
         self._success = success
 
-    def execute(self, pyspark_code: str, data_dir: str, output_var: str = "result_df"):
+    def execute(self, pyspark_code: str, data_dir: str, output_var: str = "result_df",
+                sample_keys: list[str] | None = None):
         if not self._success:
             return SparkExecutionResult(
                 status=SparkExecutionStatus.RUNTIME_ERROR,

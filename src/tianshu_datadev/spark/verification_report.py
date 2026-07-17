@@ -66,6 +66,7 @@ class PhysicalVerificationStatus(str, Enum):
     """物理链路验证状态——Phase 7B 启用，Phase 7A 始终 NOT_EXECUTED。"""
 
     RESULT_CONSISTENT = "RESULT_CONSISTENT"         # 双引擎结果一致
+    SAMPLED_CONSISTENT = "SAMPLED_CONSISTENT"       # 溢出降级：行数一致 + 抽样一致
     RESULT_MISMATCH = "RESULT_MISMATCH"             # 结果不一致
     EXECUTION_FAILED = "EXECUTION_FAILED"           # 执行失败
     NOT_EXECUTED = "NOT_EXECUTED"                   # 尚未执行物理验证
@@ -177,7 +178,12 @@ class UnifiedVerificationReport(StrictModel):
         if logic_status == ComparisonStatus.LOGIC_EQUIVALENT:
             if physical_status == PhysicalVerificationStatus.NOT_EXECUTED:
                 return VerificationOverallStatus.LOGIC_CONSISTENT_PHYSICAL_NOT_EXECUTED
-            elif physical_status == PhysicalVerificationStatus.RESULT_CONSISTENT:
+            elif physical_status in (
+                PhysicalVerificationStatus.RESULT_CONSISTENT,
+                # 溢出降级验证通过（行数一致 + 抽样一致）——门禁语义等同通过，
+                # 防止落入兜底 NOT_EXECUTED
+                PhysicalVerificationStatus.SAMPLED_CONSISTENT,
+            ):
                 return VerificationOverallStatus.ALL_CONSISTENT
             elif physical_status == PhysicalVerificationStatus.RESULT_MISMATCH:
                 return VerificationOverallStatus.LOGIC_CONSISTENT_PHYSICAL_MISMATCH

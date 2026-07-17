@@ -162,7 +162,7 @@ class TestOutputParsing:
             "===SPARK_EXECUTOR_OUTPUT_END===\n"
             "more logs\n"
         )
-        rows, cleaned, overflow = _parse_output_rows(stdout)
+        rows, cleaned, overflow, _ = _parse_output_rows(stdout)
 
         assert len(rows) == 2
         assert rows[0] == {"order_id": "1", "amount": 100}
@@ -177,14 +177,14 @@ class TestOutputParsing:
             "===SPARK_EXECUTOR_OUTPUT_START===\n"
             "===SPARK_EXECUTOR_OUTPUT_END===\n"
         )
-        rows, _, overflow = _parse_output_rows(stdout)
+        rows, _, overflow, _ = _parse_output_rows(stdout)
         assert len(rows) == 0
         assert not overflow
 
     def test_parse_no_markers(self):
         """无标记——无 JSON 行。"""
         stdout = "some output without markers"
-        rows, _, overflow = _parse_output_rows(stdout)
+        rows, _, overflow, _ = _parse_output_rows(stdout)
         assert len(rows) == 0
         assert not overflow
 
@@ -196,7 +196,7 @@ class TestOutputParsing:
             '{"valid": "row"}\n'
             "===SPARK_EXECUTOR_OUTPUT_END===\n"
         )
-        rows, _, overflow = _parse_output_rows(stdout)
+        rows, _, overflow, _ = _parse_output_rows(stdout)
         assert len(rows) == 1
         assert rows[0] == {"valid": "row"}
         assert not overflow
@@ -209,7 +209,7 @@ class TestOutputParsing:
             '{"_tianshu_overflow": true}\n'
             "===SPARK_EXECUTOR_OUTPUT_END===\n"
         )
-        rows, cleaned, overflow = _parse_output_rows(stdout)
+        rows, cleaned, overflow, _ = _parse_output_rows(stdout)
         assert overflow
         assert rows == []
         assert "some log" in cleaned
@@ -222,9 +222,89 @@ class TestOutputParsing:
             '{"order_id": "1"}\n'
             "===SPARK_EXECUTOR_OUTPUT_END===\n"
         )
-        rows, _, overflow = _parse_output_rows(stdout)
+        rows, _, overflow, _ = _parse_output_rows(stdout)
         assert overflow
         assert rows == [{"order_id": "1"}]
+
+
+class TestOverflowDegradedCollection:
+    """溢出降级收集——引擎内 count + 键排序抽样（避免 NOT_EXECUTED 直接失败）。"""
+
+    def test_parse_overflow_sentinel_with_row_count(self):
+        """哨兵携带 row_count → 第四返回值为引擎内总行数。"""
+        stdout = (
+            "===SPARK_EXECUTOR_OUTPUT_START===\n"
+            '{"_tianshu_overflow": true, "row_count": 6274396}\n'
+            "===SPARK_EXECUTOR_OUTPUT_END===\n"
+        )
+        rows, _, overflow, total = _parse_output_rows(stdout)
+        assert overflow
+        assert total == 6274396
+        assert rows == []
+
+    def test_parse_legacy_sentinel_total_is_none(self):
+        """旧版哨兵无 row_count → total 为 None（向后兼容）。"""
+        stdout = (
+            "===SPARK_EXECUTOR_OUTPUT_START===\n"
+            '{"_tianshu_overflow": true}\n'
+            "===SPARK_EXECUTOR_OUTPUT_END===\n"
+        )
+        _, _, overflow, total = _parse_output_rows(stdout)
+        assert overflow
+        assert total is None
+
+    def test_parse_overflow_sample_rows_collected(self):
+        """哨兵后的样本行进入 rows——作为降级验证的抽样数据。"""
+        stdout = (
+            "===SPARK_EXECUTOR_OUTPUT_START===\n"
+            '{"_tianshu_overflow": true, "row_count": 200000}\n'
+            '{"order_id": "1", "amount": 100}\n'
+            '{"order_id": "2", "amount": 200}\n'
+            "===SPARK_EXECUTOR_OUTPUT_END===\n"
+        )
+        rows, _, overflow, total = _parse_output_rows(stdout)
+        assert overflow
+        assert total == 200000
+        assert rows == [
+            {"order_id": "1", "amount": 100},
+            {"order_id": "2", "amount": 200},
+        ]
+
+    def test_collector_overflow_branch_computes_count_and_sample(self):
+        """溢出分支引擎内 count + 键排序抽样——count 仅出现在溢出检查之后。"""
+        injected = _inject_output_collector("result = 1", sample_keys=["order_id", "dt"])
+        # 常规路径仍是 limit(MAX+1) 单次执行
+        from tianshu_datadev.spark.executor import _MAX_RESULT_ROWS
+        assert f".limit({_MAX_RESULT_ROWS} + 1)" in injected
+        # count() 位于溢出判断之后——仅降级路径付出二次执行代价
+        overflow_check_pos = injected.index(f"> {_MAX_RESULT_ROWS}")
+        count_pos = injected.index(".count()")
+        assert count_pos > overflow_check_pos
+        # 键排序确定性抽样 + 哨兵携带 row_count
+        assert "orderBy" in injected
+        assert '"order_id"' in injected
+        assert "row_count" in injected
+
+    def test_collector_without_sample_keys_count_only(self):
+        """无抽样键——仍计数但不做 orderBy 抽样。"""
+        injected = _inject_output_collector("result = 1")
+        assert ".count()" in injected
+        assert "row_count" in injected
+
+    def test_collector_with_sample_keys_generates_valid_python(self):
+        """带抽样键注入后仍是合法 Python。"""
+        injected = _inject_output_collector("result = 1", sample_keys=["order_id"])
+        compile(injected, "<collector_check>", "exec")
+
+    def test_execution_result_has_total_row_count_field(self):
+        """SparkExecutionResult 携带引擎内总行数字段。"""
+        from tianshu_datadev.spark.executor import SparkExecutionResult
+        r = SparkExecutionResult(
+            status=SparkExecutionStatus.SUCCESS,
+            result_overflow=True,
+            total_row_count=123456,
+        )
+        assert r.total_row_count == 123456
 
 
 # ════════════════════════════════════════════
@@ -379,16 +459,19 @@ class TestExecutorBehavior:
         assert "{output_var}" not in _OUTPUT_COLLECTOR_TEMPLATE
 
     def test_output_collector_uses_limit_single_execution(self):
-        """OOM 门禁——收集器用 limit(MAX+1) 单次执行，禁止 count()+collect() 双执行。"""
+        """OOM 门禁——常规路径 limit(MAX+1) 单次执行；count() 仅允许在溢出降级分支。"""
         from tianshu_datadev.spark.executor import (
             _MAX_RESULT_ROWS,
             _OUTPUT_COLLECTOR_TEMPLATE,
         )
 
         injected = _inject_output_collector("result = 1")
-        # limit(MAX+1) 单次执行——溢出通过行数判断，不用 count()
+        # limit(MAX+1) 单次执行——溢出通过行数判断
         assert f".limit({_MAX_RESULT_ROWS} + 1)" in injected
-        assert ".count()" not in _OUTPUT_COLLECTOR_TEMPLATE
+        # count() 不得出现在溢出判断之前——常规路径禁止双执行
+        overflow_check_pos = _OUTPUT_COLLECTOR_TEMPLATE.index("> {max_rows}")
+        count_pos = _OUTPUT_COLLECTOR_TEMPLATE.index(".count()")
+        assert count_pos > overflow_check_pos
         # 溢出哨兵存在
         assert "_tianshu_overflow" in injected
 

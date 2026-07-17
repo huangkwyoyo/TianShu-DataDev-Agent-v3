@@ -3493,9 +3493,13 @@ class Pipeline:
         )
 
         # PHYSICAL_VERIFIER 特殊处理：物理不一致时标记 failed
+        # SAMPLED_CONSISTENT（溢出降级：行数一致 + 抽样一致）视为通过
         if stage == SparkPipelineStage.PHYSICAL_VERIFIER and current_status == "ok":
             report = context.physical_verify_report
-            if report is not None and report.status != PhysicalVerificationStatus.RESULT_CONSISTENT:
+            if report is not None and report.status not in (
+                PhysicalVerificationStatus.RESULT_CONSISTENT,
+                PhysicalVerificationStatus.SAMPLED_CONSISTENT,
+            ):
                 current_status = "failed"
                 # 同步更新 spark_stages 中的阶段状态——确保 run_spark_stage 响应内部一致
                 for s in spark_stages:
@@ -3601,10 +3605,15 @@ class Pipeline:
         if stage == SparkPipelineStage.PHYSICAL_VERIFIER:
             if current_status == "ok":
                 report = context.physical_verify_report
+                # 抽样降级验证通过时透出说明——用户需知道结论基于抽样而非全量
+                _sampled_msg = ""
+                if report is not None and report.status == PhysicalVerificationStatus.SAMPLED_CONSISTENT:
+                    _sampled_msg = report.error_message
                 result = {
                     "type": "physical_verify",
                     "status": "ok",
                     "skipped": False,
+                    "message": _sampled_msg,
                     "row_count_match": report.row_count_match if report else None,
                     "schema_match": report.schema_match if report else None,
                     "total_diff_count": report.total_diff_count if report else None,
@@ -4455,6 +4464,12 @@ class Pipeline:
                 context.stage_results["PHYSICAL_VERIFIER"] = "SUCCESS"
                 context.errors.append(
                     "[PHYSICAL_VERIFIER] 物理验证通过——双引擎输出一致"
+                )
+            elif report.status == PhysicalVerificationStatus.SAMPLED_CONSISTENT:
+                # 溢出降级验证通过——行数一致 + 键对齐抽样一致（弱于全量一致）
+                context.stage_results["PHYSICAL_VERIFIER"] = "SUCCESS"
+                context.errors.append(
+                    f"[PHYSICAL_VERIFIER] 物理验证通过（抽样）——{report.error_message}"
                 )
             else:
                 context.stage_results["PHYSICAL_VERIFIER"] = "FAILURE"

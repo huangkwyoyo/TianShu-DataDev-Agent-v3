@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import os
 import platform
@@ -57,9 +58,11 @@ class SparkExecutionResult:
     # 进行逐行对比——CDP 摘要替代全量数据回传。该字段在 Shadow 阶段保留。
     output_rows: list[dict] = field(default_factory=list)
     error_message: str = ""
-    # 结果行数是否超过 _MAX_RESULT_ROWS 阈值——超阈值时 output_rows 为空，
-    # 调用方应返回 NOT_EXECUTED 或 HUMAN_REVIEW，不得判定 SQL/Spark 一致
+    # 结果行数是否超过 _MAX_RESULT_ROWS 阈值——超阈值时 output_rows 仅含
+    # 键排序抽样行（降级验证数据源），调用方不得据此判定全量一致
     result_overflow: bool = False
+    # 引擎内计算的结果总行数——仅溢出时填充（count() 不经 Driver collect，无 OOM 风险）
+    total_row_count: int | None = None
     # 资源使用记录（可观测性）
     resource_usage: dict = field(default_factory=lambda: {
         "stdout_bytes": 0,
@@ -307,9 +310,14 @@ _OUTPUT_END_MARKER = "===SPARK_EXECUTOR_OUTPUT_END==="
 # 物理验证结果行数上限——超阈值不收集全量行，避免 Driver 端 Java heap OOM
 _MAX_RESULT_ROWS = 100_000
 
+# 溢出降级抽样行数——键排序确定性抽样，供物理验证降级对比使用
+_OVERFLOW_SAMPLE_ROWS = 1_000
+
 # 注入到 PySpark 代码末尾的输出收集片段
 # 将最终 DataFrame 转为 JSON 行格式输出到 stdout
 # 使用 limit(MAX+1) 单次执行检测溢出——避免 count() + collect() 导致管线执行两次
+# 溢出降级路径：引擎内 count()（不经 Driver collect，无 OOM）+ 键排序确定性抽样，
+# 使物理验证可做行数对比 + 抽样对比，而非直接 NOT_EXECUTED
 _OUTPUT_COLLECTOR_TEMPLATE = """
 # ── Executor 注入：结果收集 ──
 import json, sys as _exec_sys
@@ -319,8 +327,22 @@ result_df = transform(inputs)
 _rows = result_df.limit({max_rows} + 1).toJSON().collect()
 _exec_sys.stdout.write("{start_marker}\\n")
 if len(_rows) > {max_rows}:
-    # 超阈值——不返回业务行，仅输出溢出哨兵
-    _exec_sys.stdout.write(json.dumps({{"_tianshu_overflow": True}}) + "\\n")
+    # 超阈值——引擎内计数 + 键排序抽样（二次执行代价仅溢出时付出）
+    _total = result_df.count()
+    _exec_sys.stdout.write(
+        json.dumps({{"_tianshu_overflow": True, "row_count": _total}}) + "\\n"
+    )
+    # 抽样键需过滤到实际存在的列——键名不匹配时退化为仅计数，不得让整次执行失败
+    _sample_keys = [k for k in {sample_keys} if k in result_df.columns]
+    if _sample_keys:
+        _sample = (
+            result_df.orderBy(*_sample_keys)
+            .limit({sample_rows})
+            .toJSON()
+            .collect()
+        )
+        for _row_json in _sample:
+            _exec_sys.stdout.write(_row_json + "\\n")
 else:
     for _row_json in _rows:
         _exec_sys.stdout.write(_row_json + "\\n")
@@ -329,12 +351,17 @@ _exec_sys.stdout.flush()
 """
 
 
-def _inject_output_collector(code: str, output_var: str = "result_df") -> str:
+def _inject_output_collector(
+    code: str,
+    output_var: str = "result_df",
+    sample_keys: list[str] | None = None,
+) -> str:
     """在 PySpark 代码末尾注入输出收集器——调用 transform(inputs) 并序列化结果为 JSON 行。
 
     Args:
         code: 原始 PySpark 代码
         output_var: 保留参数，向后兼容（新模板固定使用 result_df）
+        sample_keys: 溢出降级抽样的排序键——None/空时溢出仅输出引擎内计数
 
     Returns:
         注入后的代码
@@ -343,20 +370,25 @@ def _inject_output_collector(code: str, output_var: str = "result_df") -> str:
         start_marker=_OUTPUT_START_MARKER,
         end_marker=_OUTPUT_END_MARKER,
         max_rows=_MAX_RESULT_ROWS,
+        sample_rows=_OVERFLOW_SAMPLE_ROWS,
+        # json.dumps 产出的列表字面量同时是合法 Python——安全嵌入模板
+        sample_keys=json.dumps(sample_keys or [], ensure_ascii=False),
     )
     return code.rstrip() + "\n" + collector
 
 
-def _parse_output_rows(stdout: str) -> tuple[list[dict], str, bool]:
+def _parse_output_rows(stdout: str) -> tuple[list[dict], str, bool, int | None]:
     """从 stdout 中解析 DataFrame JSON 行输出。
 
-    返回 (输出行列表, 清洗后的 stdout, 是否溢出)。
+    返回 (输出行列表, 清洗后的 stdout, 是否溢出, 引擎内总行数)。
+    溢出时输出行列表为降级抽样行；总行数来自哨兵行的 row_count
+    （旧版哨兵无该字段时为 None）。
 
     Args:
         stdout: 子进程 stdout 原始输出
 
     Returns:
-        (output_rows, cleaned_stdout, overflow)
+        (output_rows, cleaned_stdout, overflow, total_row_count)
     """
     import json
 
@@ -365,6 +397,7 @@ def _parse_output_rows(stdout: str) -> tuple[list[dict], str, bool]:
     cleaned_lines: list[str] = []
     in_output = False
     overflow = False
+    total_row_count: int | None = None
 
     for line in lines:
         if line.strip() == _OUTPUT_START_MARKER:
@@ -378,6 +411,10 @@ def _parse_output_rows(stdout: str) -> tuple[list[dict], str, bool]:
                 parsed = json.loads(line)
                 if parsed.get("_tianshu_overflow"):
                     overflow = True
+                    # 引擎内 count() 的总行数——降级验证的行数对比依据
+                    rc = parsed.get("row_count")
+                    if isinstance(rc, int):
+                        total_row_count = rc
                     continue  # 溢出行不进入业务数据
                 rows.append(parsed)
             except json.JSONDecodeError:
@@ -386,7 +423,7 @@ def _parse_output_rows(stdout: str) -> tuple[list[dict], str, bool]:
             # 非输出区域的文本保留在清洗后的 stdout 中
             cleaned_lines.append(line)
 
-    return rows, "\n".join(cleaned_lines), overflow
+    return rows, "\n".join(cleaned_lines), overflow, total_row_count
 
 
 # ════════════════════════════════════════════
@@ -682,6 +719,7 @@ class LocalSparkExecutor:
         pyspark_code: str,
         data_dir: str | None = None,
         output_var: str = "result_df",
+        sample_keys: list[str] | None = None,
     ) -> SparkExecutionResult:
         """在子进程中执行 PySpark DSL 代码。
 
@@ -690,6 +728,8 @@ class LocalSparkExecutor:
             data_dir: 数据目录路径（快照 Parquet 文件所在目录），
                       注入为 SPARK_DATA_DIR 环境变量供代码引用
             output_var: 最终 DataFrame 变量名，用于输出收集
+            sample_keys: 溢出降级抽样的排序键（如业务主键）——
+                         结果超 _MAX_RESULT_ROWS 时按键排序抽样供物理验证对比
 
         Returns:
             SparkExecutionResult——含执行状态、输出、耗时、资源使用
@@ -707,7 +747,9 @@ class LocalSparkExecutor:
         # Step 2：注入 Spark prologue → 资源限制 → 输出收集器
         # 注入顺序（从底到顶）：输出收集器 → Spark prologue → 资源限制
         # 最终脚本结构：资源限制 → Spark 初始化 → 用户代码 → 输出收集器
-        instrumented_code = _inject_output_collector(pyspark_code, output_var)
+        instrumented_code = _inject_output_collector(
+            pyspark_code, output_var, sample_keys=sample_keys,
+        )
         instrumented_code = self._inject_spark_prologue(instrumented_code)
         instrumented_code = self._inject_resource_limits(instrumented_code)
 
@@ -815,23 +857,30 @@ class LocalSparkExecutor:
         stderr_bytes = len(stderr.encode("utf-8"))
 
         # Step 9：解析输出
-        output_rows, cleaned_stdout, overflow = _parse_output_rows(stdout)
+        output_rows, cleaned_stdout, overflow, total_row_count = _parse_output_rows(stdout)
 
         # Step 10：判断执行结果
         # 结果溢出检测——优先于其他状态判断，避免将溢出误判为成功
         if overflow:
+            # 降级收集：output_rows 为键排序抽样行，total_row_count 为引擎内计数
+            _sample_desc = (
+                f"已收集键排序抽样 {len(output_rows)} 行"
+                if output_rows else "无抽样数据（未提供抽样键）"
+            )
             return SparkExecutionResult(
                 status=SparkExecutionStatus.SUCCESS,
                 stdout=cleaned_stdout,
                 stderr=stderr,
                 return_code=return_code,
                 execution_time_ms=elapsed_ms,
-                output_rows=[],
+                output_rows=output_rows,
                 result_overflow=True,
+                total_row_count=total_row_count,
                 error_message=(
                     f"结果行数超过上限（{_MAX_RESULT_ROWS}），"
                     f"不收集全量行以避免 Java heap OOM。"
-                    f"需通过 CDP 摘要验证（后续功能）。"
+                    f"引擎内总行数={total_row_count if total_row_count is not None else '未知'}，"
+                    f"{_sample_desc}，转入降级验证（行数对比 + 抽样对比）。"
                 ),
                 resource_usage={
                     "stdout_bytes": stdout_bytes,
