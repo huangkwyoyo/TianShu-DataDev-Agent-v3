@@ -1,6 +1,6 @@
 # Phase 8：Spark-first 编排硬化
 
-> 状态：已完成（2026-07-04） | 设计文档：`docs/superpowers/specs/2026-07-03-spark-first-phase-6-8-design.md` | 当前项目状态见 `docs/current-state-and-verification-status.md`
+> 状态：**已完成 ✅**（2026-07-04） | 设计文档：`docs/superpowers/specs/2026-07-03-spark-first-phase-6-8-design.md` | 当前项目状态见 `docs/current-state-and-verification-status.md`
 > 实施计划：`docs/superpowers/specs/2026-07-03-spark-first-phase-6-8-implementation-plan.md`
 > 前置依赖：Phase 7 SQL/Spark 双链验证
 
