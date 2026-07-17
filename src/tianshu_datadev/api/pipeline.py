@@ -61,7 +61,9 @@ if TYPE_CHECKING:
     from tianshu_datadev.spark.annotations import AnnotatedSparkPlan
     from tianshu_datadev.spark.compiler import SparkCompileResult
     from tianshu_datadev.spark.models import SparkPlan, SparkStep
+    from tianshu_datadev.spark.physical_verifier import PhysicalVerificationReport
     from tianshu_datadev.spark.plan_comparator import ComparisonStatus, PlanComparisonReport
+    from tianshu_datadev.spark.plan_equivalence import EquivalenceVerdict
     from tianshu_datadev.spark.snapshot import SnapshotBuilder, SnapshotManifest, SnapshotSourceProvider
     from tianshu_datadev.sql.models import CompiledSql, ExecutionTrace, ResultSummary
 
@@ -3489,6 +3491,12 @@ class Pipeline:
             context.stage_results.get(stage_val, "NOT_EXECUTED"), "skipped"
         )
 
+        # PHYSICAL_VERIFIER 特殊处理：物理不一致时标记 failed
+        if stage == SparkPipelineStage.PHYSICAL_VERIFIER and current_status == "ok":
+            report = context.physical_verify_report
+            if report is not None and not report.row_count_match:
+                current_status = "failed"
+
         # ── 构建阶段特有结果内容（供前端面板渲染）──
         result: dict | None = None
         if current_status == "ok":
@@ -3584,16 +3592,24 @@ class Pipeline:
                 "skipped": current_status == "skipped",
             }
 
-        # PHYSICAL_VERIFIER——无论 ok/skipped/failed 都返回结果消息
+        # PHYSICAL_VERIFIER——无论 ok/skipped/failed 都返回有界摘要
         if stage == SparkPipelineStage.PHYSICAL_VERIFIER:
             if current_status == "ok":
+                report = context.physical_verify_report
                 result = {
                     "type": "physical_verify",
-                    "message": "物理验证通过——双引擎输出结果一致",
+                    "status": "ok",
                     "skipped": False,
+                    "row_count_match": report.row_count_match if report else None,
+                    "schema_match": report.schema_match if report else None,
+                    "total_diff_count": report.total_diff_count if report else None,
+                    "sample_rows": {
+                        "duckdb": (report.duckdb_result.sample_rows or [])[:5],
+                        "spark": (report.spark_result.sample_rows or [])[:5],
+                    } if report else None,
                 }
             else:
-                # 收集跳过原因（来自 context.errors 中 PHYSICAL_VERIFIER 前缀的错误）
+                # 收集跳过/失败原因
                 verify_errors = [
                     e.split("] ", 1)[1] if "] " in e else e
                     for e in context.errors
@@ -3604,7 +3620,7 @@ class Pipeline:
                     "type": "physical_verify",
                     "message": reason,
                     "skipped": current_status == "skipped",
-                    "errors": verify_errors,  # 完整错误列表，供前端展示
+                    "errors": verify_errors,
                 }
 
         return {
@@ -4132,6 +4148,35 @@ class Pipeline:
         )
         return manifest
 
+    @staticmethod
+    def _should_physical_verify(
+        validator_ok: bool,
+        comparator_report: "PlanComparisonReport | None",
+    ) -> bool:
+        """判定 PHYSICAL_VERIFIER 是否应执行。"""
+        from tianshu_datadev.spark.plan_comparator import ComparisonStatus
+        from tianshu_datadev.spark.plan_equivalence import EquivalenceVerdict
+
+        if not validator_ok:
+            return False
+        if comparator_report is None:
+            return False
+        # LOGIC_EQUIVALENT → 正常执行
+        if comparator_report.status == ComparisonStatus.LOGIC_EQUIVALENT:
+            return True
+        # 白名单：仅 case_when UNSUPPORTED + 其他 step 全部 EQUIVALENT
+        if comparator_report.status == ComparisonStatus.LOGIC_UNSUPPORTED:
+            has_case_when_unsupported = False
+            for r in comparator_report.step_results:
+                if r.verdict == EquivalenceVerdict.NOT_EQUIVALENT:
+                    return False
+                if r.verdict == EquivalenceVerdict.UNSUPPORTED_COMPARISON:
+                    if r.step_type != "case_when":
+                        return False
+                    has_case_when_unsupported = True
+            return has_case_when_unsupported
+        return False
+
 
     def _do_spark_physical_verify(
         self, artifacts: PipelineArtifactBundle, context: SparkStageContext,
@@ -4142,6 +4187,16 @@ class Pipeline:
         - 可用时：调用 PhysicalVerifier 执行 DuckDB vs Spark 双引擎对比
         - 不可用时：标记 SKIPPED 并记录跳过原因
         """
+        # ── 门禁检查 ──
+        validator_ok = context.stage_results.get("VALIDATOR") == "SUCCESS"
+        if not self._should_physical_verify(validator_ok, context.comparator_report):
+            context.stage_results["PHYSICAL_VERIFIER"] = "SKIPPED"
+            context.errors.append(
+                "[PHYSICAL_VERIFIER] SKIPPED: 物理验证门禁未通过"
+                "（Validator 未通过，或 Comparator 不满足白名单条件）"
+            )
+            return
+
         # Step 1：检查 PySpark 运行时环境
         try:
             import pyspark  # noqa: F401  # 检测是否已安装
@@ -4362,6 +4417,9 @@ class Pipeline:
                 cre_environment_manifest=cre_env_manifest,
             )
 
+            # ── 保存完整物理验证报告到上下文 ──
+            context.physical_verify_report = report
+
             # Step 7：将 CRE shadow 报告存入上下文——严格 Pydantic 模型，清除 dict 逃生口
             # 后续由 RECAP/REVIEWER 阶段经 PackageInputs → ReviewPackageBuilder 一次性写入
             if report.cre_shadow_report is not None:
@@ -4523,6 +4581,7 @@ class SparkStageContext:
     errors: list[str] = field(default_factory=list)
     # ── CRE shadow 最终硬化：严格 Pydantic 模型，清除 dict 逃生口 ──
     cre_shadow_report: "CreShadowReport | None" = None
+    physical_verify_report: "PhysicalVerificationReport | None" = None
 
 
 class SparkDependencyMissingError(Exception):
