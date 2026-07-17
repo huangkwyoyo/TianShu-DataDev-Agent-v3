@@ -17,4 +17,12 @@ set -euo pipefail
 export PYTHONIOENCODING=utf-8
 
 cd "$(dirname "$0")"
-python scripts/dev_reload.py "$@"
+
+# 使用系统 Python（D:\Program Files\Python312），绕过 .venv 自动激活
+# 避免因 .venv 未安装 pyspark 导致物理验证跳过
+SYSTEM_PYTHON="/d/Program Files/Python312/python"
+if [ ! -f "$SYSTEM_PYTHON" ]; then
+    # fallback：如果系统 Python 路径不存在，使用 PATH 上的 python
+    SYSTEM_PYTHON="python"
+fi
+"$SYSTEM_PYTHON" scripts/dev_reload.py "$@"
