@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from tianshu_datadev.api.pipeline import Pipeline
+from tianshu_datadev.api.pipeline import Pipeline, PipelineArtifactBundle
 from tianshu_datadev.spark.physical_verifier import (
     EngineExecutionResult,
     PhysicalVerificationReport,
@@ -185,17 +185,24 @@ class TestShouldPhysicalVerify:
 
 
 # ════════════════════════════════════════════
-# 场景 8：物理不一致 → failed + 有界报告
+# 场景 8、9：真实 run_spark_stage 入口测试（mock _do_spark_physical_verify）
 # ════════════════════════════════════════════
 
 
-class TestPhysicalMismatchStatus:
-    """物理不一致时 run_spark_stage 返回 status="failed" + 有界摘要。"""
+class TestRunSparkStagePhysicalVerify:
+    """通过真实 run_spark_stage() 入口测试物理不一致→failed 和有界摘要。"""
 
-    def test_mismatch_maps_to_failed(self):
-        """RESULT_MISMATCH → status="failed"。"""
+    @patch.object(Pipeline, "export_artifacts")
+    @patch.object(Pipeline, "_check_stage_dependencies")
+    def test_physical_mismatch_status_failed(
+        self, mock_check_deps, mock_export,
+    ):
+        """RESULT_MISMATCH → run_spark_stage 返回 status='failed' + 有界摘要。"""
+        mock_export.return_value = PipelineArtifactBundle(request_id="test-entry-mismatch")
+
         pipeline = Pipeline()
-        context = pipeline._get_or_create_spark_context("test-mismatch")
+        request_id = "test-entry-mismatch"
+        context = pipeline._get_or_create_spark_context(request_id)
         context.stage_results["VALIDATOR"] = "SUCCESS"
         context.comparator_report = _make_comparator_report(
             ComparisonStatus.LOGIC_UNSUPPORTED, [
@@ -203,86 +210,82 @@ class TestPhysicalMismatchStatus:
             ],
         )
 
-        # 构造物理不一致报告
-        mismatch_report = _make_physver_report(
-            status=PhysicalVerificationStatus.RESULT_MISMATCH,
-            row_count_match=False,
-            total_diff_count=5,
-            sample_rows=[{"id": 1}, {"id": 2}],
-        )
-        context.physical_verify_report = mismatch_report
-        context.stage_results["PHYSICAL_VERIFIER"] = "SUCCESS"
+        # mock _do_spark_physical_verify：设置状态 + 物理不一致报告
+        with patch.object(pipeline, "_do_spark_physical_verify") as mock_do:
+            def _set_mismatch(artifacts, ctx):
+                ctx.stage_results["PHYSICAL_VERIFIER"] = "SUCCESS"
+                ctx.physical_verify_report = _make_physver_report(
+                    status=PhysicalVerificationStatus.RESULT_MISMATCH,
+                    row_count_match=False,
+                    total_diff_count=5,
+                    sample_rows=[{"id": 1}, {"id": 2}],
+                )
+            mock_do.side_effect = _set_mismatch
 
-        # 验证 status 覆写为 "failed"
-        from tianshu_datadev.spark.orchestrator import SparkPipelineStage
-        stage_val = SparkPipelineStage.PHYSICAL_VERIFIER.value
-        status_map = {"SUCCESS": "ok", "FAILURE": "failed", "SKIPPED": "skipped"}
-        current_status = status_map.get(
-            context.stage_results.get(stage_val, "NOT_EXECUTED"), "skipped",
-        )
-        # 手动触发覆写（同 pipeline.py 逻辑）
-        if current_status == "ok":
-            report = context.physical_verify_report
-            if report is not None and report.status != PhysicalVerificationStatus.RESULT_CONSISTENT:
-                current_status = "failed"
-        assert current_status == "failed"
+            from tianshu_datadev.spark.orchestrator import SparkPipelineStage
+            result = pipeline.run_spark_stage(
+                request_id, SparkPipelineStage.PHYSICAL_VERIFIER,
+            )
 
-    def test_bounded_summary_contains_sample_rows(self):
-        """有界摘要包含 sample_rows[:5]（每侧最多 5 条）。"""
+        assert result["status"] == "failed", (
+            f"物理不一致时 status 应为 'failed'，实际为 {result['status']}"
+        )
+        r = result["result"]
+        assert r["type"] == "physical_verify"
+        assert r["row_count_match"] is False
+        assert r["total_diff_count"] == 5
+        assert r["sample_rows"]["duckdb"] == [{"id": 1}, {"id": 2}]
+        assert r["sample_rows"]["spark"] == [{"id": 1}, {"id": 2}]
+
+    @patch.object(Pipeline, "export_artifacts")
+    @patch.object(Pipeline, "_check_stage_dependencies")
+    def test_single_engine_result_none_does_not_crash(
+        self, mock_check_deps, mock_export,
+    ):
+        """duckdb_result=None 时有界摘要不会 AttributeError，返回空列表。"""
+        mock_export.return_value = PipelineArtifactBundle(request_id="test-entry-none")
+
         pipeline = Pipeline()
-        context = pipeline._get_or_create_spark_context("test-summary")
-        context.physical_verify_report = _make_physver_report(
-            row_count_match=True,
-            sample_rows=[{"col": "a"}, {"col": "b"}],
-        )
-        report = context.physical_verify_report
-        bounded = {
-            "row_count_match": report.row_count_match,
-            "schema_match": report.schema_match,
-            "total_diff_count": report.total_diff_count,
-            "sample_rows": {
-                "duckdb": (report.duckdb_result.sample_rows or [])[:5],
-                "spark": (report.spark_result.sample_rows or [])[:5],
-            },
-        }
-        assert bounded["row_count_match"] is True
-        assert len(bounded["sample_rows"]["duckdb"]) == 2
-        assert len(bounded["sample_rows"]["spark"]) == 2
-        assert bounded["total_diff_count"] == 0
-
-
-# ════════════════════════════════════════════
-# 场景 9：LOGIC_EQUIVALENT → spark_ok=True
-# ════════════════════════════════════════════
-
-
-class TestSparkOkLogicEquivalent:
-    """COMPARATOR LOGIC_EQUIVALENT + 物理一致 → spark_ok=True。"""
-
-    def test_spark_ok_true_when_logic_equivalent_and_physver_ok(self):
-        """回归——全量路径 spark_ok=True。"""
-        pipeline = Pipeline()
-        context = pipeline._get_or_create_spark_context("test-spark-ok")
+        request_id = "test-entry-none"
+        context = pipeline._get_or_create_spark_context(request_id)
         context.stage_results["VALIDATOR"] = "SUCCESS"
         context.comparator_report = _make_comparator_report(
-            ComparisonStatus.LOGIC_EQUIVALENT, [
-                _make_step_result("case_when", EquivalenceVerdict.EQUIVALENT),
-                _make_step_result("filter", EquivalenceVerdict.EQUIVALENT),
+            ComparisonStatus.LOGIC_UNSUPPORTED, [
+                _make_step_result("case_when", EquivalenceVerdict.UNSUPPORTED_COMPARISON),
             ],
         )
-        context.physical_verify_report = _make_physver_report(
-            status=PhysicalVerificationStatus.RESULT_CONSISTENT,
-            row_count_match=True,
-        )
-        context.stage_results["PHYSICAL_VERIFIER"] = "SUCCESS"
 
-        # 模拟 spark_ok 判定
-        comparator_status = "LOGIC_EQUIVALENT"
-        spark_ok = (
-            context.stage_results.get("PHYSICAL_VERIFIER") == "SUCCESS"
-            and comparator_status == "LOGIC_EQUIVALENT"
-        )
-        assert spark_ok is True
+        with patch.object(pipeline, "_do_spark_physical_verify") as mock_do:
+            def _set_none_side(artifacts, ctx):
+                ctx.stage_results["PHYSICAL_VERIFIER"] = "SUCCESS"
+                # duckdb_result=None，仅 spark 侧有结果
+                ctx.physical_verify_report = PhysicalVerificationReport(
+                    report_id="test-none",
+                    contract_hash="test",
+                    snapshot_id="test",
+                    status=PhysicalVerificationStatus.RESULT_MISMATCH,
+                    row_count_match=False,
+                    total_diff_count=3,
+                    duckdb_result=None,
+                    spark_result=EngineExecutionResult(
+                        engine="spark", success=True,
+                        sample_rows=[{"col": "b"}],
+                    ),
+                )
+            mock_do.side_effect = _set_none_side
+
+            from tianshu_datadev.spark.orchestrator import SparkPipelineStage
+            result = pipeline.run_spark_stage(
+                request_id, SparkPipelineStage.PHYSICAL_VERIFIER,
+            )
+
+        # 不崩溃 + duckdb 侧空列表
+        assert result["status"] == "failed"
+        r = result["result"]
+        assert r["sample_rows"]["duckdb"] == []
+        assert r["sample_rows"]["spark"] == [{"col": "b"}]
+        assert r["row_count_match"] is False
+        assert r["total_diff_count"] == 3
 
 
 # ════════════════════════════════════════════
@@ -329,75 +332,100 @@ class TestDoSparkPhysicalVerifyGate:
 
 
 # ════════════════════════════════════════════
-# 场景 3：run_all_full 响应字段
+# 场景 3：真实 run_all_full 入口 spark_ok 判定测试
 # ════════════════════════════════════════════
 
 
-class TestFullRunResponseFields:
-    """run_all_full 和 run_all_full_stream 的响应字段。"""
+class TestFullRunResponseSparkOk:
+    """通过真实 run_all_full() 入口测试 spark_ok 判定和响应字段。"""
 
-    def test_full_run_response_contains_new_fields(self):
-        """白名单场景响应含 comparator_status/requires_human_review/review_ready。"""
-        comparator_status = "LOGIC_UNSUPPORTED"
-        response_fields = {
-            "comparator_status": comparator_status,
-            "requires_human_review": (
-                comparator_status != "LOGIC_EQUIVALENT"
-                if comparator_status else True
-            ),
-            "review_ready": (
-                comparator_status == "LOGIC_EQUIVALENT"
-                if comparator_status else False
-            ),
+    @staticmethod
+    def _mock_stage_results(
+        comparator_status: str,
+        physver_status: str,
+    ) -> list[dict]:
+        """构建 6 阶段 run_spark_stage 的 side_effect 返回值。"""
+        return [
+            {"status": "ok", "result": {"type": "mapper"}, "llm_traces": {}, "errors": []},
+            {"status": "ok", "result": {"type": "developer"}, "llm_traces": {}, "errors": []},
+            {"status": "ok", "result": {"type": "compiler", "pyspark_code": "code"}, "llm_traces": {}, "errors": []},
+            {"status": "ok", "result": {"type": "validator"}, "llm_traces": {}, "errors": []},
+            {"status": "ok", "result": {"type": "comparator", "status": comparator_status}, "llm_traces": {}, "errors": []},
+            {"status": physver_status, "result": {"type": "physical_verify"}, "llm_traces": {}, "errors": []},
+        ]
+
+    @patch.object(Pipeline, "run_spark_stage")
+    @patch.object(Pipeline, "run_all")
+    def test_spark_ok_true_when_logic_equivalent(
+        self, mock_run_all, mock_run_spark_stage,
+    ):
+        """COMPARATOR LOGIC_EQUIVALENT + 物理一致 → spark_ok=True。"""
+        mock_run_all.return_value = {
+            "request_id": "test-ok",
+            "pipeline_error": None,
+            "generated_sql": "SELECT 1",
+            "llm_traces": {},
         }
-        assert response_fields["comparator_status"] == "LOGIC_UNSUPPORTED"
-        assert response_fields["requires_human_review"] is True
-        assert response_fields["review_ready"] is False
-
-    def test_spark_ok_false_in_whitelist(self):
-        """白名单场景 spark_ok=False（即使物理一致）。"""
-        # 模拟白名单场景：物理验证未执行（门禁跳过）或物理一致
-        physver_stage = {"stage": "PHYSICAL_VERIFIER", "status": "ok"}
-        comparator_status = "LOGIC_UNSUPPORTED"
-        spark_ok = (
-            physver_stage is not None
-            and physver_stage["status"] == "ok"
-            and comparator_status == "LOGIC_EQUIVALENT"
+        mock_run_spark_stage.side_effect = self._mock_stage_results(
+            comparator_status="LOGIC_EQUIVALENT", physver_status="ok",
         )
-        assert spark_ok is False
 
-    def test_spark_ok_false_when_physver_skipped(self):
+        pipeline = Pipeline()
+        result = pipeline.run_all_full("test markdown")
+
+        assert result["spark_ok"] is True, (
+            f"LOGIC_EQUIVALENT + 物理一致时 spark_ok 应为 True，"
+            f"实际为 {result['spark_ok']}"
+        )
+        assert result["comparator_status"] == "LOGIC_EQUIVALENT"
+        assert result["requires_human_review"] is False
+        assert result["review_ready"] is True
+
+    @patch.object(Pipeline, "run_spark_stage")
+    @patch.object(Pipeline, "run_all")
+    def test_spark_ok_false_whitelist(
+        self, mock_run_all, mock_run_spark_stage,
+    ):
+        """白名单场景（LOGIC_UNSUPPORTED + 物理一致）→ spark_ok=False。"""
+        mock_run_all.return_value = {
+            "request_id": "test-whitelist",
+            "pipeline_error": None,
+            "generated_sql": "SELECT 1",
+            "llm_traces": {},
+        }
+        mock_run_spark_stage.side_effect = self._mock_stage_results(
+            comparator_status="LOGIC_UNSUPPORTED", physver_status="ok",
+        )
+
+        pipeline = Pipeline()
+        result = pipeline.run_all_full("test markdown")
+
+        assert result["spark_ok"] is False, (
+            f"白名单场景 spark_ok 应为 False，实际为 {result['spark_ok']}"
+        )
+        assert result["comparator_status"] == "LOGIC_UNSUPPORTED"
+        assert result["requires_human_review"] is True
+        assert result["review_ready"] is False
+
+    @patch.object(Pipeline, "run_spark_stage")
+    @patch.object(Pipeline, "run_all")
+    def test_spark_ok_false_physver_skipped(
+        self, mock_run_all, mock_run_spark_stage,
+    ):
         """物理验证被跳过 → spark_ok=False。"""
-        physver_stage = {"stage": "PHYSICAL_VERIFIER", "status": "skipped"}
-        comparator_status = "LOGIC_EQUIVALENT"
-        spark_ok = (
-            physver_stage is not None
-            and physver_stage["status"] == "ok"
-            and comparator_status == "LOGIC_EQUIVALENT"
+        mock_run_all.return_value = {
+            "request_id": "test-skipped",
+            "pipeline_error": None,
+            "generated_sql": "SELECT 1",
+            "llm_traces": {},
+        }
+        mock_run_spark_stage.side_effect = self._mock_stage_results(
+            comparator_status="LOGIC_EQUIVALENT", physver_status="skipped",
         )
-        assert spark_ok is False
 
-    def test_spark_ok_false_when_no_physver(self):
-        """无 PHYSICAL_VERIFIER 阶段 → spark_ok=False。"""
-        physver_stage = None
-        comparator_status = "LOGIC_EQUIVALENT"
-        spark_ok = (
-            physver_stage is not None
-            and physver_stage["status"] == "ok"
-            and comparator_status == "LOGIC_EQUIVALENT"
-        )
-        assert spark_ok is False
+        pipeline = Pipeline()
+        result = pipeline.run_all_full("test markdown")
 
-    def test_requires_human_review_false_when_logic_equivalent(self):
-        """COMPARATOR LOGIC_EQUIVALENT + 物理一致 → requires_human_review=False。"""
-        comparator_status = "LOGIC_EQUIVALENT"
-        requires_human_review = (
-            comparator_status != "LOGIC_EQUIVALENT"
-            if comparator_status else True
+        assert result["spark_ok"] is False, (
+            f"物理跳过时 spark_ok 应为 False，实际为 {result['spark_ok']}"
         )
-        assert requires_human_review is False
-        review_ready = (
-            comparator_status == "LOGIC_EQUIVALENT"
-            if comparator_status else False
-        )
-        assert review_ready is True

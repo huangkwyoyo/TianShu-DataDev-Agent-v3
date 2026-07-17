@@ -3599,8 +3599,8 @@ class Pipeline:
                     "schema_match": report.schema_match if report else None,
                     "total_diff_count": report.total_diff_count if report else None,
                     "sample_rows": {
-                        "duckdb": (report.duckdb_result.sample_rows or [])[:5],
-                        "spark": (report.spark_result.sample_rows or [])[:5],
+                        "duckdb": (report.duckdb_result.sample_rows or [])[:5] if report.duckdb_result else [],
+                        "spark": (report.spark_result.sample_rows or [])[:5] if report.spark_result else [],
                     } if report else None,
                 }
             elif current_status == "failed":
@@ -3614,8 +3614,8 @@ class Pipeline:
                     "schema_match": report.schema_match if report else None,
                     "total_diff_count": report.total_diff_count if report else None,
                     "sample_rows": {
-                        "duckdb": (report.duckdb_result.sample_rows or [])[:5],
-                        "spark": (report.spark_result.sample_rows or [])[:5],
+                        "duckdb": (report.duckdb_result.sample_rows or [])[:5] if report.duckdb_result else [],
+                        "spark": (report.spark_result.sample_rows or [])[:5] if report.spark_result else [],
                     } if report else None,
                 }
             else:
@@ -4197,6 +4197,10 @@ class Pipeline:
         - 可用时：调用 PhysicalVerifier 执行 DuckDB vs Spark 双引擎对比
         - 不可用时：标记 SKIPPED 并记录跳过原因
         """
+        # ── 清除上次运行的缓存报告——避免门禁拒绝/提前返回时写出旧数据 ──
+        context.physical_verify_report = None
+        context.cre_shadow_report = None
+
         # ── 门禁检查 ──
         validator_ok = context.stage_results.get("VALIDATOR") == "SUCCESS"
         if not self._should_physical_verify(validator_ok, context.comparator_report):
