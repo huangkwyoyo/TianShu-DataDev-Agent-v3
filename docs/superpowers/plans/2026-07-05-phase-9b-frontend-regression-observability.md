@@ -1,5 +1,7 @@
 # Phase 9B：前端自动化回归 + 双管线阶段可观测性收口——实施计划
 
+> **状态：✅ 已完成（2026-07-05）**——R11/R15 全部消除，双管线指示灯一致。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 为 Spark 管线前端集成补充自动化回归测试（R11），修复 SQL 管线成功态阶段不可见问题（R15），使双管线指示灯行为一致、可测试、可观测。

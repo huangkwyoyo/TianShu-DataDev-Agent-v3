@@ -1,6 +1,8 @@
 # 方案书索引
 
-> 最后更新：2026-07-05 | 当前阶段：Phase 9B-9A5 完成 → Phase 9 收尾 或 Phase 9B
+> 最后更新：2026-07-17 | 当前阶段：Phase 9A-9C + label_table v1 完成
+>
+> 所有已完成的计划保留为历史参考，最新状态以 `docs/current-state-and-verification-status.md` 为准。
 
 ## 执行链路（按序号阅读）
 
@@ -24,40 +26,69 @@ Phase 6-8 骨架验收                   业务集成前置准备               
                                                                                                            └──→ 07-phase-9a-production-pipeline-plan
                                                                                                                 Phase 9A 生产级串联方案
                                                                                                                 9A1 ✅ → 9A2 ✅ → 9A3 ✅ → 9A5 ✅
+                                                                                                                （9A4 NYC 01-06 已完成）
 ```
 
 ## 文档清单
+
+### 主线方案（按编号顺序阅读）
 
 | 序号 | 文件 | 阶段 | 状态 | 一句话 |
 |:---:|------|------|:---:|------|
 | 01 | `01-phase-6-8-global-acceptance.md` | Phase 6-8 验收 | ✅ | Orchestrator 骨架串联 + 组件复核 + C 类风险登记 |
 | 02 | `02-business-integration-prep.md` | 前置准备 | ✅ | R3 收口 + C1-C4 验收路径矩阵定义 |
 | 03 | `03-business-integration-round1.md` | 执行第一轮 | ✅ | C1 点亮（11/11）+ C2 方案启动 |
-| 04 | `04-c2-provider-adapter-plan.md` | C2 详细方案 | ✅ | ProviderAdapter + AnthropicAdapter + 集成测试（已完成） |
+| 04 | `04-c2-provider-adapter-plan.md` | C2 详细方案 | ✅ | ProviderAdapter + AnthropicAdapter + 集成测试 |
 | 05 | `05-c2-llm-boundary-consolidation.md` | C2 架构收口 | ✅ | 删除重复文件 + 复用统一 LLM 基础设施 |
 | 06 | `06-c3-c4-prerequisite-clarification.md` | C3/C4 前置澄清 | ✅ | 文档表述收口 + C3/C4 执行方案 |
-| **07** | **`07-phase-9a-production-pipeline-plan.md`** | **Phase 9A 计划** | **📋** | **桥接级→生产级升级方案——5 子阶段拆分** |
-| — | `_archived/sql-temp-table-comments.md` | 早期 | 📦 | SQL-first Pipeline 历史文档，与 Spark 路径无关 |
+| 07 | `07-phase-9a-production-pipeline-plan.md` | Phase 9A 计划 | ✅ | 桥接级→生产级升级方案——5 子阶段均已实现 |
 
-## 给审核人的阅读路径
+### 特性方案（按日期排序）
 
-- **10 分钟了解现状** → `README.md`（本文）→ `07-phase-9a-production-pipeline-plan.md` 的"非技术解释"和"A/B/C 风险分类"
-- **30 分钟理解全链路** → 按 01→02→03→05→06→07 顺序阅读每份文档的"能力清单"和"执行记录"
-- **接手 Phase 9A 开发** → 读 `07-phase-9a-production-pipeline-plan.md`，5 个子阶段带完整接口定义
+| 文件 | 关键内容 | 状态 |
+|------|----------|:----:|
+| `2026-07-05-case06-b-class-closure.md` | Case06 B 类设计修复 | ✅ |
+| `2026-07-05-case06-comparator-gap-closure.md` | Case06 Comparator 缺口收口 | ✅ |
+| `2026-07-05-final-hardening.md` | 核心平台最终硬化 | ✅ |
+| `2026-07-05-phase-9b-frontend-regression-observability.md` | 前端回归 + 可观测性 | ✅ |
+| `2026-07-05-phase-9b-p0-snapshot-pipeline-integration.md` | Snapshot Builder 集成 | ✅ |
+| `2026-07-05-phase-9c-e2e-implementation.md` | DOM E2E 测试 | ✅ |
+| `2026-07-05-r8-llm-production-verification.md` | LLM 生产验证 | ✅ |
+| `2026-07-05-spark-pipeline-frontend-integration.md` | Spark 前端集成 | ✅ |
+| `2026-07-05-sqlprogram-multi-statement-dag-case06.md` | SqlProgram DAG Case06 | ✅ |
+| `2026-07-06-spark-comparator-content-alignment-plan.md` | Comparator 内容对齐 | ✅ |
+| `2026-07-06-spark-stage-independent-and-llm-traces.md` | Spark 阶段独立 + 追踪 | ✅ |
+| `2026-07-07-dev-reload.md` | dev-reload 脚本 | ✅ |
+| `2026-07-07-spark-compiler-llm-annotation-injection-plan.md` | LLM 注释注入 | ✅ |
+| `2026-07-07-spark-developer-service-injection-plan.md` | SparkDeveloper 服务注入 | ✅ |
+| `2026-07-08-comparator-gap-fix.md` | Comparator 缺口修复 | ✅ |
+| `2026-07-09-comparator-crcs-v2-revision.md` | CRCS v2 修订 | ✅ |
+| `2026-07-09-comparator-window-aggregate-fix.md` | 窗口/聚合 Comparator 修复 | ✅ |
+| `2026-07-09-left-join-safety-gate-v2.md` | Left Join 安全门 v2 | ✅ |
+| `2026-07-09-snapshot-inputs-key-alias-fix.md` | Snapshot Key 别名修复 | ✅ |
+| `2026-07-10-full-pipeline-monitoring-plan.md` | 全管线监控 | ✅ |
+| `2026-07-10-monitor-human-readable-log-plan.md` | 可读日志监控 | ✅ |
+| `2026-07-13-cre-v3-cdp-implementation.md` | CRE v3 CDP 实现 | ✅ |
+| `2026-07-14-code-download-buttons.md` | 代码下载按钮 | ✅ |
+| `2026-07-14-run-all-progress-streaming.md` | Run-All 流式进度 | ✅ |
+| `2026-07-15-label-table-implementation.md` | label_table v1 完整管线 | ✅ |
+
+### 已归档
+
+| 文件 | 状态 |
+|------|:----:|
+| `_archived/sql-temp-table-comments.md` | 📦 SQL-first Pipeline 历史文档 |
 
 ## 关键里程碑
 
 | 日期 | 事件 | 证据 |
 |------|------|------|
-| 2026-07-04 | R3 Mapper input_alias 修复 | 真实 Contract E2E 全链路 PASSED |
 | 2026-07-04 | Phase 6-8 骨架验收完成 | 521 passed, 11 skipped |
-| 2026-07-04 | C1 真实 Spark 点亮 | 11/11 双引擎（DuckDB ↔ PySpark 4.1.2）100% 一致 |
-| 2026-07-04 | C2 架构收口 + 循环导入修复 | 重复文件删除 + PromptManager 可直接导入 |
-| 2026-07-04 | C3 Comparator 桥接级点亮 | Orchestrator COMPARATOR 集成，30/30 测试全绿 |
-| 2026-07-04 | C4 D4 桥接级点亮 | Harness 5 维度全绿（27/27），含 3 个 D4 桥接测试 |
-| 2026-07-05 | Phase 9A 生产级计划制定 | 5 子阶段拆分，A/B/C 分类，接口定义完整 |
-| 2026-07-05 | **9A1 SQL Pipeline 中间产物导出** | PipelineArtifactBundle + export_artifacts()，7 测试全绿 |
-| 2026-07-05 | **9A2 桥接函数替换** | contract_to_sql_steps 标记 deprecated + 真实 SqlBuildPlan 驱动 COMPARATOR，+2 集成测试全绿，610 passed/11 skipped |
-| 2026-07-05 | **9A3 Harness 自动驱动器 + Lite→V1 适配收口** | adapt_lite_to_v1() + HarnessRunner 双模式，7 测试全绿，617 passed/11 skipped |
-| ⬜ | 9A4 真实业务样本 | 待业务方提供样本 |
-| 2026-07-05 | **9A5 REVIEW_READY 终验收** | ReviewPackage 增强 + REVIEW_READY 判定 + 端到端闭环，12 测试全绿，629 passed/11 skipped |
+| 2026-07-04 | C1 真实 Spark 点亮 | 11/11 双引擎 100% 一致 |
+| 2026-07-05 | Phase 9A 全链路闭环 | 9A1-9A3 + 9A5 完成，629 passed |
+| 2026-07-05 | Phase 9B 前端回归 | R11/R15 消除 |
+| 2026-07-05 | Phase 9C DOM E2E | 6/6 Playwright 通过 |
+| 2026-07-06 | Case06 双链 LOGIC_EQUIVALENT | xfail 转正，三层剥离 |
+| 2026-07-13 | CRE shadow 物理验证可用 | 三条 Pipeline 证据通过 |
+| 2026-07-14 | Run-All 流式进度 + 代码下载按钮 | 前端体验改进 |
+| **2026-07-16** | **label_table v1 管线完成** | **Parser→Extractor→Validator→Promotion→Builder→Compiler 全链路，90 测试全绿** |

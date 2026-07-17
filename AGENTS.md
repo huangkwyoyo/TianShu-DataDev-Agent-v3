@@ -8,13 +8,15 @@ TianShu DataDev Agent v3 是 AI 辅助数据开发工具。它接收程序员编
 
 系统不自动上线、不写生产库、不生成生产数据。人是最终代码审查者和上线决策者。
 
-当前阶段：`Phase 8+ Spark-first v2.0 完成，C1-C4 桥接级全部点亮`。项目状态详见 `docs/current-state-and-verification-status.md`（Phase 进度矩阵、C1-C4 状态、测试基线、残留风险、下一步方向）。
+当前阶段：`Phase 9A-9C + label_table v1 完成。C1-C4 已消除，label_table v1 已交付`。项目状态详见 `docs/current-state-and-verification-status.md`（Phase 进度矩阵、业务集成验证状态、测试基线、残留风险、下一步方向）。
 
 ## 2. SQL Generation Boundary
 
 - 输入是 DeveloperSpec（Markdown 正文 + YAML-like metadata block），经 Parser 确定性解析为 ParsedDeveloperSpec。
 - LLM 只输出严格的 ParsedDeveloperSpec、RelationshipHypothesis、SqlBuildPlan 和 SqlProgram。
-- SqlBuildPlan 必须使用封闭类型的 ScanStep、FilterStep、JoinStep、AggregateStep、ProjectStep、CaseWhenStep、SortStep、LimitStep。
+- SqlBuildPlan 必须使用封闭类型的 ScanStep、FilterStep、JoinStep、AggregateStep、ProjectStep、CaseWhenStep、WindowStep、SortStep、LimitStep、SubqueryStep（共 10 种）。
+  - WindowStep：窗口函数白名单限定 8 种（ROW_NUMBER、RANK、DENSE_RANK、LAG、LEAD、SUM/AVG/COUNT OVER），超出白名单的窗口函数由 Validator 拒绝。
+  - SubqueryStep：仅 FROM 子句派生表子查询，深度 ≤ 2；不支持 WHERE 关联子查询、SELECT 标量子查询。
 - 禁止 `where_sql`、`join_on: str`、`expression: str`、`raw_sql` 及其他自由 SQL 片段。
 - SQL 只能由 Python 确定性编译器生成。
 - SQL 修复只能生成新 SqlBuildPlan，禁止直接修改 SQL 文本。

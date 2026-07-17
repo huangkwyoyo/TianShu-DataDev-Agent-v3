@@ -1,5 +1,7 @@
 # Phase 9C DOM E2E 测试 — 实施计划
 
+> **状态：✅ 已完成（2026-07-05）**——6/6 Playwright 测试通过。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 用 Playwright + 真实 FastAPI 后端为前端补齐 5 条 DOM 交互回归测试路径

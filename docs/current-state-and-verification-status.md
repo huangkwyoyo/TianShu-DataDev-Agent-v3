@@ -1,6 +1,7 @@
 # 项目当前状态与验证进度 — TianShu DataDev Agent v3
 
-> 文档版本：2026-07-13 CRE 物理验证可用 | 最后更新：2026-07-13 CRE shadow 最终验收通过——物理验证可用，CRE 保持 shadow，legacy 继续负责最终状态判定
+> 文档版本：2026-07-17 label_table v1 完成 + 测试统计口径修正 + 运行环境说明
+> 最后更新：2026-07-17
 > 本文是项目当前实施状态的**唯一权威文档**。各 Phase 设计文档（docs/00-09、docs/roadmap/）描述的是目标设计，实际建成状态以本文为准。
 
 ## 1. Phase 进度矩阵
@@ -29,66 +30,101 @@
 | 9C-R16 | table_paths 环境配置补齐 | ✅ | ✅ | ✅ | R16 消除，CSV fixture 自动发现，2026-07-05 |
 | 9C-R16b | table_paths 边界硬化 | ✅ | ✅ | ✅ | None/{} 语义区分 + E2E 模式开关，2026-07-05 |
 | 9B-P1 | provenance.yml 显式断言 | ✅ | ✅ | ✅ | snapshot_manifest_hash 测试覆盖矩阵补全，2026-07-05 |
-| 9A4-NYC | 真实业务样本——NYC 案例 01-05 | ✅ | ✅ | 🟡 | Case 01-04 SQL+Spark 双链 LOGIC_EQUIVALENT，Case 05 Comparator NOT_COVERED（窗口函数），2026-07-05 |
-| 10-Case06 | SqlProgram 多语句 DAG——NYC Case 06 | ✅ | ✅ | ✅ | **2026-07-06 闭环**："三层剥离"（_temp_* scan/join 过滤 + grain-aware aggregate 合并 + target_grain 透传），1 xfail 转正（test_spark_orchestrator_logic_equivalence → LOGIC_EQUIVALENT），659 passed / 11 skipped（spark+artifacts+api） |
-| 10-ContentAlign | Spark Comparator 内容级对齐 | ✅ | ✅ | ✅ | **2026-07-06 完成**：8 commits，PlanComparator.compare_program() 三层剥离 + Orchestrator target_grain 透传 + Contract _temp_ 守卫，详见 `docs/superpowers/specs/2026-07-06-spark-comparator-closure-and-risks.md` |
-| CRE Phase 2 | CRE shadow 最终准入硬化 | ✅ | ✅ | ✅ | **2026-07-13 物理验证可用**：三条 Pipeline 证据通过——RESULT_CONSISTENT（一致）、CONSISTENT_WITH_WARN（浮点容差）、RESULT_MISMATCH（真实差异）。CRE 保持 shadow，legacy 继续负责最终状态判定。不切换生产门禁。详见 `docs/CRE_v2_设计文档_20260713_1745.md` |
+| 9A4-NYC | 真实业务样本——NYC 案例 01-06 | ✅ | ✅ | 🟡 | Case 01-06 SQL+Spark 双链 LOGIC_EQUIVALENT；Case 05 窗口函数 NOT_COVERED |
+| 10-Case06 | SqlProgram 多语句 DAG——NYC Case 06 | ✅ | ✅ | ✅ | **2026-07-06 闭环**："三层剥离" |
+| 10-ContentAlign | Spark Comparator 内容级对齐 | ✅ | ✅ | ✅ | **2026-07-06 完成**：8 commits |
+| CRE Phase 2 | CRE shadow 最终准入硬化 | ✅ | ✅ | ✅ | **2026-07-13 物理验证可用** |
+| label_table v1 | 标签表类型完整管线 | ✅ | ✅ | ✅ | **2026-07-16 完成**：Parser → Extractor → Validator → Promotion → Builder(CaseWhenStep) → Compiler。8 commits，90 个测试全绿。详见 `docs/superpowers/specs/2026-07-15-label-table-design.md` |
 
-**当前测试基线**：2601 passed / 24 skipped / 2 xfailed / 13 预存失败（NYC Case 03/04 DuckDB 扩展依赖 + harness gate 缺真实人工数据），ruff/tsc/build 零告警。
+### 测试基线（2026-07-17 采集）
 
-CRE 相关测试基线：
-- CRE 核心（test_cre / test_cre_dual_engine / test_cre_shadow_pipeline / test_cre_finalizer）：125 passed / 7 skipped
-- Physical Verifier（test_physical_verifier，含 CRE shadow 集成）：191 passed / 11 skipped
+**采集口径**：
+- `pytest --collect-only`：**2818 tests collected**
+- 全量执行需要 `--run-slow` + PySpark 环境（SparkSession 启动约 30-60s，部分测试有 180s 超时）
+- 非 Spark/非 Harness 子集：**1629 passed / 6 skipped / 2 xfailed**（50s）
+- ruff/tsc/build：零告警
+
+**Spark 测试状态**（需 `--run-slow`）：
+- PySpark 4.1.2 已安装在系统 Python（D:\Program Files\Python312），.venv 不包含
+- 服务启动脚本 `dev-reload.sh` 已退出 .venv，直接使用系统 Python（详见 §7）
+
+**CRE 测试基线**（不变）：
+- CRE 核心：125 passed / 7 skipped
+- Physical Verifier（含 CRE shadow 集成）：191 passed / 11 skipped
 - artifacts 层（含 finalizer E2E）：全部通过
 
 **三条 Pipeline 验收证据（2026-07-13）**：
 
 | 证据 | 测试 | 路径 | 结果 |
 |:----:|------|------|:----:|
-| 证据 1：一致 | `TestPhysicalVerifierWithMock::test_result_consistent` | `verifier.verify()` 全链路 → CRE shadow | **RESULT_CONSISTENT** — DuckDB/Spark 完全一致 |
-| 证据 2：浮点容差 WARN | `TestPhysicalVerifierShadow::test_shadow_warn_maps_to_consistent` | `_shadow_cre_diagnose()` → DecisionEngine | **CONSISTENT_WITH_WARN** — 浮点 1e-11 级差异在容差内，WARN 但不阻断 |
-| 证据 3：真实差异 | `TestPhysicalVerifierWithMock::test_result_mismatch` | `verifier.verify()` 全链路 → CRE shadow | **RESULT_MISMATCH** — Spark 返回不同值，正确检出，原因清晰 |
+| 证据 1：一致 | `TestPhysicalVerifierWithMock::test_result_consistent` | `verifier.verify()` 全链路 → CRE shadow | **RESULT_CONSISTENT** |
+| 证据 2：浮点容差 WARN | `TestPhysicalVerifierShadow::test_shadow_warn_maps_to_consistent` | `_shadow_cre_diagnose()` → DecisionEngine | **CONSISTENT_WITH_WARN** |
+| 证据 3：真实差异 | `TestPhysicalVerifierWithMock::test_result_mismatch` | `verifier.verify()` 全链路 → CRE shadow | **RESULT_MISMATCH** |
 
-## 2. C1-C4 业务集成验证
+## 2. 业务集成验证
+
+### C1-C4（已消除）
 
 | 编号 | 内容 | 风险等级 | 状态 | 证据 |
 |:----:|------|:--------:|:----:|------|
 | C1 | 真实 Spark 物理验证 | 已消除 | ✅ 11/11 通过 | PySpark 4.1.2，DuckDB ↔ PySpark 一致性 100% |
 | C2 | LLM 基础设施架构收口 | 已消除 | ✅ 收口完成 | 重复文件已删除，18/18 测试全绿，DeepSeek 3/3 验证 |
 | C3 | Comparator 真实逻辑对比 | 已消除 | ✅ 桥接+集成 | 30/30 测试全绿，Orchestrator COMPARATOR 集成 |
-| C4 | Harness 5 维度评测 | 已消除 | ✅ 全 5 维度 | D1/D2/D3/D4/D5 共 31/31 测试全绿 |
+| C4 | Harness 5 维度评测 | 已消除 | ✅ 全 5 维度 | D1-D5 共 31/31 测试全绿 |
 
-**D4 重要说明（2026-07-05 更新）**：D4 LOGIC_EQUIVALENCE 已从**桥接级**升级到**生产级**（Phase 9A1-9A3 + 9A5）。当前使用 Pipeline.run_all() → export_artifacts() → adapt_lite_to_v1() → Orchestrator.run() → PlanComparator → ReviewBuilder → REVIEW_READY 判定的全链路闭环。`contract_to_sql_steps()` 保留为向后兼容路径（deprecated）。
+### label_table v1
+
+| 维度 | 状态 | 证据 |
+|------|:----:|------|
+| Parser → DatasetType 映射 | ✅ | `DatasetType.LABEL_TABLE`，YAML `type:` 字段支持 |
+| 标签领域模型 | ✅ | LLM 输出层（`LabelDomainOutput`）与系统层（`LabelDomain`）分离，8 种 LabelPredicateNode，6 种 LabelPredicateCondition 根约束 |
+| Gateway 文件持久化 | ✅ | Schema 校验通过后原子写入 `response_root`，FakeAdapter → Gateway → Extractor 集成测试 |
+| LlmLabelExtractor | ✅ | 从 `response_root` 文件读取 LLM JSON 输出，复用 AnthropicAdapter + PromptManager |
+| FakeLabelExtractor | ✅ | pytest 确定性输出，覆盖 ALL/COLUMN_REF/MIXED 三类标签域 |
+| LabelRuleValidator v1 | ✅ | 六项检查：FIELD_EXISTS、TYPE_COMPATIBLE、OPERATOR_VALID、AST_VALID、LABEL_DOMAIN、COVERAGE |
+| Promotion 双空阻断 | ✅ | `blocking_errors` 和 `human_review_items` 均为空才通过；evidence 非空强制 |
+| Builder CaseWhenStep | ✅ | `_validate_label_rule_set()` 集合门禁 + `DerivedColumnRuleMissing` 硬阻断 |
+| API Key 安全 | ✅ | 无 Key 时返回明确 CONFIG_ERROR，禁止回退 Fake |
+| 回归测试 | ✅ | 90 个测试全绿（models/validator/promotion/extractor/integration） |
 
 ## 3. 残留风险
 
 | 编号 | 说明 | 等级 | 处置 |
 |:----:|------|:----:|------|
-| R5 | ~~桥接函数替代完整 SQL Pipeline~~ | 已消除 | Phase 9A1-9A3 + 9A5 已升级为真实 Pipeline 全链路 |
-| R6 | ~~Harness Runner 为结果聚合器~~ | 已消除 | Phase 9A3 已升级为自动评测驱动器 |
-| R7 | ~~真实业务样本——NYC 案例 01-06 全部完成。Case 06 Spark Comparator LOGIC_EQUIVALENT 仍 xfail~~ | 已消除 | **2026-07-06 消除**：Spark Comparator 内容级对齐完成，"三层剥离"使 Case 06 双链达到 LOGIC_EQUIVALENT，xfail 转正 |
-| R-CA-1 | `target_grain` 过滤是 Case 06 特化——基于"非目标粒度=内部实现"假设，不能误解为通用业务真理。多输出粒度场景需扩展为 `target_grains` | **C** | **架构风险**——当前逻辑对 Case 06 正确，但不得推广。详见 `docs/superpowers/specs/2026-07-06-spark-comparator-closure-and-risks.md` |
-| R-CA-3 | Builder 缺 join——Case 06 Step 4 的 join step 在 builder 输出中缺失，新 case 可能暴露 | **中高（B）** | **B 类设计修复项**——独立排查 builder join 生成逻辑，记忆文件：[[rc-a-3-builder-join-bug]] |
-| R8 | ~~LLM 生产环境验证~~ | 已消除 | 2026-07-05 真实 LLM 验证 8/8 通过，100% pass rate，31,517 tokens，269.7s，DeepSeek v4-pro，报告：`llm_reports/verify_20260705.json`（已脱敏） |
-| R9 | Case 05 Spark Comparator 窗口函数 NOT_COVERED——仅排除 LOGIC_MISMATCH，未证明等价 | C | 窗口函数（ROW_NUMBER）Comparator 覆盖待完善 |
-| R10 | ~~Snapshot Builder 未集成到 REVIEW_READY 流程~~ | 已消除 | Phase 9B-P0 已将 SnapshotBuilder.build() 接入 Pipeline.run_all()，snapshot hash 写入 provenance.yml |
-| R11 | ~~前端无自动化测试框架~~ | 已消除 | Phase 9B 源码级 + Phase 9C Playwright E2E |
-| R15 | ~~SQL 成功态 pipeline_stages 为空~~ | 已消除 | handleRunAll 成功路径注入全成功阶段——SQL 指示灯始终可见 |
-| R16 | ~~Playwright E2E 缺少 table_paths 配置~~ | 已消除 | Phase 9C-R16 + R16b：CSV fixture 自动发现（E2E 模式）+ None/{} 语义区分 + 边界硬化 |
-| R-CRE-Golden | Golden Registry 为空——`passes_admission` 要求至少一个 golden MISMATCH 样本验证 Harness 判别能力 | 低（非阻断） | 后续 Phase 业务方填充已知差异样本 |
-| R-CRE-Null | `null_strategy` 始终 UNKNOWN——无法从 Contract 或执行环境证明 NULL 语义一致性 | 低（非阻断） | 仅使相关语义进入 HUMAN_REVIEW，不误伤不涉及该策略的场景 |
-| R-CRE-Finalizer | ReviewPackageFinalizer 为审计附属能力——写入失败只影响审计完整性，不改变 legacy 比较结论 | 低（非阻断） | 已实现并测试，明确为非阻断附属能力 |
+| R5 | ~~桥接函数替代完整 SQL Pipeline~~ | 已消除 | Phase 9A1-9A3 + 9A5 已升级 |
+| R6 | ~~Harness Runner 为结果聚合器~~ | 已消除 | Phase 9A3 已升级 |
+| R7 | ~~Case 06 Spark Comparator xfail~~ | 已消除 | 2026-07-06 三层剥离完成 |
+| R-CA-1 | `target_grain` 过滤是 Case 06 特化，不能误解为通用设计 | **C** | 多输出粒度场景需扩展为 `target_grains` |
+| R-CA-3 | Builder 缺 join——Case 06 Step 4 的 join step 缺失 | **中高（B）** | 独立排查 builder join 生成逻辑 |
+| R8 | ~~LLM 生产环境验证~~ | 已消除 | 2026-07-05 真实 LLM 8/8 通过 |
+| R9 | Case 05 窗口函数 Comparator NOT_COVERED | **C** | 待完善 ROW_NUMBER 等价判定 |
+| R10 | ~~Snapshot Builder 未集成~~ | 已消除 | Phase 9B-P0 |
+| R11 | ~~前端无自动化测试~~ | 已消除 | Phase 9B + 9C |
+| R-CRE-Golden | Golden Registry 为空 | 低（非阻断） | 后续 Phase 填充 |
+| R-CRE-Null | `null_strategy` 始终 UNKNOWN | 低（非阻断） | 仅进入 HUMAN_REVIEW |
+| R-CRE-Finalizer | Finalizer 写入失败不影响比较结论 | 低（非阻断） | 已实现 |
+| R-LT-1 | CASE WHEN condition 静态等价不支持——`compare_case_when_steps` 标记 UNSUPPORTED，condition（谓词条件）的语义等价对比未实现 | **B** | **设计取舍**：condition 语义对比可复用 filter Predicate 递归逻辑，但表别名归一化、等价变换误判等使性价比不高。当前状态为 **CONSISTENT_SAMPLE**（结构骨架 labels/else_value/alias 已验证，condition 待人审）。**按需建设，非当前优先级**。详见 `docs/case_when条件对比边界说明_20260717_0908.md` |
+| R-LT-2 | API Key 是环境前置条件，非架构风险——无 Key 时 label_table 请求返回 CONFIG_ERROR，SparkDeveloperService 标记 SKIPPED | **环境** | 仅影响需要 LLM 的功能子集；pytest 使用 FakeAdapter，不依赖 Key |
+| R-LT-3 | condition 中可能包含 ColumnRef 表别名——CaseWhenStep 的 WHEN condition 是结构化谓词树（LabelPredicateNode），依赖表别名的 ColumnRef 在跨源场景需要额外归一化 | **B** | 当前单表场景无此问题；多表 label_table 被 `validate_label_table_v1_scope` 阻断 |
 
 ## 4. 当前架构全景
 
 ```
 DeveloperSpec (.md 项目书)
     │
+    ├─ label_table 受控补全分支（v1）
+    │   Parser 识别 type: label_table → DatasetType.LABEL_TABLE
+    │   → LlmLabelExtractor（LLM 提取标签规则，Gateway 文件持久化）
+    │      └─ LabelRuleValidator v1（6 项检查：字段/类型/操作符/AST/LABEL_DOMAIN/COVERAGE）
+    │   → Promotion（双空阻断：blocking_errors + human_review_items 均为空）
+    │   → Builder 追加 CaseWhenStep（DerivedColumnRuleMissing 硬阻断）
+    │   → 进入下游 SQL/Spark 管线
+    │
     ├─ SQL 管线（确定性，生产可用）
-    │   Pipeline.run_all() → Parser → SourceManifest → SqlBuildPlan → Compiler → DuckDB
+    │   Pipeline.run_all() → Parser → SourceManifest → SqlBuildPlan(含CaseWhenStep) → Compiler → DuckDB
     │       │
     │       └─ export_artifacts() → PipelineArtifactBundle
-    │           ├─ sql_build_plan (真实 SqlBuildPlan)
+    │           ├─ sql_build_plan（真实 SqlBuildPlan）
     │           └─ data_transform_contract
     │               │
     │               └─ adapt_lite_to_v1() → DataTransformContractV1
@@ -106,39 +142,52 @@ DeveloperSpec (.md 项目书)
                                                   └─ SparkReviewBuilder.build()
                                                          │
                                                          └─ SparkReviewPackage
-                                                            ├─ provenance (完整溯源链)
-                                                            ├─ stage_results (6 阶段结果)
-                                                            ├─ comparator_status (对比器状态)
+                                                            ├─ provenance（完整溯源链）
+                                                            ├─ stage_results（6 阶段结果）
+                                                            ├─ comparator_status（对比器状态）
                                                             └─ review_ready ★ REVIEW_READY 判定
 ```
 
-## 5. 下一步方向（Phase 10+）
+## 5. 下一步方向
 
-1. ~~**Case 06 Spark 双链 LOGIC_EQUIVALENT**~~ → **✅ 已完成（2026-07-06）**
-2. ~~**CRE shadow 最终准入硬化**~~ → **✅ 已完成（2026-07-13）——物理验证可用，CRE 保持 shadow**
-3. **CRE 门禁切换（非阻断后续事项）**——以下三项为已知缺口，记录为后续 Phase 工作，不阻塞当前物理验证上线：
-   - **Golden Registry 为空**：`harness/datasets/regression/golden_registry.json` 无已知差异样本，`passes_admission` 要求 `total_known_differences > 0`（至少一个 golden MISMATCH 样本）才能验证 Harness 判别能力。需业务方注册已知差异样本后门禁切换前提才算完全满足。
-   - **NULL strategy 始终 UNKNOWN**：无法从 Contract 或执行环境证明 NULL 语义一致性，仅使相关语义进入 HUMAN_REVIEW，不误伤不涉及该策略的精确一致场景。
-   - **门禁切换需 Owner 批准**：设计文档 v2.3 中的接入前提（可执行样本一致率 100%、零假阴性、CRE/legacy 冲突 0）已全部满足，但正式接管生产门禁需显式批准。
-4. **Case 05 Comparator 升级**——窗口函数（ROW_NUMBER）Comparator 从 NOT_COVERED 升级到严格等价判定
-5. **Builder join 缺陷修复**（R-CA-3，中高）——Case 06 Step 4 的 join 在 builder 输出中缺失，新 case 可能暴露。B 类设计修复项，下一轮迭代优先处理
-6. **target_grain 扩展为 target_grains**（R-CA-1，C）——当前单粒度过滤是 Case 06 特化，多输出粒度场景需重构
-7. **`_temp_` 前缀检测统一**（R-CA-2，B）——提取共享 `_is_temp_table()` 谓词，消除 plan_comparator/contract_extractor 两处检测逻辑不一致
-8. **生产环境 LLM 验证**——R8 脚本就绪，待 API key 配置后执行：`TIANSHU_RUN_REAL_LLM=1 python scripts/real_llm_regression.py --output llm_reports/verify_$(date +%Y%m%d).json`
-9. **Case 06 遗留工作**（C 类→后续 Phase）：
-   - `violation_county` 代码映射的方案通用化（当前硬编码 NYC 5 个代码）
-   - `test_temp_tables_cleaned_after_execution` 真正的 temp 表清理验证（需 Pipeline 暴露 cleanup_status）
+1. ~~Case 06 Spark 双链 LOGIC_EQUIVALENT~~ → **✅ 已完成（2026-07-06）**
+2. ~~CRE shadow 最终准入硬化~~ → **✅ 已完成（2026-07-13）**
+3. **CRE 门禁切换（非阻断后续事项）**：
+   - Golden Registry 为空——需业务方注册已知差异样本
+   - NULL strategy 始终 UNKNOWN——仅进入 HUMAN_REVIEW
+   - 门禁切换需 Owner 批准
+4. **Case 05 Comparator 升级**——窗口函数 ROW_NUMBER 从 NOT_COVERED 升级到严格等价判定
+5. **Builder join 缺陷修复**（R-CA-3，中高）——Case 06 Step 4 的 join 缺失
+6. **CASE WHEN condition 等价比较**——当前设计为 UNSUPPORTED，**按需建设，非当前优先级**。condition 是业务语义核心，人工审核是当前通道
+7. **target_grain 扩展为 target_grains**（R-CA-1，C）
+8. **`_temp_` 前缀检测统一**（R-CA-2，B）
+9. **生产环境 LLM 验证**——R8 脚本就绪，待 API key 配置后执行
 
 ## 6. 关键文档索引
 
 | 文档 | 用途 |
 |------|------|
+| `AGENTS.md` | 项目宪法——所有 Agent、LLM 角色和自动化工具必须遵守 |
+| `docs/README.md` | 文档分类索引与唯一入口 |
 | `docs/00-product-charter.md` | 产品愿景和验收标准 |
 | `docs/01-target-architecture.md` | 目标架构（设计参考） |
-| `docs/04-spark-multi-agent-plan.md` | Phase 6 Spark DSL 设计 |
-| `docs/05-cross-validation-and-repair-plan.md` | Phase 7 双链验证设计 |
-| `docs/06-langgraph-orchestration-plan.md` | Phase 8 编排设计 |
 | `docs/09-test-strategy.md` | 测试策略 |
-| `docs/risks/phase-6-8-known-risks.md` | C1-C4 风险详细登记 |
-| `docs/roadmap/` | 各 Phase 实施路线图 |
-| `docs/superpowers/specs/` | Phase 6-8 完整设计+实施计划 |
+| `docs/pipeline_主链路详解_20260702_2140.md` | SQL 管线 Stage 1-7 内部实现细节 |
+| `docs/CRE_v2_设计文档_20260713_1745.md` | CRE v2 双引擎编码比较体系 |
+| `docs/CRE_v3_设计文档_20260713_2000.md` | CRE v3 CDP 工程化设计 |
+| `docs/case_when条件对比边界说明_20260717_0908.md` | CASE WHEN condition UNSUPPORTED 取舍记录 |
+| `docs/datadev_engineering_glossary_20260629_1600.md` | 工程术语表 |
+| `docs/superpowers/specs/2026-07-15-label-table-design.md` | label_table v1 完整设计 |
+| `docs/superpowers/specs/` | Spark-first Phase 6-8 完整设计 |
+| `docs/superpowers/plans/README.md` | 方案书索引与执行链路 |
+| `docs/examples/` | DeveloperSpec 示例（汇总表/标签表/多步骤加工） |
+
+## 7. 运行环境说明
+
+| 项目 | 说明 |
+|------|------|
+| Python | 系统 Python `D:\Program Files\Python312`（3.12.10） |
+| 虚拟环境 | `.venv/` 由 uv 管理（Python 3.11.15），不含 pyspark |
+| 服务启动 | `./dev-reload.sh` 已退出 .venv，固定使用系统 Python 路径；`scripts/dev_reload.py` 内 `sys.executable` 继承此路径 |
+| 依赖完整性 | uvicorn、fastapi、pydantic、duckdb 等在系统 Python 中均可用 |
+| PySpark | 4.1.2 安装在系统 Python site-packages；Java 17 可用；`JAVA_HOME` 指向 JDK 8（不影响 PySpark 4.x 在 Java 17 上运行） |

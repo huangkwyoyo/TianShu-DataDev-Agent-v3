@@ -1,5 +1,7 @@
 # Phase 9B-P0：Snapshot Builder 集成到 Pipeline.run_all()——实施计划
 
+> **状态：✅ 已完成（2026-07-05）**——SnapshotBuilder 已接入 Pipeline.run_all()，R10 消除。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 将 SnapshotBuilder 作为可选步骤接入 Pipeline.run_all() 流程，使得 Run-All 成功后可生成不可变数据快照（SnapshotManifest），其 snapshot_id / snapshot_sha256 随 ReviewPackage provenance 一起输出，形成"输入 DeveloperSpec → 输出可审计 Review Package + Snapshot"的闭环。
