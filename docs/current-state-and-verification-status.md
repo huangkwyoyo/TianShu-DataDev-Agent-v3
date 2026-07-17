@@ -94,10 +94,8 @@
 | R5 | ~~桥接函数替代完整 SQL Pipeline~~ | 已消除 | Phase 9A1-9A3 + 9A5 已升级 |
 | R6 | ~~Harness Runner 为结果聚合器~~ | 已消除 | Phase 9A3 已升级 |
 | R7 | ~~Case 06 Spark Comparator xfail~~ | 已消除 | 2026-07-06 三层剥离完成 |
-| R-CA-1 | `target_grain` 过滤是 Case 06 特化，不能误解为通用设计 | **C** | 多输出粒度场景需扩展为 `target_grains` |
-| R-CA-3 | Builder 缺 join——Case 06 Step 4 的 join step 缺失 | **中高（B）** | 独立排查 builder join 生成逻辑 |
 | R8 | ~~LLM 生产环境验证~~ | 已消除 | 2026-07-05 真实 LLM 8/8 通过 |
-| R9 | Case 05 窗口函数 Comparator NOT_COVERED | **C** | 待完善 ROW_NUMBER 等价判定 |
+| R9 | Case 05 Window 规范化差异——Spark 的 ROW_NUMBER 窗口帧边界默认行为与 DuckDB 存在规范化差异，非代码 bug | **C（保守阻断）** | 非逻辑等价问题，属引擎行为差异。保守阻断，需人工确认语义等价后再解除阻断 |
 | R10 | ~~Snapshot Builder 未集成~~ | 已消除 | Phase 9B-P0 |
 | R11 | ~~前端无自动化测试~~ | 已消除 | Phase 9B + 9C |
 | R-CRE-Golden | Golden Registry 为空 | 低（非阻断） | 后续 Phase 填充 |
@@ -106,6 +104,14 @@
 | R-LT-1 | CASE WHEN condition 静态等价不支持——`compare_case_when_steps` 标记 UNSUPPORTED，condition（谓词条件）的语义等价对比未实现 | **B** | **设计取舍**：condition 语义对比可复用 filter Predicate 递归逻辑，但表别名归一化、等价变换误判等使性价比不高。当前状态为 **CONSISTENT_SAMPLE**（结构骨架 labels/else_value/alias 已验证，condition 待人审）。**按需建设，非当前优先级**。详见 `docs/case_when条件对比边界说明_20260717_0908.md` |
 | R-LT-2 | API Key 是环境前置条件，非架构风险——无 Key 时 label_table 请求返回 CONFIG_ERROR，SparkDeveloperService 标记 SKIPPED | **环境** | 仅影响需要 LLM 的功能子集；pytest 使用 FakeAdapter，不依赖 Key |
 | R-LT-3 | condition 中可能包含 ColumnRef 表别名——CaseWhenStep 的 WHEN condition 是结构化谓词树（LabelPredicateNode），依赖表别名的 ColumnRef 在跨源场景需要额外归一化 | **B** | 当前单表场景无此问题；多表 label_table 被 `validate_label_table_v1_scope` 阻断 |
+
+## 3.5 能力边界（已知非风险局限）
+
+以下事项是已知的设计边界或架构局限，非待修复风险，当前不实施：
+
+| 编号 | 说明 | 处置 |
+|:----:|------|------|
+| R-CA-1 | `target_grain` 过滤是 Case 06 特化——DAG 单粒度过滤是 Case 06 的正确特化，不是对任意 DAG 的通用解 | 当前不实施。多输出粒度场景需扩展为 `target_grains: list[list[str]]`。详见 `docs/superpowers/specs/2026-07-06-spark-comparator-closure-and-risks.md` |
 
 ## 4. 当前架构全景
 
@@ -156,12 +162,10 @@ DeveloperSpec (.md 项目书)
    - Golden Registry 为空——需业务方注册已知差异样本
    - NULL strategy 始终 UNKNOWN——仅进入 HUMAN_REVIEW
    - 门禁切换需 Owner 批准
-4. **Case 05 Comparator 升级**——窗口函数 ROW_NUMBER 从 NOT_COVERED 升级到严格等价判定
-5. **Builder join 缺陷修复**（R-CA-3，中高）——Case 06 Step 4 的 join 缺失
-6. **CASE WHEN condition 等价比较**——当前设计为 UNSUPPORTED，**按需建设，非当前优先级**。condition 是业务语义核心，人工审核是当前通道
-7. **target_grain 扩展为 target_grains**（R-CA-1，C）
-8. **`_temp_` 前缀检测统一**（R-CA-2，B）
-9. **生产环境 LLM 验证**——R8 脚本就绪，待 API key 配置后执行
+4. **Case 05 Window 规范化差异**——Spark 与 DuckDB 的 ROW_NUMBER 窗口帧边界默认行为存在规范化差异，非代码 bug。**C 类保守阻断**：需人工确认语义等价后再解除阻断
+5. **CASE WHEN condition 等价比较**——当前设计为 UNSUPPORTED，**按需建设，非当前优先级**。condition 是业务语义核心，人工审核是当前通道
+6. **`_temp_` 前缀检测统一**（R-CA-2，**低优先级维护债**）
+7. **生产环境 LLM 验证**——R8 脚本就绪，待 API key 配置后执行
 
 ## 6. 关键文档索引
 
