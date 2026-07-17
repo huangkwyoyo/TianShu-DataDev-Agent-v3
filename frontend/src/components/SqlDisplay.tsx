@@ -29,7 +29,7 @@ export function SqlDisplay({ sql, sqlSha256, compilerVersion, trace, summary, vi
       {/* SQL 元信息 */}
       <div className="sql-meta">
         <span>Compiler: {compilerVersion || '—'}</span>
-        <span>SHA-256: {shaSnippet || '—'}...</span>
+        <span title={sqlSha256 || ''}>SHA-256: {shaSnippet || '—'}...</span>
       </div>
 
       {/* 执行追踪——trace 为 null 时展示占位信息 */}

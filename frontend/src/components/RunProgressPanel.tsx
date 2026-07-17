@@ -51,6 +51,30 @@ function aggregateStages(events: FullRunEvent[]): Map<string, FullRunEvent> {
   return stages;
 }
 
+/** 单个阶段行——失败阶段的消息以完整错误块换行展示，不做截断 */
+function StageRow({ e }: { e: FullRunEvent & { event: 'stage' } }) {
+  const isFailed = e.status === 'failed';
+  return (
+    <>
+      <div className={`progress-stage-row stage-${e.status}`}>
+        <span className="progress-stage-icon">{statusIcon(e.status)}</span>
+        <span className="progress-stage-name">{stageLabel(e.stage)}</span>
+        {e.duration_ms != null && (
+          <span className="progress-stage-duration">{(e.duration_ms / 1000).toFixed(1)}s</span>
+        )}
+        {e.message && !isFailed && (
+          <span className="progress-stage-message" title={e.message}>
+            {e.message}
+          </span>
+        )}
+      </div>
+      {e.message && isFailed && (
+        <div className="progress-stage-error-detail">{e.message}</div>
+      )}
+    </>
+  );
+}
+
 /** Run-All 实时进度面板 */
 export function RunProgressPanel({ events, isStreaming, streamError, visible }: Props) {
   if (!visible) return null;
@@ -91,18 +115,7 @@ export function RunProgressPanel({ events, isStreaming, streamError, visible }: 
           <div className="progress-pipeline-header">🟢 SQL 管线</div>
           <div className="progress-stage-list">
             {sqlStages.map((e) => (
-              <div key={`${e.pipeline}:${e.stage}`} className={`progress-stage-row stage-${e.status}`}>
-                <span className="progress-stage-icon">{statusIcon(e.status)}</span>
-                <span className="progress-stage-name">{stageLabel(e.stage)}</span>
-                {e.duration_ms != null && (
-                  <span className="progress-stage-duration">{(e.duration_ms / 1000).toFixed(1)}s</span>
-                )}
-                {e.message && (
-                  <span className="progress-stage-message" title={e.message}>
-                    {e.message.length > 80 ? e.message.slice(0, 80) + '…' : e.message}
-                  </span>
-                )}
-              </div>
+              <StageRow key={`${e.pipeline}:${e.stage}`} e={e} />
             ))}
           </div>
         </div>
@@ -114,18 +127,7 @@ export function RunProgressPanel({ events, isStreaming, streamError, visible }: 
           <div className="progress-pipeline-header">🐍 Spark 管线</div>
           <div className="progress-stage-list">
             {sparkStages.map((e) => (
-              <div key={`${e.pipeline}:${e.stage}`} className={`progress-stage-row stage-${e.status}`}>
-                <span className="progress-stage-icon">{statusIcon(e.status)}</span>
-                <span className="progress-stage-name">{stageLabel(e.stage)}</span>
-                {e.duration_ms != null && (
-                  <span className="progress-stage-duration">{(e.duration_ms / 1000).toFixed(1)}s</span>
-                )}
-                {e.message && (
-                  <span className="progress-stage-message" title={e.message}>
-                    {e.message.length > 80 ? e.message.slice(0, 80) + '…' : e.message}
-                  </span>
-                )}
-              </div>
+              <StageRow key={`${e.pipeline}:${e.stage}`} e={e} />
             ))}
           </div>
         </div>

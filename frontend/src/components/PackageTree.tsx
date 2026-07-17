@@ -50,7 +50,7 @@ function TreeNode({ nodes, depth = 0 }: { nodes: ArtifactTreeNode[]; depth?: num
               {node.name}
             </span>
             {node.sha256 && (
-              <span className="tree-sha">{node.sha256.substring(0, 12)}</span>
+              <span className="tree-sha" title={node.sha256}>{node.sha256.substring(0, 12)}</span>
             )}
           </div>
           {node.children.length > 0 && (

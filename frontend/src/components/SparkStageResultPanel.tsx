@@ -198,7 +198,7 @@ export function SparkStageResultPanel({ stage, result, status, visible }: Props)
             {result.raw_hash && (
               <>
                 <span className="stat-label" style={{ marginLeft: 16 }}>代码哈希</span>
-                <span className="stat-value" style={{ fontFamily: 'monospace', fontSize: 11 }}>
+                <span className="stat-value" style={{ fontFamily: 'monospace', fontSize: 11 }} title={result.raw_hash}>
                   {result.raw_hash.slice(0, 16)}…
                 </span>
               </>

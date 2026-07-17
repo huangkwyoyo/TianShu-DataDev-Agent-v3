@@ -32,7 +32,8 @@
 .spark-stage-result .panel-body-content {
   overflow: hidden;
   transition: max-height 0.2s ease, opacity 0.15s ease;
-  max-height: 2000px;
+  /* 上限需足够大——过小会静默裁掉长错误列表/长消息（内容必须完整展示） */
+  max-height: 10000px;
   opacity: 1;
 }
 
@@ -320,8 +321,7 @@
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: var(--space) var(--space-md);
-  max-height: 240px;
-  overflow-y: auto;
+  /* 完整展示——不限高不滚动，换行展开全部内容 */
   word-break: break-word;
   white-space: pre-wrap;
   font-family: var(--font-mono);
@@ -349,8 +349,7 @@
   font-size: var(--font-size-xs);
   color: var(--text-dim);
   line-height: 1.6;
-  max-height: 160px;
-  overflow-y: auto;
+  /* 完整展示——details 已提供折叠能力，展开后不再限高滚动 */
 }
 
 .physver-error-list li {

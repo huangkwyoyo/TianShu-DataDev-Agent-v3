@@ -96,10 +96,22 @@
 .progress-stage-message {
   font-size: var(--font-size-xs);
   color: var(--text-dim);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 280px;
+  /* 完整展示——不做省略截断，超长时换行 */
+  overflow-wrap: anywhere;
+  white-space: normal;
+  min-width: 0;
+}
+
+/* 失败阶段的完整错误详情块——换行展示全部内容，不截断 */
+.progress-stage-error-detail {
+  margin: 0 var(--space-sm) 2px calc(16px + var(--space-sm));
+  padding: var(--space-xs) var(--space-sm);
+  border-left: 2px solid var(--error);
+  background: var(--error-bg);
+  color: var(--error);
+  font-size: var(--font-size-xs);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* 等待状态 */

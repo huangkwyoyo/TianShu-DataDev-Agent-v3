@@ -574,7 +574,7 @@ export default function App() {
             {state.requestId && (
               <div className="status-strip-item">
                 <span className="status-strip-label">请求 ID</span>
-                <span className="status-strip-value status-strip-mono">{state.requestId.slice(0, 12)}…</span>
+                <span className="status-strip-value status-strip-mono" title={state.requestId}>{state.requestId.slice(0, 12)}…</span>
               </div>
             )}
             <div className="status-strip-item">
