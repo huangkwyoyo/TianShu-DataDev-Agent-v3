@@ -2224,35 +2224,27 @@ class Pipeline:
                     })
                     continue
 
-                # PHYSICAL_VERIFIER——仅当 VALIDATOR 通过后执行
+                # PHYSICAL_VERIFIER——记录执行结果，门禁已在 _do_spark_physical_verify 中
                 if stage == SparkPipelineStage.PHYSICAL_VERIFIER:
-                    validator_passed = any(
-                        s["stage"] == "VALIDATOR" and s["status"] == "ok"
-                        for s in spark_stages
-                    )
-                    if not validator_passed:
-                        spark_stages.append({
-                            "stage": stage_val, "status": "skipped",
-                            "errors": ["VALIDATOR 未通过，跳过物理验证"],
-                        })
-                        break
-
                     spark_stages.append({
                         "stage": stage_val, "status": current_status,
                         "errors": current_errors,
                     })
-                    if current_status == "ok":
-                        spark_ok = True
+                    continue
 
         # ── Step 3: 汇总 FullRunResponse ──
         # 提取 SQL 管线的 pipeline_error（供 runAction 自动提取）
         sql_pipeline_error = sql_result.get("pipeline_error")
         sql_pipeline_stages = sql_result.get("pipeline_stages", [])
-        # 判断整体 Spark 管线是否完成（至少 PHYSICAL_VERIFIER 成功）
+        # 判断整体 Spark 管线是否通过（物理一致 + COMPARATOR LOGIC_EQUIVALENT）
         physver_stage = next(
             (s for s in spark_stages if s["stage"] == "PHYSICAL_VERIFIER"), None,
         )
-        spark_ok = physver_stage is not None and physver_stage["status"] == "ok"
+        spark_ok = (
+            physver_stage is not None
+            and physver_stage["status"] == "ok"
+            and comparator_status == "LOGIC_EQUIVALENT"
+        )
 
         return {
             "request_id": request_id,
@@ -2274,6 +2266,10 @@ class Pipeline:
             "standalone_pyspark": standalone_pyspark,
             # 全量 LLM 调用追踪
             "llm_traces": all_llm_traces,
+            # COMPARATOR 细粒度状态与审核标记
+            "comparator_status": comparator_status,
+            "requires_human_review": comparator_status != "LOGIC_EQUIVALENT" if comparator_status else True,
+            "review_ready": comparator_status == "LOGIC_EQUIVALENT" if comparator_status else False,
         }
 
     def run_all_full_stream(
@@ -2466,7 +2462,7 @@ class Pipeline:
                             })
                             continue
 
-                        # PHYSICAL_VERIFIER——仅当 VALIDATOR 通过 + COMPARATOR 等价时执行
+                        # PHYSICAL_VERIFIER——仅当 VALIDATOR 通过后执行
                         if stage == SparkPipelineStage.PHYSICAL_VERIFIER:
                             validator_passed = any(
                                 s["stage"] == "VALIDATOR" and s["status"] == "ok"
@@ -2486,21 +2482,6 @@ class Pipeline:
                                 })
                                 break
 
-                            # COMPARATOR 门禁——非 LOGIC_EQUIVALENT 时跳过物理验证
-                            if comparator_status and comparator_status != "LOGIC_EQUIVALENT":
-                                event_queue.put({
-                                    "event": "stage",
-                                    "pipeline": "spark",
-                                    "stage": stage_val,
-                                    "status": "skipped",
-                                    "message": f"COMPARATOR 状态为 {comparator_status}，跳过物理验证",
-                                })
-                                spark_stages.append({
-                                    "stage": stage_val, "status": "skipped",
-                                    "errors": [f"COMPARATOR 状态为 {comparator_status}，跳过物理验证"],
-                                })
-                                break
-
                             status_event = "completed" if current_status == "ok" else "failed"
                             event_queue.put({
                                 "event": "stage",
@@ -2517,11 +2498,15 @@ class Pipeline:
                             if current_status == "ok":
                                 spark_ok = True
 
-                # ── 判断整体 Spark 管线是否成功 ──
+                # ── 判断整体 Spark 管线是否通过（物理一致 + COMPARATOR LOGIC_EQUIVALENT）──
                 physver_stage = next(
                     (s for s in spark_stages if s["stage"] == "PHYSICAL_VERIFIER"), None,
                 )
-                spark_ok = physver_stage is not None and physver_stage["status"] == "ok"
+                spark_ok = (
+                    physver_stage is not None
+                    and physver_stage["status"] == "ok"
+                    and comparator_status == "LOGIC_EQUIVALENT"
+                )
 
                 # ── 汇总 FullRunResponse ──
                 sql_pipeline_error = sql_result.get("pipeline_error")
@@ -2542,6 +2527,10 @@ class Pipeline:
                     "pyspark_code": pyspark_code,
                     "standalone_pyspark": standalone_pyspark,
                     "llm_traces": all_llm_traces,
+                    # COMPARATOR 细粒度状态与审核标记
+                    "comparator_status": comparator_status,
+                    "requires_human_review": comparator_status != "LOGIC_EQUIVALENT" if comparator_status else True,
+                    "review_ready": comparator_status == "LOGIC_EQUIVALENT" if comparator_status else False,
                 }
 
                 event_queue.put({"event": "done", "result": full_result})
