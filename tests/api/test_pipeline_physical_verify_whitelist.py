@@ -354,6 +354,17 @@ class TestFullRunResponseSparkOk:
             {"status": physver_status, "result": {"type": "physical_verify"}, "llm_traces": {}, "errors": []},
         ]
 
+    @staticmethod
+    def _setup_context(pipeline: Pipeline, request_id: str) -> None:
+        """预填 SparkStageContext 的关键阶段结果——供 _compute_review_ready 消费。"""
+        ctx = pipeline._get_or_create_spark_context(request_id)
+        ctx.stage_results.update({
+            "MAPPER": "SUCCESS",
+            "COMPILER": "SUCCESS",
+            "VALIDATOR": "SUCCESS",
+            "COMPARATOR": "SUCCESS",
+        })
+
     @patch.object(Pipeline, "run_spark_stage")
     @patch.object(Pipeline, "run_all")
     def test_spark_ok_true_when_logic_equivalent(
@@ -371,6 +382,7 @@ class TestFullRunResponseSparkOk:
         )
 
         pipeline = Pipeline()
+        self._setup_context(pipeline, "test-ok")
         result = pipeline.run_all_full("test markdown")
 
         assert result["spark_ok"] is True, (
@@ -398,6 +410,7 @@ class TestFullRunResponseSparkOk:
         )
 
         pipeline = Pipeline()
+        self._setup_context(pipeline, "test-whitelist")
         result = pipeline.run_all_full("test markdown")
 
         assert result["spark_ok"] is False, (
@@ -424,6 +437,7 @@ class TestFullRunResponseSparkOk:
         )
 
         pipeline = Pipeline()
+        self._setup_context(pipeline, "test-skipped")
         result = pipeline.run_all_full("test markdown")
 
         assert result["spark_ok"] is False, (

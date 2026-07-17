@@ -2247,6 +2247,13 @@ class Pipeline:
             and comparator_status == "LOGIC_EQUIVALENT"
         )
 
+        # ── 统一 review_ready 判定：委托 SparkReviewBuilder._compute_review_ready ──
+        from tianshu_datadev.spark.review_builder import SparkReviewBuilder
+        ctx = self._get_or_create_spark_context(request_id)
+        review_ready = SparkReviewBuilder._compute_review_ready(
+            dict(ctx.stage_results), comparator_status or "",
+        )
+
         return {
             "request_id": request_id,
             # 兼容 runAction 自动提取
@@ -2269,8 +2276,8 @@ class Pipeline:
             "llm_traces": all_llm_traces,
             # COMPARATOR 细粒度状态与审核标记
             "comparator_status": comparator_status,
-            "requires_human_review": comparator_status != "LOGIC_EQUIVALENT" if comparator_status else True,
-            "review_ready": comparator_status == "LOGIC_EQUIVALENT" if comparator_status else False,
+            "requires_human_review": not review_ready,
+            "review_ready": review_ready,
         }
 
     def run_all_full_stream(
@@ -2507,6 +2514,13 @@ class Pipeline:
                     and comparator_status == "LOGIC_EQUIVALENT"
                 )
 
+                # ── 统一 review_ready 判定：委托 SparkReviewBuilder._compute_review_ready ──
+                from tianshu_datadev.spark.review_builder import SparkReviewBuilder
+                ctx = self._get_or_create_spark_context(request_id)
+                review_ready = SparkReviewBuilder._compute_review_ready(
+                    dict(ctx.stage_results), comparator_status or "",
+                )
+
                 # ── 汇总 FullRunResponse ──
                 sql_pipeline_error = sql_result.get("pipeline_error")
 
@@ -2528,12 +2542,8 @@ class Pipeline:
                     "llm_traces": all_llm_traces,
                     # COMPARATOR 细粒度状态与审核标记
                 "comparator_status": comparator_status,
-                "requires_human_review": (
-                    comparator_status != "LOGIC_EQUIVALENT" if comparator_status else True
-                ),
-                "review_ready": (
-                    comparator_status == "LOGIC_EQUIVALENT" if comparator_status else False
-                ),
+                "requires_human_review": not review_ready,
+                "review_ready": review_ready,
                 }
 
                 event_queue.put({"event": "done", "result": full_result})
