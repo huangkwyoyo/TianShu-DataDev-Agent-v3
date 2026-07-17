@@ -63,7 +63,6 @@ if TYPE_CHECKING:
     from tianshu_datadev.spark.models import SparkPlan, SparkStep
     from tianshu_datadev.spark.physical_verifier import PhysicalVerificationReport
     from tianshu_datadev.spark.plan_comparator import ComparisonStatus, PlanComparisonReport
-    from tianshu_datadev.spark.plan_equivalence import EquivalenceVerdict
     from tianshu_datadev.spark.snapshot import SnapshotBuilder, SnapshotManifest, SnapshotSourceProvider
     from tianshu_datadev.sql.models import CompiledSql, ExecutionTrace, ResultSummary
 
@@ -3493,8 +3492,9 @@ class Pipeline:
 
         # PHYSICAL_VERIFIER 特殊处理：物理不一致时标记 failed
         if stage == SparkPipelineStage.PHYSICAL_VERIFIER and current_status == "ok":
+            from tianshu_datadev.spark.physical_verifier import PhysicalVerificationStatus
             report = context.physical_verify_report
-            if report is not None and not report.row_count_match:
+            if report is not None and report.status != PhysicalVerificationStatus.RESULT_CONSISTENT:
                 current_status = "failed"
 
         # ── 构建阶段特有结果内容（供前端面板渲染）──
