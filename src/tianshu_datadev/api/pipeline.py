@@ -2495,8 +2495,6 @@ class Pipeline:
                                 "stage": stage_val, "status": current_status,
                                 "errors": current_errors,
                             })
-                            if current_status == "ok":
-                                spark_ok = True
 
                 # ── 判断整体 Spark 管线是否通过（物理一致 + COMPARATOR LOGIC_EQUIVALENT）──
                 physver_stage = next(
