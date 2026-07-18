@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 from tianshu_datadev.developer_spec.models import (
     AggregationType,
     ComputeStep,
+    DimensionDecl,
     EnrichedSpec,
     InferredComputedMetric,
     InferredWindowMetric,
@@ -705,6 +706,144 @@ class FakeSpecEnricher:
 
         return steps, joins
 
+    def _infer_dimensions(
+        self,
+        spec: ParsedDeveloperSpec,
+        manifest: SourceManifest,
+    ) -> list[DimensionDecl]:
+        """推断输出列到源列的维度映射。
+
+        当输出列名在源表中找不到精确匹配时，通过子串匹配 + JOIN 上下文
+        自动推断 column_ref 和 source_table。这在多表 JOIN 场景中尤为关键——
+        源表列名相同但输出需要重命名（如 tz_pu.zone_name → pickup_zone_name）。
+
+        推断规则：
+        1. 输出列名精确匹配源列 → 跳过（无需维度声明）
+        2. 输出列名包含某源列名 → 候选
+        3. 单一候选 → 直接采纳
+        4. 多候选 → 通过 JOIN key 关键词消歧义
+
+        Args:
+            spec: 已解析的 DeveloperSpec
+            manifest: 源数据清单
+
+        Returns:
+            推断的 DimensionDecl 列表
+        """
+        # ── 收集所有源表列 → (table_alias, column_name, data_type) ──
+        # 从 spec.input_tables 的显式声明列构建——不使用 manifest.tables，
+        # 因为 build_manifest_from_spec 会将 output_spec 的列名（如 pickup_zone_name）
+        # 加入每个 ManifestTable，导致"精确匹配"误判并跳过维度推断。
+        all_source_cols: dict[str, list[tuple[str, str, str]]] = {}
+        for table in spec.input_tables:
+            alias = table.table_alias
+            for col_list in [table.columns, table.key_columns, table.business_columns]:
+                for col in col_list:
+                    cn = col.column_name
+                    if cn not in all_source_cols:
+                        all_source_cols[cn] = []
+                    all_source_cols[cn].append((alias, cn, col.data_type or "unknown"))
+
+        # ── 构建 JOIN key 上下文（右表别名 → 左表 join key）──
+        join_keys: dict[str, str] = {}
+        if spec.joins:
+            for join in spec.joins:
+                join_keys[join.right_table] = join.left_key
+
+        dimensions: list[DimensionDecl] = []
+        grain_set: set[str] = set(spec.output_spec.grain)
+
+        for col in spec.output_spec.columns:
+            col_name = col.name
+            # 跳过粒度列——它们是 GROUP BY 键，不是维度映射目标
+            if col_name in grain_set:
+                continue
+            # 精确匹配——无需维度声明
+            if col_name in all_source_cols:
+                continue
+
+            # ── 子串匹配：源列名出现在输出列名中 ──
+            candidates: list[tuple[str, str, str]] = []
+            for src_col_name, entries in all_source_cols.items():
+                if src_col_name in col_name:
+                    candidates.extend(
+                        (alias, src_col_name, dtype) for alias, _cn, dtype in entries
+                    )
+
+            if not candidates:
+                continue  # 无法推断，跳过
+
+            if len(candidates) == 1:
+                # 唯一匹配——直接采纳
+                alias, src_col, _ = candidates[0]
+                dimensions.append(DimensionDecl(
+                    dimension_name=col_name,
+                    column_ref=src_col,
+                    source_table=alias,
+                ))
+            else:
+                # 多候选——通过 JOIN key 关键词消歧义
+                best = self._disambiguate_by_join(col_name, candidates, join_keys)
+                if best:
+                    alias, src_col, _ = best
+                    dimensions.append(DimensionDecl(
+                        dimension_name=col_name,
+                        column_ref=src_col,
+                        source_table=alias,
+                    ))
+
+        return dimensions
+
+    @staticmethod
+    def _disambiguate_by_join(
+        col_name: str,
+        candidates: list[tuple[str, str, str]],
+        join_keys: dict[str, str],
+    ) -> tuple[str, str, str] | None:
+        """通过 JOIN key 关键词匹配消歧义。
+
+        策略：
+        1. 检查列名是否包含 table alias 的片段
+        2. 检查 JOIN key 中的关键词是否出现在列名中
+           （如 pickup_zone_name 匹配 pickup_location_id 中的 "pickup"）
+
+        Args:
+            col_name: 输出列名
+            candidates: [(table_alias, source_col, data_type), ...]
+            join_keys: {right_table_alias → left_join_key}
+
+        Returns:
+            最佳候选 (table_alias, source_col, data_type) 或 None
+        """
+        col_lower = col_name.lower()
+        best_score = 0
+        best_candidate = None
+
+        for alias, src_col, dtype in candidates:
+            score = 0
+            # 检查列名是否包含 table alias 的片段
+            alias_lower = alias.lower()
+            # 将 alias 拆分为 token（如 tz_pu → ["tz", "pu"]）
+            alias_tokens = alias_lower.replace("_", " ").split()
+            for token in alias_tokens:
+                if len(token) >= 3 and token in col_lower:
+                    score += 3
+
+            # 检查 JOIN key 中的关键词
+            if alias in join_keys:
+                join_key = join_keys[alias].lower()
+                # 提取 JOIN key 中的语义 token（去掉 _id, _key 等后缀）
+                key_tokens = join_key.replace("_id", "").replace("_key", "").split("_")
+                for token in key_tokens:
+                    if len(token) >= 3 and token in col_lower:
+                        score += 5
+
+            if score > best_score:
+                best_score = score
+                best_candidate = (alias, src_col, dtype)
+
+        return best_candidate if best_score > 0 else None
+
     def enrich(
         self,
         spec: ParsedDeveloperSpec,
@@ -875,11 +1014,15 @@ class FakeSpecEnricher:
                 j.model_dump() for j in all_generated_joins
             ]
 
+        # ── 推断维度映射 ──
+        inferred_dimensions = self._infer_dimensions(spec, manifest)
+
         return EnrichedSpec(
             original_spec=spec,
             inferred_metrics=inferred_metrics,
             inferred_window_metrics=inferred_window,
             inferred_computed_metrics=inferred_computed,
+            inferred_dimensions=inferred_dimensions,
             enrichment_metadata=metadata,
         )
 
@@ -1216,10 +1359,19 @@ class SpecEnricher:
         # ── 合并窗口指标 ──
         new_window_metrics = list(enriched.inferred_window_metrics)
 
+        # ── 合并推断的维度映射 ──
+        # 仅追加 spec 中未显式声明的维度（程序员手写优先级最高）
+        declared_dim_names = {d.dimension_name for d in spec.dimensions}
+        new_dimensions = [
+            d for d in enriched.inferred_dimensions
+            if d.dimension_name not in declared_dim_names
+        ]
+        combined_dimensions = list(spec.dimensions) + new_dimensions
+
         # 仅当有实际变更时才更新
         needs_update = bool(
             new_metrics or generated_steps_data or generated_joins_data
-            or new_window_metrics
+            or new_window_metrics or new_dimensions
         )
         if not needs_update:
             return spec
@@ -1231,6 +1383,8 @@ class SpecEnricher:
             update_dict["joins"] = combined_joins
         if new_window_metrics:
             update_dict["inferred_window_metrics"] = new_window_metrics
+        if new_dimensions:
+            update_dict["dimensions"] = combined_dimensions
 
         return spec.model_copy(update=update_dict)
 

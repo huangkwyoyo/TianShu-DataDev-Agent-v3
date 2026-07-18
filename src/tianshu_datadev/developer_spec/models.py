@@ -541,15 +541,23 @@ class EnrichedSpec(StrictModel):
     inferred_window_metrics: list[InferredWindowMetric] = []
     # 推断的计算指标（聚合后表达式计算）
     inferred_computed_metrics: list[InferredComputedMetric] = []
+    # 推断的维度映射——输出列名 → 源列名 + 源表（多表/多跳链消歧义用）
+    inferred_dimensions: list[DimensionDecl] = []
     # 丰富化元数据
     enrichment_metadata: dict = {}  # 包含 source, confidence_summary, inference_time_ms 等
 
 
 class DimensionDecl(StrictModel):
-    """维度声明——列引用指向已声明的字段。"""
+    """维度声明——列引用指向已声明的字段。
+
+    source_table 用于多表/多跳链场景中消除列歧义：
+    指定 column_ref 来自哪个输入表（table_alias），
+    Builder 据此为 ProjectStep 的 ColumnRef 设置正确的 table_ref。
+    """
 
     dimension_name: str
     column_ref: str
+    source_table: str | None = None  # 可选——单表场景无需指定
 
 
 class JoinDecl(StrictModel):
