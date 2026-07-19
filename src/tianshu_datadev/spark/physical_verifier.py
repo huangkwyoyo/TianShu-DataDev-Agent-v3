@@ -876,7 +876,11 @@ class PhysicalVerifier:
         )
 
         # 判定最终状态
-        if total_diff_count == 0 and row_count_match and schema_match:
+        # 零行门禁——双引擎都返回 0 行时无法验证数据正确性，需人工介入
+        # 0 行可能原因：快照数据为空、SQL 过滤条件筛掉了所有行、临时表缺失等
+        if duckdb_canonical_count == 0 and spark_canonical_count == 0:
+            status = PhysicalVerificationStatus.HUMAN_REVIEW
+        elif total_diff_count == 0 and row_count_match and schema_match:
             status = PhysicalVerificationStatus.RESULT_CONSISTENT
         elif not schema_match or (duckdb_canonical_count > 0 and spark_canonical_count > 0):
             status = PhysicalVerificationStatus.RESULT_MISMATCH
@@ -944,6 +948,15 @@ class PhysicalVerifier:
             environment_manifest=cre_environment_manifest,
         )
 
+        # 零行门禁——error_message 说明原因，避免前端展示空白
+        _err_msg = ""
+        if duckdb_canonical_count == 0 and spark_canonical_count == 0:
+            _err_msg = (
+                "双引擎均返回 0 行——无法验证数据正确性（可能原因："
+                "快照数据为空、SQL 过滤条件筛掉了所有行、临时表未正确创建）。"
+                "请检查快照数据是否包含所需表格，以及 SQL 是否正确。"
+            )
+
         return PhysicalVerificationReport(
             report_id=report_id,
             contract_hash=contract_hash,
@@ -960,6 +973,7 @@ class PhysicalVerifier:
             normalization_config_snapshot=config_snapshot,
             cre_shadow_report=cre_shadow_report,
             cdp_shadow_result=cdp_shadow_result,
+            error_message=_err_msg,
         )
 
     # ── 溢出降级验证 ──

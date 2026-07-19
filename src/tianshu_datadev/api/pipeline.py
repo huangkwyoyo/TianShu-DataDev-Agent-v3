@@ -2570,11 +2570,11 @@ class Pipeline:
                                 _diffs = _pr.get("total_diff_count", 0)
 
                                 _parts: list[str] = []
-                                # 验证结论
+                                # 验证结论——区分全量逐行对比 vs 降级抽样对比
                                 if _vstatus == "RESULT_CONSISTENT":
-                                    _parts.append("全量一致")
+                                    _parts.append("全量逐行一致")
                                 elif _vstatus == "SAMPLED_CONSISTENT":
-                                    _parts.append("抽样一致（溢出降级）")
+                                    _parts.append("抽样一致（溢出降级对比）")
                                 else:
                                     _parts.append(_vstatus or "通过")
 
@@ -2582,6 +2582,12 @@ class Pipeline:
                                 _ddb_str = str(_ddb_rows) if _ddb_rows is not None else "?"
                                 _spk_str = str(_spk_rows) if _spk_rows is not None else "?"
                                 _parts.append(f"DuckDB {_ddb_str} 行 ↔ Spark {_spk_str} 行")
+
+                                # 对比方式标注
+                                if _vstatus == "RESULT_CONSISTENT":
+                                    _parts.append("全量对比")
+                                elif _vstatus == "SAMPLED_CONSISTENT":
+                                    _parts.append("降级对比")
 
                                 # 对比项
                                 _checks: list[str] = []
@@ -2600,7 +2606,15 @@ class Pipeline:
 
                                 _physver_msg = " | ".join(_parts)
                             elif current_errors and current_status != "ok":
-                                _physver_msg = "; ".join(current_errors)
+                                # 失败时取第一条 PHYSICAL_VERIFIER 错误作为摘要
+                                _physver_errors = [
+                                    e.split("] ", 1)[1] if "] " in e else e
+                                    for e in current_errors
+                                    if e.startswith("[PHYSICAL_VERIFIER]")
+                                ]
+                                _physver_msg = _physver_errors[0] if _physver_errors else (
+                                    "; ".join(current_errors) if current_errors else None
+                                )
 
                             event_queue.put({
                                 "event": "stage",
@@ -3633,6 +3647,13 @@ class Pipeline:
                 PhysicalVerificationStatus.SAMPLED_CONSISTENT,
             ):
                 current_status = "failed"
+                # 将验证失败原因写入 errors——确保流式消息和面板有内容展示
+                _fail_reason = (
+                    report.error_message
+                    if report and report.error_message
+                    else f"物理验证结论: {report.status.value if report else 'UNKNOWN'}"
+                )
+                context.errors.append(f"[PHYSICAL_VERIFIER] {_fail_reason}")
                 # 同步更新 spark_stages 中的阶段状态——确保 run_spark_stage 响应内部一致
                 for s in spark_stages:
                     if s["stage"] == stage_val:
