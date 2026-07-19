@@ -2557,17 +2557,58 @@ class Pipeline:
                                 status_event = "completed"
                             else:
                                 status_event = "failed"
+
+                            # 构建物理验证摘要——用于进度面板展示（非泛化"通过"）
+                            _physver_msg: str | None = None
+                            if current_status == "ok":
+                                _pr = stage_result.get("result", {}) or {}
+                                _vstatus = _pr.get("verification_status", "")
+                                _ddb_rows = _pr.get("duckdb_row_count")
+                                _spk_rows = _pr.get("spark_row_count")
+                                _rows_match = _pr.get("row_count_match")
+                                _schema_match = _pr.get("schema_match")
+                                _diffs = _pr.get("total_diff_count", 0)
+
+                                _parts: list[str] = []
+                                # 验证结论
+                                if _vstatus == "RESULT_CONSISTENT":
+                                    _parts.append("全量一致")
+                                elif _vstatus == "SAMPLED_CONSISTENT":
+                                    _parts.append("抽样一致（溢出降级）")
+                                else:
+                                    _parts.append(_vstatus or "通过")
+
+                                # 行数对比
+                                _ddb_str = str(_ddb_rows) if _ddb_rows is not None else "?"
+                                _spk_str = str(_spk_rows) if _spk_rows is not None else "?"
+                                _parts.append(f"DuckDB {_ddb_str} 行 ↔ Spark {_spk_str} 行")
+
+                                # 对比项
+                                _checks: list[str] = []
+                                if _rows_match is True:
+                                    _checks.append("行数✅")
+                                elif _rows_match is False:
+                                    _checks.append("行数❌")
+                                if _schema_match is True:
+                                    _checks.append("Schema✅")
+                                elif _schema_match is False:
+                                    _checks.append("Schema❌")
+                                if isinstance(_diffs, int) and _diffs > 0:
+                                    _checks.append(f"差异{_diffs}")
+                                if _checks:
+                                    _parts.append(" · ".join(_checks))
+
+                                _physver_msg = " | ".join(_parts)
+                            elif current_errors and current_status != "ok":
+                                _physver_msg = "; ".join(current_errors)
+
                             event_queue.put({
                                 "event": "stage",
                                 "pipeline": "spark",
                                 "stage": stage_val,
                                 "status": status_event,
                                 "duration_ms": duration_ms,
-                                "message": (
-                                    "; ".join(current_errors)
-                                    if current_errors and current_status != "ok"
-                                    else None
-                                ),
+                                "message": _physver_msg,
                             })
                             spark_stages.append({
                                 "stage": stage_val, "status": current_status,
