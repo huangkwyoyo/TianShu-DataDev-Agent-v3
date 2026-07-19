@@ -162,7 +162,7 @@ class TestOutputParsing:
             "===SPARK_EXECUTOR_OUTPUT_END===\n"
             "more logs\n"
         )
-        rows, cleaned, overflow, _ = _parse_output_rows(stdout)
+        rows, cleaned, overflow, _, _ = _parse_output_rows(stdout)
 
         assert len(rows) == 2
         assert rows[0] == {"order_id": "1", "amount": 100}
@@ -177,14 +177,14 @@ class TestOutputParsing:
             "===SPARK_EXECUTOR_OUTPUT_START===\n"
             "===SPARK_EXECUTOR_OUTPUT_END===\n"
         )
-        rows, _, overflow, _ = _parse_output_rows(stdout)
+        rows, _, overflow, _, _ = _parse_output_rows(stdout)
         assert len(rows) == 0
         assert not overflow
 
     def test_parse_no_markers(self):
         """无标记——无 JSON 行。"""
         stdout = "some output without markers"
-        rows, _, overflow, _ = _parse_output_rows(stdout)
+        rows, _, overflow, _, _ = _parse_output_rows(stdout)
         assert len(rows) == 0
         assert not overflow
 
@@ -196,7 +196,7 @@ class TestOutputParsing:
             '{"valid": "row"}\n'
             "===SPARK_EXECUTOR_OUTPUT_END===\n"
         )
-        rows, _, overflow, _ = _parse_output_rows(stdout)
+        rows, _, overflow, _, _ = _parse_output_rows(stdout)
         assert len(rows) == 1
         assert rows[0] == {"valid": "row"}
         assert not overflow
@@ -209,7 +209,7 @@ class TestOutputParsing:
             '{"_tianshu_overflow": true}\n'
             "===SPARK_EXECUTOR_OUTPUT_END===\n"
         )
-        rows, cleaned, overflow, _ = _parse_output_rows(stdout)
+        rows, cleaned, overflow, _, _ = _parse_output_rows(stdout)
         assert overflow
         assert rows == []
         assert "some log" in cleaned
@@ -222,13 +222,13 @@ class TestOutputParsing:
             '{"order_id": "1"}\n'
             "===SPARK_EXECUTOR_OUTPUT_END===\n"
         )
-        rows, _, overflow, _ = _parse_output_rows(stdout)
+        rows, _, overflow, _, _ = _parse_output_rows(stdout)
         assert overflow
         assert rows == [{"order_id": "1"}]
 
 
 class TestOverflowDegradedCollection:
-    """溢出降级收集——引擎内 count + 键排序抽样（避免 NOT_EXECUTED 直接失败）。"""
+    """溢出降级收集——引擎内 count + 维度值抽样（避免 NOT_EXECUTED 直接失败）。"""
 
     def test_parse_overflow_sentinel_with_row_count(self):
         """哨兵携带 row_count → 第四返回值为引擎内总行数。"""
@@ -237,7 +237,7 @@ class TestOverflowDegradedCollection:
             '{"_tianshu_overflow": true, "row_count": 6274396}\n'
             "===SPARK_EXECUTOR_OUTPUT_END===\n"
         )
-        rows, _, overflow, total = _parse_output_rows(stdout)
+        rows, _, overflow, total, _ = _parse_output_rows(stdout)
         assert overflow
         assert total == 6274396
         assert rows == []
@@ -249,9 +249,13 @@ class TestOverflowDegradedCollection:
             '{"_tianshu_overflow": true}\n'
             "===SPARK_EXECUTOR_OUTPUT_END===\n"
         )
-        _, _, overflow, total = _parse_output_rows(stdout)
+        _, _, overflow, total, meta = _parse_output_rows(stdout)
         assert overflow
         assert total is None
+        # 旧版哨兵无抽样元信息——默认空
+        assert meta["sample_dim"] is None
+        assert meta["sample_values"] == []
+        assert meta["sample_truncated"] is False
 
     def test_parse_overflow_sample_rows_collected(self):
         """哨兵后的样本行进入 rows——作为降级验证的抽样数据。"""
@@ -262,7 +266,7 @@ class TestOverflowDegradedCollection:
             '{"order_id": "2", "amount": 200}\n'
             "===SPARK_EXECUTOR_OUTPUT_END===\n"
         )
-        rows, _, overflow, total = _parse_output_rows(stdout)
+        rows, _, overflow, total, _ = _parse_output_rows(stdout)
         assert overflow
         assert total == 200000
         assert rows == [
@@ -270,8 +274,38 @@ class TestOverflowDegradedCollection:
             {"order_id": "2", "amount": 200},
         ]
 
-    def test_collector_overflow_branch_computes_count_and_sample(self):
-        """溢出分支引擎内 count + 键排序抽样——count 仅出现在溢出检查之后。"""
+    def test_parse_sentinel_sample_meta(self):
+        """哨兵携带抽样维度元信息 → 第五返回值解析 dim/values/truncated。"""
+        stdout = (
+            "===SPARK_EXECUTOR_OUTPUT_START===\n"
+            '{"_tianshu_overflow": true, "row_count": 200000, '
+            '"sample_dim": "trip_id", "sample_values": ["a", "b"], '
+            '"sample_truncated": false}\n'
+            '{"trip_id": "a", "amount": 100}\n'
+            "===SPARK_EXECUTOR_OUTPUT_END===\n"
+        )
+        rows, _, overflow, total, meta = _parse_output_rows(stdout)
+        assert overflow
+        assert total == 200000
+        assert meta["sample_dim"] == "trip_id"
+        assert meta["sample_values"] == ["a", "b"]
+        assert meta["sample_truncated"] is False
+        assert rows == [{"trip_id": "a", "amount": 100}]
+
+    def test_parse_sentinel_sample_truncated(self):
+        """哨兵标记抽样截断 → meta.sample_truncated=True。"""
+        stdout = (
+            "===SPARK_EXECUTOR_OUTPUT_START===\n"
+            '{"_tianshu_overflow": true, "row_count": 200000, '
+            '"sample_dim": null, "sample_values": [], "sample_truncated": true}\n'
+            "===SPARK_EXECUTOR_OUTPUT_END===\n"
+        )
+        _, _, _, _, meta = _parse_output_rows(stdout)
+        assert meta["sample_truncated"] is True
+        assert meta["sample_dim"] is None
+
+    def test_collector_overflow_branch_computes_count_and_dim_sample(self):
+        """溢出分支引擎内 count + 维度值抽样——count 仅出现在溢出检查之后。"""
         injected = _inject_output_collector("result = 1", sample_keys=["order_id", "dt"])
         # 常规路径仍是 limit(MAX+1) 单次执行
         from tianshu_datadev.spark.executor import _MAX_RESULT_ROWS
@@ -280,13 +314,18 @@ class TestOverflowDegradedCollection:
         overflow_check_pos = injected.index(f"> {_MAX_RESULT_ROWS}")
         count_pos = injected.index(".count()")
         assert count_pos > overflow_check_pos
-        # 键排序确定性抽样 + 哨兵携带 row_count
+        # 维度值抽样：distinct 取前 N 个维度值 → isin 过滤取组全量行
+        assert ".distinct()" in injected
+        assert ".isin(" in injected
         assert "orderBy" in injected
         assert '"order_id"' in injected
+        # 哨兵携带 row_count + 抽样元信息
         assert "row_count" in injected
+        assert "sample_dim" in injected
+        assert "sample_values" in injected
 
     def test_collector_without_sample_keys_count_only(self):
-        """无抽样键——仍计数但不做 orderBy 抽样。"""
+        """无抽样键——仍计数但不做维度抽样。"""
         injected = _inject_output_collector("result = 1")
         assert ".count()" in injected
         assert "row_count" in injected
@@ -295,6 +334,19 @@ class TestOverflowDegradedCollection:
         """带抽样键注入后仍是合法 Python。"""
         injected = _inject_output_collector("result = 1", sample_keys=["order_id"])
         compile(injected, "<collector_check>", "exec")
+
+    def test_collector_force_overflow_skips_full_collect(self):
+        """已知溢出（DuckDB 侧行数超上限）→ 跳过 limit(MAX+1) 全量收集尝试。"""
+        injected = _inject_output_collector(
+            "result = 1", sample_keys=["order_id"], force_overflow=True,
+        )
+        assert "_force_overflow = True" in injected
+        compile(injected, "<collector_check>", "exec")
+
+    def test_collector_default_no_force_overflow(self):
+        """默认不强制溢出——保持常规 limit(MAX+1) 检测路径。"""
+        injected = _inject_output_collector("result = 1", sample_keys=["order_id"])
+        assert "_force_overflow = False" in injected
 
     def test_execution_result_has_total_row_count_field(self):
         """SparkExecutionResult 携带引擎内总行数字段。"""
@@ -305,6 +357,21 @@ class TestOverflowDegradedCollection:
             total_row_count=123456,
         )
         assert r.total_row_count == 123456
+
+    def test_execution_result_has_sample_meta_fields(self):
+        """SparkExecutionResult 携带抽样维度元信息字段。"""
+        from tianshu_datadev.spark.executor import SparkExecutionResult
+        r = SparkExecutionResult(
+            status=SparkExecutionStatus.SUCCESS,
+            result_overflow=True,
+            total_row_count=123456,
+            sample_dim="trip_id",
+            sample_values=["a", "b"],
+            sample_truncated=False,
+        )
+        assert r.sample_dim == "trip_id"
+        assert r.sample_values == ["a", "b"]
+        assert r.sample_truncated is False
 
 
 # ════════════════════════════════════════════

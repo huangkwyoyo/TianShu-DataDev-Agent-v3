@@ -142,24 +142,16 @@ class TestTemplateButtons:
 
     @pytest.mark.skipif(not os.path.isdir(os.path.join(_DIST, "assets")),
                         reason="frontend/dist/assets 不存在——前端未构建")
-    def test_template_names_in_bundle(self):
-        """验证模板名称（汇总表/标签表/多步骤加工）存在于 JS bundle。
-
-        Vite production 构建会对字符串进行压缩处理，因此采用子串匹配策略——
-        检查每个模板名称的关键子串是否出现在构建产物中。
-        """
-        # 使用简短关键子串避免 minifier 截断问题
-        template_keywords = ["汇总表", "标签表", "多步骤"]
+    def test_template_api_path_in_bundle(self):
+        """验证前端通过模板 API 动态加载按钮，不要求复制后端模板名称。"""
         assets_dir = os.path.join(_DIST, "assets")
         js_files = [f for f in os.listdir(assets_dir) if f.endswith(".js")]
-        found = set()
-        for js_file in js_files:
-            content = _read_dist_file(os.path.join("assets", js_file))
-            for kw in template_keywords:
-                if kw in content:
-                    found.add(kw)
-        missing = set(template_keywords) - found
-        assert not missing, f"JS bundle 中未找到模板关键词: {missing}"
+        content = "\n".join(
+            _read_dist_file(os.path.join("assets", js_file))
+            for js_file in js_files
+        )
+
+        assert "/templates" in content, "JS bundle 中未找到模板 API 路径"
 
     def test_template_ids_in_pipeline(self):
         """验证模板 ID 存在于模板定义中（模板由 API 端提供，非前端硬编码）。

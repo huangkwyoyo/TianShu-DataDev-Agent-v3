@@ -51,7 +51,8 @@ class _MockSparkExecutor:
         self._success = success
 
     def execute(self, pyspark_code: str, data_dir: str, output_var: str = "result_df",
-                sample_keys: list[str] | None = None):
+                sample_keys: list[str] | None = None,
+                force_overflow: bool = False):
         if not self._success:
             return SparkExecutionResult(
                 status=SparkExecutionStatus.RUNTIME_ERROR,

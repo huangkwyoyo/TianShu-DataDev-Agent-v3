@@ -510,6 +510,18 @@ class InferredWindowMetric(StrictModel):
     confidence: str = "medium"  # high | medium | low（LLM 推断置信度）
 
 
+class PostWindowFilterDecl(StrictModel):
+    """窗口计算后的封闭过滤条件。
+
+    该结构只允许比较窗口输出列与标量，避免把业务描述中的自由 SQL
+    直接传给编译器。Builder 会将其确定性转换为 WindowStep 后的 FilterStep。
+    """
+
+    column: str
+    operator: CompareOp
+    value: int | float
+
+
 class InferredComputedMetric(StrictModel):
     """SpecEnricher 推断的计算指标——比率、百分位等聚合后计算。
 
@@ -539,6 +551,8 @@ class EnrichedSpec(StrictModel):
     inferred_metrics: list[MetricDecl] = []
     # 推断的窗口指标（后续转为 WindowStep）
     inferred_window_metrics: list[InferredWindowMetric] = []
+    # 推断的窗口后过滤（后续转为 WindowStep 后的 FilterStep）
+    inferred_post_window_filters: list[PostWindowFilterDecl] = []
     # 推断的计算指标（聚合后表达式计算）
     inferred_computed_metrics: list[InferredComputedMetric] = []
     # 推断的维度映射——输出列名 → 源列名 + 源表（多表/多跳链消歧义用）
@@ -934,6 +948,7 @@ class ParsedDeveloperSpec(StrictModel):
     output_spec: OutputSpecDecl
     compute_steps: list[ComputeStep] | None = None  # 分步计算声明——None 时走原路径
     inferred_window_metrics: list[InferredWindowMetric] = []  # SpecEnricher 推断的窗口指标
+    inferred_post_window_filters: list[PostWindowFilterDecl] = []  # 窗口输出上的封闭过滤
     # ── v4-light 最终版: 标签表支持 ──
     dataset_type: DatasetType = DatasetType.UNSPECIFIED  # 数据产品类型——Label Extractor 推断
     # 已提升的 CASE WHEN 标签规则——仅 LABEL_TABLE 时非空；Proposal 仅保存在 Artifact

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from tianshu_datadev.planning.models import ColumnRef
 from tianshu_datadev.planning.relationship_hypothesis import RelationshipEvidence
 from tianshu_datadev.planning.sql_build_plan import (
     AggregateStep,
@@ -68,6 +69,7 @@ class DataTransformContractExtractor:
         self,
         plan: SqlBuildPlan,
         evidence_map: dict[str, RelationshipEvidence] | None = None,
+        output_grain: list[str] | None = None,
     ) -> DataTransformContractLite:
         """从 SqlBuildPlan 确定性抽取 DataTransformContract-lite。
 
@@ -76,6 +78,7 @@ class DataTransformContractExtractor:
             evidence_map: Join candidate_id → RelationshipEvidence 的映射，
                          用于填充 join_relationships 中的 evidence_chain。
                          若为 None，Join 的 evidence_chain 为空。
+            output_grain: DeveloperSpec 已声明的输出粒度；未提供时回退聚合分组键。
 
         Returns:
             DataTransformContractLite——不包含 SQL 代码字段
@@ -96,11 +99,15 @@ class DataTransformContractExtractor:
         sort_spec: list[ContractSort] | None = None
         limit_spec: ContractLimit | None = None
         business_keys: list[str] = []
+        # ── Phase 3B 字段——lite 路径也需要提取以通过 adapt_lite_to_v1 传递 ──
+        case_when_labels: list[CaseWhenLabelSpec] = []
+        window_specs: list[WindowSpecSummary] = []
 
         # 用于跟踪已添加的表（去重）
         seen_tables: set[str] = set()
         # 用于跟踪已添加的列（去重——按 (table_ref, normalized_name) 去重）
         seen_columns: set[tuple[str, str]] = set()
+        window_seen = False
 
         for step in plan.steps:
             if isinstance(step, ScanStep):
@@ -109,7 +116,10 @@ class DataTransformContractExtractor:
                 )
 
             elif isinstance(step, FilterStep):
-                filters.append(self._extract_filter(step))
+                filters.append(self._extract_filter(
+                    step,
+                    phase="post_window" if window_seen else "pre_transform",
+                ))
 
             elif isinstance(step, JoinStep):
                 join_rel = self._extract_join(step, evidence_map)
@@ -131,6 +141,30 @@ class DataTransformContractExtractor:
             elif isinstance(step, LimitStep):
                 limit_spec = self._extract_limit(step)
 
+            elif isinstance(step, CaseWhenStep):
+                # Phase 3B：lite 路径必须提取 CASE WHEN，否则
+                # adapt_lite_to_v1 会硬编码 case_when_labels=[] 静默丢弃。
+                case_when_labels.extend(
+                    self._extract_case_when_v1(step, "main")
+                )
+
+            elif isinstance(step, WindowStep):
+                # Phase 3B：lite 路径必须提取 Window 规格
+                window_specs.extend(
+                    self._extract_window_v1(step, "main")
+                )
+                window_seen = True
+
+        # ── 将 CASE WHEN / Window 输出列合并到 output_columns ──
+        # ProjectStep 仅包含基础 SELECT 列，不包含 CaseWhenStep/WindowStep
+        # 生成的派生列。SQL 编译器会合并它们（compiler.py:639），
+        # 但 Contract 提取器必须显式追加，否则 PySpark select() 缺列。
+        output_columns = self._merge_derived_output_columns(
+            output_columns, case_when_labels, window_specs,
+        )
+        if aggregations:
+            output_columns = self._clear_post_aggregate_qualifiers(output_columns)
+
         # 生成确定性 contract ID
         contract_id = DataTransformContractLite.generate_contract_id(plan_hash)
 
@@ -146,14 +180,76 @@ class DataTransformContractExtractor:
             aggregations=aggregations,
             grouping_keys=grouping_keys,
             output_columns=output_columns,
-            output_grain=grouping_keys,  # 输出粒度 = 分组键
+            output_grain=(
+                list(output_grain) if output_grain is not None else grouping_keys
+            ),
             sort_spec=sort_spec,
             limit_spec=limit_spec,
             business_keys=business_keys,
             semantic_policy_ref="",
+            case_when_labels=case_when_labels,
+            window_specs=window_specs,
         )
 
         return contract
+
+    # ── 派生列合并辅助 ──
+
+    @staticmethod
+    def _merge_derived_output_columns(
+        output_columns: list[ContractOutputColumn],
+        case_when_labels: list[CaseWhenLabelSpec],
+        window_specs: list[WindowSpecSummary],
+    ) -> list[ContractOutputColumn]:
+        """将 CASE WHEN / Window 派生列追加到 output_columns。
+
+        ProjectStep 仅包含基础 SELECT 列——CaseWhenStep 和 WindowStep
+        的输出列不会出现在 ProjectStep.columns 中。SQL 编译器在末尾合并
+        它们（compiler.py:639），但 Contract 提取器必须显式追加，
+        否则 PySpark 的 .select() 会丢失这些列。
+
+        去重逻辑：按 column_name 去重，保留已存在的列（ProjectStep 优先）。
+
+        Args:
+            output_columns: 从 ProjectStep 提取的输出列
+            case_when_labels: 从所有 CaseWhenStep 提取的标签规格
+            window_specs: 从所有 WindowStep 提取的窗口规格
+
+        Returns:
+            合并后的 output_columns（包含派生列）
+        """
+        existing_names = {oc.column_name for oc in output_columns}
+        result = list(output_columns)
+
+        for cw in case_when_labels:
+            if cw.output_alias and cw.output_alias not in existing_names:
+                result.append(ContractOutputColumn(
+                    column_name=cw.output_alias,
+                    alias=cw.output_alias,
+                    data_type="unknown",
+                ))
+                existing_names.add(cw.output_alias)
+
+        for ws in window_specs:
+            if ws.alias and ws.alias not in existing_names:
+                result.append(ContractOutputColumn(
+                    column_name=ws.alias,
+                    alias=ws.alias,
+                    data_type="unknown",
+                ))
+                existing_names.add(ws.alias)
+
+        return result
+
+    @staticmethod
+    def _clear_post_aggregate_qualifiers(
+        output_columns: list[ContractOutputColumn],
+    ) -> list[ContractOutputColumn]:
+        """聚合结果列已脱离源表命名空间，最终投影不得保留表限定符。"""
+        return [
+            column.model_copy(update={"source_table_ref": ""})
+            for column in output_columns
+        ]
 
     # ── Step 抽取辅助 ──
 
@@ -194,7 +290,10 @@ class DataTransformContractExtractor:
                 )
 
     @staticmethod
-    def _extract_filter(step: FilterStep) -> ContractPredicate:
+    def _extract_filter(
+        step: FilterStep,
+        phase: str = "pre_transform",
+    ) -> ContractPredicate:
         """从 FilterStep 提取结构化过滤条件——不含自由文本表达式。
 
         人类可读的表达式渲染由 review.md 层负责，
@@ -209,12 +308,14 @@ class DataTransformContractExtractor:
             operator=op_str,
             left=left_str,
             right=right_str,
+            phase=phase,
         )
 
     @staticmethod
     def _extract_join(
         step: JoinStep,
         evidence_map: dict[str, RelationshipEvidence],
+        temp_column_lineage: dict[tuple[str, str], ColumnRef] | None = None,
     ) -> ContractJoin | None:
         """从 JoinStep 提取 Join 关系（含证据链）。"""
         if not step.join_keys:
@@ -222,6 +323,14 @@ class DataTransformContractExtractor:
 
         # 取第一对 join key（Phase 1B 仅支持单 key Join）
         left_key, right_key = step.join_keys[0]
+        left_key = DataTransformContractExtractor._resolve_column_lineage(
+            left_key,
+            temp_column_lineage or {},
+        )
+        right_key = DataTransformContractExtractor._resolve_column_lineage(
+            right_key,
+            temp_column_lineage or {},
+        )
 
         # 构建 evidence_chain
         evidence_chain: dict = {}
@@ -281,23 +390,75 @@ class DataTransformContractExtractor:
         return aggs, groups, biz_keys
 
     @staticmethod
-    def _extract_project(step: ProjectStep) -> list[ContractOutputColumn]:
+    def _extract_project(
+        step: ProjectStep,
+        temp_column_lineage: dict[tuple[str, str], ColumnRef] | None = None,
+    ) -> list[ContractOutputColumn]:
         """从 ProjectStep 提取输出列。"""
         cols: list[ContractOutputColumn] = []
         for ae in step.columns:
-            col_name = (
-                ae.expression.column_name
-                if hasattr(ae.expression, "column_name")
-                else str(ae.expression)
-            )
+            expression = ae.expression
+            if isinstance(expression, ColumnRef):
+                expression = DataTransformContractExtractor._resolve_column_lineage(
+                    expression,
+                    temp_column_lineage or {},
+                )
+                col_name = expression.column_name
+                source_table_ref = expression.table_ref
+            else:
+                col_name = str(expression)
+                source_table_ref = ""
             cols.append(
                 ContractOutputColumn(
                     column_name=col_name,
                     alias=ae.alias,
                     data_type="unknown",
+                    source_table_ref=source_table_ref,
                 )
             )
         return cols
+
+    @staticmethod
+    def _resolve_column_lineage(
+        column: ColumnRef,
+        temp_column_lineage: dict[tuple[str, str], ColumnRef],
+    ) -> ColumnRef:
+        """沿结构化 ProjectStep 血缘解析临时表列，禁止读取 SQL 文本。"""
+        current = column
+        visiting: set[tuple[str, str]] = set()
+        while current.table_ref.startswith("_temp_"):
+            key = (current.table_ref, current.column_name)
+            if key in visiting:
+                raise ValueError(f"临时表列血缘存在循环：{key}")
+            visiting.add(key)
+            upstream = temp_column_lineage.get(key)
+            if upstream is None:
+                break
+            current = upstream
+        return current
+
+    @staticmethod
+    def _record_temp_column_lineage(
+        temp_table: str,
+        plan: SqlBuildPlan,
+        temp_column_lineage: dict[tuple[str, str], ColumnRef],
+    ) -> None:
+        """记录生产语句 ProjectStep 输出列到原始 ColumnRef 的映射。"""
+        project_steps = [
+            step for step in plan.steps if isinstance(step, ProjectStep)
+        ]
+        if not project_steps:
+            return
+        for alias_expr in project_steps[-1].columns:
+            if not isinstance(alias_expr.expression, ColumnRef):
+                continue
+            output_name = alias_expr.alias or alias_expr.expression.column_name
+            temp_column_lineage[(temp_table, output_name)] = (
+                DataTransformContractExtractor._resolve_column_lineage(
+                    alias_expr.expression,
+                    temp_column_lineage,
+                )
+            )
 
     @staticmethod
     def _extract_sort(step: SortStep) -> list[ContractSort]:
@@ -355,6 +516,7 @@ class DataTransformContractExtractor:
         sql_program: SqlProgram,
         write_plan: FinalWritePlan | None = None,
         evidence_map: dict[str, RelationshipEvidence] | None = None,
+        output_grain: list[str] | None = None,
     ) -> DataTransformContractV1:
         """从 SqlProgram 确定性抽取 DataTransformContract v1。
 
@@ -367,6 +529,7 @@ class DataTransformContractExtractor:
             evidence_map: Join candidate_id → RelationshipEvidence 的映射，
                          用于填充 join_relationships 中的 evidence_chain。
                          若为 None，Join 的 evidence_chain 为空。
+            output_grain: DeveloperSpec 已声明的输出粒度；未提供时回退聚合分组键。
 
         Returns:
             DataTransformContractV1——不包含 SQL 代码字段
@@ -395,6 +558,7 @@ class DataTransformContractExtractor:
 
         seen_tables: set[str] = set()
         seen_columns: set[tuple[str, str]] = set()
+        temp_column_lineage: dict[tuple[str, str], ColumnRef] = {}
 
         # ── v1 新增字段收集 ──
         step_dag: dict[str, list[str]] = {}
@@ -407,6 +571,7 @@ class DataTransformContractExtractor:
         for stmt in sql_program.statements:
             plan = stmt.plan
             sid = stmt.statement_id
+            window_seen = False
 
             # step_dag 条目
             step_dag[sid] = list(stmt.depends_on)
@@ -421,15 +586,24 @@ class DataTransformContractExtractor:
                         step, input_tables, input_columns, seen_tables, seen_columns,
                     )
                 elif isinstance(step, FilterStep):
-                    filters.append(self._extract_filter(step))
+                    filters.append(self._extract_filter(
+                        step,
+                        phase="post_window" if window_seen else "pre_transform",
+                    ))
                 elif isinstance(step, JoinStep):
-                    # _temp_* 表之间的 Join 是 DAG 内部管道——不进入 Contract
+                    # 两个临时关系之间的 Join 属于 DAG 内部编排；临时结果与外部表
+                    # 的 Join 仍是业务语义，必须还原结构化列血缘后进入 Contract。
                     if step.join_keys and any(
-                        k[0].table_ref.startswith("_temp_") or k[1].table_ref.startswith("_temp_")
+                        k[0].table_ref.startswith("_temp_")
+                        and k[1].table_ref.startswith("_temp_")
                         for k in step.join_keys
                     ):
                         continue
-                    join_rel = self._extract_join(step, evidence_map)
+                    join_rel = self._extract_join(
+                        step,
+                        evidence_map,
+                        temp_column_lineage,
+                    )
                     if join_rel:
                         join_relationships.append(join_rel)
                 elif isinstance(step, AggregateStep):
@@ -438,7 +612,10 @@ class DataTransformContractExtractor:
                     grouping_keys.extend(groups)
                     business_keys.extend(biz_keys)
                 elif isinstance(step, ProjectStep):
-                    output_columns = self._extract_project(step)
+                    output_columns = self._extract_project(
+                        step,
+                        temp_column_lineage,
+                    )
                 elif isinstance(step, SortStep):
                     sort_spec = self._extract_sort(step)
                 elif isinstance(step, LimitStep):
@@ -451,6 +628,23 @@ class DataTransformContractExtractor:
                     window_specs.extend(
                         self._extract_window_v1(step, sid)
                     )
+                    window_seen = True
+
+            if stmt.produces:
+                self._record_temp_column_lineage(
+                    stmt.produces,
+                    plan,
+                    temp_column_lineage,
+                )
+
+        # ── 将 CASE WHEN / Window 派生列合并到 output_columns ──
+        # 与 lite 路径相同：ProjectStep 不含 CaseWhenStep/WindowStep 生成的派生列，
+        # SQL 编译器合并它们，Contract 提取器也必须显式追加。
+        output_columns = self._merge_derived_output_columns(
+            output_columns, case_when_labels, window_specs,
+        )
+        if aggregations:
+            output_columns = self._clear_post_aggregate_qualifiers(output_columns)
 
         # ── temp_tables 序列化 ──
         temp_tables: list[dict] = [
@@ -472,7 +666,9 @@ class DataTransformContractExtractor:
             aggregations=aggregations,
             grouping_keys=grouping_keys,
             output_columns=output_columns,
-            output_grain=grouping_keys,
+            output_grain=(
+                list(output_grain) if output_grain is not None else grouping_keys
+            ),
             sort_spec=sort_spec,
             limit_spec=limit_spec,
             business_keys=business_keys,
@@ -675,9 +871,13 @@ class DataTransformContractExtractor:
                 for cr in wexpr.partition_by
             ]
 
-            # 排序键——归一化名（不含方向）
+            # 排序键必须保留方向，否则 SQL DESC 会在 Spark 中退化为 ASC。
             order_by = [
-                s.column if hasattr(s, "column") else str(s)
+                (
+                    f"{s.column} "
+                    f"{s.direction.value if hasattr(s.direction, 'value') else s.direction}"
+                )
+                if hasattr(s, "column") else str(s)
                 for s in wexpr.order_by
             ]
 

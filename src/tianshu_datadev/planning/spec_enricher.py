@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from tianshu_datadev.developer_spec.models import (
     AggregationType,
+    CompareOp,
     ComputeStep,
     DimensionDecl,
     EnrichedSpec,
@@ -35,7 +36,9 @@ from tianshu_datadev.developer_spec.models import (
     LegacyDescriptionDSLWarning,
     MetricDecl,
     MetricFilterDecl,
+    OutputColumnDecl,
     ParsedDeveloperSpec,
+    PostWindowFilterDecl,
     SourceManifest,
 )
 from tianshu_datadev.sql.expression_guard import validate_input_expression
@@ -78,13 +81,6 @@ _RATIO_PATTERNS: list[re.Pattern] = [
     re.compile(r"(率|比|占比|比例|百分比|覆盖率|渗透率|转化率|合格率)"),
 ]
 
-# 窗口/排名关键词
-_WINDOW_PATTERNS: list[re.Pattern] = [
-    re.compile(r"(排名|排行|名次|前\d+|TOP\s*\d+|top\s*\d+)"),
-    re.compile(r"(累计|累加|累积)"),
-    re.compile(r"(同比|环比|去年同期|上月同期)"),
-]
-
 # ════════════════════════════════════════════
 # Description 解析——仅处理机械 SQL 签名，不碰自然语言
 # ════════════════════════════════════════════
@@ -116,6 +112,13 @@ _DESC_WINDOW_RE = re.compile(
 # 比率/表达式模式：identifier / identifier
 _DESC_RATIO_RE = re.compile(
     r"\b(\w+)\s*/\s*(\w+)\b",
+)
+
+_WINDOW_ALIAS_RE = re.compile(r"^\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+_POST_WINDOW_FILTER_RE = re.compile(
+    r"\b(?:WHERE|QUALIFY)\s+([A-Za-z_][A-Za-z0-9_]*)\s*"
+    r"(<=|>=|!=|=|<|>)\s*(-?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
 )
 
 # 不支持函数——返回 None，标记低置信度
@@ -274,6 +277,57 @@ def _parse_description_to_window(col) -> InferredWindowMetric | None:
         alias=col.name,
         confidence="high",
     )
+
+
+def _parse_business_description_windows(
+    spec: ParsedDeveloperSpec,
+) -> tuple[list[InferredWindowMetric], list[PostWindowFilterDecl]]:
+    """机械提取正文中明确写出的窗口表达式及其外层比较条件。
+
+    这里只识别封闭的函数、标识符、比较符和数值，不接受自由 SQL。
+    自然语言需求由真实 SpecEnricher Agent 输出同一结构。
+    """
+    output_names = {col.name for col in spec.output_spec.columns}
+    windows: list[InferredWindowMetric] = []
+
+    for match in _DESC_WINDOW_RE.finditer(spec.description):
+        alias_match = _WINDOW_ALIAS_RE.match(spec.description[match.end():])
+        if not alias_match:
+            continue
+        alias = alias_match.group(1)
+        if alias not in output_names:
+            continue
+
+        function = match.group(1).upper()
+        function = _WINDOW_FUNCTION_ALIASES.get(function, function)
+        input_column = match.group(2).strip() if match.group(2) else ""
+        partition_raw = match.group(3).strip() if match.group(3) else ""
+        order_raw = match.group(4).strip() if match.group(4) else ""
+        windows.append(InferredWindowMetric(
+            metric_name=alias,
+            window_function=function,
+            input_column=input_column,
+            partition_by=[p.strip() for p in partition_raw.split(",") if p.strip()],
+            order_by=[o.strip() for o in order_raw.split(",") if o.strip()],
+            alias=alias,
+            confidence="high",
+        ))
+
+    window_aliases = {window.alias for window in windows}
+    filters: list[PostWindowFilterDecl] = []
+    for match in _POST_WINDOW_FILTER_RE.finditer(spec.description):
+        column, raw_operator, raw_value = match.groups()
+        if column not in window_aliases:
+            continue
+        value: int | float
+        value = float(raw_value) if "." in raw_value else int(raw_value)
+        filters.append(PostWindowFilterDecl(
+            column=column,
+            operator=CompareOp(raw_operator),
+            value=value,
+        ))
+
+    return windows, filters
 
 
 def _find_matching_columns(
@@ -709,7 +763,8 @@ class FakeSpecEnricher:
     def _infer_dimensions(
         self,
         spec: ParsedDeveloperSpec,
-        manifest: SourceManifest,
+        manifest: SourceManifest | None,
+        excluded_output_names: set[str] | None = None,
     ) -> list[DimensionDecl]:
         """推断输出列到源列的维度映射。
 
@@ -751,15 +806,26 @@ class FakeSpecEnricher:
                 join_keys[join.right_table] = join.left_key
 
         dimensions: list[DimensionDecl] = []
-        grain_set: set[str] = set(spec.output_spec.grain)
+        declared_dimensions = {d.dimension_name for d in spec.dimensions}
+        excluded = excluded_output_names or set()
 
         for col in spec.output_spec.columns:
             col_name = col.name
-            # 跳过粒度列——它们是 GROUP BY 键，不是维度映射目标
-            if col_name in grain_set:
+            if col_name in declared_dimensions or col_name in excluded:
                 continue
-            # 精确匹配——无需维度声明
+
+            # 精确源列也是维度候选。若它不是指标/窗口输出，就必须进入
+            # dimensions，AggregateStep 才会把它纳入 GROUP BY。
             if col_name in all_source_cols:
+                exact_candidates = all_source_cols[col_name]
+                exact_tables = {item[0] for item in exact_candidates}
+                if len(exact_tables) == 1:
+                    alias, src_col, _ = exact_candidates[0]
+                    dimensions.append(DimensionDecl(
+                        dimension_name=col_name,
+                        column_ref=src_col,
+                        source_table=alias,
+                    ))
                 continue
 
             # ── 子串匹配：源列名出现在输出列名中 ──
@@ -863,6 +929,22 @@ class FakeSpecEnricher:
         inferred_window: list[InferredWindowMetric] = []
         inferred_computed: list[InferredComputedMetric] = []
 
+        # 模板无需逐列声明语义：明确写在业务正文中的窗口表达式可确定性提取；
+        # 自然语言窗口需求由生产环境的 SpecEnricher Agent 输出相同结构。
+        for col in spec.output_spec.columns:
+            window = col.window_hint
+            if window is None and col.description:
+                window = _parse_description_to_window(col)
+            if window is not None:
+                inferred_window.append(window)
+        business_windows, post_window_filters = \
+            _parse_business_description_windows(spec)
+        known_window_aliases = {window.alias for window in inferred_window}
+        for window in business_windows:
+            if window.alias not in known_window_aliases:
+                inferred_window.append(window)
+                known_window_aliases.add(window.alias)
+
         # 收集已声明的指标 alias 和使用的列
         declared_aliases: set[str] = {m.alias for m in spec.metrics}
         declared_columns: set[str] = set()
@@ -875,15 +957,28 @@ class FakeSpecEnricher:
         # 但结构化 hint（metric_hint/computed_hint/window_hint）仍需处理
         metrics_explicitly_empty = len(spec.metrics) == 0
 
+        # 先识别维度，再判断剩余输出是否为指标。源表中存在的普通字段
+        # 不能因为未写入 dimensions 就被默认推断成 SUM。
+        semantic_aliases = declared_aliases | known_window_aliases | {
+            col.name for col in spec.output_spec.columns
+            if col.metric_hint or col.computed_hint
+        }
+        inferred_dimensions = self._infer_dimensions(
+            spec, manifest, excluded_output_names=semantic_aliases,
+        )
+        dimension_names = {d.dimension_name for d in spec.dimensions}
+        dimension_names.update(d.dimension_name for d in inferred_dimensions)
+
         # 收集 output_columns 中的指标列（非维度列、非 grain 列）
         grain_set: set[str] = set(spec.output_spec.grain)
         output_metric_cols: list[OutputColumnDecl] = [
             c for c in spec.output_spec.columns
             if c.name not in grain_set and c.name not in declared_aliases
+            and c.name not in dimension_names
+            and c.name not in known_window_aliases
         ]
 
         # 对每个未声明的输出指标列，尝试推断
-        from tianshu_datadev.developer_spec.models import OutputColumnDecl
         for col in output_metric_cols:
             col_name = col.name
 
@@ -926,6 +1021,11 @@ class FakeSpecEnricher:
 
             input_col = matched_cols[0] if matched_cols else None
 
+            # COUNT(*) 是唯一允许无输入列的聚合。其他聚合缺少字段时保持未解析，
+            # 交给 Agent/HumanReview，而不是制造 SUM(*) 之类的无效计划。
+            if input_col is None and agg_type != AggregationType.COUNT:
+                continue
+
             # 尝试推断过滤条件
             filter_cond = _infer_filter_condition(spec.description)
 
@@ -967,22 +1067,6 @@ class FakeSpecEnricher:
                     )
                     break
 
-        # 检测窗口/排名类指标——优先使用结构化 hint
-        for col in output_metric_cols:
-            # 优先使用结构化 hint（推荐方式）
-            if col.window_hint:
-                inferred_window.append(col.window_hint)
-                continue
-            # 次优：从旧 description DSL 解析（兼容模式）
-            if col.description:
-                window = _parse_description_to_window(col)
-                if window:
-                    inferred_window.append(window)
-        # 兜底：关键词匹配
-        for pattern in _WINDOW_PATTERNS:
-            if pattern.search(spec.description):
-                break
-
         # ── Phase 5：跨粒度依赖检测 ──
         cross_grain_steps, cross_grain_joins = \
             self._detect_cross_grain_dependency(spec, inferred_computed, manifest)
@@ -1014,13 +1098,11 @@ class FakeSpecEnricher:
                 j.model_dump() for j in all_generated_joins
             ]
 
-        # ── 推断维度映射 ──
-        inferred_dimensions = self._infer_dimensions(spec, manifest)
-
         return EnrichedSpec(
             original_spec=spec,
             inferred_metrics=inferred_metrics,
             inferred_window_metrics=inferred_window,
+            inferred_post_window_filters=post_window_filters,
             inferred_computed_metrics=inferred_computed,
             inferred_dimensions=inferred_dimensions,
             enrichment_metadata=metadata,
@@ -1031,8 +1113,9 @@ class FakeSpecEnricher:
 # LLM Prompt 模板——Phase 4 启用
 # ════════════════════════════════════════════
 
-_METRIC_INFERENCE_SYSTEM_PROMPT = """你是数据仓库指标推断专家。你的任务是阅读业务描述，
-推断程序员可能需要的聚合指标，并输出严格的 JSON 结构。
+_METRIC_INFERENCE_SYSTEM_PROMPT = """你是数据开发规格分析 Agent。你的任务是阅读程序员提供的
+字段、业务描述和源表 Schema，将输出列分类为维度、聚合指标、计算指标或窗口指标，
+并输出严格的 JSON 结构。程序员不需要为每个输出列重复填写结构化提示。
 
 ════════════════════════════════════
 硬约束（违反任何一条都是错误）
@@ -1050,7 +1133,7 @@ H3. filter.column 必须存在于同一张源表中，禁止跨表引用过滤�
 
 H4. 不要推断 JOIN 关系——这不是你的职责。
     JOIN 由 RelationshipPlanner 独立处理，你的推断会被独立验证。
-    你只需要关注单表的聚合指标。
+    你可以分类多表输出字段，但不能自行创建或修改表间关系。
 
 H5. 不能修改 [Existing Metrics] 中程序员已手写的条目。
     程序员显式声明 > LLM 推断。如果已有手写指标覆盖了某个输出列，
@@ -1066,6 +1149,12 @@ H7. 不确定时设置 confidence=low，不要猜测。
 
 H8. 你只接收 schema 信息（列名 + 类型 + 描述），不接收数据样本。
     不要要求或期望看到实际数据值。
+
+H9. 普通源字段应输出为 inferred_dimensions，禁止把 varchar 等维度列推断成 SUM。
+    非 COUNT 聚合必须提供 input_column 或受控 input_expression。
+
+H10. 窗口结果上的 TopN/排名过滤只能输出 inferred_post_window_filters，
+     column 必须引用本次 inferred_window_metrics 的 alias，禁止输出 SQL 片段。
 
 ════════════════════════════════════
 推断规则
@@ -1115,6 +1204,16 @@ H8. 你只接收 schema 信息（列名 + 类型 + 描述），不接收数据�
       "alias": "输出别名",
       "confidence": "high|medium|low",
       "reasoning": "推断依据"
+    }
+  ],
+  "inferred_post_window_filters": [
+    {"column": "窗口输出 alias", "operator": "<=|<|=|!=|>|>=", "value": 10}
+  ],
+  "inferred_dimensions": [
+    {
+      "dimension_name": "输出列名",
+      "column_ref": "Table Schemas 中的源列名",
+      "source_table": "源表 table_ref"
     }
   ],
   "inferred_computed_metrics": [
@@ -1245,8 +1344,40 @@ _METRIC_JSON_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "inferred_dimensions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "dimension_name": {"type": "string"},
+                    "column_ref": {"type": "string"},
+                    "source_table": {"type": ["string", "null"]},
+                },
+                "required": ["dimension_name", "column_ref", "source_table"],
+                "additionalProperties": False,
+            },
+        },
+        "inferred_post_window_filters": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "column": {"type": "string"},
+                    "operator": {
+                        "type": "string",
+                        "enum": ["=", "!=", ">", ">=", "<", "<="],
+                    },
+                    "value": {"type": "number"},
+                },
+                "required": ["column", "operator", "value"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["inferred_metrics", "inferred_window_metrics", "inferred_computed_metrics"],
+    "required": [
+        "inferred_metrics", "inferred_window_metrics", "inferred_computed_metrics",
+        "inferred_dimensions", "inferred_post_window_filters",
+    ],
     "additionalProperties": False,
 }
 
@@ -1356,8 +1487,25 @@ class SpecEnricher:
             for jd in generated_joins_data:
                 combined_joins.append(JoinDecl(**jd))
 
-        # ── 合并窗口指标 ──
-        new_window_metrics = list(enriched.inferred_window_metrics)
+        # ── 合并窗口指标与窗口后过滤 ──
+        existing_window_aliases = {m.alias for m in spec.inferred_window_metrics}
+        new_window_metrics = [
+            m for m in enriched.inferred_window_metrics
+            if m.alias not in existing_window_aliases
+        ]
+        combined_window_metrics = list(spec.inferred_window_metrics) + new_window_metrics
+
+        existing_post_filter_keys = {
+            (f.column, f.operator, f.value)
+            for f in spec.inferred_post_window_filters
+        }
+        new_post_window_filters = [
+            f for f in enriched.inferred_post_window_filters
+            if (f.column, f.operator, f.value) not in existing_post_filter_keys
+        ]
+        combined_post_window_filters = (
+            list(spec.inferred_post_window_filters) + new_post_window_filters
+        )
 
         # ── 合并推断的维度映射 ──
         # 仅追加 spec 中未显式声明的维度（程序员手写优先级最高）
@@ -1371,7 +1519,7 @@ class SpecEnricher:
         # 仅当有实际变更时才更新
         needs_update = bool(
             new_metrics or generated_steps_data or generated_joins_data
-            or new_window_metrics or new_dimensions
+            or new_window_metrics or new_post_window_filters or new_dimensions
         )
         if not needs_update:
             return spec
@@ -1382,7 +1530,9 @@ class SpecEnricher:
         if combined_joins:
             update_dict["joins"] = combined_joins
         if new_window_metrics:
-            update_dict["inferred_window_metrics"] = new_window_metrics
+            update_dict["inferred_window_metrics"] = combined_window_metrics
+        if new_post_window_filters:
+            update_dict["inferred_post_window_filters"] = combined_post_window_filters
         if new_dimensions:
             update_dict["dimensions"] = combined_dimensions
 
@@ -1398,7 +1548,20 @@ class SpecEnricher:
         tables_info: list[dict] = []
         for table in manifest.tables:
             cols_info: list[dict] = []
+            declared_input_columns = {
+                column.column_name
+                for input_table in spec.input_tables
+                if input_table.table_alias == table.table_ref
+                for group in (
+                    input_table.columns,
+                    input_table.key_columns,
+                    input_table.business_columns,
+                )
+                for column in group
+            }
             for col in table.columns:
+                if declared_input_columns and col.column_name not in declared_input_columns:
+                    continue
                 cols_info.append({
                     "column_name": col.column_name,
                     "data_type": col.data_type,
@@ -1445,7 +1608,13 @@ class SpecEnricher:
             EnrichedSpec
         """
         context = self._build_context(spec, manifest)
-        raw: dict = {"inferred_metrics": [], "inferred_window_metrics": [], "inferred_computed_metrics": []}
+        raw: dict = {
+            "inferred_metrics": [],
+            "inferred_window_metrics": [],
+            "inferred_computed_metrics": [],
+            "inferred_dimensions": [],
+            "inferred_post_window_filters": [],
+        }
 
         try:
             raw = self._adapter.invoke(
@@ -1484,6 +1653,8 @@ class SpecEnricher:
         inferred_metrics: list[MetricDecl] = []
         inferred_window: list[InferredWindowMetric] = []
         inferred_computed: list[InferredComputedMetric] = []
+        inferred_dimensions: list[DimensionDecl] = []
+        inferred_post_window_filters: list[PostWindowFilterDecl] = []
 
         # 解析指标
         for item in raw.get("inferred_metrics", []):
@@ -1515,11 +1686,24 @@ class SpecEnricher:
                     )
                     raw_input_expr = None  # 校验失败时静默丢弃表达式
 
+            input_column = item.get("input_column")
+            if (
+                agg != AggregationType.COUNT
+                and input_column is None
+                and raw_input_expr is None
+            ):
+                logger.warning(
+                    "LLM 产出聚合 %s(%s) 缺少输入列，已拒绝",
+                    agg.value,
+                    item.get("alias", ""),
+                )
+                continue
+
             inferred_metrics.append(
                 MetricDecl(
                     metric_name=item.get("metric_name", ""),
                     aggregation=agg,
-                    input_column=item.get("input_column"),
+                    input_column=input_column,
                     alias=item.get("alias", ""),
                     filter=filter_decl,
                     input_expression=raw_input_expr,
@@ -1540,13 +1724,61 @@ class SpecEnricher:
                 InferredWindowMetric(
                     metric_name=item.get("metric_name", ""),
                     window_function=wf,
-                    input_column=item.get("input_column", ""),
+                    input_column=item.get("input_column") or "",
                     partition_by=item.get("partition_by", []),
                     order_by=item.get("order_by", []),
                     alias=item.get("alias", ""),
                     confidence=item.get("confidence", "medium"),
                 )
             )
+
+        # 解析维度，并限定为输出列与已声明源字段的交集
+        output_names = {col.name for col in spec.output_spec.columns}
+        source_columns: dict[str, set[str]] = {}
+        for table in spec.input_tables:
+            columns = {
+                col.column_name
+                for group in (table.columns, table.key_columns, table.business_columns)
+                for col in group
+            }
+            source_columns[table.table_alias] = columns
+
+        for item in raw.get("inferred_dimensions", []):
+            dimension_name = item.get("dimension_name", "")
+            column_ref = item.get("column_ref", "")
+            source_table = item.get("source_table")
+            if dimension_name not in output_names:
+                continue
+            if source_table:
+                if column_ref not in source_columns.get(source_table, set()):
+                    continue
+            else:
+                candidates = [
+                    alias for alias, columns in source_columns.items()
+                    if column_ref in columns
+                ]
+                if len(candidates) != 1:
+                    continue
+                source_table = candidates[0]
+            inferred_dimensions.append(DimensionDecl(
+                dimension_name=dimension_name,
+                column_ref=column_ref,
+                source_table=source_table,
+            ))
+
+        # 窗口后过滤只能引用本次已验证的窗口 alias
+        window_aliases = {window.alias for window in inferred_window}
+        for item in raw.get("inferred_post_window_filters", []):
+            if item.get("column") not in window_aliases:
+                continue
+            try:
+                inferred_post_window_filters.append(PostWindowFilterDecl(
+                    column=item["column"],
+                    operator=CompareOp(item["operator"]),
+                    value=item["value"],
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue
 
         # 解析计算指标
         for item in raw.get("inferred_computed_metrics", []):
@@ -1576,11 +1808,39 @@ class SpecEnricher:
                 )
             )
 
+        # Agent 可以解释业务语义，但不应独占显然的字段事实判断。
+        # 输出列与唯一源字段同名时，确定性补为维度，避免模型漏项导致
+        # 聚合查询丢失 GROUP BY。指标、窗口和计算列始终优先排除。
+        semantic_aliases = {
+            metric.alias for metric in spec.metrics
+        } | {
+            metric.alias for metric in inferred_metrics
+        } | {
+            metric.alias for metric in inferred_window
+        } | {
+            metric.alias for metric in inferred_computed
+        }
+        existing_dimension_names = {
+            dimension.dimension_name for dimension in spec.dimensions
+        } | {
+            dimension.dimension_name for dimension in inferred_dimensions
+        }
+        for dimension in self._fake._infer_dimensions(
+            spec,
+            None,
+            excluded_output_names=semantic_aliases,
+        ):
+            if dimension.dimension_name not in existing_dimension_names:
+                inferred_dimensions.append(dimension)
+                existing_dimension_names.add(dimension.dimension_name)
+
         return EnrichedSpec(
             original_spec=spec,
             inferred_metrics=inferred_metrics,
             inferred_window_metrics=inferred_window,
+            inferred_post_window_filters=inferred_post_window_filters,
             inferred_computed_metrics=inferred_computed,
+            inferred_dimensions=inferred_dimensions,
             enrichment_metadata={
                 "source": "SpecEnricher",
                 "method": "llm",

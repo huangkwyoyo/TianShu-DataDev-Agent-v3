@@ -21,7 +21,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
+import tempfile
 from enum import Enum
+from pathlib import Path
 from typing import Literal
 
 import pyarrow as pa
@@ -117,6 +120,9 @@ class SnapshotManifest(StrictModel):
 # 快照目录内的 inputs 索引侧车文件名——executor prologue 据此按别名装载 inputs
 _INPUTS_INDEX_FILENAME = "_inputs_index.json"
 
+# 必须不高于 Executor 的完整结果上限，否则合法快照会在 execute 阶段必然阻断。
+SNAPSHOT_DEFAULT_ROW_LIMIT = 10_000
+
 
 # ════════════════════════════════════════════
 # SnapshotBuilder
@@ -141,6 +147,10 @@ class SnapshotSourceNotAllowlistedError(Exception):
         )
         self.source_name = source_name
         self.provider_id = provider_id
+
+
+class SnapshotMaterializationError(Exception):
+    """仓库快照无法在资源和关系一致性边界内生成。"""
 
 
 class SnapshotBuilder:
@@ -275,6 +285,313 @@ class SnapshotBuilder:
         )
 
         return manifest
+
+    def materialize_warehouse_tables(
+        self,
+        *,
+        contract_hash: str,
+        source_tables: list[str],
+        duckdb_path: str,
+        joins: list[dict[str, str]],
+        table_aliases: dict[str, str] | None = None,
+        table_role_aliases: dict[str, list[str]] | None = None,
+        sampling: SamplingSpec | None = None,
+        memory_limit: str = "1GB",
+        threads: int = 1,
+        max_temp_directory_size: str = "4GB",
+    ) -> SnapshotManifest:
+        """从 DuckDB 仓库生成受控、关系一致的 Parquet 快照。
+
+        第一张锚点表最多抽取 ``sampling.limit`` 行；其余表只抽取与已选
+        锚点键匹配的行。任何下游表超过上限或无法沿 Join 图到达时都阻断，
+        避免逐表独立 LIMIT 生成关系不一致的快照。
+        """
+        import duckdb
+
+        from tianshu_datadev.developer_spec.models import (
+            _render_sql_string_literal,
+            _validate_physical_table_name,
+        )
+
+        if not source_tables:
+            raise SnapshotMaterializationError("Contract 未声明可快照的数据源表")
+        if not os.path.isfile(duckdb_path):
+            raise SnapshotMaterializationError(f"DuckDB 源库不存在：{duckdb_path}")
+
+        aliases = table_aliases or {}
+        physical_to_aliases: dict[str, list[str]] = {}
+        alias_to_physical: dict[str, str] = {}
+        for table in source_tables:
+            role_aliases = list((table_role_aliases or {}).get(table, []))
+            primary_alias = aliases.get(table, table)
+            ordered_aliases = list(dict.fromkeys([primary_alias, *role_aliases]))
+            physical_to_aliases[table] = ordered_aliases
+            for alias in ordered_aliases:
+                previous = alias_to_physical.setdefault(alias, table)
+                if previous != table:
+                    raise SnapshotMaterializationError(
+                        f"输入别名 {alias} 同时映射到多个物理表"
+                    )
+        if len({aliases.get(table, table) for table in source_tables}) != len(source_tables):
+            raise SnapshotMaterializationError("多个物理表映射到同一输入别名")
+        for table in source_tables:
+            _validate_physical_table_name(table)
+
+        spec = sampling or SamplingSpec(
+            mode="head",
+            limit=SNAPSHOT_DEFAULT_ROW_LIMIT,
+        )
+        row_limit = spec.limit
+        if spec.mode != "head" or row_limit is None or row_limit <= 0:
+            raise SnapshotMaterializationError("仓库快照只支持带正数上限的 head 采样")
+
+        normalized_joins = self._validate_warehouse_join_graph(
+            aliases=list(alias_to_physical),
+            joins=joins,
+        )
+        anchor_alias = self._select_anchor_alias(
+            aliases=list(alias_to_physical),
+            joins=normalized_joins,
+        )
+
+        stat = os.stat(duckdb_path)
+        provider_fingerprint = hashlib.sha256(
+            f"{Path(duckdb_path).resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode()
+        ).hexdigest()[:16]
+        snapshot_id = self._generate_snapshot_id(
+            contract_hash=contract_hash,
+            source_tables=source_tables,
+            provider_id=f"duckdb:{provider_fingerprint}",
+            sampling_spec=spec,
+        )
+        snapshot_dir = os.path.join(self._output_dir, snapshot_id)
+        os.makedirs(self._output_dir, exist_ok=True)
+        if os.path.isdir(snapshot_dir):
+            shutil.rmtree(snapshot_dir)
+        os.makedirs(snapshot_dir)
+
+        files: list[SnapshotFile] = []
+        selected_paths: dict[str, str] = {}
+        spill_parent = os.path.join(self._output_dir, "_duckdb_spill")
+        os.makedirs(spill_parent, exist_ok=True)
+
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="snapshot_",
+                dir=spill_parent,
+            ) as spill_dir:
+                con = duckdb.connect(duckdb_path, read_only=True)
+                try:
+                    con.execute(f"SET memory_limit = '{memory_limit}'")
+                    con.execute(f"SET threads = {threads}")
+                    con.execute(
+                        f"SET temp_directory = {_render_sql_string_literal(spill_dir)}"
+                    )
+                    con.execute(
+                        "SET max_temp_directory_size = "
+                        f"'{max_temp_directory_size}'"
+                    )
+
+                    anchor_table = alias_to_physical[anchor_alias]
+                    anchor_path = self._snapshot_file_path(
+                        snapshot_dir,
+                        anchor_table,
+                    )
+                    self._copy_query_to_parquet(
+                        con,
+                        f"SELECT * FROM {anchor_table} LIMIT {row_limit}",
+                        anchor_path,
+                    )
+                    for alias in physical_to_aliases[anchor_table]:
+                        selected_paths[alias] = anchor_path
+                    files.append(self._snapshot_file(
+                        physical_to_aliases[anchor_table][0],
+                        anchor_path,
+                    ))
+
+                    unresolved_tables = set(source_tables) - {anchor_table}
+                    while unresolved_tables:
+                        progress = False
+                        for target_table in sorted(unresolved_tables):
+                            predicates: list[str] = []
+                            for join in normalized_joins:
+                                left_alias = join["left_table"]
+                                right_alias = join["right_table"]
+                                if (
+                                    left_alias in selected_paths
+                                    and alias_to_physical[right_alias] == target_table
+                                ):
+                                    source_alias = left_alias
+                                    source_key = join["left_key"]
+                                    target_key = join["right_key"]
+                                elif (
+                                    right_alias in selected_paths
+                                    and alias_to_physical[left_alias] == target_table
+                                ):
+                                    source_alias = right_alias
+                                    source_key = join["right_key"]
+                                    target_key = join["left_key"]
+                                else:
+                                    continue
+
+                                source_path = _render_sql_string_literal(
+                                    selected_paths[source_alias]
+                                )
+                                predicates.append(
+                                    f"{target_key} IN ("
+                                    f"SELECT DISTINCT {source_key} "
+                                    f"FROM read_parquet({source_path})"
+                                    ")"
+                                )
+
+                            if not predicates:
+                                continue
+
+                            target_path = self._snapshot_file_path(
+                                snapshot_dir,
+                                target_table,
+                            )
+                            query = (
+                                f"SELECT * FROM {target_table} "
+                                f"WHERE {' OR '.join(predicates)} "
+                                f"LIMIT {row_limit + 1}"
+                            )
+                            self._copy_query_to_parquet(con, query, target_path)
+                            primary_alias = physical_to_aliases[target_table][0]
+                            snapshot_file = self._snapshot_file(primary_alias, target_path)
+                            if snapshot_file.row_count > row_limit:
+                                raise SnapshotMaterializationError(
+                                    f"表 {target_table} 的关系样本超过 {row_limit} 行上限"
+                                )
+                            for alias in physical_to_aliases[target_table]:
+                                selected_paths[alias] = target_path
+                            files.append(snapshot_file)
+                            unresolved_tables.remove(target_table)
+                            progress = True
+                            break
+
+                        if not progress:
+                            raise SnapshotMaterializationError(
+                                "Contract Join 图无法覆盖全部输入表："
+                                f"{sorted(unresolved_tables)}"
+                            )
+                finally:
+                    con.close()
+
+            alias_targets = {
+                alias: aliases_for_table[0]
+                for aliases_for_table in physical_to_aliases.values()
+                for alias in aliases_for_table[1:]
+            }
+            self._write_inputs_index(
+                snapshot_dir,
+                files,
+                alias_targets=alias_targets,
+            )
+            manifest = SnapshotManifest(
+                snapshot_id=snapshot_id,
+                contract_hash=contract_hash,
+                snapshot_dir=snapshot_dir,
+                files=files,
+                snapshot_sha256=self._compute_snapshot_hash(files),
+                source_provider_id=f"duckdb:{provider_fingerprint}",
+                source_type=SnapshotSourceType.DEV_WAREHOUSE.value,
+                sampling_spec=spec,
+                deidentification="none",
+            )
+            self._prune_snapshot_cache(current_snapshot_id=snapshot_id)
+            return manifest
+        except Exception:
+            shutil.rmtree(snapshot_dir, ignore_errors=True)
+            raise
+
+    @staticmethod
+    def _validate_warehouse_join_graph(
+        *,
+        aliases: list[str],
+        joins: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        """校验快照仅使用 Contract 内封闭的单键 Join 图。"""
+        if len(aliases) > 1 and not joins:
+            raise SnapshotMaterializationError("多表快照缺少 Contract Join 关系")
+        alias_set = set(aliases)
+        normalized: list[dict[str, str]] = []
+        from tianshu_datadev.developer_spec.models import _validate_physical_table_name
+
+        for join in joins:
+            required = {"left_table", "right_table", "left_key", "right_key", "join_type"}
+            if not required.issubset(join):
+                raise SnapshotMaterializationError("Contract Join 元数据不完整")
+            if join["left_table"] not in alias_set or join["right_table"] not in alias_set:
+                raise SnapshotMaterializationError("Contract Join 引用了未知输入表")
+            if join["join_type"].upper() not in {"INNER", "LEFT"}:
+                raise SnapshotMaterializationError(
+                    f"快照暂不支持 {join['join_type']} JOIN"
+                )
+            for key_name in (join["left_key"], join["right_key"]):
+                _validate_physical_table_name(key_name)
+                if "." in key_name:
+                    raise SnapshotMaterializationError(
+                        f"快照 Join 键必须是不带表前缀的字段名：{key_name}"
+                    )
+            normalized.append(join)
+        return normalized
+
+    @staticmethod
+    def _select_anchor_alias(
+        *,
+        aliases: list[str],
+        joins: list[dict[str, str]],
+    ) -> str:
+        """选择 Join 图根节点；存在歧义时按 Contract 输入顺序稳定选择。"""
+        if not joins:
+            return aliases[0]
+        right_aliases = {join["right_table"] for join in joins}
+        roots = [alias for alias in aliases if alias not in right_aliases]
+        return roots[0] if roots else aliases[0]
+
+    @staticmethod
+    def _snapshot_file_path(snapshot_dir: str, table_name: str) -> str:
+        """保留物理表名，便于 Executor 还原 schema.table。"""
+        return os.path.join(snapshot_dir, f"{table_name}.parquet")
+
+    @staticmethod
+    def _copy_query_to_parquet(con, query: str, parquet_path: str) -> None:
+        """由 DuckDB 流式写 Parquet，避免完整结果进入 Python 内存。"""
+        from tianshu_datadev.developer_spec.models import _render_sql_string_literal
+
+        con.execute(
+            f"COPY ({query}) TO {_render_sql_string_literal(parquet_path)} "
+            "(FORMAT PARQUET)"
+        )
+
+    @classmethod
+    def _snapshot_file(cls, source_name: str, parquet_path: str) -> SnapshotFile:
+        """读取 Parquet 元数据并生成快照文件记录。"""
+        metadata = pq.ParquetFile(parquet_path).metadata
+        return SnapshotFile(
+            source_name=source_name,
+            file_path=parquet_path,
+            format="parquet",
+            row_count=metadata.num_rows,
+            file_sha256=cls._compute_file_sha256(parquet_path),
+        )
+
+    def _prune_snapshot_cache(
+        self,
+        *,
+        current_snapshot_id: str,
+        keep: int = 3,
+    ) -> None:
+        """仅清理本 Builder 输出根目录中的旧快照，防止个人电脑磁盘累积。"""
+        candidates = [
+            path
+            for path in Path(self._output_dir).glob("snap_*")
+            if path.is_dir() and path.name != current_snapshot_id
+        ]
+        candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        for old_snapshot in candidates[max(keep - 1, 0):]:
+            shutil.rmtree(old_snapshot, ignore_errors=True)
 
     def verify_integrity(self, manifest: SnapshotManifest) -> bool:
         """校验快照完整性——检查 Manifest 结构 + 文件存在性 + SHA-256。
@@ -585,13 +902,26 @@ class SnapshotBuilder:
         return files
 
     @staticmethod
-    def _write_inputs_index(snapshot_dir: str, files: list[SnapshotFile]) -> None:
+    def _write_inputs_index(
+        snapshot_dir: str,
+        files: list[SnapshotFile],
+        alias_targets: dict[str, str] | None = None,
+    ) -> None:
         """写 inputs 索引侧车——记录 {source_name(别名): 物理文件名}。
 
         executor prologue 读取此索引，按别名装载 Parquet 为 inputs dict。
         与 DuckDB 的 glob-by-stem 视图注册互不干扰（索引为 .json，非 .parquet）。
+
+        同一物理表被多个业务别名引用时，alias_targets 记录
+        {附加别名: 已存在的 source_name}，多个 key 共享同一 Parquet 文件。
         """
         index = {f.source_name: os.path.basename(f.file_path) for f in files}
+        for alias, target in (alias_targets or {}).items():
+            if target not in index:
+                raise ValueError(
+                    f"inputs 索引别名 '{alias}' 指向不存在的数据源 '{target}'"
+                )
+            index[alias] = index[target]
         index_path = os.path.join(snapshot_dir, _INPUTS_INDEX_FILENAME)
         with open(index_path, "w", encoding="utf-8") as fp:
             json.dump(index, fp, sort_keys=True, ensure_ascii=False)

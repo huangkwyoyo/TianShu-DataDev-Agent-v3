@@ -26,6 +26,10 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tianshu_datadev.spark.cdp_spec import DigestExecutionEnvelope
 
 # ════════════════════════════════════════════
 # 执行结果
@@ -59,10 +63,16 @@ class SparkExecutionResult:
     output_rows: list[dict] = field(default_factory=list)
     error_message: str = ""
     # 结果行数是否超过 _MAX_RESULT_ROWS 阈值——超阈值时 output_rows 仅含
-    # 键排序抽样行（降级验证数据源），调用方不得据此判定全量一致
+    # 维度值抽样行（降级验证数据源），调用方不得据此判定全量一致
     result_overflow: bool = False
     # 引擎内计算的结果总行数——仅溢出时填充（count() 不经 Driver collect，无 OOM 风险）
     total_row_count: int | None = None
+    # 抽样维度列名——溢出降级维度值抽样使用的维度（第一个抽样键）
+    sample_dim: str | None = None
+    # 抽样维度值列表——output_rows 覆盖这些维度值映射的全部行
+    sample_values: list[str] = field(default_factory=list)
+    # 抽样是否因超行数上限被放弃——低基数维度防护（组不完整会产生假差异）
+    sample_truncated: bool = False
     # 资源使用记录（可观测性）
     resource_usage: dict = field(default_factory=lambda: {
         "stdout_bytes": 0,
@@ -310,39 +320,71 @@ _OUTPUT_END_MARKER = "===SPARK_EXECUTOR_OUTPUT_END==="
 # 物理验证结果行数上限——超阈值不收集全量行，避免 Driver 端 Java heap OOM
 _MAX_RESULT_ROWS = 100_000
 
-# 溢出降级抽样行数——键排序确定性抽样，供物理验证降级对比使用
-_OVERFLOW_SAMPLE_ROWS = 1_000
+# 溢出降级抽样的维度值个数——取抽样维度最小 N 个 distinct 值
+_SAMPLE_DIM_COUNT = 10
+
+# 溢出降级抽样行数硬上限——低基数维度防护（组总行数超上限则放弃抽样，防再次 OOM）
+_SAMPLE_ROW_CAP = 10_000
 
 # 注入到 PySpark 代码末尾的输出收集片段
 # 将最终 DataFrame 转为 JSON 行格式输出到 stdout
 # 使用 limit(MAX+1) 单次执行检测溢出——避免 count() + collect() 导致管线执行两次
-# 溢出降级路径：引擎内 count()（不经 Driver collect，无 OOM）+ 键排序确定性抽样，
-# 使物理验证可做行数对比 + 抽样对比，而非直接 NOT_EXECUTED
+# 溢出降级路径：引擎内 count()（不经 Driver collect，无 OOM）+ 维度值抽样
+# （取抽样维度最小 N 个 distinct 值映射的全部行——组完整才能做确定性组内对比），
+# 使物理验证可做行数对比 + 抽样组对比，而非直接 NOT_EXECUTED
 _OUTPUT_COLLECTOR_TEMPLATE = """
 # ── Executor 注入：结果收集 ──
 import json, sys as _exec_sys
 
 # 调用编译器产出的 transform 函数——传入 executor prologue 构造的 inputs 字典
 result_df = transform(inputs)
-_rows = result_df.limit({max_rows} + 1).toJSON().collect()
+# 已知溢出（如 DuckDB 侧行数超上限）时跳过全量收集尝试，直接走降级路径
+_force_overflow = {force_overflow}
+if _force_overflow:
+    _rows = []
+    _overflow = True
+else:
+    _rows = result_df.limit({max_rows} + 1).toJSON().collect()
+    _overflow = len(_rows) > {max_rows}
 _exec_sys.stdout.write("{start_marker}\\n")
-if len(_rows) > {max_rows}:
-    # 超阈值——引擎内计数 + 键排序抽样（二次执行代价仅溢出时付出）
+if _overflow:
+    # 超阈值——引擎内计数 + 维度值抽样（二次执行代价仅溢出时付出）
     _total = result_df.count()
-    _exec_sys.stdout.write(
-        json.dumps({{"_tianshu_overflow": True, "row_count": _total}}) + "\\n"
-    )
     # 抽样键需过滤到实际存在的列——键名不匹配时退化为仅计数，不得让整次执行失败
     _sample_keys = [k for k in {sample_keys} if k in result_df.columns]
-    if _sample_keys:
+    _dim = _sample_keys[0] if _sample_keys else None
+    _dim_values = []
+    _sample = []
+    if _dim is not None:
+        # 取抽样维度最小 N 个 distinct 值——确定性抽样（NULL 值不参与组对齐）
+        _dim_values = [
+            _r[0]
+            for _r in result_df.select(_dim).distinct()
+            .orderBy(_dim).limit({dim_count}).collect()
+            if _r[0] is not None
+        ]
+    if _dim_values:
+        # 取维度值映射的全部行——组完整才能做组内行数与逐列对比
         _sample = (
-            result_df.orderBy(*_sample_keys)
-            .limit({sample_rows})
+            result_df.filter(result_df[_dim].isin(_dim_values))
+            .orderBy(*_sample_keys)
+            .limit({sample_cap} + 1)
             .toJSON()
             .collect()
         )
-        for _row_json in _sample:
-            _exec_sys.stdout.write(_row_json + "\\n")
+    # 低基数维度防护：组总行数超上限则组不完整——放弃抽样退化为仅计数
+    _truncated = len(_sample) > {sample_cap}
+    if _truncated:
+        _sample = []
+    _exec_sys.stdout.write(json.dumps({{
+        "_tianshu_overflow": True,
+        "row_count": _total,
+        "sample_dim": _dim if _sample else None,
+        "sample_values": [str(_v) for _v in _dim_values] if _sample else [],
+        "sample_truncated": _truncated,
+    }}, ensure_ascii=False, default=str) + "\\n")
+    for _row_json in _sample:
+        _exec_sys.stdout.write(_row_json + "\\n")
 else:
     for _row_json in _rows:
         _exec_sys.stdout.write(_row_json + "\\n")
@@ -355,13 +397,15 @@ def _inject_output_collector(
     code: str,
     output_var: str = "result_df",
     sample_keys: list[str] | None = None,
+    force_overflow: bool = False,
 ) -> str:
     """在 PySpark 代码末尾注入输出收集器——调用 transform(inputs) 并序列化结果为 JSON 行。
 
     Args:
         code: 原始 PySpark 代码
         output_var: 保留参数，向后兼容（新模板固定使用 result_df）
-        sample_keys: 溢出降级抽样的排序键——None/空时溢出仅输出引擎内计数
+        sample_keys: 溢出降级抽样的排序键——第一个键作为抽样维度；None/空时溢出仅输出引擎内计数
+        force_overflow: 已知必然溢出（如 DuckDB 侧行数超上限）——跳过 limit(MAX+1) 全量收集尝试
 
     Returns:
         注入后的代码
@@ -370,25 +414,30 @@ def _inject_output_collector(
         start_marker=_OUTPUT_START_MARKER,
         end_marker=_OUTPUT_END_MARKER,
         max_rows=_MAX_RESULT_ROWS,
-        sample_rows=_OVERFLOW_SAMPLE_ROWS,
+        dim_count=_SAMPLE_DIM_COUNT,
+        sample_cap=_SAMPLE_ROW_CAP,
         # json.dumps 产出的列表字面量同时是合法 Python——安全嵌入模板
         sample_keys=json.dumps(sample_keys or [], ensure_ascii=False),
+        force_overflow=repr(bool(force_overflow)),
     )
     return code.rstrip() + "\n" + collector
 
 
-def _parse_output_rows(stdout: str) -> tuple[list[dict], str, bool, int | None]:
+def _parse_output_rows(
+    stdout: str,
+) -> tuple[list[dict], str, bool, int | None, dict]:
     """从 stdout 中解析 DataFrame JSON 行输出。
 
-    返回 (输出行列表, 清洗后的 stdout, 是否溢出, 引擎内总行数)。
+    返回 (输出行列表, 清洗后的 stdout, 是否溢出, 引擎内总行数, 抽样元信息)。
     溢出时输出行列表为降级抽样行；总行数来自哨兵行的 row_count
-    （旧版哨兵无该字段时为 None）。
+    （旧版哨兵无该字段时为 None）；抽样元信息含 sample_dim/sample_values/
+    sample_truncated（维度值抽样的对齐依据）。
 
     Args:
         stdout: 子进程 stdout 原始输出
 
     Returns:
-        (output_rows, cleaned_stdout, overflow, total_row_count)
+        (output_rows, cleaned_stdout, overflow, total_row_count, sample_meta)
     """
     import json
 
@@ -398,6 +447,11 @@ def _parse_output_rows(stdout: str) -> tuple[list[dict], str, bool, int | None]:
     in_output = False
     overflow = False
     total_row_count: int | None = None
+    sample_meta: dict = {
+        "sample_dim": None,
+        "sample_values": [],
+        "sample_truncated": False,
+    }
 
     for line in lines:
         if line.strip() == _OUTPUT_START_MARKER:
@@ -415,6 +469,16 @@ def _parse_output_rows(stdout: str) -> tuple[list[dict], str, bool, int | None]:
                     rc = parsed.get("row_count")
                     if isinstance(rc, int):
                         total_row_count = rc
+                    # 维度值抽样元信息——verifier 据此在 DuckDB 侧选取同组行
+                    sd = parsed.get("sample_dim")
+                    if isinstance(sd, str):
+                        sample_meta["sample_dim"] = sd
+                    sv = parsed.get("sample_values")
+                    if isinstance(sv, list):
+                        sample_meta["sample_values"] = [str(v) for v in sv]
+                    sample_meta["sample_truncated"] = bool(
+                        parsed.get("sample_truncated", False),
+                    )
                     continue  # 溢出行不进入业务数据
                 rows.append(parsed)
             except json.JSONDecodeError:
@@ -423,7 +487,7 @@ def _parse_output_rows(stdout: str) -> tuple[list[dict], str, bool, int | None]:
             # 非输出区域的文本保留在清洗后的 stdout 中
             cleaned_lines.append(line)
 
-    return rows, "\n".join(cleaned_lines), overflow, total_row_count
+    return rows, "\n".join(cleaned_lines), overflow, total_row_count, sample_meta
 
 
 # ════════════════════════════════════════════
@@ -720,6 +784,7 @@ class LocalSparkExecutor:
         data_dir: str | None = None,
         output_var: str = "result_df",
         sample_keys: list[str] | None = None,
+        force_overflow: bool = False,
     ) -> SparkExecutionResult:
         """在子进程中执行 PySpark DSL 代码。
 
@@ -729,7 +794,9 @@ class LocalSparkExecutor:
                       注入为 SPARK_DATA_DIR 环境变量供代码引用
             output_var: 最终 DataFrame 变量名，用于输出收集
             sample_keys: 溢出降级抽样的排序键（如业务主键）——
-                         结果超 _MAX_RESULT_ROWS 时按键排序抽样供物理验证对比
+                         结果超 _MAX_RESULT_ROWS 时第一个键作为抽样维度
+            force_overflow: 已知必然溢出（如 DuckDB 侧行数超上限）——
+                            跳过 limit(MAX+1) 全量收集尝试，直接走降级路径
 
         Returns:
             SparkExecutionResult——含执行状态、输出、耗时、资源使用
@@ -749,6 +816,7 @@ class LocalSparkExecutor:
         # 最终脚本结构：资源限制 → Spark 初始化 → 用户代码 → 输出收集器
         instrumented_code = _inject_output_collector(
             pyspark_code, output_var, sample_keys=sample_keys,
+            force_overflow=force_overflow,
         )
         instrumented_code = self._inject_spark_prologue(instrumented_code)
         instrumented_code = self._inject_resource_limits(instrumented_code)
@@ -857,16 +925,24 @@ class LocalSparkExecutor:
         stderr_bytes = len(stderr.encode("utf-8"))
 
         # Step 9：解析输出
-        output_rows, cleaned_stdout, overflow, total_row_count = _parse_output_rows(stdout)
+        (
+            output_rows, cleaned_stdout, overflow, total_row_count, sample_meta,
+        ) = _parse_output_rows(stdout)
 
         # Step 10：判断执行结果
         # 结果溢出检测——优先于其他状态判断，避免将溢出误判为成功
         if overflow:
-            # 降级收集：output_rows 为键排序抽样行，total_row_count 为引擎内计数
-            _sample_desc = (
-                f"已收集键排序抽样 {len(output_rows)} 行"
-                if output_rows else "无抽样数据（未提供抽样键）"
-            )
+            # 降级收集：output_rows 为维度值抽样行，total_row_count 为引擎内计数
+            if output_rows:
+                _sample_desc = (
+                    f"已收集维度值抽样 {len(output_rows)} 行"
+                    f"（维度={sample_meta['sample_dim']}，"
+                    f"{len(sample_meta['sample_values'])} 个值）"
+                )
+            elif sample_meta["sample_truncated"]:
+                _sample_desc = "抽样组行数超上限已放弃抽样（低基数维度防护）"
+            else:
+                _sample_desc = "无抽样数据（未提供抽样键）"
             return SparkExecutionResult(
                 status=SparkExecutionStatus.SUCCESS,
                 stdout=cleaned_stdout,
@@ -876,11 +952,14 @@ class LocalSparkExecutor:
                 output_rows=output_rows,
                 result_overflow=True,
                 total_row_count=total_row_count,
+                sample_dim=sample_meta["sample_dim"],
+                sample_values=sample_meta["sample_values"],
+                sample_truncated=sample_meta["sample_truncated"],
                 error_message=(
                     f"结果行数超过上限（{_MAX_RESULT_ROWS}），"
                     f"不收集全量行以避免 Java heap OOM。"
                     f"引擎内总行数={total_row_count if total_row_count is not None else '未知'}，"
-                    f"{_sample_desc}，转入降级验证（行数对比 + 抽样对比）。"
+                    f"{_sample_desc}，转入降级验证（行数对比 + 抽样组对比）。"
                 ),
                 resource_usage={
                     "stdout_bytes": stdout_bytes,

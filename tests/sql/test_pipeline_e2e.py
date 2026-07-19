@@ -15,6 +15,7 @@ from tianshu_datadev.developer_spec.models import (
     SourceManifest,
 )
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
+from tianshu_datadev.planning.spec_enricher import SpecEnricher
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
 from tianshu_datadev.sql.executor import DuckDBExecutor
@@ -187,6 +188,9 @@ class TestPipelineE2E:
 
         # 2. 构建 SourceManifest
         manifest = _build_manifest(spec)
+
+        # 真实管线先由 Agent/确定性规则补充可从字段事实推导的维度。
+        spec = SpecEnricher().apply_enrichment(spec, manifest)
 
         # 3. RelationshipHypothesis → SqlBuildPlan（无 LLM client → 退化与 Fake 一致）
         planner = RelationshipPlanner()

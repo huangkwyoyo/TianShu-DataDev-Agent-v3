@@ -79,10 +79,10 @@ def adapt_lite_to_v1(
         limit_spec=lite.limit_spec,
         business_keys=lite.business_keys,
         semantic_policy_ref=lite.semantic_policy_ref,
-        # ── V1 独有字段：安全默认值 ──
+        # ── V1 独有字段：从 Lite 透传（Phase 3B 修复——lite 路径现在也提取这些字段）──
         step_dag={},
         temp_tables=[],
-        case_when_labels=[],
-        window_specs=[],
+        case_when_labels=getattr(lite, "case_when_labels", None) or [],
+        window_specs=getattr(lite, "window_specs", None) or [],
         write_spec=None,
     )

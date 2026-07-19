@@ -738,6 +738,7 @@ class SqlBuildPlanBuilder:
                 window = self._build_window_step(spec)
                 if window:
                     plan_steps.append(window)
+                    plan_steps.extend(self._build_post_window_filter_steps(spec))
 
             # ── ProjectStep ──
             if is_final:
@@ -1449,6 +1450,41 @@ class SqlBuildPlanBuilder:
             window_exprs=window_exprs,
         )
 
+    def _build_post_window_filter_steps(
+        self, spec: ParsedDeveloperSpec,
+    ) -> list[FilterStep]:
+        """将窗口输出上的封闭比较条件转换为 WindowStep 后的 FilterStep。"""
+        window_aliases = {metric.alias for metric in spec.inferred_window_metrics}
+        operator_map = {
+            CompareOp.EQ: PredicateOperator.EQ,
+            CompareOp.NEQ: PredicateOperator.NEQ,
+            CompareOp.GT: PredicateOperator.GT,
+            CompareOp.GTE: PredicateOperator.GTE,
+            CompareOp.LT: PredicateOperator.LT,
+            CompareOp.LTE: PredicateOperator.LTE,
+        }
+        steps: list[FilterStep] = []
+        for filter_decl in spec.inferred_post_window_filters:
+            if filter_decl.column not in window_aliases:
+                continue
+            steps.append(FilterStep(
+                step_id=SqlBuildPlan.generate_step_id("filter", {
+                    "window_column": filter_decl.column,
+                    "operator": filter_decl.operator.value,
+                    "value": filter_decl.value,
+                }),
+                predicate=Predicate(
+                    left=ColumnRef(
+                        table_ref="",
+                        column_name=filter_decl.column,
+                        normalized_name=self._normalizer.normalize(filter_decl.column),
+                    ),
+                    operator=operator_map[filter_decl.operator],
+                    right=SqlLiteral(value=filter_decl.value),
+                ),
+            ))
+        return steps
+
     # ── 单表路径 ──
 
     # ── label_table 支持：CaseWhenStep 生成 ──
@@ -1763,6 +1799,7 @@ class SqlBuildPlanBuilder:
         window = self._build_window_step(spec, table.table_alias)
         if window:
             steps.append(window)
+            steps.extend(self._build_post_window_filter_steps(spec))
 
         # ── 防御性检查：label_table 输出列必须有解析规则——禁止回退成物理 ColumnRef ──
         self._assert_all_output_columns_resolved(spec)
@@ -1960,6 +1997,7 @@ class SqlBuildPlanBuilder:
         window = self._build_window_step(spec, "")
         if window:
             steps.append(window)
+            steps.extend(self._build_post_window_filter_steps(spec))
 
         # 6. ProjectStep（排除窗口函数已产出的别名）
         # 自引用时用左别名消除列歧义——左右表列名完全相同，DuckDB 无法自动解析
@@ -2144,7 +2182,21 @@ class SqlBuildPlanBuilder:
             window = self._build_window_step(spec, left_source)
             if window:
                 steps.append(window)
-            project = self._build_project_step(spec)
+                steps.extend(self._build_post_window_filter_steps(spec))
+            # 构建 per-column table_ref 覆盖——
+            # 多跳链中左源为 temp 表、右表为新 Join 的维度表。
+            # 维度声明的 source_table 匹配 right_alias 时使用右表别名，
+            # 其余列默认使用 left_source（temp 表）。
+            col_overrides: dict[str, str] = {}
+            for d in spec.dimensions:
+                if d.source_table and d.source_table == right_alias:
+                    col_overrides[d.dimension_name] = right_alias
+                elif d.source_table:
+                    col_overrides[d.dimension_name] = left_source
+            project = self._build_project_step(
+                spec, default_table_ref=left_source,
+                column_table_overrides=col_overrides,
+            )
             # 排除窗口别名——避免 SELECT 中重复
             if window:
                 win_aliases = {str(w.alias) for w in window.window_exprs if w.alias}
@@ -2476,9 +2528,14 @@ class SqlBuildPlanBuilder:
             for s in spec.output_spec.sort:
                 _add(s.column)
 
-        # 输出列的源列
+        # 输出列的源列——若输出列名匹配维度声明，
+        # 使用维度的 column_ref（源列名）而非输出列名（别名）
+        dim_col_map: dict[str, str] = {
+            d.dimension_name: d.column_ref for d in spec.dimensions
+        }
         for col in spec.output_spec.columns:
-            _add(col.name)
+            source_col = dim_col_map.get(col.name, col.name)
+            _add(source_col)
 
         return cols
 
@@ -2534,7 +2591,7 @@ class SqlBuildPlanBuilder:
             normalized = self._normalizer.normalize(d.column_ref)
             group_cols.append(
                 ColumnRef(
-                    table_ref=primary_table,
+                    table_ref=d.source_table or primary_table,
                     column_name=d.column_ref,
                     normalized_name=normalized,
                 )
@@ -2571,22 +2628,46 @@ class SqlBuildPlanBuilder:
 
     def _build_project_step(
         self, spec: ParsedDeveloperSpec, default_table_ref: str = "",
+        column_table_overrides: dict[str, str] | None = None,
     ) -> ProjectStep:
         """从 spec.output_spec 构建 ProjectStep。
+
+        列解析优先级：
+        1. 维度声明匹配——若某输出列的 name 等于某个 dimension 的 dimension_name，
+           使用 dimension.column_ref 作为源列名、dimension.source_table 作为 table_ref
+        2. column_table_overrides——调用方按列名指定的 table_ref 覆盖（优先级高于维度）
+        3. default_table_ref——兜底表别名
 
         Args:
             spec: 已解析的 DeveloperSpec
             default_table_ref: 列引用的默认表别名——合流步骤中用于消除列歧义
+            column_table_overrides: 列名→table_ref 的覆盖映射——多跳链最终步骤使用
         """
+        # ── 构建维度名→(源列, 源表) 的映射 ──
+        dim_source_map: dict[str, tuple[str, str]] = {}
+        for d in spec.dimensions:
+            table_ref = d.source_table or ""
+            dim_source_map[d.dimension_name] = (d.column_ref, table_ref)
+
+        overrides = column_table_overrides or {}
+
         proj_cols: list[AliasExpr] = []
         for col in spec.output_spec.columns:
             col_name = col.name
-            normalized = self._normalizer.normalize(col_name)
+            # 解析源列名和表别名
+            if col_name in dim_source_map:
+                source_col, dim_table = dim_source_map[col_name]
+                # 维度声明的 source_table 可被 overrides 覆盖
+                table_ref = overrides.get(col_name, dim_table or default_table_ref)
+            else:
+                source_col = col_name
+                table_ref = overrides.get(col_name, default_table_ref)
+            normalized = self._normalizer.normalize(source_col)
             proj_cols.append(
                 AliasExpr(
                     expression=ColumnRef(
-                        table_ref=default_table_ref,  # 合流步骤传左表别名消除歧义
-                        column_name=col_name,
+                        table_ref=table_ref,
+                        column_name=source_col,
                         normalized_name=normalized,
                     ),
                     alias=col_name,

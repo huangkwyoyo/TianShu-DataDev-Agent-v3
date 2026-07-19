@@ -1,13 +1,14 @@
-"""case_when UNSUPPORTED 物理验证白名单测试——API/Pipeline 级别。
+"""物理验证门禁测试——API/Pipeline 级别。
 
-覆盖 9 个场景：
-1-3: 三条入口白名单执行（含 spark_ok=False）
-4: Validator 未通过跳过
-5: 非 case_when 的 UNSUPPORTED 跳过
-6: NOT_EQUIVALENT 跳过
-7: 无 comparator 报告跳过
-8: 物理不一致→failed + 保留有界报告
-9: LOGIC_EQUIVALENT 回归 spark_ok=True
+_should_physical_verify 门禁逻辑：
+- Validator 未通过 / report=None / NOT_EXECUTED → False（阻止物理验证）
+- 所有其他 COMPARATOR 状态 → True（物理验证是 ground truth）
+
+覆盖：
+- _should_physical_verify 单元测试（7 场景）
+- run_spark_stage 入口测试（物理不一致→failed + 有界摘要）
+- _do_spark_physical_verify 门禁集成测试
+- run_all_full spark_ok 判定测试
 """
 
 from __future__ import annotations
@@ -99,28 +100,33 @@ def _make_physver_report(
 class TestShouldPhysicalVerify:
     """Pipeline._should_physical_verify 的单元测试。
 
-    白名单条件：
-    - Validator 通过
-    - comparator_report.status == LOGIC_UNSUPPORTED
-    - 所有 step_results 中：
-      - 无 NOT_EQUIVALENT
-      - 仅 case_when 的 UNSUPPORTED_COMPARISON
-      - 至少有一个 case_when UNSUPPORTED
-    - 以上全部满足 → True；否则 False
+    物理验证是 ground truth——只要 Validator 通过且 Comparator 已执行，
+    就应该允许物理验证运行。仅以下情况跳过：
+    - Validator 未通过（安全风险）
+    - Comparator 报告为 None（无逻辑对比基线）
+    - Comparator 状态为 NOT_EXECUTED（逻辑对比未实际执行）
     """
 
     def test_validator_not_ok_returns_false(self):
-        """场景 4：Validator 未通过 → 跳过。"""
+        """Validator 未通过 → 跳过。"""
         pipeline = Pipeline()
-        report = _make_comparator_report(ComparisonStatus.LOGIC_UNSUPPORTED, [
-            _make_step_result("case_when", EquivalenceVerdict.UNSUPPORTED_COMPARISON),
+        report = _make_comparator_report(ComparisonStatus.LOGIC_EQUIVALENT, [
+            _make_step_result("filter", EquivalenceVerdict.EQUIVALENT),
         ])
         assert not pipeline._should_physical_verify(False, report)
 
     def test_no_comparator_report_returns_false(self):
-        """场景 7：无 comparator 报告 → 跳过。"""
+        """无 comparator 报告 → 跳过。"""
         pipeline = Pipeline()
         assert not pipeline._should_physical_verify(True, None)
+
+    def test_not_executed_returns_false(self):
+        """NOT_EXECUTED → 跳过（逻辑对比未实际执行）。"""
+        pipeline = Pipeline()
+        report = _make_comparator_report(ComparisonStatus.NOT_EXECUTED, [
+            _make_step_result("filter", EquivalenceVerdict.EQUIVALENT),
+        ])
+        assert not pipeline._should_physical_verify(True, report)
 
     def test_logic_equivalent_returns_true(self):
         """LOGIC_EQUIVALENT → 放行（基线路径）。"""
@@ -131,57 +137,40 @@ class TestShouldPhysicalVerify:
         ])
         assert pipeline._should_physical_verify(True, report)
 
-    def test_whitelist_case_when_only_returns_true(self):
-        """场景 2：白名单——仅 case_when UNSUPPORTED + 其他 EQUIVALENT → 放行。"""
-        pipeline = Pipeline()
-        report = _make_comparator_report(ComparisonStatus.LOGIC_UNSUPPORTED, [
-            _make_step_result("case_when", EquivalenceVerdict.UNSUPPORTED_COMPARISON),
-            _make_step_result("filter", EquivalenceVerdict.EQUIVALENT),
-            _make_step_result("project", EquivalenceVerdict.EQUIVALENT),
-        ])
-        assert pipeline._should_physical_verify(True, report)
-
-    def test_whitelist_no_case_when_unsupported_returns_false(self):
-        """LOGIC_UNSUPPORTED 但没有 case_when UNSUPPORTED → 跳过。"""
+    def test_logic_unsupported_returns_true(self):
+        """LOGIC_UNSUPPORTED → 放行——物理验证是唯一验证手段。"""
         pipeline = Pipeline()
         report = _make_comparator_report(ComparisonStatus.LOGIC_UNSUPPORTED, [
             _make_step_result("filter", EquivalenceVerdict.UNSUPPORTED_COMPARISON),
         ])
-        assert not pipeline._should_physical_verify(True, report)
+        assert pipeline._should_physical_verify(True, report)
 
-    def test_non_case_when_unsupported_returns_false(self):
-        """场景 5：非 case_when 的 UNSUPPORTED → 跳过。"""
+    def test_logic_unsupported_with_not_equivalent_returns_true(self):
+        """LOGIC_UNSUPPORTED 含 NOT_EQUIVALENT → 仍放行。
+        NOT_EQUIVALENT 可能是 UNSUPPORTED 步骤的副作用（如缺失列导致
+        project 不等价），物理验证提供 ground truth 确认这些差异的实际影响。"""
         pipeline = Pipeline()
         report = _make_comparator_report(ComparisonStatus.LOGIC_UNSUPPORTED, [
             _make_step_result("case_when", EquivalenceVerdict.UNSUPPORTED_COMPARISON),
-            _make_step_result("subquery", EquivalenceVerdict.UNSUPPORTED_COMPARISON),
+            _make_step_result("project", EquivalenceVerdict.NOT_EQUIVALENT),
         ])
-        assert not pipeline._should_physical_verify(True, report)
+        assert pipeline._should_physical_verify(True, report)
 
-    def test_not_equivalent_returns_false(self):
-        """场景 6：存在 NOT_EQUIVALENT → 跳过。"""
-        pipeline = Pipeline()
-        report = _make_comparator_report(ComparisonStatus.LOGIC_MISMATCH, [
-            _make_step_result("case_when", EquivalenceVerdict.UNSUPPORTED_COMPARISON),
-            _make_step_result("filter", EquivalenceVerdict.NOT_EQUIVALENT),
-        ])
-        assert not pipeline._should_physical_verify(True, report)
-
-    def test_logic_mismatch_returns_false(self):
-        """LOGIC_MISMATCH（全部 NOT_EQUIVALENT）→ 跳过。"""
+    def test_logic_mismatch_returns_true(self):
+        """LOGIC_MISMATCH → 放行——物理验证确认不等价是否影响实际输出。"""
         pipeline = Pipeline()
         report = _make_comparator_report(ComparisonStatus.LOGIC_MISMATCH, [
             _make_step_result("filter", EquivalenceVerdict.NOT_EQUIVALENT),
         ])
-        assert not pipeline._should_physical_verify(True, report)
+        assert pipeline._should_physical_verify(True, report)
 
-    def test_not_covered_returns_false(self):
-        """NOT_COVERED → 跳过。"""
+    def test_not_covered_returns_true(self):
+        """NOT_COVERED → 放行——物理验证提供兜底保障。"""
         pipeline = Pipeline()
         report = _make_comparator_report(ComparisonStatus.NOT_COVERED, [
             _make_step_result("window", EquivalenceVerdict.EQUIVALENT),
         ])
-        assert not pipeline._should_physical_verify(True, report)
+        assert pipeline._should_physical_verify(True, report)
 
 
 # ════════════════════════════════════════════
@@ -331,6 +320,84 @@ class TestDoSparkPhysicalVerifyGate:
         assert not any(gate_skip_msg in e for e in context.errors)
 
 
+class TestPhysicalVerifySafetyHelpers:
+    """覆盖物理验证入口曾遗漏的排序键与受控快照路径。"""
+
+    def test_extract_sort_step_order_keys(self):
+        """SparkSortStep 应读取 order_by.column，不访问不存在的 columns。"""
+        from tianshu_datadev.api.pipeline import _extract_spark_order_keys
+        from tianshu_datadev.spark.models import (
+            SparkPlan,
+            SparkSortDirection,
+            SparkSortSpec,
+            SparkSortStep,
+        )
+
+        plan = SparkPlan(
+            plan_id="sort_plan",
+            source_contract_hash="contract_hash",
+            steps=[SparkSortStep(
+                input_alias="f1",
+                order_by=[
+                    SparkSortSpec(column="borough", direction=SparkSortDirection.ASC),
+                    SparkSortSpec(column="trip_count", direction=SparkSortDirection.DESC),
+                ],
+            )],
+        )
+
+        assert _extract_spark_order_keys(plan) == ["borough", "trip_count"]
+
+    def test_duckdb_snapshot_fallback_uses_controlled_builder(self):
+        """DuckDB 备选路径必须委托统一快照构建，禁止自行全表导出。"""
+        from tianshu_datadev.api.pipeline import SparkStageContext
+        from tianshu_datadev.artifacts.models import (
+            ContractInputTable,
+            DataTransformContractLite,
+        )
+        from tianshu_datadev.spark.snapshot import SnapshotManifest
+
+        contract = DataTransformContractLite(
+            contract_id="contract_safe_snapshot",
+            source_sqlbuildplan_hash="plan_hash",
+            input_tables=[ContractInputTable(
+                table_ref="ft",
+                source_table="gold.fact_trips",
+            )],
+        )
+        artifacts = PipelineArtifactBundle(
+            request_id="req_safe_snapshot",
+            data_transform_contract=contract,
+        )
+        manifest = SnapshotManifest(
+            snapshot_id="snap_safe",
+            contract_hash="hash",
+            snapshot_dir="snapshot_dir",
+            files=[],
+        )
+        pipeline = Pipeline(duckdb_path="warehouse.duckdb")
+        pipeline._results[artifacts.request_id] = {
+            "table_mapping": {"ft": "gold.fact_trips"},
+        }
+
+        with patch.object(
+            pipeline,
+            "_prepare_run_all_snapshot",
+            return_value=(manifest, {}),
+        ) as prepare:
+            result = pipeline._build_snapshot_from_duckdb(
+                artifacts,
+                SparkStageContext(),
+            )
+
+        assert result is manifest
+        assert artifacts.snapshot_manifest is manifest
+        prepare.assert_called_once_with(
+            contract=contract,
+            table_mapping={"ft": "gold.fact_trips"},
+            table_paths=None,
+        )
+
+
 # ════════════════════════════════════════════
 # 场景 3：真实 run_all_full 入口 spark_ok 判定测试
 # ════════════════════════════════════════════
@@ -348,9 +415,19 @@ class TestFullRunResponseSparkOk:
         return [
             {"status": "ok", "result": {"type": "mapper"}, "llm_traces": {}, "errors": []},
             {"status": "ok", "result": {"type": "developer"}, "llm_traces": {}, "errors": []},
-            {"status": "ok", "result": {"type": "compiler", "pyspark_code": "code"}, "llm_traces": {}, "errors": []},
+            {
+                "status": "ok",
+                "result": {"type": "compiler", "pyspark_code": "code"},
+                "llm_traces": {},
+                "errors": [],
+            },
             {"status": "ok", "result": {"type": "validator"}, "llm_traces": {}, "errors": []},
-            {"status": "ok", "result": {"type": "comparator", "status": comparator_status}, "llm_traces": {}, "errors": []},
+            {
+                "status": "ok",
+                "result": {"type": "comparator", "status": comparator_status},
+                "llm_traces": {},
+                "errors": [],
+            },
             {"status": physver_status, "result": {"type": "physical_verify"}, "llm_traces": {}, "errors": []},
         ]
 

@@ -119,15 +119,14 @@ class TestRunAll:
         assert "open_questions" in data
 
     def test_run_all_invalid_spec(self, client, csv_path):
-        """无效输入 → 200 + pipeline_error（Pipeline 内部捕获，8 阶段）。"""
+        """无效输入 → 200 + pipeline_error（Pipeline 内部捕获，9 阶段）。"""
         resp = client.post("/api/run-all", json={"markdown_text": ""})
         assert resp.status_code == 200, f"期望 200，实际 {resp.status_code}: {resp.text}"
         data = resp.json()
         assert "pipeline_error" in data
         assert data["pipeline_error"]["stage"] == "parser"
-        # run_all 使用 8 阶段（含 validate）
-        assert len(data["pipeline_stages"]) == 8
-        # 验证 contract/package 在 7 阶段中
+        # run_all 使用 9 阶段（含 snapshot）
+        assert len(data["pipeline_stages"]) == 9
         stage_names = [s["stage"] for s in data["pipeline_stages"]]
         assert "contract" in stage_names
         assert "package" in stage_names
@@ -142,12 +141,15 @@ class TestRunAll:
         assert resp.status_code == 200
         data = resp.json()
         assert "pipeline_error" not in data
-        # 成功路径应包含 pipeline_stages（8 阶段全部 ok），供流式进度使用
+        # 成功路径应包含 pipeline_stages（9 阶段全部 ok），供流式进度使用
         assert "pipeline_stages" in data
-        assert len(data["pipeline_stages"]) == 8
+        assert len(data["pipeline_stages"]) == 9
         assert all(s["status"] == "ok" for s in data["pipeline_stages"])
         stage_names = [s["stage"] for s in data["pipeline_stages"]]
-        assert stage_names == ["parser", "enrich", "build", "validate", "compile", "execute", "contract", "package"]
+        assert stage_names == [
+            "parser", "enrich", "build", "validate", "compile",
+            "contract", "snapshot", "execute", "package",
+        ]
         assert data["package_id"].startswith("pkg_")
         # 成功路径应包含链路状态字段
         assert "validation_passed" in data
@@ -170,8 +172,8 @@ class TestRunAll:
 
         assert "pipeline_error" in result
         assert result["pipeline_error"]["stage"] == "build"
-        # 8 阶段（含 validate）
-        assert len(result["pipeline_stages"]) == 8
+        # 9 阶段（含 snapshot）
+        assert len(result["pipeline_stages"]) == 9
         # 产物已保存
         assert result["request_id"] in pipeline._results
         saved = pipeline._results[result["request_id"]]
@@ -214,9 +216,10 @@ class TestRunAll:
         assert result["pipeline_error"]["stage"] == "execute"
         # 不应有 package_id
         assert "package_id" not in result or result.get("package_id") == ""
-        # 8 阶段，execute=failed, contract=skipped, package=skipped
+        # Contract 与 Snapshot 已完成，execute 失败后 package 跳过
         stages = {s["stage"]: s["status"] for s in result["pipeline_stages"]}
-        assert len(result["pipeline_stages"]) == 8
+        assert len(result["pipeline_stages"]) == 9
+        assert stages["contract"] == "ok"
+        assert stages["snapshot"] == "ok"
         assert stages["execute"] == "failed"
-        assert stages["contract"] == "skipped"
         assert stages["package"] == "skipped"

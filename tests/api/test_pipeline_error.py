@@ -238,6 +238,46 @@ class TestPipelineErrorHandling:
         assert "trace" in saved
         assert saved["trace"].error_message == "模拟执行失败"
 
+    def test_execute_blocks_every_non_success_status(self, pipeline, golden_spec_passing):
+        """TIMEOUT 和 RESULT_TOO_LARGE 都必须在 execute 阶段阻断。"""
+        import tianshu_datadev.api.pipeline as pipeline_mod
+
+        original = pipeline_mod.DuckDBExecutor
+        try:
+            for status in (ExecutionStatus.TIMEOUT, ExecutionStatus.RESULT_TOO_LARGE):
+                class BlockingExecutor:
+                    def execute(self, compiled):
+                        trace = ExecutionTrace(
+                            trace_id=f"trace_{status.value.lower()}",
+                            plan_id=compiled.input_plan_hash,
+                            engine="duckdb",
+                            generated_sql=compiled.sql,
+                            status=status,
+                            row_count=0,
+                            execution_time_ms=1.0,
+                            error_message=status.value,
+                        )
+                        summary = ResultSummary(
+                            summary_id=f"summary_{status.value.lower()}",
+                            trace_id=trace.trace_id,
+                            engine="duckdb",
+                            columns=[],
+                            column_types=[],
+                            row_count=0,
+                            null_counts={},
+                            numeric_sums={},
+                            sample_rows=[],
+                        )
+                        return trace, summary
+
+                pipeline_mod.DuckDBExecutor = lambda **kw: BlockingExecutor()
+                result = pipeline.execute(golden_spec_passing)
+                assert result["pipeline_error"]["stage"] == "execute"
+                assert result["execution_trace"] is None
+                assert result["result_summary"] is None
+        finally:
+            pipeline_mod.DuckDBExecutor = original
+
     # ── Phase 4.7b: execute_rich RUNTIME_FAIL 阻断 ──
 
     def test_execute_rich_runtime_fail_blocks_and_preserves(self, pipeline, golden_spec_passing):
@@ -351,15 +391,15 @@ class TestPipelineStagesHelper:
         assert pipeline._stage_name_cn("package") == "打包"
         assert pipeline._stage_name_cn("unknown") == "unknown"
 
-    def test_build_pipeline_stages_8_stages(self, pipeline):
-        """run_all 的 8 阶段列表——contract 失败时前 6 阶段为 ok。"""
+    def test_build_pipeline_stages_9_stages(self, pipeline):
+        """run_all 的 9 阶段列表——contract 失败时前 5 阶段为 ok。"""
         run_all_stages = [
             "parser", "enrich", "build", "validate",
-            "compile", "execute", "contract", "package",
+            "compile", "contract", "snapshot", "execute", "package",
         ]
         error_info = pipeline._capture_error("contract", RuntimeError("打包前契约抽取失败"))
         stages = pipeline._build_pipeline_stages("contract", error_info, run_all_stages)
-        assert len(stages) == 8
+        assert len(stages) == 9
         statuses = {s["stage"]: s["status"] for s in stages}
         assert statuses == {
             "parser": "ok",
@@ -367,16 +407,17 @@ class TestPipelineStagesHelper:
             "build": "ok",
             "validate": "ok",
             "compile": "ok",
-            "execute": "ok",
             "contract": "failed",
+            "snapshot": "skipped",
+            "execute": "skipped",
             "package": "skipped",
         }
 
     def test_build_pipeline_stages_package_failed(self, pipeline):
-        """package 失败——前 7 阶段为 ok。"""
+        """package 失败——前 8 阶段为 ok。"""
         run_all_stages = [
             "parser", "enrich", "build", "validate",
-            "compile", "execute", "contract", "package",
+            "compile", "contract", "snapshot", "execute", "package",
         ]
         error_info = pipeline._capture_error("package", RuntimeError("打包失败"))
         stages = pipeline._build_pipeline_stages("package", error_info, run_all_stages)
@@ -422,9 +463,9 @@ class TestPipelineValidationBlocking:
         assert result["pipeline_error"]["error_type"] == "ValidationBlocked"
         # 不应有执行和打包产物
         assert result["execution_status"] == "not_executed"
-        # pipeline_stages 使用 8 阶段，validate 为 failed
+        # pipeline_stages 使用 9 阶段，validate 为 failed
         stages = {s["stage"]: s["status"] for s in result["pipeline_stages"]}
-        assert len(result["pipeline_stages"]) == 8
+        assert len(result["pipeline_stages"]) == 9
         assert stages["validate"] == "failed"
         assert stages["compile"] == "skipped"
         assert stages["contract"] == "skipped"

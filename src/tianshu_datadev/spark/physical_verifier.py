@@ -39,10 +39,12 @@ from tianshu_datadev.cre_models import (
 )
 from tianshu_datadev.developer_spec.models import StrictModel
 from tianshu_datadev.spark.executor import (
+    _MAX_RESULT_ROWS,
     LocalSparkExecutor,
     SparkExecutionResult,
     SparkExecutionStatus,
 )
+from tianshu_datadev.sql.models import ProgramCompiledSql
 
 # ════════════════════════════════════════════
 # SQL 安全校验——白名单 + 纵深防御（方案 B）
@@ -277,21 +279,34 @@ class ResultCanonicalizer:
         if isinstance(value, float):
             if _math.isnan(value):
                 return ""
-        # Decimal 归一化——转为字符串（禁止转 float，避免大值精度损失）
+            # 整值浮点去 ".0"——与整值 Decimal 去尾零表示对齐（100.0 vs Decimal('100.00')）
+            if _math.isfinite(value) and value == int(value):
+                return str(int(value))
+        # Decimal 归一化——去尾零后以定点格式输出（禁止转 float 避免大值精度损失；
+        # format 'f' 避免 normalize() 对整值产生科学计数法 100.00 → 1E+2）
         if hasattr(value, "__class__") and value.__class__.__name__ == "Decimal":
-            return str(value)
+            if value == 0:
+                return "0"  # 规避 Decimal('-0.00') 归一化产生 '-0'
+            return format(value.normalize(), "f")
         # datetime.date → 规范化为 YYYY-MM-DD 格式
         if isinstance(value, _dt.date) and not isinstance(value, _dt.datetime):
             return value.isoformat()
         # datetime.datetime → 规范化为 YYYY-MM-DD HH:MM:SS 格式（空格分隔，与 DuckDB 一致）
         if isinstance(value, _dt.datetime):
             return value.strftime("%Y-%m-%d %H:%M:%S")
-        # 字符串：检测 ISO 8601 datetime 格式（T 分隔，如 "2026-01-15T10:30:00"）
-        # PySpark toJSON() 序列化产物——需归一化为空格分隔以与 DuckDB 原生 str() 对齐
-        if isinstance(value, str) and _re.match(
-            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?$", value,
-        ):
-            return value.replace("T", " ")
+        # 字符串：检测 ISO 8601 datetime（T 分隔，可含小数秒与时区后缀——
+        # Spark toJSON 默认格式 yyyy-MM-dd'T'HH:mm:ss.SSSXXX）。
+        # 归一化为秒级空格分隔——小数秒统一丢弃（DuckDB 侧 strftime 已丢弃微秒，
+        # 保留会导致溢出降级键对齐每行必不相等）；时区后缀直接剥离
+        # （Spark 按 session 时区序列化，与 DuckDB naive 本地时间墙钟一致）
+        if isinstance(value, str):
+            _m = _re.match(
+                r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})"
+                r"(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$",
+                value,
+            )
+            if _m:
+                return f"{_m.group(1)} {_m.group(2)}"
         return str(value)
 
     def canonicalize(
@@ -533,6 +548,7 @@ class PhysicalVerifier:
         cre_primary_keys: list[str] | None = None,
         cre_timezone: str = "",
         cre_environment_manifest: EnvironmentManifest | None = None,
+        compiled_program: ProgramCompiledSql | None = None,
     ) -> PhysicalVerificationReport:
         """执行双引擎物理验证。
 
@@ -575,21 +591,44 @@ class PhysicalVerifier:
             )
 
         # Step 2：DuckDB 执行 SQL
-        duckdb_result = self._execute_duckdb(sql_query, snapshot_dir, duckdb_path=duckdb_path)
+        duckdb_result = self._execute_duckdb(
+            sql_query,
+            snapshot_dir,
+            duckdb_path=duckdb_path,
+            compiled_program=compiled_program,
+        )
 
-        # 自动检测排序键：当无显式排序键时，优先使用业务主键（cre_primary_keys），
-        # 否则从 DuckDB 结果列名自动提取。使用业务主键排序可避免聚合指标列
-        # （如 avg_distance、total_fare）参与排序导致浮点尾差行错位。
+        # 无显式排序键时只接受 Contract 权威键。结果列集合不是业务键，
+        # 用它排序会让浮点尾差参与行对齐并产生不稳定结论。
         # 必须在 Spark 执行之前解析——溢出降级抽样需要在引擎内按键排序
         if not order_keys and duckdb_result.output_rows:
             if cre_primary_keys:
                 order_keys = list(cre_primary_keys)
-            else:
-                order_keys = list(duckdb_result.output_rows[0].keys())
+            elif len(duckdb_result.output_rows) > 1:
+                return PhysicalVerificationReport(
+                    report_id=self._generate_report_id(contract_hash, snapshot_id),
+                    contract_hash=contract_hash,
+                    snapshot_id=snapshot_id,
+                    status=PhysicalVerificationStatus.CANONICALIZATION_NEEDED,
+                    duckdb_result=EngineExecutionResult(
+                        engine="duckdb",
+                        success=True,
+                        raw_row_count=len(duckdb_result.output_rows),
+                        sample_rows=duckdb_result.output_rows[:20],
+                    ),
+                    error_message=(
+                        "多行结果缺少显式排序键或 Contract 权威键，"
+                        "无法确定性对齐双引擎结果，需人工确认输出粒度。"
+                    ),
+                )
 
-        # Step 3：Spark 执行 PySpark DSL——传入排序键供溢出降级抽样使用
+        # Step 3：Spark 执行 PySpark DSL——传入排序键供溢出降级抽样使用。
+        # DuckDB 侧行数已超收集上限时必然溢出——直接告知 executor 跳过
+        # limit(MAX+1) 全量收集尝试，节省无谓的 Driver 端收集开销
+        expected_overflow = len(duckdb_result.output_rows or []) > _MAX_RESULT_ROWS
         spark_result = self._execute_spark(
             pyspark_code, snapshot_dir, sample_keys=order_keys,
+            force_overflow=expected_overflow,
         )
 
         # ── 诊断日志：输出关键中间数据（用 warning 级别确保输出）──
@@ -644,7 +683,7 @@ class PhysicalVerifier:
                     contract_hash,
                     snapshot_id,
                 )
-                return self._verify_overflow_degraded(
+                degraded_report = self._verify_overflow_degraded(
                     duckdb_result=duckdb_result,
                     spark_result=spark_result,
                     duckdb_rows=duckdb_rows,
@@ -653,6 +692,20 @@ class PhysicalVerifier:
                     contract_hash=contract_hash,
                     snapshot_id=snapshot_id,
                 )
+                # 降级验证不通过时落盘诊断——否则无法离线回答
+                # "差异来自数据还是表示/对齐"（DuckDB 侧仅保存头部，防大结果爆盘）
+                if degraded_report.status == PhysicalVerificationStatus.RESULT_MISMATCH:
+                    self._save_mismatch_diagnostics(
+                        pyspark_code=pyspark_code,
+                        sql_query=sql_query,
+                        duckdb_rows=duckdb_rows[:5000],
+                        spark_rows=spark_result.output_rows,
+                        snapshot_id=snapshot_id,
+                        contract_hash=contract_hash,
+                        duckdb_row_count=len(duckdb_rows),
+                        spark_row_count=spark_result.total_row_count or 0,
+                    )
+                return degraded_report
 
             if spark_result.status == SparkExecutionStatus.SUCCESS:
                 spark_rows = self._canonicalizer.canonicalize(
@@ -736,6 +789,7 @@ class PhysicalVerifier:
                     cdp_spec=cdp_spec,
                     snapshot_id=snapshot_id,
                     duckdb_con=None,  # 新建独立连接
+                    compiled_program=compiled_program,
                 )
         except Exception:
             # Shadow 异常不影响 legacy 判定
@@ -920,22 +974,28 @@ class PhysicalVerifier:
         contract_hash: str,
         snapshot_id: str,
     ) -> PhysicalVerificationReport:
-        """溢出降级验证——引擎内行数对比 + 键对齐抽样对比。
+        """溢出降级验证——引擎内行数对比 + 维度值抽样组对比。
 
         Spark 结果超收集上限时无法全量逐行对比，但仍可获得两类强证据：
         1. 引擎内 count()（不经 Driver collect，无 OOM）vs DuckDB 全量行数
-        2. 键排序确定性抽样 vs DuckDB 同键行的逐列对比
+        2. 维度值抽样：取抽样维度 N 个 distinct 值映射的全部行，与 DuckDB
+           同维度值的行组做组内行数 + 全字段排序逐列对比。
+           按单一维度值对齐（而非全列拼接键精确对齐）——规避浮点/时间戳
+           表示差异导致的全键错配假差异。
 
         判定规则：
         - 行数不一致 → RESULT_MISMATCH（确定性差异）
-        - 行数一致 + 抽样逐列一致 → SAMPLED_CONSISTENT（弱于全量一致，语义诚实）
-        - 行数一致 + 抽样有差异 → RESULT_MISMATCH
+        - 行数一致 + 抽样组逐列一致 → SAMPLED_CONSISTENT（弱于全量一致，语义诚实）
+        - 行数一致 + 组内行数或值有差异 → RESULT_MISMATCH
+        - 维度值零对齐 → NOT_EXECUTED（对齐失败更可能是表示差异，不误报）
         - 无引擎内计数或无抽样数据 → NOT_EXECUTED（保留原行为，消息附行数）
         """
         report_id = self._generate_report_id(contract_hash, snapshot_id)
         duckdb_total = len(duckdb_rows)
         spark_total = spark_result.total_row_count
         sample_raw = spark_result.output_rows or []
+        sample_dim = getattr(spark_result, "sample_dim", None)
+        sample_values = getattr(spark_result, "sample_values", None) or []
 
         duckdb_engine = EngineExecutionResult(
             engine="duckdb",
@@ -992,12 +1052,17 @@ class PhysicalVerifier:
                 row_count_match=False,
             )
 
-        # 证据 2：键对齐抽样对比
-        if not sample_raw or not order_keys:
+        # 证据 2：维度值抽样组对比——需要抽样行 + 维度元信息 + 排序键
+        if not sample_raw or not sample_dim or not sample_values or not order_keys:
+            _truncated_hint = (
+                "（抽样组行数超上限已放弃抽样）"
+                if getattr(spark_result, "sample_truncated", False) else
+                "（抽样键缺失或键名与结果列不匹配）"
+            )
             return _report(
                 PhysicalVerificationStatus.NOT_EXECUTED,
                 f"溢出降级验证：行数一致（{duckdb_total}）但无抽样数据"
-                f"（抽样键缺失或键名与结果列不匹配），无法进一步对比。"
+                f"{_truncated_hint}，无法进一步对比。"
                 f"详情：{spark_result.error_message}",
                 spark_result=_spark_engine(),
                 row_count_match=True,
@@ -1015,22 +1080,63 @@ class PhysicalVerifier:
                 row_count_match=True,
             )
 
-        # 按抽样行的排序键从 DuckDB 全量中选出同键行——键对齐规避 TOP-N 边界 tie 假差异
-        norm_keys = [
-            self._canonicalizer._normalize_column_name(k) for k in order_keys
-        ]
-        sample_key_set = {
-            self._build_sort_key(r, norm_keys) for r in sample_rows
-        }
-        duckdb_subset = [
-            r for r in duckdb_rows
-            if self._build_sort_key(r, norm_keys) in sample_key_set
-        ]
+        # 权威 schema 补齐——toJSON() 省略 NULL 键导致的列缺失（与常规路径一致）
+        sample_rows = self._fill_missing_columns(sample_rows)
 
+        # 按单一维度值选取 DuckDB 同组行——单列对齐规避浮点/时间戳多列拼键错配
+        norm_dim = self._canonicalizer._normalize_column_name(sample_dim)
+        norm_values = {
+            self._canonicalizer._normalize_value(v) for v in sample_values
+        }
+        duckdb_subset = self._fill_missing_columns([
+            r for r in duckdb_rows
+            if str(r.get(norm_dim, "")) in norm_values
+        ])
+
+        if not duckdb_subset:
+            # 零对齐——总行数已一致，更可能是维度值表示差异而非数据差异，
+            # 诚实降级为 NOT_EXECUTED，不误报 RESULT_MISMATCH
+            return _report(
+                PhysicalVerificationStatus.NOT_EXECUTED,
+                f"溢出降级验证：行数一致（{duckdb_total}）但抽样维度值"
+                f"（{sample_dim} × {len(sample_values)} 值）在 DuckDB 侧零对齐，"
+                f"无法进行组对比（可能为维度值表示差异）。",
+                spark_result=_spark_engine(len(sample_rows), sample_rows),
+                row_count_match=True,
+            )
+
+        # 组内行数对比——同维度值的行数不等即确定性差异
+        def _group_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+            """按抽样维度值统计组内行数。"""
+            counts: dict[str, int] = {}
+            for r in rows:
+                v = str(r.get(norm_dim, ""))
+                counts[v] = counts.get(v, 0) + 1
+            return counts
+
+        duckdb_counts = _group_counts(duckdb_subset)
+        spark_counts = _group_counts(sample_rows)
+        if duckdb_counts != spark_counts:
+            _diff_groups = [
+                f"{v}：DuckDB={duckdb_counts.get(v, 0)}，Spark={spark_counts.get(v, 0)}"
+                for v in sorted(set(duckdb_counts) | set(spark_counts))
+                if duckdb_counts.get(v, 0) != spark_counts.get(v, 0)
+            ]
+            return _report(
+                PhysicalVerificationStatus.RESULT_MISMATCH,
+                f"溢出降级验证：总行数一致（{duckdb_total}）但抽样组内行数不一致"
+                f"（维度={sample_dim}）——{'；'.join(_diff_groups[:5])}。",
+                spark_result=_spark_engine(len(sample_rows), sample_rows),
+                row_count_match=True,
+                total_diff_count=len(_diff_groups),
+            )
+
+        # 组内全字段排序逐列对比——双方均已按 order_keys 规范化排序，
+        # 表示一致（规范化修复后）保证同序；索引对齐 + 容差比较
         diffs, total_diff_count, diffs_truncated = self._compute_diffs(
             duckdb_subset, sample_rows,
             config=self._normalization_config,
-            order_keys=norm_keys,
+            order_keys=None,
         )
 
         # schema 对比基于抽样列集合
@@ -1045,8 +1151,9 @@ class PhysicalVerifier:
         if total_diff_count == 0 and schema_match:
             return _report(
                 PhysicalVerificationStatus.SAMPLED_CONSISTENT,
-                f"溢出降级验证通过：行数一致（{duckdb_total}）且键对齐抽样"
-                f" {len(sample_rows)} 行逐列一致。"
+                f"溢出降级验证通过：行数一致（{duckdb_total}）且维度值抽样"
+                f"（{sample_dim} × {len(sample_values)} 值，共 {len(sample_rows)} 行）"
+                f"组内逐列一致。"
                 f"全量逐行对比因超收集上限（结果 {spark_total} 行）未执行。",
                 spark_result=_spark_engine(len(sample_rows), sample_rows),
                 row_count_match=True,
@@ -1054,7 +1161,8 @@ class PhysicalVerifier:
             )
         return _report(
             PhysicalVerificationStatus.RESULT_MISMATCH,
-            f"溢出降级验证：行数一致（{duckdb_total}）但抽样 {len(sample_rows)} 行中"
+            f"溢出降级验证：行数一致（{duckdb_total}）但维度值抽样"
+            f"（{sample_dim} × {len(sample_values)} 值，共 {len(sample_rows)} 行）中"
             f"发现 {total_diff_count} 处差异（schema一致={schema_match}）。",
             spark_result=_spark_engine(len(sample_rows), sample_rows),
             row_count_match=True,
@@ -1185,6 +1293,7 @@ class PhysicalVerifier:
         sql_query: str,
         snapshot_dir: str,
         duckdb_path: str | None = None,
+        compiled_program: ProgramCompiledSql | None = None,
     ) -> SparkExecutionResult:
         """通过 DuckDB 执行 SQL 查询——主进程内执行（轻量，无安全风险）。
 
@@ -1206,6 +1315,7 @@ class PhysicalVerifier:
         # 白名单 SQL 安全校验——仅允许单条只读 SELECT
         try:
             _validate_select_sql(sql_query)
+            self._validate_compiled_program(compiled_program, sql_query)
         except ValueError as e:
             return SparkExecutionResult(
                 status=SparkExecutionStatus.SECURITY_REJECTED,
@@ -1215,6 +1325,7 @@ class PhysicalVerifier:
         import time
         start = time.monotonic()
 
+        con = None
         try:
             import duckdb
 
@@ -1231,6 +1342,7 @@ class PhysicalVerifier:
             # CREATE OR REPLACE VIEW 会覆盖 Step 1 中 ATTACH 的同名视图
             _register_parquet_views(con, snapshot_dir)
 
+            self._execute_program_prerequisites(con, compiled_program)
             result = con.execute(sql_query)
             # 转换为 dict 列表
             columns = [desc[0] for desc in result.description]
@@ -1238,8 +1350,6 @@ class PhysicalVerifier:
                 dict(zip(columns, row))
                 for row in result.fetchall()
             ]
-            con.close()
-
             elapsed = (time.monotonic() - start) * 1000
             return SparkExecutionResult(
                 status=SparkExecutionStatus.SUCCESS,
@@ -1253,6 +1363,80 @@ class PhysicalVerifier:
                 execution_time_ms=elapsed,
                 error_message=str(e),
             )
+        finally:
+            if con is not None:
+                self._cleanup_compiled_program(con, compiled_program)
+                con.close()
+
+    @staticmethod
+    def _validate_compiled_program(
+        compiled_program: ProgramCompiledSql | None,
+        final_sql: str,
+    ) -> None:
+        """只允许执行确定性编译器产出的临时表依赖链。"""
+        if compiled_program is None:
+            return
+        if not compiled_program.statements:
+            raise ValueError("编译程序不能为空")
+        if compiled_program.statements[-1].sql != final_sql:
+            raise ValueError("编译程序的最终语句与物理验证 SQL 不一致")
+
+        for statement in compiled_program.statements[:-1]:
+            cleaned = _strip_sql_comments(statement.sql).strip()
+            if _SELECT_STRUCTURE_RE.match(cleaned):
+                _validate_select_sql(statement.sql)
+                continue
+            match = re.fullmatch(
+                r'CREATE\s+TEMP\s+TABLE\s+"?(_temp_[A-Za-z0-9_]+)"?\s+AS\s+(SELECT\b.*)',
+                cleaned,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if match is None:
+                raise ValueError(
+                    "编译程序前置语句仅允许只读 SELECT 或 "
+                    "CREATE TEMP TABLE _temp_* AS SELECT"
+                )
+            _validate_select_sql(match.group(2))
+
+        for cleanup_sql in compiled_program.cleanup_sql:
+            cleaned = _strip_sql_comments(cleanup_sql).strip()
+            if re.fullmatch(
+                r'DROP\s+TABLE\s+IF\s+EXISTS\s+"?_temp_[A-Za-z0-9_]+"?',
+                cleaned,
+                flags=re.IGNORECASE,
+            ) is None:
+                raise ValueError(
+                    "编译程序清理语句仅允许 DROP TABLE IF EXISTS _temp_*"
+                )
+
+    @staticmethod
+    def _execute_program_prerequisites(
+        con,
+        compiled_program: ProgramCompiledSql | None,
+    ) -> None:
+        """在最终查询前按编译顺序创建所需临时关系。"""
+        if compiled_program is None:
+            return
+        for statement in compiled_program.statements[:-1]:
+            con.execute(statement.sql)
+
+    @staticmethod
+    def _cleanup_compiled_program(
+        con,
+        compiled_program: ProgramCompiledSql | None,
+    ) -> None:
+        """尽力清理临时关系，不覆盖主执行错误。"""
+        if compiled_program is None:
+            return
+        for cleanup_sql in reversed(compiled_program.cleanup_sql):
+            try:
+                con.execute(cleanup_sql)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "物理验证清理临时表失败: %s",
+                    cleanup_sql,
+                    exc_info=True,
+                )
 
     @staticmethod
     def _attach_external_database(con, duckdb_path: str) -> None:
@@ -1316,6 +1500,7 @@ class PhysicalVerifier:
         pyspark_code: str,
         snapshot_dir: str,
         sample_keys: list[str] | None = None,
+        force_overflow: bool = False,
     ) -> SparkExecutionResult:
         """通过 LocalSparkExecutor 在子进程中执行 PySpark DSL。
 
@@ -1323,7 +1508,8 @@ class PhysicalVerifier:
             pyspark_code: 已编译的 PySpark DSL 代码
             snapshot_dir: 快照目录
             sample_keys: 溢出降级抽样的排序键——结果超收集上限时
-                         按键排序抽样，供降级验证对比使用
+                         第一个键作为抽样维度做维度值抽样
+            force_overflow: DuckDB 侧行数已超上限——跳过全量收集尝试
 
         Returns:
             SparkExecutionResult——含输出行数据
@@ -1333,6 +1519,7 @@ class PhysicalVerifier:
             data_dir=snapshot_dir,
             output_var="result_df",
             sample_keys=sample_keys,
+            force_overflow=force_overflow,
         )
 
     # ── CDP v1 Engine-side Shadow（Task 8） ──
@@ -1419,6 +1606,7 @@ class PhysicalVerifier:
         cdp_spec: object,
         snapshot_id: str,
         duckdb_con=None,
+        compiled_program: ProgramCompiledSql | None = None,
     ) -> dict | None:
         """执行 CDP v1 engine-side shadow——双引擎摘要计算 + compare()。
 
@@ -1459,6 +1647,10 @@ class PhysicalVerifier:
                 own_con = True
                 # 注册快照视图（与 _execute_duckdb 相同的协议）
                 _register_parquet_views(duckdb_con, snapshot_dir)
+                self._execute_program_prerequisites(
+                    duckdb_con,
+                    compiled_program,
+                )
 
             from tianshu_datadev.spark.cdp_duckdb_builder import DuckdbCdpBuilder
 
@@ -1485,6 +1677,10 @@ class PhysicalVerifier:
         finally:
             if own_con and duckdb_con is not None:
                 try:
+                    self._cleanup_compiled_program(
+                        duckdb_con,
+                        compiled_program,
+                    )
                     duckdb_con.close()
                 except Exception:
                     pass

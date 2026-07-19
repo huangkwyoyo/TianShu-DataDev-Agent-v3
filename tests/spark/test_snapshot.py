@@ -15,21 +15,164 @@ from __future__ import annotations
 
 import os
 import shutil
+from pathlib import Path
 
 import pytest
 
 from tests._test_utils import read_fixture
 from tianshu_datadev.api.pipeline import Pipeline
 from tianshu_datadev.spark.snapshot import (
+    SNAPSHOT_DEFAULT_ROW_LIMIT,
     SamplingSpec,
     SnapshotBuilder,
     SnapshotFile,
     SnapshotIntegrityError,
     SnapshotManifest,
+    SnapshotMaterializationError,
     SnapshotSourceNotAllowlistedError,
     SnapshotSourceProvider,
     SnapshotSourceType,
 )
+
+
+def test_default_snapshot_limit_does_not_exceed_executor_result_limit():
+    """默认快照必须能被 Executor 完整读取，禁止两个资源上限再次漂移。"""
+    from tianshu_datadev.sql.executor import _DEFAULT_MAX_RESULT_ROWS
+
+    assert SNAPSHOT_DEFAULT_ROW_LIMIT <= _DEFAULT_MAX_RESULT_ROWS
+
+
+class TestWarehouseSnapshotMaterialization:
+    """DuckDB 仓库快照必须受限并保持 Join 键关系。"""
+
+    @staticmethod
+    def _create_warehouse(path: str) -> None:
+        import duckdb
+
+        con = duckdb.connect(path)
+        try:
+            con.execute("CREATE SCHEMA gold")
+            con.execute(
+                "CREATE TABLE gold.fact_orders AS "
+                "SELECT * FROM (VALUES (1, 10), (2, 20), (3, 10), (4, 30)) "
+                "AS t(order_id, customer_id)"
+            )
+            con.execute(
+                "CREATE TABLE gold.dim_customer AS "
+                "SELECT * FROM (VALUES (10, 'a'), (20, 'b'), (30, 'c'), (40, 'd')) "
+                "AS t(customer_id, customer_name)"
+            )
+        finally:
+            con.close()
+
+    def test_anchor_snapshot_cascades_join_keys(self, tmp_path):
+        """维表只保留锚点事实样本命中的 Join 键。"""
+        import pyarrow.parquet as pq
+
+        db_path = tmp_path / "warehouse.duckdb"
+        self._create_warehouse(str(db_path))
+        builder = SnapshotBuilder(str(tmp_path / "snapshots"))
+
+        manifest = builder.materialize_warehouse_tables(
+            contract_hash="a" * 64,
+            source_tables=["gold.fact_orders", "gold.dim_customer"],
+            duckdb_path=str(db_path),
+            joins=[{
+                "left_table": "ft",
+                "right_table": "dc",
+                "left_key": "customer_id",
+                "right_key": "customer_id",
+                "join_type": "LEFT",
+            }],
+            table_aliases={"gold.fact_orders": "ft", "gold.dim_customer": "dc"},
+            sampling=SamplingSpec(mode="head", limit=2),
+            memory_limit="128MB",
+            max_temp_directory_size="128MB",
+        )
+
+        files = {item.source_name: item for item in manifest.files}
+        assert files["ft"].row_count == 2
+        assert files["dc"].row_count == 2
+        dim = pq.read_table(files["dc"].file_path)
+        assert dim.column("customer_id").to_pylist() == [10, 20]
+
+    def test_role_aliases_share_one_relation_consistent_snapshot(self, tmp_path):
+        """同一维表的多个角色应合并 Join 命中行，并共享一个 Parquet。"""
+        import json
+
+        import duckdb
+        import pyarrow.parquet as pq
+
+        db_path = tmp_path / "role_warehouse.duckdb"
+        con = duckdb.connect(str(db_path))
+        try:
+            con.execute("CREATE SCHEMA gold")
+            con.execute(
+                "CREATE TABLE gold.fact_trip AS "
+                "SELECT * FROM (VALUES (1, 10, 20)) "
+                "AS t(trip_id, pickup_id, dropoff_id)"
+            )
+            con.execute(
+                "CREATE TABLE gold.dim_zone AS "
+                "SELECT * FROM (VALUES (10, 'pickup'), (20, 'dropoff'), (30, 'unused')) "
+                "AS t(zone_id, zone_name)"
+            )
+        finally:
+            con.close()
+
+        manifest = SnapshotBuilder(str(tmp_path / "snapshots")).materialize_warehouse_tables(
+            contract_hash="c" * 64,
+            source_tables=["gold.fact_trip", "gold.dim_zone"],
+            duckdb_path=str(db_path),
+            joins=[
+                {
+                    "left_table": "ft",
+                    "right_table": "tz_pu",
+                    "left_key": "pickup_id",
+                    "right_key": "zone_id",
+                    "join_type": "LEFT",
+                },
+                {
+                    "left_table": "ft",
+                    "right_table": "tz_do",
+                    "left_key": "dropoff_id",
+                    "right_key": "zone_id",
+                    "join_type": "LEFT",
+                },
+            ],
+            table_aliases={"gold.fact_trip": "ft", "gold.dim_zone": "tz_pu"},
+            table_role_aliases={
+                "gold.fact_trip": ["ft"],
+                "gold.dim_zone": ["tz_pu", "tz_do"],
+            },
+            sampling=SamplingSpec(mode="head", limit=10),
+            memory_limit="128MB",
+            max_temp_directory_size="128MB",
+        )
+
+        assert len(manifest.files) == 2
+        zone_file = next(item for item in manifest.files if item.source_name == "tz_pu")
+        zone_ids = pq.read_table(zone_file.file_path).column("zone_id").to_pylist()
+        assert zone_ids == [10, 20]
+        with open(Path(manifest.snapshot_dir) / "_inputs_index.json", encoding="utf-8") as fp:
+            index = json.load(fp)
+        assert index["tz_pu"] == index["tz_do"]
+
+    def test_disconnected_multi_table_snapshot_is_rejected(self, tmp_path):
+        """多表无 Join 关系时阻断，禁止逐表独立 LIMIT。"""
+        db_path = tmp_path / "warehouse.duckdb"
+        self._create_warehouse(str(db_path))
+        builder = SnapshotBuilder(str(tmp_path / "snapshots"))
+
+        with pytest.raises(SnapshotMaterializationError, match="缺少 Contract Join"):
+            builder.materialize_warehouse_tables(
+                contract_hash="b" * 64,
+                source_tables=["gold.fact_orders", "gold.dim_customer"],
+                duckdb_path=str(db_path),
+                joins=[],
+                table_aliases={"gold.fact_orders": "ft", "gold.dim_customer": "dc"},
+                sampling=SamplingSpec(mode="head", limit=2),
+            )
 
 
 def _make_local_fixture_builder(tmpdir: str):
@@ -745,6 +888,122 @@ class TestSnapshotBuilderAliases:
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    def test_inputs_index_supports_multiple_aliases_for_one_file(self):
+        """同一物理维表可由多个业务别名共享，不复制 Parquet。"""
+        import json
+        import tempfile
+
+        tmpdir = tempfile.mkdtemp(prefix="tianshu_multi_alias_")
+        try:
+            provider, builder = _make_local_fixture_builder(tmpdir)
+            manifest = builder.build(
+                contract_hash="c_hash",
+                source_tables=["fact_trips_sample"],
+                provider=provider,
+                table_aliases={"fact_trips_sample": "tz_pu"},
+            )
+            SnapshotBuilder._write_inputs_index(
+                manifest.snapshot_dir,
+                manifest.files,
+                alias_targets={"tz_do": "tz_pu"},
+            )
+
+            index_path = os.path.join(manifest.snapshot_dir, "_inputs_index.json")
+            with open(index_path, encoding="utf-8") as fp:
+                index = json.load(fp)
+
+            assert index == {
+                "tz_do": "fact_trips_sample.parquet",
+                "tz_pu": "fact_trips_sample.parquet",
+            }
+            assert len(list(Path(manifest.snapshot_dir).glob("*.parquet"))) == 1
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_inputs_index_rejects_missing_alias_target(self, tmp_path):
+        """附加别名没有基础快照文件时必须失败，禁止生成残缺 inputs。"""
+        with pytest.raises(ValueError, match="不存在的数据源"):
+            SnapshotBuilder._write_inputs_index(
+                str(tmp_path),
+                [],
+                alias_targets={"tz_do": "tz_pu"},
+            )
+
+    def test_run_all_snapshot_indexes_two_aliases_for_same_table(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Run-All 对角色扮演维表只物化一次，但必须暴露全部 inputs key。"""
+        import json
+
+        from tianshu_datadev.artifacts.models import (
+            ContractInputTable,
+            DataTransformContractLite,
+        )
+        from tianshu_datadev.sql.executor import DuckDBExecutor
+
+        parquet_path = tmp_path / "silver.taxi_zone.parquet"
+        parquet_path.write_bytes(b"parquet-placeholder")
+        fake_manifest = SnapshotManifest(
+            snapshot_id="snap_multi_alias",
+            contract_hash="contract_hash",
+            snapshot_dir=str(tmp_path),
+            files=[SnapshotFile(
+                source_name="tz_pu",
+                file_path=str(parquet_path),
+                format="parquet",
+                row_count=1,
+                file_sha256="hash",
+            )],
+            source_type="dev_warehouse",
+        )
+
+        def _fake_materialize(_self, **_kwargs):
+            SnapshotBuilder._write_inputs_index(
+                fake_manifest.snapshot_dir,
+                fake_manifest.files,
+            )
+            return fake_manifest
+
+        monkeypatch.setattr(
+            DuckDBExecutor,
+            "materialize_snapshot",
+            _fake_materialize,
+        )
+        contract = DataTransformContractLite(
+            contract_id="contract_multi_alias",
+            source_sqlbuildplan_hash="plan_hash",
+            input_tables=[
+                ContractInputTable(
+                    table_ref="tz_pu",
+                    source_table="silver.taxi_zone",
+                ),
+                ContractInputTable(
+                    table_ref="tz_do",
+                    source_table="silver.taxi_zone",
+                ),
+            ],
+        )
+        pipeline = Pipeline(duckdb_path="unused.duckdb")
+
+        manifest, execution_paths = pipeline._prepare_run_all_snapshot(
+            contract=contract,
+            table_mapping={
+                "tz_pu": "silver.taxi_zone",
+                "tz_do": "silver.taxi_zone",
+            },
+            table_paths=None,
+        )
+
+        assert manifest is fake_manifest
+        assert execution_paths == {"silver.taxi_zone": str(parquet_path)}
+        with open(tmp_path / "_inputs_index.json", encoding="utf-8") as fp:
+            assert json.load(fp) == {
+                "tz_do": "silver.taxi_zone.parquet",
+                "tz_pu": "silver.taxi_zone.parquet",
+            }
+
     def test_build_without_aliases_keeps_physical_source_name(self):
         """未提供 table_aliases——source_name 回退物理名（向后兼容）。"""
         import tempfile
@@ -817,7 +1076,7 @@ class TestSnapshotPipelineIntegration:
     1. 无 SnapshotBuilder 时 Pipeline 行为不变（向后兼容）
     2. 有 SnapshotBuilder + Provider 时 run_all() 产出 SnapshotManifest
     3. export_artifacts() 能导出 snapshot_manifest
-    4. Snapshot 失败不阻断 run_all() 主流程
+    4. DuckDB 仓库 Snapshot 失败时 fail-closed
     5. 白名单外 table 被过滤，不传给 SnapshotBuilder
     """
 
@@ -850,6 +1109,57 @@ class TestSnapshotPipelineIntegration:
         assert bundle.snapshot_manifest is None, (
             "未注入 SnapshotBuilder 时 snapshot_manifest 应为 None"
         )
+
+    def test_run_all_duckdb_executes_materialized_snapshot(self, tmp_path):
+        """仓库路径先生成 Parquet，业务 Executor 不再读取 DuckDB 源库。"""
+        import duckdb
+
+        db_path = tmp_path / "warehouse.duckdb"
+        csv_path = os.path.abspath("tests/fixtures/sql/test_fact.csv")
+        con = duckdb.connect(str(db_path))
+        try:
+            con.execute(
+                "CREATE TABLE test_fact AS SELECT * FROM read_csv_auto(?)",
+                [csv_path],
+            )
+        finally:
+            con.close()
+
+        pipeline = Pipeline(duckdb_path=str(db_path))
+        result = pipeline.run_all(read_fixture("fixtures/golden/golden_passing.md"))
+
+        assert "pipeline_error" not in result, result.get("pipeline_error")
+        bundle = pipeline.export_artifacts(result["request_id"])
+        assert bundle.snapshot_manifest is not None
+        assert bundle.snapshot_manifest.files[0].row_count == 10
+        assert bundle.snapshot_manifest.files[0].file_path.endswith(".parquet")
+
+    def test_run_all_snapshot_failure_is_fail_closed(self, tmp_path, monkeypatch):
+        """仓库快照失败时 execute 必须保持未调用。"""
+        from tianshu_datadev.sql.executor import DuckDBExecutor
+
+        db_path = tmp_path / "warehouse.duckdb"
+        db_path.touch()
+        execute_called = False
+
+        def fail_snapshot(*_args, **_kwargs):
+            raise RuntimeError("snapshot boom")
+
+        def mark_execute(*_args, **_kwargs):
+            nonlocal execute_called
+            execute_called = True
+            raise AssertionError("snapshot 失败后不应执行 SQL")
+
+        monkeypatch.setattr(DuckDBExecutor, "materialize_snapshot", fail_snapshot)
+        monkeypatch.setattr(DuckDBExecutor, "execute", mark_execute)
+        monkeypatch.setattr(DuckDBExecutor, "execute_program", mark_execute)
+
+        pipeline = Pipeline(duckdb_path=str(db_path))
+        result = pipeline.run_all(read_fixture("fixtures/golden/golden_passing.md"))
+
+        assert result["pipeline_error"]["stage"] == "snapshot"
+        assert result["execution_status"] == "not_executed"
+        assert execute_called is False
 
     def test_run_all_with_snapshot_builder_produces_manifest(self, local_fixture_provider):
         """注入 SnapshotBuilder + LOCAL_FIXTURE Provider 时 run_all() 产出 SnapshotManifest。"""
@@ -940,8 +1250,8 @@ class TestSnapshotPipelineIntegration:
         # 清理临时目录
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def test_snapshot_failure_does_not_block_run_all(self, local_fixture_provider):
-        """Snapshot 构建失败不阻断 run_all() 主流程——优雅降级。"""
+    def test_optional_fixture_snapshot_skips_unallowlisted_tables(self, local_fixture_provider):
+        """本地 fixture 无白名单交集时不生成额外审计副本。"""
         import tempfile
         tmpdir = tempfile.mkdtemp(prefix="tianshu_snap_fail_")
         # 构造一个会失败的 provider——白名单空（source_tables 过滤后为空，但不抛异常）
@@ -960,8 +1270,8 @@ class TestSnapshotPipelineIntegration:
         }
 
         result = pipeline.run_all(md, table_paths=table_paths)
-        assert result["request_id"], "snapshot 失败不应阻断 run_all"
-        assert result["package_id"], "snapshot 失败不应阻断 package 生成"
+        assert result["request_id"]
+        assert result["package_id"]
 
         bundle = pipeline.export_artifacts(result["request_id"])
         assert bundle is not None

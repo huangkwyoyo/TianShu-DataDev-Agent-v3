@@ -9,8 +9,6 @@
 - v1 hash 一致性
 """
 
-import os
-
 from tests._test_utils import read_fixture
 from tianshu_datadev.artifacts.contract_extractor import DataTransformContractExtractor
 from tianshu_datadev.artifacts.models import (
@@ -49,15 +47,6 @@ from tianshu_datadev.planning.sql_program import (
     StatementKind,
 )
 from tianshu_datadev.planning.temp_table import TempTableSpec
-
-# ── 辅助 ──
-
-
-def read_fixture(path: str) -> str:
-    """读取测试 fixture 文件。"""
-    abs_path = os.path.join(os.path.dirname(__file__), "..", path)
-    with open(abs_path, "r", encoding="utf-8") as f:
-        return f.read()
 
 
 def _parse_spec(fixture_path: str):
@@ -510,7 +499,7 @@ class TestContractExtractorV1:
         assert ws.alias == "rn"
         assert ws.input_column is None  # 排名函数无输入列
         assert "category" in ws.partition_by
-        assert "total" in ws.order_by
+        assert "total DESC" in ws.order_by
 
         # LAG 窗口函数的 input_column 必须被正确提取
         ws2 = contract.window_specs[1]
@@ -663,6 +652,20 @@ class TestContractExtractorV1:
         extractor = DataTransformContractExtractor()
         with pytest.raises(ValueError, match="不含任何 statement"):
             extractor.extract_v1(sql_program)
+
+    def test_extract_v1_preserves_declared_output_grain(self):
+        """明细表的 DeveloperSpec 粒度必须进入 Contract，不能只保留聚合键。"""
+        from tianshu_datadev.planning.program_factory import build_sql_program
+
+        plan = _make_minimal_plan("plan_detail_grain")
+        program = build_sql_program(plan, "spec_detail_grain")
+
+        contract = DataTransformContractExtractor().extract_v1(
+            program,
+            output_grain=["trip_id"],
+        )
+
+        assert contract.output_grain == ["trip_id"]
 
     def test_predicate_to_case_when_rejects_column_ref_right(self):
         """二元比较右侧是 ColumnRef（列-列比较）→ ValueError，不静默字符串化。"""
@@ -827,6 +830,78 @@ class TestContractExtractorV1:
             f"_temp_* 表不应进入 Contract input_tables，实际={input_refs}"
         )
 
+    def test_temp_to_external_join_restores_source_lineage(self):
+        """临时结果关联外部角色表时，Contract 必须保留 Join 和列来源。"""
+        from tianshu_datadev.artifacts.contract_extractor import (
+            DataTransformContractExtractor,
+        )
+        from tianshu_datadev.planning.models import AliasExpr, ColumnRef, JoinType
+        from tianshu_datadev.planning.sql_build_plan import JoinStep, ProjectStep
+
+        lineage = {
+            ("_temp_trip_pickup", "dropoff_location_id"): ColumnRef(
+                table_ref="ft",
+                column_name="dropoff_location_id",
+                normalized_name="dropoff_location_id",
+            ),
+            ("_temp_trip_pickup", "pickup_zone_name"): ColumnRef(
+                table_ref="tz_pu",
+                column_name="zone_name",
+                normalized_name="zone_name",
+            ),
+        }
+        join = JoinStep(
+            step_id="join_dropoff",
+            right_table_ref="tz_do",
+            join_type=JoinType.LEFT,
+            join_keys=[(
+                ColumnRef(
+                    table_ref="_temp_trip_pickup",
+                    column_name="dropoff_location_id",
+                    normalized_name="dropoff_location_id",
+                ),
+                ColumnRef(
+                    table_ref="tz_do",
+                    column_name="location_id",
+                    normalized_name="location_id",
+                ),
+            )],
+            relationship_ref="join_dropoff_relation",
+        )
+
+        extracted_join = DataTransformContractExtractor._extract_join(
+            join,
+            {},
+            lineage,
+        )
+        assert extracted_join is not None
+        assert extracted_join.left_table == "ft"
+        assert extracted_join.right_table == "tz_do"
+
+        project = ProjectStep(
+            step_id="project_zones",
+            columns=[
+                AliasExpr(
+                    expression=ColumnRef(
+                        table_ref="_temp_trip_pickup",
+                        column_name="pickup_zone_name",
+                        normalized_name="pickup_zone_name",
+                    ),
+                    alias="pickup_zone_name",
+                ),
+                AliasExpr(
+                    expression=ColumnRef(
+                        table_ref="tz_do",
+                        column_name="zone_name",
+                        normalized_name="zone_name",
+                    ),
+                    alias="dropoff_zone_name",
+                ),
+            ],
+        )
+        outputs = DataTransformContractExtractor._extract_project(project, lineage)
+        assert [item.source_table_ref for item in outputs] == ["tz_pu", "tz_do"]
+
 
 # ════════════════════════════════════════════
 # Phase 3C Step 2——Pipeline 集成测试
@@ -949,13 +1024,15 @@ class TestPipelineStep2:
         assert contract.version == "lite"
         assert contract.source_phase == "phase-2"
         assert contract.source_sqlbuildplan_hash != ""
-        # lite 不含 v1 字段
+        # lite 不含 v1 专属的 DAG/temp_tables/write_spec 字段
         data = contract.model_dump()
         assert "step_dag" not in data
         assert "temp_tables" not in data
-        assert "case_when_labels" not in data
-        assert "window_specs" not in data
         assert "write_spec" not in data
+        # Phase 3B 修复：lite 现在包含 case_when_labels/window_specs——
+        # 否则 adapt_lite_to_v1 硬编码 [] 会静默丢弃 CASE WHEN/Window 信息
+        assert "case_when_labels" in data
+        assert "window_specs" in data
 
 
 # ════════════════════════════════════════════
@@ -1106,6 +1183,14 @@ class TestSingleStatementV1Regression:
         assert len(cw.branches) == 2
         assert all(b.condition is not None for b in cw.branches)
 
+        # Phase 3B 修复：output_columns 必须包含 CaseWhenStep 的派生列
+        # （历史缺陷：ProjectStep 只含基础列，CaseWhen 输出列被遗漏）
+        output_col_names = {oc.column_name for oc in contract.output_columns}
+        assert "value_level" in output_col_names, (
+            f"output_columns 缺少 CaseWhen 派生列 value_level，"
+            f"当前列：{output_col_names}"
+        )
+
         # ── Contract → SparkPlan 映射 ──
         result = map_contract_to_spark_plan(contract)
         assert result.success, f"映射失败：gaps={result.gaps}, unsupported={result.unsupported}"
@@ -1129,6 +1214,63 @@ class TestSingleStatementV1Regression:
         assert len(spark_cw.branches) == 2
         assert all(b.condition is not None for b in spark_cw.branches)
         assert spark_cw.else_value == "低价值"
+
+    def test_case_when_lite_path_preserves_labels_and_output_columns(self):
+        """Phase 3B 修复：lite 路径 extract() 必须提取 case_when_labels 并将
+        CaseWhenStep 输出列合并到 output_columns。
+
+        历史缺陷：lite extract() 跳过 CaseWhenStep，导致：
+        1. case_when_labels=[] → adapt_lite_to_v1 硬编码 [] → Mapper 不生成 CaseWhenStep
+        2. output_columns 只含 ProjectStep 基础列 → PySpark select() 缺派生列
+        """
+        from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+
+        plan = self._make_case_when_full_chain_plan()
+
+        extractor = DataTransformContractExtractor()
+        lite = extractor.extract(plan)
+
+        # lite 必须捕获 CaseWhenStep
+        assert lite.version == "lite"
+        assert len(lite.case_when_labels) == 1, (
+            f"lite 路径应提取 case_when_labels，但得到 {lite.case_when_labels}"
+        )
+        cw = lite.case_when_labels[0]
+        assert cw.output_alias == "value_level"
+
+        # output_columns 必须包含 CaseWhen 派生列
+        output_col_names = {oc.column_name for oc in lite.output_columns}
+        assert "value_level" in output_col_names, (
+            f"lite output_columns 缺少 CaseWhen 派生列 value_level，"
+            f"当前列：{output_col_names}"
+        )
+
+        # adapt_lite_to_v1 必须透传 case_when_labels
+        v1 = adapt_lite_to_v1(lite)
+        assert len(v1.case_when_labels) == 1
+        assert v1.case_when_labels[0].output_alias == "value_level"
+        # output_columns 在 v1 中也应包含派生列
+        v1_output_col_names = {oc.column_name for oc in v1.output_columns}
+        assert "value_level" in v1_output_col_names, (
+            f"v1 output_columns 缺少 CaseWhen 派生列 value_level，"
+            f"当前列：{v1_output_col_names}"
+        )
+
+    def test_case_when_output_columns_not_duplicated(self):
+        """CaseWhen 派生列不应在 output_columns 中重复——去重逻辑验证。"""
+        plan = self._make_case_when_full_chain_plan()
+
+        extractor = DataTransformContractExtractor()
+        lite = extractor.extract(plan)
+
+        # value_level 只出现一次
+        value_level_count = sum(
+            1 for oc in lite.output_columns
+            if oc.column_name == "value_level"
+        )
+        assert value_level_count == 1, (
+            f"value_level 在 output_columns 中出现 {value_level_count} 次，应精确 1 次"
+        )
 
     def test_window_step_single_statement_v1_path(self):
         """WindowStep 单语句：build_sql_program + extract_v1 必须捕获 window_specs。"""

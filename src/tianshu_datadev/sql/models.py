@@ -22,7 +22,8 @@ class ExecutionStatus(str, Enum):
     NOT_EXECUTED = "NOT_EXECUTED"  # 步骤未执行
     RUNTIME_PASS = "RUNTIME_PASS"  # 在当前快照上运行成功
     RUNTIME_FAIL = "RUNTIME_FAIL"  # 执行失败（SQL 错误、超时等）
-    TIMEOUT = "TIMEOUT"  # 执行超时
+    TIMEOUT = "TIMEOUT"  # 执行超时（被 interrupt() 中断）
+    RESULT_TOO_LARGE = "RESULT_TOO_LARGE"  # 结果行数超过 max_result_rows 上限
 
 
 # ════════════════════════════════════════════

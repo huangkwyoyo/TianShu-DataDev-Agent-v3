@@ -168,6 +168,7 @@ class SparkProjectColumn(StrictModel):
 
     column_name: str  # 源列名
     alias: str  # 输出别名
+    source_alias: str = ""  # Join 后同名列的来源 DataFrame 别名
 
 
 class SparkCaseWhenStep(StrictModel):
@@ -226,7 +227,7 @@ class SparkWindowExpr(StrictModel):
     alias: str  # 输出列别名
     input_column: str | None = None  # 输入列名（LAG/LEAD/SUM_OVER/AVG_OVER/COUNT_OVER 需要；排名函数不需要）
     partition_by: list[str] = []  # 分区键列名列表
-    order_by: list[str] = []  # 排序键列名列表
+    order_by: list[str] = []  # 排序键及可选方向，如 "trip_count DESC"
     # 帧边界配置（可选——默认使用函数类型对应的标准帧）
     frame_type: str = "rows"  # "rows" | "range"
     frame_start: str = "unbounded_preceding"  # 帧起始边界

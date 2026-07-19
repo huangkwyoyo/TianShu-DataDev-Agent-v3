@@ -86,7 +86,7 @@ def cross_validate(
         return []
 
     # ── 构建查找结构 ──
-    # 列名 → 拥有该列的表集合
+    # 列名 → 拥有该列的表集合（全量——含推断列）
     col_to_tables: dict[str, set[str]] = {}
     # table_ref → 该表所有列名集合
     table_cols: dict[str, set[str]] = {}
@@ -97,6 +97,15 @@ def cross_validate(
             if col.column_name not in col_to_tables:
                 col_to_tables[col.column_name] = set()
             col_to_tables[col.column_name].add(table.table_ref)
+
+    # 显式列→表映射——仅基于 key_columns + business_columns，不含推断列。
+    # CV3 使用此映射以避免 build_manifest_from_spec() 推断列造成的误报。
+    explicit_col_to_tables: dict[str, set[str]] = {}
+    for t in spec.input_tables:
+        for c in t.key_columns + t.business_columns:
+            if c.column_name not in explicit_col_to_tables:
+                explicit_col_to_tables[c.column_name] = set()
+            explicit_col_to_tables[c.column_name].add(t.table_alias)
 
     # 事实表——spec 的第一张输入表
     fact_table = spec.input_tables[0].table_alias if spec.input_tables else ""
@@ -129,8 +138,8 @@ def cross_validate(
     used_columns: set[str] = {col for col, _ in col_refs}
     _cv2_check(hypothesis.candidates, used_columns, table_cols, reachable, questions)
 
-    # ── CV3: 跨表列歧义 ──
-    _cv3_check(col_refs, col_to_tables, reachable, hypothesis.candidates, questions)
+    # ── CV3: 跨表列歧义（使用显式列映射，避免推断列误报）──
+    _cv3_check(col_refs, explicit_col_to_tables, reachable, hypothesis.candidates, questions)
 
     # ── CV4: 粒度一致性 ──
     _cv4_check(spec, col_to_tables, reachable, fact_table, questions)

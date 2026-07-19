@@ -316,14 +316,66 @@ export function SparkStageResultPanel({ stage, result, status, visible }: Props)
         <div className={`physver-section${result.skipped ? ' stage-skipped' : ''}`}>
           <div className="physver-header">
             <span className="physver-status-icon">
-              {result.skipped ? '⏭️' : '✅'}
+              {result.skipped ? '⏭️' : result.status === 'failed' ? '❌' : '✅'}
             </span>
             <span className="physver-brief">
-              {result.skipped ? '物理验证已跳过' : '物理验证完成'}
+              {result.skipped ? '物理验证已跳过'
+                : result.status === 'failed' ? '物理验证未通过'
+                : '物理验证通过'}
             </span>
           </div>
           {result.message && (
             <div className="physver-message">{result.message}</div>
+          )}
+          {/* 物理验证失败时展示关键指标 */}
+          {result.status === 'failed' && (
+            <div className="physver-metrics">
+              {result.row_count_match !== undefined && (
+                <span className="physver-metric">
+                  行数一致：{result.row_count_match ? '✅' : '❌'}
+                </span>
+              )}
+              {result.schema_match !== undefined && (
+                <span className="physver-metric">
+                  Schema一致：{result.schema_match ? '✅' : '❌'}
+                </span>
+              )}
+              {result.total_diff_count !== undefined && result.total_diff_count > 0 && (
+                <span className="physver-metric">
+                  差异数：{result.total_diff_count}
+                </span>
+              )}
+            </div>
+          )}
+          {/* 差异详情——逐行展示 DuckDB vs Spark */}
+          {result.diffs && result.diffs.length > 0 && (
+            <details className="physver-details">
+              <summary className="physver-details-summary">
+                差异明细 ({result.diffs.length} 条{(result.total_diff_count ?? 0) > result.diffs.length ? `，共 ${result.total_diff_count} 条` : ''})
+              </summary>
+              <div className="physver-diff-table-wrap">
+                <table className="physver-diff-table">
+                  <thead>
+                    <tr>
+                      <th>行</th>
+                      <th>列</th>
+                      <th>DuckDB</th>
+                      <th>Spark</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {result.diffs.map((d, i) => (
+                      <tr key={i}>
+                        <td className="diff-row-idx">{d.row_index ?? '-'}</td>
+                        <td className="diff-col">{d.column}</td>
+                        <td className="diff-val duckdb">{String(d.duckdb_value)}</td>
+                        <td className="diff-val spark">{String(d.spark_value)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </details>
           )}
           {result.errors && result.errors.length > 1 && (
             <details className="physver-details">

@@ -47,6 +47,22 @@ from tianshu_datadev.spark.physical_verifier import (
     _strip_sql_comments,
     _validate_select_sql,
 )
+from tianshu_datadev.sql.models import CompiledSql, OptimizedSQLPlan, ProgramCompiledSql
+
+
+def _compiled_sql(sql: str) -> CompiledSql:
+    """构造物理验证测试使用的最小确定性编译产物。"""
+    optimized_plan = OptimizedSQLPlan(
+        input_plan_hash="plan_hash",
+        output_plan_hash="plan_hash",
+    )
+    return CompiledSql(
+        sql=sql,
+        sql_sha256=CompiledSql.compute_sql_hash(sql, "test"),
+        optimized_plan=optimized_plan,
+        compiler_version="test",
+        input_plan_hash="plan_hash",
+    )
 
 # ════════════════════════════════════════════
 # ResultCanonicalizer 测试
@@ -195,10 +211,78 @@ class TestResultCanonicalizer:
         assert result == "2026-01-15 10:30:00"
 
     def test_iso_t_microsecond_string_normalization(self):
-        """ISO 8601 含微秒的 T 分隔字符串 → 保留微秒的空格分隔。"""
+        """ISO 8601 含微秒的 T 分隔字符串 → 秒级空格分隔（小数秒丢弃）。
+
+        DuckDB 侧 datetime 经 strftime("%H:%M:%S") 丢弃微秒，Spark 侧
+        ISO 字符串必须同样丢弃小数秒，否则键对齐时每行必不相等。
+        """
         canonicalizer = ResultCanonicalizer()
         result = canonicalizer._normalize_value("2026-01-15T10:30:00.123456")
-        assert result == "2026-01-15 10:30:00.123456"
+        assert result == "2026-01-15 10:30:00"
+
+    def test_iso_t_millis_timezone_normalization(self):
+        """Spark toJSON 默认时间戳格式（毫秒+时区偏移）→ 秒级空格分隔。
+
+        溢出降级抽样零匹配的根因之一：'2026-01-06T06:04:06.000+08:00'
+        旧正则不匹配时区后缀导致原样保留，与 DuckDB '2026-01-06 06:04:06'
+        键对齐必然失败。
+        """
+        canonicalizer = ResultCanonicalizer()
+        assert canonicalizer._normalize_value(
+            "2026-01-06T06:04:06.000+08:00",
+        ) == "2026-01-06 06:04:06"
+
+    def test_iso_t_millis_utc_z_normalization(self):
+        """UTC Z 后缀的 ISO 时间戳 → 秒级空格分隔。"""
+        canonicalizer = ResultCanonicalizer()
+        assert canonicalizer._normalize_value(
+            "2026-01-06T06:04:06.000Z",
+        ) == "2026-01-06 06:04:06"
+
+    def test_iso_t_compact_timezone_normalization(self):
+        """紧凑时区偏移（+0800 无冒号）的 ISO 时间戳 → 秒级空格分隔。"""
+        canonicalizer = ResultCanonicalizer()
+        assert canonicalizer._normalize_value(
+            "2026-01-06T06:04:06.000+0800",
+        ) == "2026-01-06 06:04:06"
+
+    # ── Decimal/浮点表示归一化（溢出降级键对齐根因之二）──
+
+    def test_decimal_trailing_zeros_normalized(self):
+        """Decimal 去尾零——DuckDB Decimal('11.80') 与 Spark JSON float 11.8 对齐。"""
+        from decimal import Decimal
+        canonicalizer = ResultCanonicalizer()
+        assert canonicalizer._normalize_value(Decimal("11.80")) == "11.8"
+
+    def test_decimal_integral_no_scientific_notation(self):
+        """整值 Decimal 归一化不得产生科学计数法（100.00 → '100' 而非 '1E+2'）。"""
+        from decimal import Decimal
+        canonicalizer = ResultCanonicalizer()
+        assert canonicalizer._normalize_value(Decimal("100.00")) == "100"
+
+    def test_decimal_vs_spark_float_equivalence(self):
+        """DuckDB Decimal 与 Spark JSON 解析 float 归一化后必须相等。"""
+        from decimal import Decimal
+        canonicalizer = ResultCanonicalizer()
+        assert canonicalizer._normalize_value(
+            Decimal("11.80"),
+        ) == canonicalizer._normalize_value(11.8)
+        assert canonicalizer._normalize_value(
+            Decimal("100.00"),
+        ) == canonicalizer._normalize_value(100.0)
+
+    def test_integral_float_drops_point_zero(self):
+        """整值 float 去 '.0'——与整值 Decimal 表示对齐。"""
+        canonicalizer = ResultCanonicalizer()
+        assert canonicalizer._normalize_value(100.0) == "100"
+
+    def test_decimal_large_precision_preserved(self):
+        """大数值 Decimal 归一化保留全部有效位（禁止经 float 转换损失精度）。"""
+        from decimal import Decimal
+        canonicalizer = ResultCanonicalizer()
+        assert canonicalizer._normalize_value(
+            Decimal("123456789012345678.90"),
+        ) == "123456789012345678.9"
 
     def test_duckdb_datetime_vs_spark_json_string_equivalence(self):
         """DuckDB 原生 datetime 与 PySpark JSON 字符串归一化后等价。
@@ -315,6 +399,50 @@ class TestDuckDBExecution:
         rows_by_region = {r["region"]: r["cnt"] for r in result.output_rows}
         assert rows_by_region["east"] == 2
         assert rows_by_region["west"] == 1
+
+    def test_duckdb_executes_compiled_program_prerequisites(self, temp_parquet_dir):
+        """多语句编译产物必须在同一连接中创建并读取临时表。"""
+        setup_sql = (
+            "-- deterministic compiler output\n"
+            "CREATE TEMP TABLE _temp_orders AS\n"
+            'SELECT * FROM "order_info" WHERE "amount" >= 100'
+        )
+        final_sql = 'SELECT * FROM _temp_orders ORDER BY "order_id"'
+        program = ProgramCompiledSql(
+            program_id="program_test",
+            statements=[_compiled_sql(setup_sql), _compiled_sql(final_sql)],
+            cleanup_sql=["DROP TABLE IF EXISTS _temp_orders"],
+            statement_order=["setup", "final"],
+        )
+
+        result = PhysicalVerifier()._execute_duckdb(
+            final_sql,
+            temp_parquet_dir,
+            compiled_program=program,
+        )
+
+        assert result.status == SparkExecutionStatus.SUCCESS
+        assert [row["order_id"] for row in result.output_rows] == ["1", "2", "3"]
+
+    def test_duckdb_rejects_unsafe_compiled_program(self, temp_parquet_dir):
+        """结构化程序也不能借前置语句执行任意 DDL/DML。"""
+        final_sql = 'SELECT * FROM "order_info"'
+        program = ProgramCompiledSql(
+            program_id="program_unsafe",
+            statements=[
+                _compiled_sql('CREATE TABLE unsafe AS SELECT * FROM "order_info"'),
+                _compiled_sql(final_sql),
+            ],
+            statement_order=["unsafe", "final"],
+        )
+
+        result = PhysicalVerifier()._execute_duckdb(
+            final_sql,
+            temp_parquet_dir,
+            compiled_program=program,
+        )
+
+        assert result.status == SparkExecutionStatus.SECURITY_REJECTED
 
     def test_duckdb_rejects_dangerous_sql(self, temp_parquet_dir):
         """危险 SQL（DROP）→ SECURITY_REJECTED。"""
@@ -656,7 +784,8 @@ class _MockSparkExecutor:
 
     def execute(self, pyspark_code: str, data_dir: str | None = None,
                 output_var: str = "result_df",
-                sample_keys: list[str] | None = None) -> SparkExecutionResult:
+                sample_keys: list[str] | None = None,
+                force_overflow: bool = False) -> SparkExecutionResult:
         self._call_count += 1
         if self._success:
             return SparkExecutionResult(
@@ -672,43 +801,54 @@ class _MockSparkExecutor:
 
 
 class _MockOverflowSparkExecutor:
-    """Mock 溢出执行器——模拟结果超收集上限的降级收集（count + 抽样）。"""
+    """Mock 溢出执行器——模拟结果超收集上限的降级收集（count + 维度值抽样）。"""
 
     def __init__(
         self,
         total_row_count: int | None,
         sample_rows: list[dict] | None = None,
+        sample_dim: str | None = None,
+        sample_values: list[str] | None = None,
     ) -> None:
         self._total = total_row_count
         self._sample = sample_rows or []
+        self._sample_dim = sample_dim
+        self._sample_values = sample_values or []
         self.received_sample_keys: list[str] | None = None
+        self.received_force_overflow: bool | None = None
 
     def execute(self, pyspark_code: str, data_dir: str | None = None,
                 output_var: str = "result_df",
-                sample_keys: list[str] | None = None) -> SparkExecutionResult:
+                sample_keys: list[str] | None = None,
+                force_overflow: bool = False) -> SparkExecutionResult:
         self.received_sample_keys = sample_keys
+        self.received_force_overflow = force_overflow
         return SparkExecutionResult(
             status=SparkExecutionStatus.SUCCESS,
             output_rows=list(self._sample),
             result_overflow=True,
             total_row_count=self._total,
+            sample_dim=self._sample_dim,
+            sample_values=list(self._sample_values),
             execution_time_ms=10.0,
             error_message="结果行数超过上限（100000）——mock 降级收集",
         )
 
 
 class TestOverflowDegradedVerification:
-    """溢出降级验证——行数对比 + 键对齐抽样对比，替代直接 NOT_EXECUTED。"""
+    """溢出降级验证——行数对比 + 维度值抽样组对比，替代直接 NOT_EXECUTED。"""
 
     def test_count_and_sample_match_returns_sampled_consistent(self, temp_parquet_dir):
-        """行数一致 + 抽样逐列一致 → SAMPLED_CONSISTENT（抽样一致，非全量一致）。"""
-        # DuckDB 侧 3 行；mock Spark 引擎内计数 3，抽样返回其中 2 行（与 DuckDB 同值）
+        """行数一致 + 抽样组逐列一致 → SAMPLED_CONSISTENT（抽样一致，非全量一致）。"""
+        # DuckDB 侧 3 行；mock Spark 引擎内计数 3，维度值抽样覆盖 order_id ∈ {1, 3}
         mock_spark = _MockOverflowSparkExecutor(
             total_row_count=3,
             sample_rows=[
                 {"order_id": "1", "amount": 100, "region": "east"},
                 {"order_id": "3", "amount": 150, "region": "east"},
             ],
+            sample_dim="order_id",
+            sample_values=["1", "3"],
         )
         verifier = PhysicalVerifier(spark_executor=mock_spark)
 
@@ -747,12 +887,14 @@ class TestOverflowDegradedVerification:
         assert "行数" in report.error_message
 
     def test_sample_value_mismatch_returns_result_mismatch(self, temp_parquet_dir):
-        """行数一致但抽样值不一致 → RESULT_MISMATCH 且携带差异明细。"""
+        """行数一致但抽样组内值不一致 → RESULT_MISMATCH 且携带差异明细。"""
         mock_spark = _MockOverflowSparkExecutor(
             total_row_count=3,
             sample_rows=[
                 {"order_id": "1", "amount": 999, "region": "east"},  # amount 不同
             ],
+            sample_dim="order_id",
+            sample_values=["1"],
         )
         verifier = PhysicalVerifier(spark_executor=mock_spark)
 
@@ -768,6 +910,84 @@ class TestOverflowDegradedVerification:
         assert report.status == PhysicalVerificationStatus.RESULT_MISMATCH
         assert report.row_count_match
         assert len(report.diffs) > 0
+
+    def test_group_row_count_mismatch_returns_result_mismatch(self, temp_parquet_dir):
+        """抽样组内行数不一致（Spark 同维度值多一行）→ RESULT_MISMATCH（确定性差异）。"""
+        mock_spark = _MockOverflowSparkExecutor(
+            total_row_count=3,
+            sample_rows=[
+                {"order_id": "1", "amount": 100, "region": "east"},
+                {"order_id": "1", "amount": 100, "region": "east"},  # 多出的重复行
+            ],
+            sample_dim="order_id",
+            sample_values=["1"],
+        )
+        verifier = PhysicalVerifier(spark_executor=mock_spark)
+
+        report = verifier.verify(
+            sql_query='SELECT * FROM "order_info" ORDER BY "order_id"',
+            pyspark_code='result_df = input_df.orderBy("order_id")',
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_hash_overflow",
+            snapshot_id="snap_overflow_006",
+            order_keys=["order_id"],
+        )
+
+        assert report.status == PhysicalVerificationStatus.RESULT_MISMATCH
+        assert report.row_count_match  # 总行数一致，组内行数不一致
+        assert "组" in report.error_message
+
+    def test_zero_dim_alignment_returns_not_executed(self, temp_parquet_dir):
+        """抽样维度值在 DuckDB 侧零匹配 → NOT_EXECUTED（对齐失败，不误报 MISMATCH）。
+
+        零匹配远比"数据真的完全不同"更可能是表示差异/维度选择问题——
+        总行数已一致，不应据此判定失败。
+        """
+        mock_spark = _MockOverflowSparkExecutor(
+            total_row_count=3,
+            sample_rows=[
+                {"order_id": "zzz", "amount": 1, "region": "x"},
+            ],
+            sample_dim="order_id",
+            sample_values=["zzz"],
+        )
+        verifier = PhysicalVerifier(spark_executor=mock_spark)
+
+        report = verifier.verify(
+            sql_query='SELECT * FROM "order_info" ORDER BY "order_id"',
+            pyspark_code='result_df = input_df.orderBy("order_id")',
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_hash_overflow",
+            snapshot_id="snap_overflow_007",
+            order_keys=["order_id"],
+        )
+
+        assert report.status == PhysicalVerificationStatus.NOT_EXECUTED
+        assert "对齐" in report.error_message
+
+    def test_overflow_without_dim_counts_only(self, temp_parquet_dir):
+        """有抽样行但无维度元信息（旧格式）→ 行数一致时 NOT_EXECUTED（仅计数）。"""
+        mock_spark = _MockOverflowSparkExecutor(
+            total_row_count=3,
+            sample_rows=[
+                {"order_id": "1", "amount": 100, "region": "east"},
+            ],
+            sample_dim=None,
+            sample_values=[],
+        )
+        verifier = PhysicalVerifier(spark_executor=mock_spark)
+
+        report = verifier.verify(
+            sql_query='SELECT * FROM "order_info" ORDER BY "order_id"',
+            pyspark_code='result_df = input_df.orderBy("order_id")',
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_hash_overflow",
+            snapshot_id="snap_overflow_008",
+            order_keys=["order_id"],
+        )
+
+        assert report.status == PhysicalVerificationStatus.NOT_EXECUTED
+        assert report.row_count_match
 
     def test_legacy_overflow_without_count_returns_not_executed(self, temp_parquet_dir):
         """旧版溢出（无引擎内计数、无抽样）→ 保留 NOT_EXECUTED，消息附带 DuckDB 行数。"""
@@ -787,7 +1007,7 @@ class TestOverflowDegradedVerification:
         assert "3" in report.error_message  # DuckDB 侧行数可见
 
     def test_verify_passes_sample_keys_to_spark_executor(self, temp_parquet_dir):
-        """verify 将有效排序键传给 Spark 执行器——溢出时才能做键排序抽样。"""
+        """verify 将有效排序键传给 Spark 执行器——溢出时才能做维度值抽样。"""
         mock_spark = _MockOverflowSparkExecutor(total_row_count=3, sample_rows=[])
         verifier = PhysicalVerifier(spark_executor=mock_spark)
 
@@ -801,6 +1021,70 @@ class TestOverflowDegradedVerification:
         )
 
         assert mock_spark.received_sample_keys == ["order_id"]
+
+    def test_duckdb_exceeds_cap_forces_overflow(self, temp_parquet_dir, monkeypatch):
+        """DuckDB 行数超收集上限 → 传 force_overflow=True，跳过全量收集尝试。"""
+        # 收缩上限至 2（快照有 3 行）——模拟 DuckDB 侧先行超限
+        monkeypatch.setattr(
+            "tianshu_datadev.spark.physical_verifier._MAX_RESULT_ROWS", 2,
+        )
+        mock_spark = _MockOverflowSparkExecutor(total_row_count=3, sample_rows=[])
+        verifier = PhysicalVerifier(spark_executor=mock_spark)
+
+        verifier.verify(
+            sql_query='SELECT * FROM "order_info" ORDER BY "order_id"',
+            pyspark_code='result_df = input_df.orderBy("order_id")',
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_hash_overflow",
+            snapshot_id="snap_overflow_009",
+            order_keys=["order_id"],
+        )
+
+        assert mock_spark.received_force_overflow is True
+
+    def test_duckdb_within_cap_no_force_overflow(self, temp_parquet_dir):
+        """DuckDB 行数未超上限 → force_overflow=False（保持常规检测路径）。"""
+        mock_spark = _MockOverflowSparkExecutor(total_row_count=3, sample_rows=[])
+        verifier = PhysicalVerifier(spark_executor=mock_spark)
+
+        verifier.verify(
+            sql_query='SELECT * FROM "order_info" ORDER BY "order_id"',
+            pyspark_code='result_df = input_df.orderBy("order_id")',
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_hash_overflow",
+            snapshot_id="snap_overflow_010",
+            order_keys=["order_id"],
+        )
+
+        assert mock_spark.received_force_overflow is False
+
+    def test_degraded_mismatch_saves_diagnostics(self, temp_parquet_dir, tmp_path, monkeypatch):
+        """降级验证 RESULT_MISMATCH → 落盘诊断文件（双侧抽样行 + 代码），可离线定位。"""
+        monkeypatch.chdir(tmp_path)
+        mock_spark = _MockOverflowSparkExecutor(
+            total_row_count=3,
+            sample_rows=[
+                {"order_id": "1", "amount": 999, "region": "east"},  # amount 不同
+            ],
+            sample_dim="order_id",
+            sample_values=["1"],
+        )
+        verifier = PhysicalVerifier(spark_executor=mock_spark)
+
+        report = verifier.verify(
+            sql_query='SELECT * FROM "order_info" ORDER BY "order_id"',
+            pyspark_code='result_df = input_df.orderBy("order_id")',
+            snapshot_dir=temp_parquet_dir,
+            contract_hash="test_hash_overflow",
+            snapshot_id="snap_overflow_011",
+            order_keys=["order_id"],
+        )
+
+        assert report.status == PhysicalVerificationStatus.RESULT_MISMATCH
+        diag_root = tmp_path / "logs" / "monitor" / "diagnostics"
+        diag_dirs = list(diag_root.glob("physver_snap_overflow_011_*"))
+        assert diag_dirs, "降级 mismatch 应保存诊断目录"
+        assert (diag_dirs[0] / "manifest.json").exists()
 
     def test_sampled_consistent_derives_all_consistent(self):
         """derive_overall_status：SAMPLED_CONSISTENT 门禁语义等同通过，不落兜底 NOT_EXECUTED。"""
@@ -928,8 +1212,8 @@ class TestPhysicalVerifierWithMock:
             f"window 不应被 UNSUPPORTED_SEMANTICS 拦截，实际状态：{report.status.value}"
         )
 
-    def test_auto_sort_keys_when_missing(self, temp_parquet_dir):
-        """无显式排序键 → 自动从 DuckDB 结果列名提取排序键，结果一致。"""
+    def test_missing_authoritative_keys_requires_canonicalization(self, temp_parquet_dir):
+        """多行结果无显式或 Contract 权威键时必须 fail-closed。"""
         # Spark mock 返回与 DuckDB 一致的数据（无显式排序键）
         expected_rows = [
             {"order_id": "1", "amount": 100, "region": "east"},
@@ -951,14 +1235,11 @@ class TestPhysicalVerifierWithMock:
             order_keys=None,  # 不指定排序键——应自动从 DuckDB 结果列名提取
         )
 
-        # 自动排序后应得到一致结果
-        assert report.status == PhysicalVerificationStatus.RESULT_CONSISTENT, (
-            f"预期自动排序后 RESULT_CONSISTENT，实际 {report.status.value}。"
-            f" 错误：{report.error_message}"
-        )
+        assert report.status == PhysicalVerificationStatus.CANONICALIZATION_NEEDED
+        assert "缺少显式排序键或 Contract 权威键" in report.error_message
 
-    def test_canonicalization_needed_no_order_keys_data_mismatch(self, temp_parquet_dir):
-        """自动排序后数据不一致 → RESULT_MISMATCH（非 CANONICALIZATION_NEEDED）。"""
+    def test_missing_keys_does_not_claim_result_mismatch(self, temp_parquet_dir):
+        """没有权威键时不得用全部结果列对齐后声称结果不一致。"""
         # Spark mock 返回不同数据——自动排序后应检测到差异
         mismatched_rows = [
             {"order_id": "1", "amount": 999, "region": "east"},
@@ -978,8 +1259,7 @@ class TestPhysicalVerifierWithMock:
             order_keys=None,
         )
 
-        # 自动排序后应检测到不一致（不再因缺少排序键而 CANONICALIZATION_NEEDED）
-        assert report.status == PhysicalVerificationStatus.RESULT_MISMATCH
+        assert report.status == PhysicalVerificationStatus.CANONICALIZATION_NEEDED
 
     def test_spark_execution_error(self, temp_parquet_dir):
         """Spark 执行失败 → EXECUTION_ERROR。"""

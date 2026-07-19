@@ -423,6 +423,15 @@ export interface SparkStageResult {
   uncovered_step_types?: string[];
   errors?: string[];
   skipped?: boolean;  // true 表示该阶段因环境/配置原因被跳过
+  row_count_match?: boolean;
+  schema_match?: boolean;
+  total_diff_count?: number;
+  diffs?: {
+    row_index?: number;
+    column: string;
+    duckdb_value: unknown;
+    spark_value: unknown;
+  }[];
   // ── Phase 8: DEVELOPER 阶段标注输出 ──
   annotations?: {
     step_id: string;

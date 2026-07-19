@@ -13,7 +13,7 @@ import re
 from enum import Enum
 from typing import Annotated
 
-from pydantic import AfterValidator
+from pydantic import AfterValidator, model_validator
 
 from tianshu_datadev.developer_spec.models import (
     AggregationType,
@@ -208,6 +208,19 @@ class AggregateSpec(StrictModel):
     distinct: bool = False  # 去重聚合（用于 SUM(DISTINCT col)，COUNT_DISTINCT 已独立处理）
     # ── Phase 5 新增字段 ──
     source_table: str | None = None  # 源表别名——多表场景下消除列歧义
+
+    @model_validator(mode="after")
+    def _validate_aggregate_input(self):
+        """仅 COUNT 允许省略输入列，阻止 SUM(*) 等无效 IR 进入编译器。"""
+        if (
+            self.aggregation != AggregationType.COUNT
+            and self.input_column is None
+            and self.input_expression is None
+        ):
+            raise ValueError(
+                f"{self.aggregation.value} 聚合必须声明 input_column 或 input_expression"
+            )
+        return self
 
 
 class SortSpec(StrictModel):

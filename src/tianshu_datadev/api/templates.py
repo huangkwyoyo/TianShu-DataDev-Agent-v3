@@ -271,7 +271,7 @@ TEMPLATES: list[dict] = [
             "        - name: pickup_at\n"
             "          type: timestamp\n"
             "          nullable: false\n"
-            "        - name: pickup_location_id\n"
+            "        - name: pickup_date_key\n"
             "          type: integer\n"
             "          nullable: true\n"
             "        - name: passenger_count\n"

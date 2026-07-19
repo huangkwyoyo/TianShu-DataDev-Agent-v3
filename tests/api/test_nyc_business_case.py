@@ -1131,6 +1131,11 @@ class TestNYCCase06SqlPipeline:
             f"执行应成功: {trace.get('error_message')}"
         )
 
+        bundle = pipeline.export_artifacts(result["request_id"])
+        assert bundle is not None
+        assert bundle.compiled_program is not None
+        assert len(bundle.compiled_program.statements) > 1
+
         # 验证输出包含 borough 列，且至少有 5 个不同的 borough
         summary = result["result_summary"]
         assert "borough" in summary.get("columns", []), (

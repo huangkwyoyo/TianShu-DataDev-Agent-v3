@@ -238,7 +238,10 @@ class SparkCompiler:
         step = resolved.step
         out_alias = resolved.output_var  # resolver 已分配 tN
         key_str = self.renderer.render_dict_key(step.source_name)
-        raw = f"{out_alias} = inputs[{key_str}]"
+        source_alias = self.renderer.validate_identifier(
+            step.alias, "ReadStep.alias",
+        )
+        raw = f'{out_alias} = inputs[{key_str}].alias("{source_alias}")'
 
         comment = self._build_comment_block(
             step_id=step_id, index=index, total=total,
@@ -313,13 +316,19 @@ class SparkCompiler:
             col_name = self.renderer.validate_identifier(
                 col.column_name, "ProjectStep.column_name"
             )
+            qualified_name = (
+                f"{col.source_alias}.{col_name}"
+                if col.source_alias
+                else col_name
+            )
+            col_expr = self.renderer.render_column(qualified_name)
             if col.alias and col.alias != col.column_name:
                 alias = self.renderer.validate_identifier(
                     col.alias, "ProjectStep.alias"
                 )
-                col_strs.append(f'F.col("{col_name}").alias("{alias}")')
+                col_strs.append(f'{col_expr}.alias("{alias}")')
             else:
-                col_strs.append(f'F.col("{col_name}")')
+                col_strs.append(col_expr)
 
         cols_joined = ", ".join(col_strs)
         raw = f"{out_alias} = {input_alias}.select({cols_joined})"
@@ -718,9 +727,17 @@ class SparkCompiler:
 
         # orderBy
         if expr.order_by:
-            order_cols = ", ".join(
-                self.renderer.render_column(c) for c in expr.order_by
-            )
+            rendered_order_cols: list[str] = []
+            for item in expr.order_by:
+                order_parts = item.rsplit(maxsplit=1)
+                if len(order_parts) == 2 and order_parts[1].upper() in {"ASC", "DESC"}:
+                    column_expr = self.renderer.render_column(order_parts[0])
+                    rendered_order_cols.append(
+                        f"{column_expr}.{order_parts[1].lower()}()"
+                    )
+                else:
+                    rendered_order_cols.append(self.renderer.render_column(item))
+            order_cols = ", ".join(rendered_order_cols)
             # 仅当 partitionBy 在前时才省略 Window. 前缀
             if expr.partition_by:
                 parts.append(f"orderBy({order_cols})")

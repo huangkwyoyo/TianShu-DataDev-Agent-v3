@@ -46,8 +46,10 @@ from tianshu_datadev.sql.models import (
     CompiledSql,
     ExecutionStatus,
     ExecutionTrace,
+    ProgramCompiledSql,
     ResultSummary,
     SqlArtifact,
+    SqlProgramArtifact,
 )
 from tianshu_datadev.sql.validator import SqlBuildPlanValidator
 
@@ -160,6 +162,7 @@ class PipelineArtifactBundle(StrictModel):
     # 接受 Lite（extract(plan) 产出）和 V1（extract_v1(sql_program) 产出）两种类型
     data_transform_contract: DataTransformContractLite | DataTransformContractV1 | None = None
     compiled_sql: CompiledSql | None = None
+    compiled_program: ProgramCompiledSql | None = None
     execution_trace: ExecutionTrace | None = None
     result_summary: ResultSummary | None = None
     # ── Phase 9B-P0: Snapshot 集成 ──
@@ -695,7 +698,7 @@ class Pipeline:
         """将异常封装为结构化错误信息。
 
         Args:
-            stage: 失败阶段标识（parser/enrich/build/compile/execute）
+            stage: 失败阶段标识（parser/enrich/build/compile/contract/snapshot/execute）
             exc: 捕获的异常
 
         Returns:
@@ -718,7 +721,7 @@ class Pipeline:
 
         Args:
             method: 调用方法名（parse_only/build_plan/execute/run_all/...）
-            stage: 失败阶段标识（parser/enrich/build/compile/execute/contract/package）
+            stage: 失败阶段标识（parser/enrich/build/compile/contract/snapshot/execute/package）
             exc: 捕获的异常
             request_id: 请求 ID——parser 阶段失败时为 "pending"
         """
@@ -742,7 +745,7 @@ class Pipeline:
         Args:
             failed_stage: 失败的阶段标识
             error_info: 失败阶段的错误详情（可选，合并到 failed 条目）
-            all_stages: 完整阶段列表（默认 5 阶段，run_all 用 7 阶段）
+            all_stages: 完整阶段列表（默认 6 阶段，run_all 用 9 阶段）
 
         Returns:
             阶段状态列表，前端据此渲染指示灯
@@ -771,8 +774,9 @@ class Pipeline:
             "build": "构建",
             "validate": "验证",
             "compile": "编译",
-            "execute": "执行",
             "contract": "契约",
+            "snapshot": "快照",
+            "execute": "执行",
             "package": "打包",
         }
         return _names.get(stage, stage)
@@ -856,6 +860,120 @@ class Pipeline:
         if table_paths is not None:
             return table_paths
         return self._default_table_paths
+
+    def _prepare_run_all_snapshot(
+        self,
+        *,
+        contract,
+        table_mapping: dict[str, str],
+        table_paths: dict[str, str] | None,
+    ) -> tuple[SnapshotManifest | None, dict[str, str]]:
+        """在 SQL 执行前准备同源快照，并返回 Executor 的表路径。"""
+        from pathlib import Path
+
+        from tianshu_datadev.artifacts.models import (
+            DataTransformContractLite,
+            DataTransformContractV1,
+        )
+        from tianshu_datadev.spark.snapshot import (
+            SNAPSHOT_DEFAULT_ROW_LIMIT,
+            SamplingSpec,
+            SnapshotBuilder,
+        )
+
+        resolved_paths = self._resolve_table_paths(table_paths)
+        contract_hash = (
+            DataTransformContractV1.compute_contract_hash(contract)
+            if isinstance(contract, DataTransformContractV1)
+            else DataTransformContractLite.compute_contract_hash(contract)
+        )
+
+        physical_tables: list[str] = []
+        physical_to_alias: dict[str, str] = {}
+        physical_to_aliases: dict[str, list[str]] = {}
+        for input_table in contract.input_tables:
+            physical = (
+                table_mapping.get(input_table.table_ref)
+                or table_mapping.get(input_table.source_table)
+                or input_table.source_table
+            )
+            if physical not in physical_tables:
+                physical_tables.append(physical)
+                physical_to_alias[physical] = input_table.table_ref
+            physical_to_aliases.setdefault(physical, []).append(input_table.table_ref)
+
+        if self._duckdb_path is not None:
+            if not physical_tables:
+                raise RuntimeError("Snapshot 构建失败：Contract 未声明输入表")
+            output_dir = str(
+                Path(__file__).resolve().parents[3]
+                / ".tianshu_cache"
+                / "snapshots"
+            )
+            snapshot_executor = DuckDBExecutor(
+                duckdb_path=self._duckdb_path,
+                memory_limit="1GB",
+                threads=1,
+                max_temp_directory_size="4GB",
+                process_memory_limit_mb=1536,
+            )
+            snapshot_manifest = snapshot_executor.materialize_snapshot(
+                output_dir=output_dir,
+                contract_hash=contract_hash,
+                source_tables=physical_tables,
+                joins=[join.model_dump(mode="json") for join in contract.join_relationships],
+                table_aliases=physical_to_alias,
+                table_role_aliases=physical_to_aliases,
+                sampling=SamplingSpec(
+                    mode="head",
+                    limit=SNAPSHOT_DEFAULT_ROW_LIMIT,
+                ).model_dump(mode="json"),
+            )
+            alias_targets = {
+                alias: physical_to_alias[physical]
+                for physical, aliases in physical_to_aliases.items()
+                for alias in aliases[1:]
+            }
+            if alias_targets:
+                SnapshotBuilder._write_inputs_index(
+                    snapshot_manifest.snapshot_dir,
+                    snapshot_manifest.files,
+                    alias_targets=alias_targets,
+                )
+            files_by_alias = {
+                snapshot_file.source_name: snapshot_file.file_path
+                for snapshot_file in snapshot_manifest.files
+            }
+            snapshot_paths = {
+                physical: files_by_alias[alias]
+                for physical, alias in physical_to_alias.items()
+            }
+            return snapshot_manifest, snapshot_paths
+
+        # 本地 fixture 文件本身就是受控开发数据；可选 Builder 仅生成审计副本。
+        snapshot_manifest = None
+        if self._snapshot_builder is not None and self._snapshot_provider is not None:
+            allowlisted = set(self._snapshot_provider.allowlisted_tables)
+            source_tables = [table for table in resolved_paths if table in allowlisted]
+            if source_tables:
+                snapshot_manifest = self._snapshot_builder.build(
+                    contract_hash=contract_hash,
+                    source_tables=source_tables,
+                    provider=self._snapshot_provider,
+                    table_aliases=physical_to_alias,
+                )
+                alias_targets = {
+                    alias: physical_to_alias[physical]
+                    for physical, aliases in physical_to_aliases.items()
+                    for alias in aliases[1:]
+                }
+                if alias_targets:
+                    SnapshotBuilder._write_inputs_index(
+                        snapshot_manifest.snapshot_dir,
+                        snapshot_manifest.files,
+                        alias_targets=alias_targets,
+                    )
+        return snapshot_manifest, resolved_paths
 
     # ── 公共方法 ──────────────────────────────────────────
 
@@ -1279,8 +1397,8 @@ class Pipeline:
                     if trace:
                         ctx.set_result(row_count=trace.row_count)
 
-            # ── 执行状态检查——RUNTIME_FAIL 阻断，不进入成功路径 ──
-            if isinstance(trace.status, ExecutionStatus) and trace.status == ExecutionStatus.RUNTIME_FAIL:
+            # 只有 RUNTIME_PASS 能进入成功路径，资源限制和超时必须阻断
+            if isinstance(trace.status, ExecutionStatus) and trace.status != ExecutionStatus.RUNTIME_PASS:
                 _plan_id = plan.plan_id if plan is not None else ""
                 _sql_sha256 = compiled.sql_sha256 if compiled is not None else ""
                 _compiler_ver = compiled.compiler_version if compiled is not None else ""
@@ -1372,7 +1490,11 @@ class Pipeline:
                         evidence_map_sp[c.candidate_id] = c.evidence
             extractor = DataTransformContractExtractor()
             sql_program = build_sql_program(plan, spec.spec_hash)
-            contract = extractor.extract_v1(sql_program, evidence_map=evidence_map_sp)
+            contract = extractor.extract_v1(
+                sql_program,
+                evidence_map=evidence_map_sp,
+                output_grain=spec.output_spec.grain,
+            )
         except Exception as contract_err:
             logger.warning("Contract 抽取失败（非阻断）：%s", contract_err)
 
@@ -1383,6 +1505,9 @@ class Pipeline:
             "manifest": manifest,
             "plan": plan,
             "compiled": compiled,
+            "compiled_program": (
+                program_artifact.compiled if program_artifact is not None else None
+            ),
             "trace": trace,
             "summary": summary,
             "table_mapping": table_mapping or {},
@@ -1424,7 +1549,7 @@ class Pipeline:
         """全流程 + ReviewPackage 打包——返回 RunAllResponse 的 dict。
 
         失败时保留已完成产物到 self._results，返回含 pipeline_error 的部分结果。
-        7 阶段：parser → enrich → build → compile → execute → contract → package。
+        9 阶段：parser → enrich → build → validate → compile → contract → snapshot → execute → package。
 
         Args:
             markdown_text: DeveloperSpec Markdown 全文
@@ -1438,7 +1563,7 @@ class Pipeline:
         collector = get_collector()
         _run_all_stages = [
             "parser", "enrich", "build", "validate",
-            "compile", "execute", "contract", "package",
+            "compile", "contract", "snapshot", "execute", "package",
         ]
 
         # ── Stage 1-2: Parser + Enrich ──
@@ -1475,7 +1600,7 @@ class Pipeline:
             })
             return blocked
 
-        # ── Stage 3-7: Build → Compile → Execute → Contract → Package ──
+        # ── Stage 3-9: Build → Compile → Contract → Snapshot → Execute → Package ──
         plan = None
         compiled_sql = None
         program_artifact = None
@@ -1537,11 +1662,30 @@ class Pipeline:
                     )
                 compiled_sql = program_artifact.compiled.statements[-1]
 
+                stage = "contract"
+                extractor = DataTransformContractExtractor()
+                with collector.stage("contract_extractor", request_id) as ctx:
+                    contract = extractor.extract_v1(
+                        sql_program,
+                        output_grain=spec.output_spec.grain,
+                    )
+                    ctx.set_result(artifact_path=f"contract/{contract.contract_id[:12]}")
+
+                stage = "snapshot"
+                with collector.stage("snapshot_builder", request_id) as ctx:
+                    snapshot_manifest, execution_paths = self._prepare_run_all_snapshot(
+                        contract=contract,
+                        table_mapping=table_mapping or {},
+                        table_paths=table_paths,
+                    )
+                    if snapshot_manifest is not None:
+                        ctx.set_result(
+                            artifact_path=f"snapshot/{snapshot_manifest.snapshot_id}",
+                            row_count=len(snapshot_manifest.files),
+                        )
+
                 stage = "execute"
-                executor = DuckDBExecutor(
-                    table_paths=self._resolve_table_paths(table_paths),
-                    duckdb_path=self._duckdb_path,
-                )
+                executor = DuckDBExecutor(table_paths=execution_paths)
                 with collector.stage("sql_executor", request_id) as ctx:
                     program_result = executor.execute_program(
                         program_artifact.compiled
@@ -1559,18 +1703,10 @@ class Pipeline:
                 program_cleanup_status = program_result.cleanup_status if program_result else None
                 program_cleanup_error = program_result.cleanup_error if program_result else None
 
-                # ── Contract 提取（执行状态检查之前——contract 不依赖执行结果）──
-                extractor = DataTransformContractExtractor()
-                with collector.stage("contract_extractor", request_id) as ctx:
-                    contract = extractor.extract_v1(sql_program)
-                    if contract:
-                        ctx.set_result(artifact_path=f"contract/{contract.contract_id[:12]}")
-
-
-                # ── 执行状态检查——RUNTIME_FAIL 阻断 ──
+                # 只有 RUNTIME_PASS 能进入成功路径
                 if execution_trace is not None \
                         and isinstance(execution_trace.status, ExecutionStatus) \
-                        and execution_trace.status == ExecutionStatus.RUNTIME_FAIL:
+                        and execution_trace.status != ExecutionStatus.RUNTIME_PASS:
                     request_id = self._gen_request_id(spec)
                     self._store_result(request_id, {
                         "parsed_spec": spec,
@@ -1596,7 +1732,7 @@ class Pipeline:
                         "spec_id": spec.spec_id,
                         "plan_id": plan.plan_id,
                         "validation_passed": passed,
-                        "execution_status": "runtime_failed",
+                        "execution_status": execution_trace.status.value.lower(),
                         "row_count": 0,
                         "elapsed_ms": 0,
                         "open_questions": _summarize_open_questions(
@@ -1607,52 +1743,6 @@ class Pipeline:
                             "execute", error_info, _run_all_stages,
                         ),
                     }
-
-                stage = "contract"
-
-                # ── Phase 9B-P0: Snapshot 阶段（可选——仅当注入 SnapshotBuilder + Provider 时执行）──
-                # 必须在 contract 提取之后——依赖 contract 的 hash
-                snapshot_manifest = None
-                if self._snapshot_builder is not None and self._snapshot_provider is not None:
-                    with collector.stage("snapshot_builder", request_id) as ctx:
-                        try:
-                            # 计算 contract_hash——使用 Contract 模型的静态方法
-                            from tianshu_datadev.artifacts.models import (
-                                DataTransformContractLite as _Lite,
-                            )
-                            from tianshu_datadev.artifacts.models import (
-                                DataTransformContractV1 as _V1,  # noqa: N814
-                            )
-                            if isinstance(contract, _V1):
-                                contract_hash = _V1.compute_contract_hash(contract)
-                            else:
-                                contract_hash = _Lite.compute_contract_hash(contract)
-
-                            # 从 table_paths 推导 source_tables——与 provider 白名单交集
-                            source_tables = list(table_paths.keys()) if table_paths else []
-                            allowlisted = set(self._snapshot_provider.allowlisted_tables)
-                            source_tables = [t for t in source_tables if t in allowlisted]
-
-                            if source_tables:
-                                snapshot_manifest = self._snapshot_builder.build(
-                                    contract_hash=contract_hash,
-                                    source_tables=source_tables,
-                                    provider=self._snapshot_provider,
-                                    table_aliases=_aliases_from_table_mapping(table_mapping),
-                                )
-                                ctx.set_result(
-                                    artifact_path=f"snapshot/{snapshot_manifest.snapshot_id}",
-                                    row_count=len(snapshot_manifest.files),
-                                )
-                                logger.info(
-                                    "Snapshot 构建成功——snapshot_id=%s，文件数=%d",
-                                    snapshot_manifest.snapshot_id,
-                                    len(snapshot_manifest.files),
-                                )
-                        except Exception as snap_err:
-                            # Snapshot 失败不阻断主流程——记录日志，继续 Package
-                            logger.warning("Snapshot 构建失败（非阻断）：%s", snap_err)
-                            snapshot_manifest = None
 
                 stage = "package"
                 request_id = self._gen_request_id(spec)
@@ -1701,6 +1791,10 @@ class Pipeline:
                     ),
                     "contract": contract,
                     "plan": plan,
+                    "compiled": compiled_sql,
+                    "compiled_program": program_artifact.compiled,
+                    "trace": execution_trace,
+                    "summary": execution_summary,
                     "parsed_spec": spec,
                     "sql_program": sql_program,             # SqlProgram 实例——供 Spark Comparator 多语句对比
                     "manifest": manifest,
@@ -1796,30 +1890,6 @@ class Pipeline:
                     )
                 compiled_sql = program_artifact.compiled.statements[-1]
 
-                stage = "execute"
-                execute_executor = DuckDBExecutor(
-                    table_paths=self._resolve_table_paths(table_paths),
-                    duckdb_path=self._duckdb_path,
-                )
-                with collector.stage("sql_executor", request_id) as ctx:
-                    program_result = execute_executor.execute_program(
-                        program_artifact.compiled
-                    )
-                    if program_result and program_result.results:
-                        last_trace = program_result.results[-1].trace
-                        if last_trace:
-                            ctx.set_result(row_count=last_trace.row_count)
-                trace = (
-                    program_result.results[-1].trace
-                    if program_result.results else None
-                )
-                summary = (
-                    program_result.results[-1].summary
-                    if program_result.results else None
-                )
-                # ── Final Hardening: 捕获 cleanup 状态 ──
-                program_cleanup_status = program_result.cleanup_status if program_result else None
-                program_cleanup_error = program_result.cleanup_error if program_result else None
             else:
                 with collector.stage("sql_builder", request_id) as ctx:
                     plan, plan_questions = builder.build(spec, hypothesis=hypothesis)
@@ -1849,20 +1919,61 @@ class Pipeline:
                     compiled_sql = artifact.compiled_sql
                     ctx.set_result(artifact_path=f"compiled/{compiled_sql.sql_sha256[:12]}")
 
-                stage = "execute"
-                execute_executor = DuckDBExecutor(
-                    table_paths=self._resolve_table_paths(table_paths),
-                    duckdb_path=self._duckdb_path,
-                )
-                with collector.stage("sql_executor", request_id) as ctx:
-                    trace, summary = execute_executor.execute(compiled_sql)
-                    if trace:
-                        ctx.set_result(row_count=trace.row_count)
-
                 sql_program = build_sql_program(plan, spec.spec_hash)
 
-            # ── 执行状态检查——RUNTIME_FAIL 阻断，不进入 Contract + Package ──
-            if isinstance(trace.status, ExecutionStatus) and trace.status == ExecutionStatus.RUNTIME_FAIL:
+            # Contract 是快照的权威输入，必须先于任何业务 SQL 执行。
+            stage = "contract"
+            evidence_map: dict = {}
+            if hypothesis:
+                for candidate in hypothesis.candidates:
+                    if candidate.evidence:
+                        evidence_map[candidate.candidate_id] = candidate.evidence
+            contract_extractor = DataTransformContractExtractor()
+            with collector.stage("contract_extractor", request_id) as ctx:
+                contract = contract_extractor.extract_v1(
+                    sql_program,
+                    evidence_map=evidence_map,
+                    output_grain=spec.output_spec.grain,
+                )
+                ctx.set_result(artifact_path=f"contract/{contract.contract_id[:12]}")
+
+            stage = "snapshot"
+            with collector.stage("snapshot_builder", request_id) as ctx:
+                snapshot_manifest, execution_paths = self._prepare_run_all_snapshot(
+                    contract=contract,
+                    table_mapping=table_mapping or {},
+                    table_paths=table_paths,
+                )
+                if snapshot_manifest is not None:
+                    ctx.set_result(
+                        artifact_path=f"snapshot/{snapshot_manifest.snapshot_id}",
+                        row_count=len(snapshot_manifest.files),
+                    )
+
+            stage = "execute"
+            execute_executor = DuckDBExecutor(table_paths=execution_paths)
+            with collector.stage("sql_executor", request_id) as ctx:
+                if program_artifact is not None:
+                    program_result = execute_executor.execute_program(
+                        program_artifact.compiled
+                    )
+                    trace = (
+                        program_result.results[-1].trace
+                        if program_result.results else None
+                    )
+                    summary = (
+                        program_result.results[-1].summary
+                        if program_result.results else None
+                    )
+                    program_cleanup_status = program_result.cleanup_status
+                    program_cleanup_error = program_result.cleanup_error
+                else:
+                    trace, summary = execute_executor.execute(compiled_sql)
+                if trace:
+                    ctx.set_result(row_count=trace.row_count)
+
+            # 只有 RUNTIME_PASS 能进入 Package 阶段
+            if isinstance(trace.status, ExecutionStatus) and trace.status != ExecutionStatus.RUNTIME_PASS:
                 request_id = self._gen_request_id(spec)
                 self._store_result(request_id, {
                     "parsed_spec": spec,
@@ -1886,7 +1997,7 @@ class Pipeline:
                     "spec_id": spec.spec_id,
                     "plan_id": plan.plan_id,
                     "validation_passed": passed,
-                    "execution_status": "runtime_failed",
+                    "execution_status": trace.status.value.lower(),
                     "row_count": 0,
                     "elapsed_ms": 0,
                     "open_questions": _summarize_open_questions(
@@ -1901,64 +2012,6 @@ class Pipeline:
                         "execute", error_info, _run_all_stages,
                     ),
                 }
-
-            # ── 公共阶段：Contract + Package（所有路径——ComputeSteps 和非 ComputeSteps）──
-            stage = "contract"
-            # 构建 evidence_map——将 RelationshipPlanner 产出的证据链传入 Contract
-            evidence_map: dict = {}
-            if hypothesis:
-                for c in hypothesis.candidates:
-                    if c.evidence:
-                        evidence_map[c.candidate_id] = c.evidence
-            contract_extractor = DataTransformContractExtractor()
-            with collector.stage("contract_extractor", request_id) as ctx:
-                contract = contract_extractor.extract_v1(sql_program, evidence_map=evidence_map)
-                if contract:
-                    ctx.set_result(artifact_path=f"contract/{contract.contract_id[:12]}")
-
-            # ── Phase 9B-P0: Snapshot 阶段（可选——仅当注入 SnapshotBuilder + Provider 时执行）──
-            # 必须在 contract 提取之后——依赖 contract 的 hash
-            snapshot_manifest = None
-            if self._snapshot_builder is not None and self._snapshot_provider is not None:
-                with collector.stage("snapshot_builder", request_id) as ctx:
-                    try:
-                        # 计算 contract_hash——使用 Contract 模型的静态方法
-                        from tianshu_datadev.artifacts.models import (
-                            DataTransformContractLite as _Lite,
-                        )
-                        from tianshu_datadev.artifacts.models import (
-                            DataTransformContractV1 as _V1,  # noqa: N814
-                        )
-                        if isinstance(contract, _V1):
-                            contract_hash = _V1.compute_contract_hash(contract)
-                        else:
-                            contract_hash = _Lite.compute_contract_hash(contract)
-
-                        # 从 table_paths 推导 source_tables——与 provider 白名单交集
-                        source_tables = list(table_paths.keys()) if table_paths else []
-                        allowlisted = set(self._snapshot_provider.allowlisted_tables)
-                        source_tables = [t for t in source_tables if t in allowlisted]
-
-                        if source_tables:
-                            snapshot_manifest = self._snapshot_builder.build(
-                                contract_hash=contract_hash,
-                                source_tables=source_tables,
-                                provider=self._snapshot_provider,
-                                table_aliases=_aliases_from_table_mapping(table_mapping),
-                            )
-                            ctx.set_result(
-                                artifact_path=f"snapshot/{snapshot_manifest.snapshot_id}",
-                                row_count=len(snapshot_manifest.files),
-                            )
-                            logger.info(
-                                "Snapshot 构建成功——snapshot_id=%s，文件数=%d",
-                                snapshot_manifest.snapshot_id,
-                                len(snapshot_manifest.files),
-                            )
-                    except Exception as snap_err:
-                        # Snapshot 失败不阻断主流程——记录日志，继续 Package
-                        logger.warning("Snapshot 构建失败（非阻断）：%s", snap_err)
-                        snapshot_manifest = None
 
             stage = "package"
             request_id = self._gen_request_id(spec)
@@ -2048,6 +2101,9 @@ class Pipeline:
             "manifest": manifest,
             "plan": plan,
             "compiled": compiled_sql,
+            "compiled_program": (
+                program_artifact.compiled if program_artifact is not None else None
+            ),
             "trace": trace,
             "summary": summary,
             "contract": contract,
@@ -2305,7 +2361,7 @@ class Pipeline:
         import queue as _queue_mod
         import threading
 
-        event_queue: "queue.Queue" = _queue_mod.Queue(maxsize=500)
+        event_queue: "_queue_mod.Queue" = _queue_mod.Queue(maxsize=500)
         stop_event = threading.Event()
         logger = logging.getLogger(__name__)
 
@@ -2443,7 +2499,11 @@ class Pipeline:
                                 "stage": stage_val,
                                 "status": status_event,
                                 "duration_ms": duration_ms,
-                                "message": "; ".join(current_errors) if current_errors and current_status == "failed" else None,
+                                "message": (
+                                    "; ".join(current_errors)
+                                    if current_errors and current_status == "failed"
+                                    else None
+                                ),
                             })
                             spark_stages.append({
                                 "stage": stage_val, "status": current_status,
@@ -2490,14 +2550,24 @@ class Pipeline:
                                 })
                                 break
 
-                            status_event = "completed" if current_status == "ok" else "failed"
+                            # PHYSICAL_VERIFIER 终态：ok/failed/skipped 分别处理
+                            if current_status == "skipped":
+                                status_event = "skipped"
+                            elif current_status == "ok":
+                                status_event = "completed"
+                            else:
+                                status_event = "failed"
                             event_queue.put({
                                 "event": "stage",
                                 "pipeline": "spark",
                                 "stage": stage_val,
                                 "status": status_event,
                                 "duration_ms": duration_ms,
-                                "message": "; ".join(current_errors) if current_errors and current_status == "failed" else None,
+                                "message": (
+                                    "; ".join(current_errors)
+                                    if current_errors and current_status != "ok"
+                                    else None
+                                ),
                             })
                             spark_stages.append({
                                 "stage": stage_val, "status": current_status,
@@ -2662,9 +2732,25 @@ class Pipeline:
         # 提取 compiled——execute/run_all 单表路径存储为 "compiled"
         # 防御：ComputeSteps 失败路径存储 SqlProgramArtifact 而非 CompiledSql，
         # 此处仅当类型匹配时才传递，否则置 None
-        compiled = data.get("compiled")
-        if compiled is not None and not isinstance(compiled, CompiledSql):
+        compiled_value = data.get("compiled")
+        compiled_program = data.get("compiled_program")
+        if isinstance(compiled_value, SqlProgramArtifact):
+            compiled_program = compiled_value.compiled
+            compiled = (
+                compiled_program.statements[-1]
+                if compiled_program.statements
+                else None
+            )
+        elif isinstance(compiled_value, CompiledSql):
+            compiled = compiled_value
+        else:
             compiled = None
+
+        program_artifact = data.get("program_artifact")
+        if compiled_program is None and isinstance(program_artifact, SqlProgramArtifact):
+            compiled_program = program_artifact.compiled
+        if not isinstance(compiled_program, ProgramCompiledSql):
+            compiled_program = None
 
         # ── Phase 9B-P0: 提取 snapshot_manifest ──
         snapshot_manifest = data.get("snapshot_manifest")
@@ -2675,6 +2761,7 @@ class Pipeline:
             sql_build_plan=data.get("plan"),
             data_transform_contract=contract,
             compiled_sql=compiled,
+            compiled_program=compiled_program,
             execution_trace=data.get("trace"),
             result_summary=data.get("summary"),
             # ── Phase 9B-P0 ──
@@ -3091,8 +3178,8 @@ class Pipeline:
                 if trace:
                     ctx.set_result(row_count=trace.row_count)
 
-            # ── 执行状态检查——RUNTIME_FAIL 阻断，不进入成功路径 ──
-            if isinstance(trace.status, ExecutionStatus) and trace.status == ExecutionStatus.RUNTIME_FAIL:
+            # 只有 RUNTIME_PASS 能进入成功路径
+            if isinstance(trace.status, ExecutionStatus) and trace.status != ExecutionStatus.RUNTIME_PASS:
                 _plan_id = plan.plan_id if plan is not None else ""
                 _sql_sha256 = compiled.sql_sha256 if compiled is not None else ""
                 _compiler_ver = compiled.compiler_version if compiled is not None else ""
@@ -3173,7 +3260,11 @@ class Pipeline:
                         evidence_map_d[c.candidate_id] = c.evidence
             extractor = DataTransformContractExtractor()
             sql_program = build_sql_program(plan, spec.spec_hash)
-            contract = extractor.extract_v1(sql_program, evidence_map=evidence_map_d)
+            contract = extractor.extract_v1(
+                sql_program,
+                evidence_map=evidence_map_d,
+                output_grain=spec.output_spec.grain,
+            )
         except Exception as contract_err:
             logger.warning("Contract 抽取失败（非阻断）：%s", contract_err)
 
@@ -3618,22 +3709,36 @@ class Pipeline:
                     "schema_match": report.schema_match if report else None,
                     "total_diff_count": report.total_diff_count if report else None,
                     "sample_rows": {
-                        "duckdb": (report.duckdb_result.sample_rows or [])[:5] if report.duckdb_result else [],
+                        "duckdb": (
+                            (report.duckdb_result.sample_rows or [])[:5]
+                            if report.duckdb_result else []
+                        ),
                         "spark": (report.spark_result.sample_rows or [])[:5] if report.spark_result else [],
                     } if report else None,
                 }
             elif current_status == "failed":
                 # 物理执行成功但结果不一致——返回有界摘要供人工审核诊断
                 report = context.physical_verify_report
+                # 兜底消息——report 可能为 None 或 error_message 为空时提供最小上下文
+                _failed_msg = (
+                    report.error_message
+                    if report and report.error_message
+                    else "物理验证未通过，无详细错误信息"
+                )
                 result = {
                     "type": "physical_verify",
                     "status": "failed",
                     "skipped": False,
+                    "message": _failed_msg,
                     "row_count_match": report.row_count_match if report else None,
                     "schema_match": report.schema_match if report else None,
                     "total_diff_count": report.total_diff_count if report else None,
+                    "diffs": report.diffs[:10] if report and report.diffs else [],
                     "sample_rows": {
-                        "duckdb": (report.duckdb_result.sample_rows or [])[:5] if report.duckdb_result else [],
+                        "duckdb": (
+                            (report.duckdb_result.sample_rows or [])[:5]
+                            if report.duckdb_result else []
+                        ),
                         "spark": (report.spark_result.sample_rows or [])[:5] if report.spark_result else [],
                     } if report else None,
                 }
@@ -3982,199 +4087,39 @@ class Pipeline:
         artifacts: PipelineArtifactBundle,
         context: SparkStageContext,
     ) -> SnapshotManifest | None:
-        """从 DuckDB 数据库直接导出 Parquet 快照——生产路径的 SnapshotBuilder 替代方案。
-
-        读取 Contract 中声明的 input_tables，从 DuckDB 逐表导出为 Parquet，
-        生成 SnapshotManifest 供 PhysicalVerifier 双引擎读取。
-
-        安全边界：
-        - 仅导出 Contract.input_tables 中声明的表——不扫描 DuckDB 全库
-        - 使用 DuckDB 只读连接——不修改源数据库
-        - 快照写入临时目录——会话结束后由 OS 回收
-        """
-        logger.warning("DuckDB快照入口——进入 _build_snapshot_from_duckdb")
-        from tianshu_datadev.spark.snapshot import SnapshotFile
-        from tianshu_datadev.spark.snapshot import SnapshotManifest as _SnapManifest
-
+        """复用 Run-All 的受控快照路径，禁止独立全表导出。"""
         contract = artifacts.data_transform_contract
         if contract is None or not contract.input_tables:
             context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
             context.errors.append(
                 "[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
                 "Contract 无 input_tables——无法确定需要快照的源表。"
-                "请先执行「编译执行」生成 Contract。"
             )
             return None
 
-        # 从 _results 获取正确的 别名→物理表名 映射
-        # Contract._extract_scan() 会把 source_table 设为别名（step.table_ref），
-        # 但 DeveloperSpec 和 _auto_table_mapping() 持有正确的物理表名；
-        # 此处从 _results[request_id]["table_mapping"] 取得正确映射作为补丁。
-        _results_data = self._results.get(artifacts.request_id, {})
-        _results_table_mapping: dict[str, str] = _results_data.get("table_mapping") or {}
-
-        # 去重收集源表物理名（同一物理表可能被多个别名引用）
-        # 优先用 _results 中的 table_mapping 解析物理表名（Web UI / DuckDB 路径），
-        # 回退到 contract.source_table（E2E CSV 路径——source_table 即 CSV 文件名）
-        _contract_sources: list[str] = list(dict.fromkeys(
-            t.source_table for t in contract.input_tables
-        ))
-        source_tables: list[str] = []
-        for _src in _contract_sources:
-            _physical = _results_table_mapping.get(_src, _src)
-            source_tables.append(_physical)
-
-        # 构建物理表名→别名映射——用于 SnapshotFile.source_name 和 _inputs_index.json
-        # 若同一物理表有多个别名，取第一个（其余别名不会被 executor prologue 装载）
-        _alias_map: dict[str, str] = {}
-        for t in contract.input_tables:
-            _physical = _results_table_mapping.get(t.source_table, t.source_table)
-            if _physical not in _alias_map:
-                _alias_map[_physical] = t.table_ref
-        logger.info(
-            "DuckDB快照诊断——source_tables=%s, _alias_map=%s, "
-            "input_tables_count=%d",
-            source_tables, _alias_map, len(contract.input_tables),
-        )
-
-        import os as _os
-        import tempfile as _tempfile
-
-        import duckdb as _duckdb
-        import pyarrow.parquet as _pq
-
-        # 计算 contract_hash——用于快照溯源
-        contract_hash = ""
-        if contract is not None:
-            from tianshu_datadev.artifacts.models import (
-                DataTransformContractLite as _Lite,
-            )
-            from tianshu_datadev.artifacts.models import (
-                DataTransformContractV1 as _V1,  # noqa: N814
-            )
-            if isinstance(contract, _V1):
-                contract_hash = _V1.compute_contract_hash(contract)
-            elif isinstance(contract, _Lite):
-                contract_hash = _Lite.compute_contract_hash(contract)
-
-        # 使用 D: 盘项目缓存（~124GB 空闲），避免系统 temp 空间耗尽
-        import pathlib as _pathlib
-        import shutil as _shutil
-        _cache_dir = _os.path.join(
-            str(_pathlib.Path(__file__).resolve().parent.parent.parent.parent),
-            ".tianshu_cache", "snapshots",
-        )
-        _os.makedirs(_cache_dir, exist_ok=True)
-        # 清理旧快照——仅保留最近 3 次，防止无限累积
-        _existing = sorted([
-            _os.path.join(_cache_dir, d)
-            for d in _os.listdir(_cache_dir)
-            if _os.path.isdir(_os.path.join(_cache_dir, d))
-        ])
-        while len(_existing) > 3:
-            _old = _existing.pop(0)
-            try:
-                _shutil.rmtree(_old)
-                logger.debug("清理旧快照：%s", _os.path.basename(_old))
-            except Exception:
-                pass
-        snap_dir = _tempfile.mkdtemp(prefix="snap_", dir=_cache_dir)
-        files: list[SnapshotFile] = []
-
+        results_data = self._results.get(artifacts.request_id, {})
         try:
-            con = _duckdb.connect(self._duckdb_path, read_only=True)
-        except Exception as e:
-            context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
-            context.errors.append(
-                f"[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
-                f"无法连接 DuckDB 数据库 {self._duckdb_path}——{e}"
+            manifest, _ = self._prepare_run_all_snapshot(
+                contract=contract,
+                table_mapping=results_data.get("table_mapping") or {},
+                table_paths=None,
             )
-            logger.warning("DuckDB 快照——连接失败：%s", e)
-            return None
-
-        try:
-            for table_name in source_tables:
-                # 单表导出——失败则立即终止整个快照构建（防止部分快照导致
-                # _inputs_index.json 缺失条目 → Spark KeyError）
-                try:
-                    # 查询全表 → PyArrow Table → 写入 Parquet
-                    # 使用 to_arrow_table() 而非 .arrow()——
-                    # DuckDB ≥1.0 中 .arrow() 返回 RecordBatchReader（流式），
-                    # pyarrow.parquet.write_table() 要求 Table 类型。
-                    arrow_table = con.execute(
-                        f"SELECT * FROM {table_name}"
-                    ).to_arrow_table()
-                    parquet_path = _os.path.join(
-                        snap_dir, f"{table_name}.parquet",
-                    )
-                    _pq.write_table(arrow_table, parquet_path)
-
-                    # 计算行数和文件 hash
-                    row_count = int(arrow_table.num_rows)
-                    file_sha256 = hashlib.sha256()
-                    with open(parquet_path, "rb") as _fh:
-                        for _chunk in iter(lambda: _fh.read(8192), b""):
-                            file_sha256.update(_chunk)
-
-                    # 使用别名作为 source_name——executor prologue 按此 key 装载 inputs dict
-                    _source = _alias_map.get(table_name, table_name)
-                    files.append(SnapshotFile(
-                        source_name=_source,
-                        file_path=parquet_path,
-                        format="parquet",
-                        row_count=row_count,
-                        file_sha256=file_sha256.hexdigest(),
-                    ))
-                    logger.info(
-                        "DuckDB 快照导出——表 %s，%d 行",
-                        table_name, row_count,
-                    )
-                except Exception as _exp_err:
-                    logger.error(
-                        "DuckDB 快照导出失败（表 %s）：%s",
-                        table_name, _exp_err,
-                    )
-                    context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
-                    context.errors.append(
-                        f"[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
-                        f"DuckDB 快照导出失败——表 {table_name}：{_exp_err}"
-                    )
-                    return None
-        finally:
-            con.close()
-
-        if not files:
+        except Exception as exc:
             context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
             context.errors.append(
                 "[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
-                f"DuckDB 快照导出——{len(source_tables)} 个源表无一成功导出。"
-                f"源表列表：{source_tables}"
+                f"受控快照构建失败——{exc}"
             )
+            logger.warning("PHYSICAL_VERIFIER 受控快照构建失败：%s", exc)
             return None
 
-        # 生成确定性 snapshot_id + manifest
-        snap_id = (
-            f"snap_{contract_hash[:16]}"
-            if contract_hash
-            else "snap_adhoc"
-        )
-        manifest = _SnapManifest(
-            snapshot_id=snap_id,
-            contract_hash=contract_hash,
-            snapshot_dir=snap_dir,
-            files=files,
-            source_type="dev_warehouse",
-        )
-
-        # 写入 _inputs_index.json——executor prologue 据此将别名映射到 Parquet 文件
-        from tianshu_datadev.spark.snapshot import SnapshotBuilder
-        SnapshotBuilder._write_inputs_index(snap_dir, files)
-        # 回写 artifacts——供后续代码引用
+        if manifest is None:
+            context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
+            context.errors.append(
+                "[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: 受控快照未生成清单"
+            )
+            return None
         artifacts.snapshot_manifest = manifest
-        logger.info(
-            "DuckDB 快照创建成功——snapshot_id=%s，文件数=%d",
-            snap_id, len(files),
-        )
         return manifest
 
     @staticmethod
@@ -4182,29 +4127,27 @@ class Pipeline:
         validator_ok: bool,
         comparator_report: "PlanComparisonReport | None",
     ) -> bool:
-        """判定 PHYSICAL_VERIFIER 是否应执行。"""
+        """判定 PHYSICAL_VERIFIER 是否应执行。
+
+        物理验证是 ground truth——它实际执行 DuckDB 与 Spark 双引擎并对比结果。
+        逻辑对比（Comparator）的结论不影响物理验证的必要性：
+        - LOGIC_EQUIVALENT：物理验证确认结果一致
+        - LOGIC_MISMATCH：物理验证确认不等价是否影响实际输出
+        - LOGIC_UNSUPPORTED：逻辑对比无法覆盖，物理验证是唯一验证手段
+        - NOT_COVERED：同上，物理验证提供兜底保障
+
+        仅当 Validator 未通过（安全风险）或 Comparator 未执行（缺少前置条件）时跳过。
+        """
         from tianshu_datadev.spark.plan_comparator import ComparisonStatus
-        from tianshu_datadev.spark.plan_equivalence import EquivalenceVerdict
 
         if not validator_ok:
             return False
         if comparator_report is None:
             return False
-        # LOGIC_EQUIVALENT → 正常执行
-        if comparator_report.status == ComparisonStatus.LOGIC_EQUIVALENT:
-            return True
-        # 白名单：仅 case_when UNSUPPORTED + 其他 step 全部 EQUIVALENT
-        if comparator_report.status == ComparisonStatus.LOGIC_UNSUPPORTED:
-            has_case_when_unsupported = False
-            for r in comparator_report.step_results:
-                if r.verdict == EquivalenceVerdict.NOT_EQUIVALENT:
-                    return False
-                if r.verdict == EquivalenceVerdict.UNSUPPORTED_COMPARISON:
-                    if r.step_type != "case_when":
-                        return False
-                    has_case_when_unsupported = True
-            return has_case_when_unsupported
-        return False
+        if comparator_report.status == ComparisonStatus.NOT_EXECUTED:
+            return False
+        # 所有其他状态均允许物理验证——物理验证是 ground truth
+        return True
 
 
     def _do_spark_physical_verify(
@@ -4220,13 +4163,44 @@ class Pipeline:
         context.physical_verify_report = None
         context.cre_shadow_report = None
 
+        # ── 诊断日志：打印所有早期返回条件的值 ──
+        _diag = {
+            "validator_ok": context.stage_results.get("VALIDATOR"),
+            "comparator_report": (
+                type(context.comparator_report).__name__
+                if context.comparator_report else None
+            ),
+            "sandbox_transform_code_set": context.sandbox_transform_code is not None,
+            "sandbox_transform_code_len": (
+                len(context.sandbox_transform_code)
+                if context.sandbox_transform_code else 0
+            ),
+            "compiled_sql_set": artifacts.compiled_sql is not None,
+            "snapshot_manifest_set": artifacts.snapshot_manifest is not None,
+            "snapshot_builder_set": self._snapshot_builder is not None,
+            "duckdb_path_set": self._duckdb_path is not None,
+            "compile_result_set": context.compile_result is not None,
+        }
+        logger.warning("[PHYSVER_DIAG] _do_spark_physical_verify 入口: %s", _diag)
+
         # ── 门禁检查 ──
         validator_ok = context.stage_results.get("VALIDATOR") == "SUCCESS"
+        # 诊断：打印 COMPARATOR 状态和步骤结论
+        if context.comparator_report:
+            _cr = context.comparator_report
+            _cr_status = _cr.status.value if hasattr(_cr.status, "value") else str(_cr.status)
+            _cr_steps = [
+                f"{r.step_type}={r.verdict.value if hasattr(r.verdict, 'value') else r.verdict}"
+                for r in (_cr.step_results or [])
+            ]
+            logger.warning("[PHYSVER_DIAG] COMPARATOR状态=%s, 步骤=%s", _cr_status, _cr_steps)
         if not self._should_physical_verify(validator_ok, context.comparator_report):
+            logger.warning("[PHYSVER_DIAG] 退出点1: _should_physical_verify 返回 False, validator_ok=%s",
+                           validator_ok)
             context.stage_results["PHYSICAL_VERIFIER"] = "SKIPPED"
             context.errors.append(
                 "[PHYSICAL_VERIFIER] SKIPPED: 物理验证门禁未通过"
-                "（Validator 未通过，或 Comparator 不满足白名单条件）"
+                "（Validator 未通过，或 Comparator 未执行）"
             )
             return
 
@@ -4234,6 +4208,7 @@ class Pipeline:
         try:
             import pyspark  # noqa: F401  # 检测是否已安装
         except ImportError:
+            logger.warning("[PHYSVER_DIAG] 退出点2: PySpark 未安装")
             context.stage_results["PHYSICAL_VERIFIER"] = "SKIPPED"
             context.errors.append(
                 "[PHYSICAL_VERIFIER] SKIPPED: PySpark 未安装——"
@@ -4243,6 +4218,7 @@ class Pipeline:
 
         # Step 2：检查必要产物
         if context.sandbox_transform_code is None:
+            logger.warning("[PHYSVER_DIAG] 退出点3: sandbox_transform_code 为 None")
             context.stage_results["PHYSICAL_VERIFIER"] = "FAILURE"
             context.errors.append(
                 "[PHYSICAL_VERIFIER] 错误: 缺少沙箱可执行 PySpark 编译产物（sandbox_transform_code）——"
@@ -4251,6 +4227,7 @@ class Pipeline:
             return
 
         if artifacts.compiled_sql is None:
+            logger.warning("[PHYSVER_DIAG] 退出点4: compiled_sql 为 None")
             context.stage_results["PHYSICAL_VERIFIER"] = "SKIPPED"
             context.errors.append(
                 "[PHYSICAL_VERIFIER] SKIPPED: 缺少 SQL 编译产物（compiled_sql）——"
@@ -4279,11 +4256,7 @@ class Pipeline:
         # Step 4：提取排序键（从 SparkPlan 的 SortStep 中获取）
         order_keys: list[str] = []
         if context.spark_plan is not None:
-            for step in context.spark_plan.steps:
-                from tianshu_datadev.spark.models import SparkSortStep
-                if isinstance(step, SparkSortStep):
-                    order_keys = [col.ref_name for col in step.columns if hasattr(col, "ref_name")]
-                    break
+            order_keys = _extract_spark_order_keys(context.spark_plan)
 
         # Step 5：获取 unsupported step types（从 Comparator 报告中继承）
         uncovered_types: list[str] = []
@@ -4437,6 +4410,7 @@ class Pipeline:
             verifier = PhysicalVerifier(normalization_config=norm_config)
             report = verifier.verify(
                 sql_query=sql_query,
+                compiled_program=artifacts.compiled_program,
                 pyspark_code=context.sandbox_transform_code,
                 snapshot_dir=snapshot_dir,
                 contract_hash=contract_hash,
@@ -4542,6 +4516,16 @@ def _safe_enum_value(obj, attr: str) -> str:
     if hasattr(val, "value"):
         return val.value
     return str(val)
+
+
+def _extract_spark_order_keys(spark_plan: "SparkPlan") -> list[str]:
+    """从首个 Spark Sort 步骤提取列名，仅用于确定性结果对齐。"""
+    from tianshu_datadev.spark.models import SparkSortStep
+
+    for step in spark_plan.steps:
+        if isinstance(step, SparkSortStep):
+            return [item.column for item in step.order_by]
+    return []
 
 
 # ════════════════════════════════════════════

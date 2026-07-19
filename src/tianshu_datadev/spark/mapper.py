@@ -133,7 +133,14 @@ def map_contract_to_spark_plan(
     read_steps = _map_input_tables(contract.input_tables)
 
     # ── Step 2：过滤条件 → FilterStep ──
-    filter_steps = _map_filters(contract.filters, unsupported)
+    pre_filter_steps = _map_filters(
+        [f for f in contract.filters if f.phase != "post_window"],
+        unsupported,
+    )
+    post_window_filter_steps = _map_filters(
+        [f for f in contract.filters if f.phase == "post_window"],
+        unsupported,
+    )
 
     # ── Step 3：Join 关系 → JoinStep ──
     join_steps = _map_joins(contract.join_relationships, unsupported)
@@ -195,11 +202,12 @@ def map_contract_to_spark_plan(
     # 步骤顺序：Read → Filter → Join → Aggregate → Window → CaseWhen → Project → Sort → Limit
     steps: list = []
     steps.extend(read_steps)
-    steps.extend(filter_steps)
+    steps.extend(pre_filter_steps)
     steps.extend(join_steps)
     steps.extend(agg_steps)
     steps.extend(window_steps)
     steps.extend(case_when_steps)
+    steps.extend(post_window_filter_steps)
     steps.extend(project_steps)
     steps.extend(sort_steps)
     steps.extend(limit_steps)
@@ -485,6 +493,7 @@ def _map_output_columns(
         SparkProjectColumn(
             column_name=oc.column_name,
             alias=oc.alias,
+            source_alias=oc.source_table_ref,
         )
         for oc in output_columns
     ]

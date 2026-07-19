@@ -35,20 +35,26 @@ function wrap(text: string): string {
   return '```markdown\n' + inner + '\n```';
 }
 
-const placeholder = `spec:
+const placeholder = `---
+spec:
   type: aggregate_table
   target_table: ads.metrics_daily
   source_tables:
     - name: dwd.user_events
       alias: ue
       role: fact
-  metrics:
-    - name: pv
-      aggregation: COUNT
-      input_column: id
+      key_columns:
+        - name: id
+          type: varchar
+      business_columns:
+        - name: stat_date
+          type: date
   output_columns:
     - name: stat_date
-    - name: pv`;
+    - name: pv
+---
+# 每日事件量
+按 stat_date 统计事件数量，输出 stat_date 和 pv。`;
 
 /** DeveloperSpec Markdown 编辑器（含行号）
  *

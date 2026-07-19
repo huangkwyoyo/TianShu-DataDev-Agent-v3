@@ -146,10 +146,12 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
 
     # ── Phase 8: 创建 SparkDeveloperService（API Key preflight）──
     spark_developer_service = None
+    planning_adapter = None
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if api_key:
         try:
             adapter = AnthropicAdapter()
+            planning_adapter = adapter
             prompt_manager = PromptManager()
             spark_developer_service = SparkDeveloperService.from_provider_adapter(
                 adapter, prompt_manager, max_llm_retries=1
@@ -227,6 +229,7 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
         if _e2e_val == "true":
             fixture_paths = _discover_csv_fixtures()
             pipeline = Pipeline(
+                adapter=planning_adapter,
                 default_table_paths=fixture_paths,
                 duckdb_path=db_path,
                 developer_service=spark_developer_service,
@@ -237,6 +240,7 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
             _inject_snapshot_deps(pipeline, fixture_paths)
         else:
             pipeline = Pipeline(
+                adapter=planning_adapter,
                 duckdb_path=db_path,
                 developer_service=spark_developer_service,
                 label_extractor=llm_label_extractor,

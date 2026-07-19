@@ -76,6 +76,8 @@ class ContractPredicate(StrictModel):
     operator: str  # 操作符，如 "GT" / "EQ" / "AND" / "IN"
     left: str  # 左操作数（列引用或嵌套谓词的规范化字符串表示）
     right: str  # 右操作数（列引用、字面量或空字符串）
+    phase: Literal["pre_transform", "post_window"] = "pre_transform"
+    """过滤所在阶段。默认值保持旧 Contract 向后兼容。"""
 
 
 class ContractAggregation(StrictModel):
@@ -92,6 +94,7 @@ class ContractOutputColumn(StrictModel):
     column_name: str  # 列名
     alias: str  # 输出别名
     data_type: str | None = None  # 推断的数据类型
+    source_table_ref: str = ""  # 原始来源表别名；用于 Join 后同名列消歧
 
 
 class ContractSort(StrictModel):
@@ -134,6 +137,9 @@ class DataTransformContractLite(StrictModel):
     limit_spec: ContractLimit | None = None  # 行限制
     business_keys: list[str] = []  # 业务键（从 dimensions + grain 推导）
     semantic_policy_ref: str = ""  # 语义策略引用（Phase 2 固定为空）
+    # ── Phase 3B 字段（lite 路径透传至 adapt_lite_to_v1）──
+    case_when_labels: list = []  # CaseWhenLabelSpec 列表——避免 lite→v1 适配时丢失 CASE WHEN
+    window_specs: list = []  # WindowSpecSummary 列表——避免 lite→v1 适配时丢失窗口函数
 
     @staticmethod
     def generate_contract_id(plan_hash: str) -> str:
@@ -214,7 +220,7 @@ class WindowSpecSummary(StrictModel):
     input_column: str | None = None  # 窗口函数输入列（LAG/LEAD/SUM_OVER/AVG_OVER/COUNT_OVER）
     # NTILE 时为正整数字符串（如 "4"）；排名函数（ROW_NUMBER/RANK/DENSE_RANK）为 None
     partition_by: list[str] = []  # 分区键列名列表（归一化名）
-    order_by: list[str] = []  # 排序键列名列表（归一化名，不含方向）
+    order_by: list[str] = []  # 排序键及方向，如 "trip_count DESC"
 
 
 class DataTransformContractV1(StrictModel):

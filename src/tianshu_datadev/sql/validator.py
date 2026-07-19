@@ -32,6 +32,7 @@ from tianshu_datadev.planning.sql_build_plan import (
     AggregateStep,
     CaseWhenStep,
     JoinStep,
+    ProjectStep,
     ScanStep,
     SqlBuildPlan,
     StepNode,
@@ -131,6 +132,10 @@ class SqlBuildPlanValidator:
 
         # ── 14. 聚合类型声明对比（Phase 4C 补全——原 known_gap） ──
         self._validate_aggregation_declaration(ctx, questions, spec)
+
+        # 聚合后的投影只能引用分组键、聚合结果或后续派生列。
+        # 该门禁保护“字段 + 业务描述”场景，避免 Agent 漏维度时生成非法 SQL。
+        self._validate_aggregate_projection(ctx, questions)
 
         # ── 15. 子查询校验——V-010a~e 五规则（Phase 4.6 Step 2） ──
         self._validate_subquery(ctx, questions)
@@ -795,6 +800,66 @@ class SqlBuildPlanValidator:
                                 blocking=True,
                             )
                         )
+
+    def _validate_aggregate_projection(
+        self,
+        ctx: _ValidationContext,
+        questions: list[OpenQuestion],
+    ) -> None:
+        """阻断聚合后投影未分组的原始列。"""
+        available: set[str] | None = None
+
+        for step in ctx.plan.steps:
+            if isinstance(step, AggregateStep):
+                available = {
+                    name
+                    for key in step.group_keys
+                    for name in (key.column_name, key.normalized_name)
+                }
+                available.update(metric.alias for metric in step.metrics)
+                continue
+
+            if available is None:
+                continue
+
+            if isinstance(step, CaseWhenStep):
+                if step.alias:
+                    available.add(step.alias)
+                continue
+
+            if isinstance(step, WindowStep):
+                available.update(expr.alias for expr in step.window_exprs)
+                continue
+
+            if not isinstance(step, ProjectStep):
+                continue
+
+            for column in step.columns:
+                expression = column.expression
+                column_name = getattr(expression, "column_name", None)
+                normalized_name = getattr(expression, "normalized_name", None)
+                if column_name is None:
+                    continue
+                if (
+                    column_name in available
+                    or normalized_name in available
+                    or column.alias in available
+                ):
+                    continue
+                questions.append(
+                    OpenQuestion(
+                        question_id=(
+                            f"Q-VAL-AGG-PROJECT-{step.step_id}-{column.alias}"
+                        ),
+                        source="validator",
+                        field_ref=f"{step.step_id}.columns.{column.alias}",
+                        description=(
+                            f"聚合后输出列 '{column.alias}' 引用了未分组的原始字段 "
+                            f"'{column_name}'。请将该字段加入维度，或将输出改为聚合指标。"
+                        ),
+                        blocking=True,
+                    )
+                )
 
     def _validate_time_filter(self, ctx: _ValidationContext, questions: list[OpenQuestion]) -> None:
         """检查大事实表是否包含时间过滤条件。

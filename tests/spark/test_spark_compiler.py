@@ -775,7 +775,8 @@ class TestCompileAggregate:
         compiler = SparkCompiler()
         result = compiler.compile(plan)
 
-        assert result.raw_pyspark.count(".alias(") == 5
+        for metric_alias in ("cnt", "total", "avg_amt", "min_amt", "max_amt"):
+            assert f'.alias("{metric_alias}")' in result.raw_pyspark
         assert "F.count(F.lit(1))" in result.raw_pyspark
         assert "F.sum" in result.raw_pyspark
         assert "F.avg" in result.raw_pyspark
