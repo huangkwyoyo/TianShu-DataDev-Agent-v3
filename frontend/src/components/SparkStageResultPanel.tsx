@@ -314,80 +314,185 @@ export function SparkStageResultPanel({ stage, result, status, visible }: Props)
       {/* PHYSICAL_VERIFIER——物理验证结果（含 skipped 原因展示） */}
       {result.type === 'physical_verify' && (
         <div className={`physver-section${result.skipped ? ' stage-skipped' : ''}`}>
-          <div className="physver-header">
-            <span className="physver-status-icon">
-              {result.skipped ? '⏭️' : result.status === 'failed' ? '❌' : '✅'}
-            </span>
-            <span className="physver-brief">
-              {result.skipped ? '物理验证已跳过'
-                : result.status === 'failed' ? '物理验证未通过'
-                : '物理验证通过'}
-            </span>
-          </div>
-          {result.message && (
-            <div className="physver-message">{result.message}</div>
-          )}
-          {/* 物理验证失败时展示关键指标 */}
-          {result.status === 'failed' && (
-            <div className="physver-metrics">
-              {result.row_count_match !== undefined && (
-                <span className="physver-metric">
-                  行数一致：{result.row_count_match ? '✅' : '❌'}
-                </span>
-              )}
-              {result.schema_match !== undefined && (
-                <span className="physver-metric">
-                  Schema一致：{result.schema_match ? '✅' : '❌'}
-                </span>
-              )}
-              {result.total_diff_count !== undefined && result.total_diff_count > 0 && (
-                <span className="physver-metric">
-                  差异数：{result.total_diff_count}
-                </span>
-              )}
+          {/* 跳过态 */}
+          {result.skipped && (
+            <div className="physver-header">
+              <span className="physver-status-icon">⏭️</span>
+              <span className="physver-brief">物理验证已跳过</span>
             </div>
           )}
-          {/* 差异详情——逐行展示 DuckDB vs Spark */}
-          {result.diffs && result.diffs.length > 0 && (
-            <details className="physver-details">
-              <summary className="physver-details-summary">
-                差异明细 ({result.diffs.length} 条{(result.total_diff_count ?? 0) > result.diffs.length ? `，共 ${result.total_diff_count} 条` : ''})
-              </summary>
-              <div className="physver-diff-table-wrap">
-                <table className="physver-diff-table">
-                  <thead>
-                    <tr>
-                      <th>行</th>
-                      <th>列</th>
-                      <th>DuckDB</th>
-                      <th>Spark</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {result.diffs.map((d, i) => (
-                      <tr key={i}>
-                        <td className="diff-row-idx">{d.row_index ?? '-'}</td>
-                        <td className="diff-col">{d.column}</td>
-                        <td className="diff-val duckdb">{String(d.duckdb_value)}</td>
-                        <td className="diff-val spark">{String(d.spark_value)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+
+          {/* 执行态（ok 或 failed） */}
+          {!result.skipped && (
+            <>
+              {/* 标题行：状态 + 验证结论 */}
+              <div className="physver-header">
+                <span className="physver-status-icon">
+                  {result.status === 'failed' ? '❌' : '✅'}
+                </span>
+                <span className="physver-brief">
+                  {result.status === 'failed'
+                    ? '物理验证未通过'
+                    : result.verification_status === 'SAMPLED_CONSISTENT'
+                      ? '物理验证通过（抽样一致）'
+                      : result.verification_status === 'RESULT_CONSISTENT'
+                        ? '物理验证通过（全量一致）'
+                        : result.verification_status
+                          ? `物理验证通过（${result.verification_status}）`
+                          : '物理验证通过'}
+                </span>
               </div>
-            </details>
+
+              {/* 双引擎行数与耗时对比 */}
+              <div className="physver-metrics">
+                <span className="physver-metric">
+                  DuckDB 行数：{result.duckdb_row_count ?? '-'}
+                </span>
+                <span className="physver-metric" style={{ marginLeft: 12 }}>
+                  Spark 行数：{result.spark_row_count ?? '-'}
+                </span>
+                {result.duckdb_time_ms !== undefined && result.duckdb_time_ms !== null && (
+                  <span className="physver-metric" style={{ marginLeft: 12 }}>
+                    DuckDB {result.duckdb_time_ms.toFixed(0)}ms
+                  </span>
+                )}
+                {result.spark_time_ms !== undefined && result.spark_time_ms !== null && (
+                  <span className="physver-metric" style={{ marginLeft: 12 }}>
+                    Spark {result.spark_time_ms.toFixed(0)}ms
+                  </span>
+                )}
+              </div>
+
+              {/* 对比项——行数 / Schema / 差异 */}
+              <div className="physver-metrics">
+                {result.row_count_match !== undefined && (
+                  <span className="physver-metric">
+                    行数一致：{result.row_count_match ? '✅' : '❌'}
+                  </span>
+                )}
+                {result.schema_match !== undefined && (
+                  <span className="physver-metric" style={{ marginLeft: 12 }}>
+                    Schema 一致：{result.schema_match ? '✅' : '❌'}
+                  </span>
+                )}
+                {result.total_diff_count !== undefined && result.total_diff_count > 0 && (
+                  <span className="physver-metric" style={{ marginLeft: 12 }}>
+                    差异数：{result.total_diff_count}
+                  </span>
+                )}
+                {result.total_diff_count === 0 && result.row_count_match && result.schema_match && (
+                  <span className="physver-metric" style={{ marginLeft: 12 }}>
+                    差异数：0
+                  </span>
+                )}
+              </div>
+
+              {/* 溢出降级说明 */}
+              {result.message && (
+                <div className="physver-message">{result.message}</div>
+              )}
+
+              {/* 抽样行对比——DuckDB vs Spark 双栏并排 */}
+              {result.sample_rows && (
+                (result.sample_rows.duckdb.length > 0 || result.sample_rows.spark.length > 0) && (
+                  <details className="physver-details">
+                    <summary className="physver-details-summary">
+                      抽样行对比（DuckDB {result.sample_rows.duckdb.length} 行 / Spark {result.sample_rows.spark.length} 行）
+                    </summary>
+                    <div className="physver-diff-table-wrap">
+                      <table className="physver-diff-table">
+                        <thead>
+                          <tr>
+                            <th>引擎</th>
+                            <th>#</th>
+                            {result.sample_rows.duckdb.length > 0
+                              && Object.keys(result.sample_rows.duckdb[0]).map((k) => (
+                                <th key={k}>{k}</th>
+                              ))
+                            }
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {result.sample_rows.duckdb.map((row, i) => (
+                            <tr key={`ddb-${i}`}>
+                              <td className="diff-val duckdb">DuckDB</td>
+                              <td className="diff-row-idx">{i + 1}</td>
+                              {Object.values(row).map((v, j) => (
+                                <td key={j} className="diff-val duckdb">{String(v)}</td>
+                              ))}
+                            </tr>
+                          ))}
+                          {result.sample_rows.spark.map((row, i) => (
+                            <tr key={`spk-${i}`}>
+                              <td className="diff-val spark">Spark</td>
+                              <td className="diff-row-idx">{i + 1}</td>
+                              {Object.values(row).map((v, j) => (
+                                <td key={j} className="diff-val spark">{String(v)}</td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </details>
+                )
+              )}
+
+              {/* 差异详情——逐行展示 DuckDB vs Spark（仅失败时） */}
+              {result.diffs && result.diffs.length > 0 && (
+                <details className="physver-details">
+                  <summary className="physver-details-summary">
+                    差异明细 ({result.diffs.length} 条{(result.total_diff_count ?? 0) > result.diffs.length ? `，共 ${result.total_diff_count} 条` : ''})
+                  </summary>
+                  <div className="physver-diff-table-wrap">
+                    <table className="physver-diff-table">
+                      <thead>
+                        <tr>
+                          <th>行</th>
+                          <th>列</th>
+                          <th>DuckDB</th>
+                          <th>Spark</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {result.diffs.map((d, i) => (
+                          <tr key={i}>
+                            <td className="diff-row-idx">{d.row_index ?? '-'}</td>
+                            <td className="diff-col">{d.column}</td>
+                            <td className="diff-val duckdb">{String(d.duckdb_value)}</td>
+                            <td className="diff-val spark">{String(d.spark_value)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+              )}
+
+              {/* 详细错误（折叠） */}
+              {result.errors && result.errors.length > 1 && (
+                <details className="physver-details">
+                  <summary className="physver-details-summary">
+                    详细错误 ({result.errors.length - 1} 条)
+                  </summary>
+                  <ul className="physver-error-list">
+                    {result.errors.slice(1).map((e, i) => (
+                      <li key={i}>{e}</li>
+                    ))}
+                  </ul>
+                </details>
+              )}
+            </>
           )}
-          {result.errors && result.errors.length > 1 && (
-            <details className="physver-details">
-              <summary className="physver-details-summary">
-                详细错误 ({result.errors.length - 1} 条)
-              </summary>
-              <ul className="physver-error-list">
-                {result.errors.slice(1).map((e, i) => (
-                  <li key={i}>{e}</li>
-                ))}
-              </ul>
-            </details>
+
+          {/* 跳过态的 message 和错误 */}
+          {result.skipped && result.message && (
+            <div className="physver-message">{result.message}</div>
+          )}
+          {result.skipped && result.errors && result.errors.length > 0 && (
+            <ul className="physver-error-list">
+              {result.errors.map((e, i) => <li key={i}>{e}</li>)}
+            </ul>
           )}
         </div>
       )}

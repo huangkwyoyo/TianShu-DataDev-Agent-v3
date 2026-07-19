@@ -312,6 +312,27 @@
   color: var(--text);
 }
 
+/* 物理验证指标条——双引擎行数/耗时/Schema 对比 */
+.physver-metrics {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: var(--space-sm);
+  font-size: var(--font-size-sm);
+  color: var(--text-dim);
+}
+
+.physver-metric {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  white-space: nowrap;
+}
+
 /* 长消息——可滚动、自动换行 */
 .physver-message {
   font-size: var(--font-size-sm);

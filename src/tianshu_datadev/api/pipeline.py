@@ -3705,6 +3705,25 @@ class Pipeline:
                     "status": "ok",
                     "skipped": False,
                     "message": _sampled_msg,
+                    # 双引擎行数与耗时——用于前端展示对比摘要
+                    "duckdb_row_count": (
+                        report.duckdb_result.raw_row_count
+                        if report and report.duckdb_result else None
+                    ),
+                    "spark_row_count": (
+                        report.spark_result.raw_row_count
+                        if report and report.spark_result else None
+                    ),
+                    "duckdb_time_ms": (
+                        report.duckdb_result.execution_time_ms
+                        if report and report.duckdb_result else None
+                    ),
+                    "spark_time_ms": (
+                        report.spark_result.execution_time_ms
+                        if report and report.spark_result else None
+                    ),
+                    # 验证结论——区分全量一致 / 抽样一致
+                    "verification_status": report.status.value if report else None,
                     "row_count_match": report.row_count_match if report else None,
                     "schema_match": report.schema_match if report else None,
                     "total_diff_count": report.total_diff_count if report else None,

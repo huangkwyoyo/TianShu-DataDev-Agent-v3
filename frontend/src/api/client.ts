@@ -423,9 +423,19 @@ export interface SparkStageResult {
   uncovered_step_types?: string[];
   errors?: string[];
   skipped?: boolean;  // true 表示该阶段因环境/配置原因被跳过
+  // 物理验证专用字段
   row_count_match?: boolean;
   schema_match?: boolean;
   total_diff_count?: number;
+  duckdb_row_count?: number | null;
+  spark_row_count?: number | null;
+  duckdb_time_ms?: number | null;
+  spark_time_ms?: number | null;
+  verification_status?: string | null;
+  sample_rows?: {
+    duckdb: Record<string, unknown>[];
+    spark: Record<string, unknown>[];
+  } | null;
   diffs?: {
     row_index?: number;
     column: string;
