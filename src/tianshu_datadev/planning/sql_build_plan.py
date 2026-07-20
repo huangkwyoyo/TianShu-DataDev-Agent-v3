@@ -1769,7 +1769,7 @@ class SqlBuildPlanBuilder:
                 self._collect_label_condition_columns(tb.condition, label_source_columns)
 
         # 1. ScanStep——构建 required_columns
-        scan_cols = self._build_required_columns(table.table_alias, spec)
+        scan_cols = self._build_required_columns(table.table_alias, spec, table)
         # 排除标签输出列（它们不是物理列）并追加标签源列
         scan_cols = [
             c for c in scan_cols
@@ -1943,7 +1943,7 @@ class SqlBuildPlanBuilder:
             right_alias = right_table.table_alias
 
         # 1. ScanStep——左表
-        left_cols = self._build_required_columns(left_alias, spec)
+        left_cols = self._build_required_columns(left_alias, spec, left_table)
         left_scan = ScanStep(
             step_id=SqlBuildPlan.generate_step_id("scan_l", {"table": left_table.source_table}),
             table_ref=left_alias,
@@ -1953,7 +1953,7 @@ class SqlBuildPlanBuilder:
         steps.append(left_scan)
 
         # 2. ScanStep——右表
-        right_cols = self._build_required_columns(right_alias, spec)
+        right_cols = self._build_required_columns(right_alias, spec, right_table)
         right_scan = ScanStep(
             step_id=SqlBuildPlan.generate_step_id("scan_r", {"table": right_table.source_table}),
             table_ref=right_alias,
@@ -2112,7 +2112,7 @@ class SqlBuildPlanBuilder:
         if step_index == 0:
             left_table = table_map[candidate.left_table]
             # 使用可能已修改的别名构建 required_columns
-            left_cols = self._build_required_columns(left_alias, spec)
+            left_cols = self._build_required_columns(left_alias, spec, left_table)
             # 确保 join key 在 required_columns 中
             left_key_norm = self._normalizer.normalize(candidate.left_key)
             if not any(c.normalized_name == left_key_norm for c in left_cols):
@@ -2136,7 +2136,7 @@ class SqlBuildPlanBuilder:
         steps.append(left_scan)
 
         # ── 2. ScanStep - 右侧 ──
-        right_cols = self._build_required_columns(right_alias, spec)
+        right_cols = self._build_required_columns(right_alias, spec, right_table)
         right_key_norm = self._normalizer.normalize(candidate.right_key)
         if not any(c.normalized_name == right_key_norm for c in right_cols):
             right_cols.append(ColumnRef(
@@ -2509,19 +2509,26 @@ class SqlBuildPlanBuilder:
         return []
 
     def _build_required_columns(
-        self, table_alias: str, spec: ParsedDeveloperSpec
+        self, table_alias: str, spec: ParsedDeveloperSpec, table: InputTableDecl,
     ) -> list[ColumnRef]:
-        """从 spec 的指标和维度引用中推断需要的列。
+        """从 spec 的指标和维度引用中推断需要的列——仅包含属于该表的列。
 
-        收集所有指标引用（input_column）、维度引用和排序引用，
-        构建 ColumnRef 列表。
+        构建该表已声明列的归一化集合，所有候选列引用（指标 input_column、
+        维度 column_ref、排序列、输出列源列）必须通过此集合过滤，
+        防止将其他表的列错误地分配给当前表的 ScanStep。
         """
+        # 该表所有已声明列名的归一化集合（来自 key_columns + business_columns + columns）
+        declared: set[str] = set()
+        for col_list in [table.key_columns, table.business_columns, table.columns]:
+            for c in col_list:
+                declared.add(self._normalizer.normalize(c.column_name))
+
         seen: set[str] = set()
         cols: list[ColumnRef] = []
 
         def _add(col_name: str) -> None:
             normalized = self._normalizer.normalize(col_name)
-            if normalized not in seen:
+            if normalized in declared and normalized not in seen:
                 seen.add(normalized)
                 cols.append(
                     ColumnRef(
@@ -2531,14 +2538,18 @@ class SqlBuildPlanBuilder:
                     )
                 )
 
-        # 指标引用
+        # 指标引用——仅保留 input_column 属于该表的指标
         for m in spec.metrics:
             if m.input_column:
                 _add(m.input_column)
 
-        # 维度引用
+        # 维度引用——有 source_table 时严格按表过滤，无时靠列名匹配
         for d in spec.dimensions:
-            _add(d.column_ref)
+            if d.source_table:
+                if d.source_table == table_alias:
+                    _add(d.column_ref)
+            else:
+                _add(d.column_ref)
 
         # 排序引用
         if spec.output_spec.sort:

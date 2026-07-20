@@ -521,27 +521,11 @@ def build_manifest_from_spec(spec: ParsedDeveloperSpec) -> SourceManifest:
                 )
             )
 
-        # 从显式声明的列开始
+        # 从该表显式声明的列构建——不注入跨表列，
+        # 因为指标/维度/输出/排序列可能来自其他表，
+        # 错误的注入会导致 Validator 的列存在性检查失效。
         for c in t.columns + t.key_columns + t.business_columns:
             _add(c.column_name)
-
-        # 从指标引用中提取
-        for m in spec.metrics:
-            if m.input_column:
-                _add(m.input_column)
-
-        # 从维度引用中提取
-        for d in spec.dimensions:
-            _add(d.column_ref)
-
-        # 从输出列提取
-        for col in spec.output_spec.columns:
-            _add(col.name)
-
-        # 从排序列提取
-        if spec.output_spec.sort:
-            for s in spec.output_spec.sort:
-                _add(s.column)
 
         # 提取主键（来自 key_columns 中标记 unique=True 的字段）
         primary_key = [c.column_name for c in t.key_columns if c.unique]
