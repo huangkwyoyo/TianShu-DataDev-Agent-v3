@@ -861,12 +861,87 @@ class Pipeline:
             return table_paths
         return self._default_table_paths
 
+    @staticmethod
+    def _build_snapshot_time_filter(spec: ParsedDeveloperSpec | None):
+        """将已验证时间范围转换为封闭的锚表快照过滤规格。"""
+        if spec is None or spec.time_range is None:
+            return None
+
+        from datetime import date, timedelta
+
+        from tianshu_datadev.spark.snapshot import (
+            SnapshotMaterializationError,
+            SnapshotTimeFilter,
+        )
+
+        time_range = spec.time_range
+        if time_range.relative_range:
+            raise SnapshotMaterializationError(
+                "相对时间范围暂不支持确定性快照，请改用固定 start/end"
+            )
+
+        start = time_range.start
+        end = time_range.end
+        if time_range.calendar_type != "calendar" and time_range.fiscal_year:
+            fiscal_year = time_range.fiscal_year
+            if time_range.calendar_type == "fiscal_jul":
+                start, end = f"{fiscal_year}-07-01", f"{fiscal_year + 1}-06-30"
+            elif time_range.calendar_type == "fiscal_apr":
+                start, end = f"{fiscal_year}-04-01", f"{fiscal_year + 1}-03-31"
+
+        if not start or not end:
+            raise SnapshotMaterializationError("时间范围缺少固定 start/end")
+
+        column = time_range.column_ref
+        if not column:
+            time_field_tables = [
+                table for table in spec.input_tables if table.time_field
+            ]
+            if len(time_field_tables) == 1:
+                column = time_field_tables[0].time_field or ""
+        candidates = []
+        for table in spec.input_tables:
+            declared_columns = {
+                item.column_name
+                for group in (table.columns, table.key_columns, table.business_columns)
+                for item in group
+            }
+            if table.time_field == column or column in declared_columns:
+                candidates.append(table)
+        if len(candidates) > 1:
+            fact_candidates = [table for table in candidates if table.role == "fact"]
+            candidates = fact_candidates if len(fact_candidates) == 1 else candidates
+        if not candidates and len(spec.input_tables) == 1:
+            candidates = [spec.input_tables[0]]
+        if len(candidates) != 1:
+            raise SnapshotMaterializationError(
+                f"无法唯一确定时间字段 '{column}' 所属的快照锚表"
+            )
+
+        end_operator = "LTE"
+        try:
+            if len(start) == 10 and len(end) == 10:
+                date.fromisoformat(start)
+                end = (date.fromisoformat(end) + timedelta(days=1)).isoformat()
+                end_operator = "LT"
+        except ValueError:
+            end_operator = "LTE"
+
+        return SnapshotTimeFilter(
+            table_alias=candidates[0].table_alias,
+            column=column,
+            start=start,
+            end=end,
+            end_operator=end_operator,
+        )
+
     def _prepare_run_all_snapshot(
         self,
         *,
         contract,
         table_mapping: dict[str, str],
         table_paths: dict[str, str] | None,
+        spec: ParsedDeveloperSpec | None = None,
     ) -> tuple[SnapshotManifest | None, dict[str, str]]:
         """在 SQL 执行前准备同源快照，并返回 Executor 的表路径。"""
         from pathlib import Path
@@ -905,6 +980,7 @@ class Pipeline:
         if self._duckdb_path is not None:
             if not physical_tables:
                 raise RuntimeError("Snapshot 构建失败：Contract 未声明输入表")
+            anchor_time_filter = self._build_snapshot_time_filter(spec)
             output_dir = str(
                 Path(__file__).resolve().parents[3]
                 / ".tianshu_cache"
@@ -928,6 +1004,10 @@ class Pipeline:
                     mode="head",
                     limit=SNAPSHOT_DEFAULT_ROW_LIMIT,
                 ).model_dump(mode="json"),
+                anchor_time_filter=(
+                    anchor_time_filter.model_dump(mode="json")
+                    if anchor_time_filter is not None else None
+                ),
             )
             alias_targets = {
                 alias: physical_to_alias[physical]
@@ -1677,6 +1757,7 @@ class Pipeline:
                         contract=contract,
                         table_mapping=table_mapping or {},
                         table_paths=table_paths,
+                        spec=spec,
                     )
                     if snapshot_manifest is not None:
                         ctx.set_result(
@@ -1943,6 +2024,7 @@ class Pipeline:
                     contract=contract,
                     table_mapping=table_mapping or {},
                     table_paths=table_paths,
+                    spec=spec,
                 )
                 if snapshot_manifest is not None:
                     ctx.set_result(
@@ -4184,9 +4266,16 @@ class Pipeline:
                 contract=contract,
                 table_mapping=results_data.get("table_mapping") or {},
                 table_paths=None,
+                spec=results_data.get("parsed_spec"),
             )
         except Exception as exc:
-            context.stage_results["PHYSICAL_VERIFIER"] = "SNAPSHOT_NOT_READY"
+            from tianshu_datadev.spark.snapshot import SnapshotEmptyForFilterError
+
+            context.stage_results["PHYSICAL_VERIFIER"] = (
+                "SNAPSHOT_EMPTY_FOR_FILTER"
+                if isinstance(exc, SnapshotEmptyForFilterError)
+                else "SNAPSHOT_NOT_READY"
+            )
             context.errors.append(
                 "[PHYSICAL_VERIFIER] SNAPSHOT_NOT_READY: "
                 f"受控快照构建失败——{exc}"

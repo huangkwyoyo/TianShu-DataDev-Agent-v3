@@ -34,6 +34,7 @@ import pyarrow.parquet as pq
 from pydantic import Field
 
 from tianshu_datadev.developer_spec.models import StrictModel
+from tianshu_datadev.planning.models import SafeIdentifier
 
 # ════════════════════════════════════════════
 # 快照数据源配置
@@ -81,6 +82,16 @@ class SamplingSpec(StrictModel):
     seed: int | None = None               # 随机种子（保证可复现）
     strata_keys: list[str] = Field(default_factory=list)     # 分层采样键
     anchor_keys: list[str] = Field(default_factory=list)     # 稳定排序锚点键
+
+
+class SnapshotTimeFilter(StrictModel):
+    """锚表快照使用的封闭时间范围，不接受自由 SQL。"""
+
+    table_alias: SafeIdentifier
+    column: SafeIdentifier
+    start: str
+    end: str
+    end_operator: Literal["LT", "LTE"] = "LT"
 
 
 # ════════════════════════════════════════════
@@ -151,6 +162,10 @@ class SnapshotSourceNotAllowlistedError(Exception):
 
 class SnapshotMaterializationError(Exception):
     """仓库快照无法在资源和关系一致性边界内生成。"""
+
+
+class SnapshotEmptyForFilterError(SnapshotMaterializationError):
+    """锚表在声明时间范围内没有可验证数据。"""
 
 
 class SnapshotBuilder:
@@ -296,6 +311,7 @@ class SnapshotBuilder:
         table_aliases: dict[str, str] | None = None,
         table_role_aliases: dict[str, list[str]] | None = None,
         sampling: SamplingSpec | None = None,
+        anchor_time_filter: SnapshotTimeFilter | None = None,
         memory_limit: str = "1GB",
         threads: int = 1,
         max_temp_directory_size: str = "4GB",
@@ -353,6 +369,14 @@ class SnapshotBuilder:
             aliases=list(alias_to_physical),
             joins=normalized_joins,
         )
+        if (
+            anchor_time_filter is not None
+            and anchor_time_filter.table_alias != anchor_alias
+        ):
+            raise SnapshotMaterializationError(
+                "时间范围字段不属于快照锚表："
+                f"filter={anchor_time_filter.table_alias}, anchor={anchor_alias}"
+            )
 
         stat = os.stat(duckdb_path)
         provider_fingerprint = hashlib.sha256(
@@ -397,17 +421,34 @@ class SnapshotBuilder:
                         snapshot_dir,
                         anchor_table,
                     )
+                    anchor_where = ""
+                    if anchor_time_filter is not None:
+                        end_op = "<" if anchor_time_filter.end_operator == "LT" else "<="
+                        anchor_where = (
+                            f" WHERE {anchor_time_filter.column} >= "
+                            f"{_render_sql_string_literal(anchor_time_filter.start)}"
+                            f" AND {anchor_time_filter.column} {end_op} "
+                            f"{_render_sql_string_literal(anchor_time_filter.end)}"
+                        )
                     self._copy_query_to_parquet(
                         con,
-                        f"SELECT * FROM {anchor_table} LIMIT {row_limit}",
+                        f"SELECT * FROM {anchor_table}{anchor_where} LIMIT {row_limit}",
                         anchor_path,
                     )
                     for alias in physical_to_aliases[anchor_table]:
                         selected_paths[alias] = anchor_path
-                    files.append(self._snapshot_file(
+                    anchor_file = self._snapshot_file(
                         physical_to_aliases[anchor_table][0],
                         anchor_path,
-                    ))
+                    )
+                    if anchor_time_filter is not None and anchor_file.row_count == 0:
+                        raise SnapshotEmptyForFilterError(
+                            "[SNAPSHOT_EMPTY_FOR_FILTER] 锚表在声明时间范围内无数据："
+                            f"{anchor_time_filter.column} >= {anchor_time_filter.start}, "
+                            f"{anchor_time_filter.column} "
+                            f"{anchor_time_filter.end_operator} {anchor_time_filter.end}"
+                        )
+                    files.append(anchor_file)
 
                     unresolved_tables = set(source_tables) - {anchor_table}
                     while unresolved_tables:

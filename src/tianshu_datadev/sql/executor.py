@@ -128,12 +128,14 @@ class DuckDBExecutor:
         table_aliases: dict[str, str],
         sampling: dict,
         table_role_aliases: dict[str, list[str]] | None = None,
+        anchor_time_filter: dict | None = None,
     ):
         """在受硬限制 Worker 中从 DuckDB 源库构建快照。"""
         from tianshu_datadev.spark.snapshot import (
             SamplingSpec,
             SnapshotBuilder,
             SnapshotManifest,
+            SnapshotTimeFilter,
         )
 
         if not self._duckdb_path:
@@ -147,6 +149,10 @@ class DuckDBExecutor:
                 table_aliases=table_aliases,
                 table_role_aliases=table_role_aliases,
                 sampling=SamplingSpec.model_validate(sampling),
+                anchor_time_filter=(
+                    SnapshotTimeFilter.model_validate(anchor_time_filter)
+                    if anchor_time_filter is not None else None
+                ),
                 memory_limit=self._memory_limit,
                 threads=self._threads,
                 max_temp_directory_size=self._max_temp_directory_size,
@@ -161,8 +167,13 @@ class DuckDBExecutor:
             "table_aliases": table_aliases,
             "table_role_aliases": table_role_aliases or {},
             "sampling": sampling,
+            "anchor_time_filter": anchor_time_filter,
         })
         if payload is None:
+            if "[SNAPSHOT_EMPTY_FOR_FILTER]" in error:
+                from tianshu_datadev.spark.snapshot import SnapshotEmptyForFilterError
+
+                raise SnapshotEmptyForFilterError(error)
             raise RuntimeError(error)
         return SnapshotManifest.model_validate(payload)
 

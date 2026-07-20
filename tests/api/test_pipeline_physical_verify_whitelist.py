@@ -395,7 +395,48 @@ class TestPhysicalVerifySafetyHelpers:
             contract=contract,
             table_mapping={"ft": "gold.fact_trips"},
             table_paths=None,
+            spec=None,
         )
+
+    def test_empty_filtered_snapshot_has_explicit_physical_status(self):
+        """过滤后空快照必须显式进入人工审查状态，不能当作双引擎一致。"""
+        from tianshu_datadev.api.pipeline import SparkStageContext
+        from tianshu_datadev.artifacts.models import (
+            ContractInputTable,
+            DataTransformContractLite,
+        )
+        from tianshu_datadev.spark.snapshot import SnapshotEmptyForFilterError
+
+        contract = DataTransformContractLite(
+            contract_id="contract_empty_snapshot",
+            source_sqlbuildplan_hash="plan_hash",
+            input_tables=[ContractInputTable(
+                table_ref="ft",
+                source_table="gold.fact_trips",
+            )],
+        )
+        artifacts = PipelineArtifactBundle(
+            request_id="req_empty_snapshot",
+            data_transform_contract=contract,
+        )
+        pipeline = Pipeline(duckdb_path="warehouse.duckdb")
+        pipeline._results[artifacts.request_id] = {}
+        context = SparkStageContext()
+
+        with patch.object(
+            pipeline,
+            "_prepare_run_all_snapshot",
+            side_effect=SnapshotEmptyForFilterError(
+                "[SNAPSHOT_EMPTY_FOR_FILTER] no rows"
+            ),
+        ):
+            result = pipeline._build_snapshot_from_duckdb(artifacts, context)
+
+        assert result is None
+        assert context.stage_results["PHYSICAL_VERIFIER"] == (
+            "SNAPSHOT_EMPTY_FOR_FILTER"
+        )
+        assert any("SNAPSHOT_EMPTY_FOR_FILTER" in error for error in context.errors)
 
 
 # ════════════════════════════════════════════

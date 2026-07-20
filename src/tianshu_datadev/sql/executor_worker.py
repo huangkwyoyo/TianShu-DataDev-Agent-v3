@@ -51,6 +51,7 @@ def main() -> int:
                 table_aliases=request["table_aliases"],
                 table_role_aliases=request.get("table_role_aliases"),
                 sampling=request["sampling"],
+                anchor_time_filter=request.get("anchor_time_filter"),
             )
             payload = manifest.model_dump(mode="json")
         else:

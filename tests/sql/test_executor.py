@@ -382,6 +382,47 @@ class TestDuckDBExecutorResourceProtection:
         assert "TIANSHU_FAKE_SECRET" not in env
         assert "PATH" in env
 
+    def test_snapshot_worker_transports_anchor_time_filter(self, tmp_path):
+        """隔离 Worker 必须透传时间过滤，不能退回无条件 head 采样。"""
+        import duckdb
+        import pyarrow.parquet as pq
+
+        db_path = tmp_path / "worker_snapshot.duckdb"
+        con = duckdb.connect(str(db_path))
+        try:
+            con.execute(
+                "CREATE TABLE fact_trip AS SELECT * FROM (VALUES "
+                "(1, DATE '2026-01-01'), (2, DATE '2026-03-25'), "
+                "(3, DATE '2026-04-01')) AS t(id, event_date)"
+            )
+        finally:
+            con.close()
+
+        manifest = DuckDBExecutor(
+            duckdb_path=str(db_path),
+            memory_limit="128MB",
+            threads=1,
+            max_temp_directory_size="128MB",
+            process_memory_limit_mb=1536,
+        ).materialize_snapshot(
+            output_dir=str(tmp_path / "snapshots"),
+            contract_hash="f" * 64,
+            source_tables=["fact_trip"],
+            joins=[],
+            table_aliases={"fact_trip": "ft"},
+            sampling={"mode": "head", "limit": 10},
+            anchor_time_filter={
+                "table_alias": "ft",
+                "column": "event_date",
+                "start": "2026-03-25",
+                "end": "2026-04-01",
+                "end_operator": "LT",
+            },
+        )
+
+        values = pq.read_table(manifest.files[0].file_path).column("id").to_pylist()
+        assert values == [2]
+
 
 # ════════════════════════════════════════════
 # _is_interrupt_exception 单元测试

@@ -25,6 +25,7 @@ from tianshu_datadev.spark.snapshot import (
     SNAPSHOT_DEFAULT_ROW_LIMIT,
     SamplingSpec,
     SnapshotBuilder,
+    SnapshotEmptyForFilterError,
     SnapshotFile,
     SnapshotIntegrityError,
     SnapshotManifest,
@@ -32,6 +33,7 @@ from tianshu_datadev.spark.snapshot import (
     SnapshotSourceNotAllowlistedError,
     SnapshotSourceProvider,
     SnapshotSourceType,
+    SnapshotTimeFilter,
 )
 
 
@@ -173,6 +175,110 @@ class TestWarehouseSnapshotMaterialization:
                 table_aliases={"gold.fact_orders": "ft", "gold.dim_customer": "dc"},
                 sampling=SamplingSpec(mode="head", limit=2),
             )
+
+    def test_anchor_time_filter_precedes_limit_and_cascades_join_keys(self, tmp_path):
+        """时间过滤必须先于 LIMIT，维表仍按过滤后的锚点键级联。"""
+        import duckdb
+        import pyarrow.parquet as pq
+
+        db_path = tmp_path / "time_warehouse.duckdb"
+        con = duckdb.connect(str(db_path))
+        try:
+            con.execute("CREATE SCHEMA gold")
+            con.execute(
+                "CREATE TABLE gold.fact_trip AS SELECT * FROM (VALUES "
+                "(1, TIMESTAMP '2026-01-06 06:00:00', 10), "
+                "(2, TIMESTAMP '2026-03-25 09:00:00', 20), "
+                "(3, TIMESTAMP '2026-03-31 23:59:59', 30), "
+                "(4, TIMESTAMP '2026-04-01 00:00:00', 40)"
+                ") AS t(trip_id, pickup_at, location_id)"
+            )
+            con.execute(
+                "CREATE TABLE gold.dim_zone AS SELECT * FROM (VALUES "
+                "(10, 'old'), (20, 'a'), (30, 'b'), (40, 'new')"
+                ") AS t(location_id, zone_name)"
+            )
+        finally:
+            con.close()
+
+        manifest = SnapshotBuilder(
+            str(tmp_path / "snapshots")
+        ).materialize_warehouse_tables(
+            contract_hash="d" * 64,
+            source_tables=["gold.fact_trip", "gold.dim_zone"],
+            duckdb_path=str(db_path),
+            joins=[{
+                "left_table": "ft",
+                "right_table": "tz",
+                "left_key": "location_id",
+                "right_key": "location_id",
+                "join_type": "INNER",
+            }],
+            table_aliases={"gold.fact_trip": "ft", "gold.dim_zone": "tz"},
+            sampling=SamplingSpec(mode="head", limit=10),
+            anchor_time_filter=SnapshotTimeFilter(
+                table_alias="ft",
+                column="pickup_at",
+                start="2026-03-25",
+                end="2026-04-01",
+                end_operator="LT",
+            ),
+        )
+
+        files = {item.source_name: item for item in manifest.files}
+        fact_ids = pq.read_table(files["ft"].file_path).column("trip_id").to_pylist()
+        zone_ids = pq.read_table(files["tz"].file_path).column("location_id").to_pylist()
+        assert fact_ids == [2, 3]
+        assert zone_ids == [20, 30]
+
+    def test_empty_anchor_time_filter_is_explicit_failure(self, tmp_path):
+        """时间范围无数据时不能生成可被误判为一致的空快照。"""
+        db_path = tmp_path / "warehouse.duckdb"
+        self._create_warehouse(str(db_path))
+
+        with pytest.raises(
+            SnapshotEmptyForFilterError,
+            match="SNAPSHOT_EMPTY_FOR_FILTER",
+        ):
+            SnapshotBuilder(
+                str(tmp_path / "snapshots")
+            ).materialize_warehouse_tables(
+                contract_hash="e" * 64,
+                source_tables=["gold.fact_orders"],
+                duckdb_path=str(db_path),
+                joins=[],
+                table_aliases={"gold.fact_orders": "ft"},
+                sampling=SamplingSpec(mode="head", limit=10),
+                anchor_time_filter=SnapshotTimeFilter(
+                    table_alias="ft",
+                    column="order_id",
+                    start="100",
+                    end="200",
+                    end_operator="LT",
+                ),
+            )
+
+
+def test_pipeline_builds_half_open_snapshot_filter_from_spec():
+    """Pipeline 必须复用编译器的日期半开区间语义。"""
+    from tianshu_datadev.api.templates import TEMPLATES
+    from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
+
+    markdown = next(
+        item["markdown_template"]
+        for item in TEMPLATES
+        if item["template_id"] == "tpl_window_topn"
+    )
+    spec = DeveloperSpecParser().parse(markdown)
+
+    snapshot_filter = Pipeline._build_snapshot_time_filter(spec)
+
+    assert snapshot_filter is not None
+    assert snapshot_filter.table_alias == "ft"
+    assert snapshot_filter.column == "pickup_at"
+    assert snapshot_filter.start == "2026-03-25"
+    assert snapshot_filter.end == "2026-04-01"
+    assert snapshot_filter.end_operator == "LT"
 
 
 def _make_local_fixture_builder(tmpdir: str):
