@@ -96,7 +96,8 @@ def test_contract_preserves_post_window_filter_for_spark():
     assert [item.phase for item in contract.filters] == [
         "pre_transform", "pre_transform", "post_window",
     ]
-    assert contract.window_specs[0].order_by == ["trip_count DESC"]
+    # grain tiebreaker 追加后：location_id 作为确定性排序键，确保跨引擎一致
+    assert contract.window_specs[0].order_by == ["trip_count DESC", "location_id ASC"]
 
     mapping = map_contract_to_spark_plan(contract)
     assert mapping.success is True
@@ -105,7 +106,9 @@ def test_contract_preserves_post_window_filter_for_spark():
 
     code = SparkCompiler().compile(mapping.spark_plan).raw_pyspark
     compile(code, "<generated-spark>", "exec")
-    assert '.orderBy(F.col("trip_count").desc())' in code
+    # grain tiebreaker 追加后——location_id ASC 作为确定性排序键
+    assert 'F.col("trip_count").desc()' in code
+    assert 'F.col("location_id").asc()' in code
     assert 'filter(F.col("rank_in_borough") <= 10)' in code
     assert 'F.col("tz.zone_name")' not in code
 

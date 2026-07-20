@@ -1414,6 +1414,23 @@ class SqlBuildPlanBuilder:
                     direction=direction,
                 ))
 
+            # 为 ROW_NUMBER/RANK/DENSE_RANK 自动追加 grain 列作为 tiebreaker——
+            # 避免平局时跨引擎（DuckDB vs Spark）ROW_NUMBER 赋值不一致导致物理验证误报。
+            # 只在 ORDER BY 和 PARTITION BY 中尚未出现的 grain 列才追加。
+            if func_name in ("ROW_NUMBER", "RANK", "DENSE_RANK") and spec.output_spec.grain:
+                existing_order_cols = {s.column.lower() for s in order_by}
+                partition_cols = {p.column_name.lower() for p in partition_by}
+                for grain_col in spec.output_spec.grain:
+                    if (
+                        grain_col.lower() not in existing_order_cols
+                        and grain_col.lower() not in partition_cols
+                    ):
+                        order_by.append(SortSpec(
+                            column=grain_col,
+                            direction=SortDirection.ASC,
+                        ))
+                        existing_order_cols.add(grain_col.lower())
+
             # 构建 input——根据函数类型选择 ColumnRef 或 SqlLiteral
             win_input: ColumnRef | SqlLiteral | None = None
             if func_name in _ntile_functions:
