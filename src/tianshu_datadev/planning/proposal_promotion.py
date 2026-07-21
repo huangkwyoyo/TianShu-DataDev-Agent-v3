@@ -36,8 +36,8 @@ class ProposalPromotion:
         Returns:
             修改后的 ParsedDeveloperSpec 副本
         """
-        # 浅拷贝——Pydantic model_copy 返回新实例
-        result = spec.model_copy(deep=False)
+        # 深拷贝——确保 .append() 操作不污染原始 spec 的列表
+        result = spec.model_copy(deep=True)
 
         # ── dimensions：仅当 proposal 非空且 spec 为空时写入 ──
         if proposal.dimensions and not result.dimensions:

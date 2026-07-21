@@ -1272,6 +1272,65 @@ class TestSingleStatementV1Regression:
             f"value_level 在 output_columns 中出现 {value_level_count} 次，应精确 1 次"
         )
 
+    def test_extract_case_when_with_time_transform_expr_left(self):
+        """CaseWhenStep 的 Predicate.left 为 TimeTransformExpr 时不应崩溃。
+
+        Critical 缺陷 #1：_extract_case_when_v1 未向 _predicate_to_case_when_condition
+        传递 derived_expr_map，导致 TimeTransformExpr 反查 alias 时抛出 ValueError。
+        """
+        from tianshu_datadev.planning.models import (
+            DerivedGroupKey, TimeTransformExpr, SafeIdentifier, WhenBranch,
+        )
+
+        # 构建含 DerivedGroupKey 的 AggregateStep——用于构建 derived_expr_map
+        agg = AggregateStep(
+            step_id="agg_1",
+            group_keys=[
+                DerivedGroupKey(
+                    alias="pickup_hour",
+                    expr=TimeTransformExpr(
+                        source_column=SafeIdentifier("pickup_at"),
+                        source_table=SafeIdentifier("ft"),
+                        time_function="HOUR",
+                    ),
+                ),
+            ],
+            metrics=[],
+        )
+        # 构建 Predicate.left 为 TimeTransformExpr 的 CaseWhenStep
+        pred = Predicate(
+            operator=PredicateOperator.GTE,
+            left=TimeTransformExpr(
+                source_column=SafeIdentifier("pickup_at"),
+                source_table=SafeIdentifier("ft"),
+                time_function="HOUR",
+            ),
+            right=SqlLiteral(value=8),
+        )
+        case_step = CaseWhenStep(
+            step_id="cw_1",
+            alias="peak_type",
+            cases=[WhenBranch(condition=pred, result=SqlLiteral(value="高峰"))],
+            else_value=SqlLiteral(value="平峰"),
+        )
+        plan = SqlBuildPlan(
+            plan_id="plan_cw_tte",
+            spec_hash="hash_cw_tte",
+            steps=[ScanStep(
+                step_id="scan_ft",
+                table_ref="ft",
+                required_columns=[
+                    ColumnRef(table_ref="ft", column_name="pickup_at", normalized_name="pickup_at"),
+                ],
+            ), agg, case_step],
+        )
+        # lite 路径：extract() 必须自动构建 derived_expr_map 并透传
+        extractor = DataTransformContractExtractor()
+        result = extractor.extract(plan)
+        assert len(result.case_when_labels) == 1
+        cw = result.case_when_labels[0]
+        assert cw.output_alias == "peak_type"
+
     def test_window_step_single_statement_v1_path(self):
         """WindowStep 单语句：build_sql_program + extract_v1 必须捕获 window_specs。"""
         from tianshu_datadev.planning.program_factory import build_sql_program

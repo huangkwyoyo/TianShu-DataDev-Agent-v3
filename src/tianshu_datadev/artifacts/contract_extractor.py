@@ -111,6 +111,14 @@ class DataTransformContractExtractor:
         seen_columns: set[tuple[str, str]] = set()
         window_seen = False
 
+        # 从 AggregateStep 构建 derived_expr_map（TimeTransformExpr alias 反查）
+        derived_expr_map: dict[str, TimeTransformExpr] = {}
+        for step in plan.steps:
+            if isinstance(step, AggregateStep):
+                for gk in step.group_keys:
+                    if isinstance(gk, DerivedGroupKey):
+                        derived_expr_map[gk.alias] = gk.expr
+
         for step in plan.steps:
             if isinstance(step, ScanStep):
                 self._extract_scan(
@@ -148,7 +156,7 @@ class DataTransformContractExtractor:
                 # Phase 3B：lite 路径必须提取 CASE WHEN，否则
                 # adapt_lite_to_v1 会硬编码 case_when_labels=[] 静默丢弃。
                 case_when_labels.extend(
-                    self._extract_case_when_v1(step, "main")
+                    self._extract_case_when_v1(step, "main", derived_expr_map)
                 )
 
             elif isinstance(step, WindowStep):
@@ -594,6 +602,14 @@ class DataTransformContractExtractor:
             sid = stmt.statement_id
             window_seen = False
 
+            # 从当前 plan 的 AggregateStep 构建 derived_expr_map
+            derived_expr_map: dict[str, TimeTransformExpr] = {}
+            for s in plan.steps:
+                if isinstance(s, AggregateStep):
+                    for gk in s.group_keys:
+                        if isinstance(gk, DerivedGroupKey):
+                            derived_expr_map[gk.alias] = gk.expr
+
             # step_dag 条目
             step_dag[sid] = list(stmt.depends_on)
 
@@ -644,7 +660,7 @@ class DataTransformContractExtractor:
                     limit_spec = self._extract_limit(step)
                 elif isinstance(step, CaseWhenStep):
                     case_when_labels.extend(
-                        self._extract_case_when_v1(step, sid)
+                        self._extract_case_when_v1(step, sid, derived_expr_map)
                     )
                 elif isinstance(step, WindowStep):
                     window_specs.extend(
@@ -710,6 +726,7 @@ class DataTransformContractExtractor:
     @staticmethod
     def _extract_case_when_v1(
         step: CaseWhenStep, statement_id: str,
+        derived_expr_map: dict[str, TimeTransformExpr] | None = None,
     ) -> list[CaseWhenLabelSpec]:
         """从 CaseWhenStep 提取 CASE WHEN 标签规格。
 
@@ -743,7 +760,7 @@ class DataTransformContractExtractor:
             if branch.condition is not None:
                 # 结构化条件分支（简单比较，如 status = 'VIP'）
                 cond = DataTransformContractExtractor._predicate_to_case_when_condition(
-                    branch.condition,
+                    branch.condition, derived_expr_map,
                 )
             else:
                 # raw_condition 模式——复杂布尔表达式（如 A OR B / A AND B）
