@@ -142,6 +142,7 @@ class SparkAggregateStep(StrictModel):
     input_alias: str  # 输入 DataFrame 别名
     group_keys: list[str] = []  # 分组键（归一化字段名列表）
     metrics: list[SparkAggregateSpec] = []  # 聚合指标
+    time_transforms: list[SparkTimeTransformExpr] = Field(default_factory=list)
 
 
 class SparkAggregateSpec(StrictModel):
@@ -150,6 +151,14 @@ class SparkAggregateSpec(StrictModel):
     function: SparkAggFunction  # 聚合函数
     input_column: str | None = None  # 输入列（COUNT(*) 时为 None）
     alias: str  # 输出列别名
+
+
+class SparkTimeTransformExpr(StrictModel):
+    """Spark 侧时间变换表达式——从 ContractTimeTransform 确定性映射。"""
+    source_column: str
+    source_table: str
+    time_function: str   # "hour"（已小写）
+    alias: str
 
 
 class SparkProjectStep(StrictModel):

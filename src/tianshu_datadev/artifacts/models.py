@@ -88,6 +88,15 @@ class ContractAggregation(StrictModel):
     alias: str  # 输出别名
 
 
+class ContractTimeTransform(StrictModel):
+    """Contract 侧时间变换——禁止 dict 逃生口。"""
+    type: Literal["time_transform"] = "time_transform"
+    source_column: str
+    source_table: str
+    time_function: str   # "HOUR"
+    alias: str           # 输出别名——与 grouping_keys 中的逻辑名对应
+
+
 class ContractOutputColumn(StrictModel):
     """Contract 中的输出列——精简自 ProjectStep。"""
 
@@ -140,6 +149,7 @@ class DataTransformContractLite(StrictModel):
     # ── Phase 3B 字段（lite 路径透传至 adapt_lite_to_v1）──
     case_when_labels: list = []  # CaseWhenLabelSpec 列表——避免 lite→v1 适配时丢失 CASE WHEN
     window_specs: list = []  # WindowSpecSummary 列表——避免 lite→v1 适配时丢失窗口函数
+    time_transforms: list[ContractTimeTransform] = []
 
     @staticmethod
     def generate_contract_id(plan_hash: str) -> str:
@@ -260,6 +270,7 @@ class DataTransformContractV1(StrictModel):
     temp_tables: list[dict] = []  # TempTableSpec 序列化 dict
     case_when_labels: list[CaseWhenLabelSpec] = []
     window_specs: list[WindowSpecSummary] = []
+    time_transforms: list[ContractTimeTransform] = []
     write_spec: dict | None = None  # FinalWritePlan 序列化 dict
 
     @staticmethod
