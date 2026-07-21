@@ -265,9 +265,25 @@ class TestRequirementPlanner:
         plan, plan_questions = builder.build(spec)
 
         # 验证 AggregateStep 含 DerivedGroupKey
-        agg_steps = [s for s in plan.steps if s.__class__.__name__ == "AggregateStep"]
+        from tianshu_datadev.planning.models import TimeTransformExpr
+        from tianshu_datadev.planning.sql_build_plan import AggregateStep, CaseWhenStep
+
+        agg_steps = [s for s in plan.steps if isinstance(s, AggregateStep)]
         assert len(agg_steps) > 0
         agg = agg_steps[0]
         derived_keys = [k for k in agg.group_keys if hasattr(k, "alias") and hasattr(k, "expr")]
         assert len(derived_keys) >= 1
         assert derived_keys[0].alias == "pickup_hour"
+
+        # 验证 CaseWhenStep 的 Predicate.left 为 TimeTransformExpr
+        case_when_steps = [s for s in plan.steps if isinstance(s, CaseWhenStep)]
+        assert len(case_when_steps) >= 1, "应生成至少一个 CaseWhenStep"
+        case_when = case_when_steps[0]
+        assert len(case_when.cases) >= 1
+        condition_left = case_when.cases[0].condition.left
+        assert isinstance(condition_left, TimeTransformExpr), (
+            f"Predicate.left 应为 TimeTransformExpr，实际为 {type(condition_left).__name__}"
+        )
+        assert str(condition_left.source_column) == "pickup_at"
+        assert str(condition_left.source_table) == "ft"
+        assert condition_left.time_function == "HOUR"
