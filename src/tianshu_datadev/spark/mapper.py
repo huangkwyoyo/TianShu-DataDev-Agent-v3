@@ -199,14 +199,21 @@ def map_contract_to_spark_plan(
     # ── 组装 SparkPlan ──
     plan_id = SparkPlan.generate_plan_id(contract_hash)
 
-    # 步骤顺序：Read → Filter → Join → Aggregate → Window → CaseWhen → Project → Sort → Limit
+    # 步骤顺序：
+    #   Read → Filter → Join → (pre CaseWhen) → Aggregate → Window
+    #   → (post CaseWhen) → Filter(post_window) → Project → Sort → Limit
+    pre_agg_cw = [s for s in case_when_steps
+                   if s.evaluation_phase == "pre_aggregate"]
+    post_agg_cw = [s for s in case_when_steps
+                    if s.evaluation_phase != "pre_aggregate"]
     steps: list = []
     steps.extend(read_steps)
     steps.extend(pre_filter_steps)
     steps.extend(join_steps)
+    steps.extend(pre_agg_cw)          # pre-aggregate CASE WHEN——Join 后、聚合前
     steps.extend(agg_steps)
     steps.extend(window_steps)
-    steps.extend(case_when_steps)
+    steps.extend(post_agg_cw)         # post-aggregate CASE WHEN——聚合/窗口后
     steps.extend(post_window_filter_steps)
     steps.extend(project_steps)
     steps.extend(sort_steps)
@@ -540,6 +547,7 @@ def _map_case_when(
                 output_alias=cwl.output_alias,
                 branches=branches,
                 else_value=cwl.else_label,
+                evaluation_phase=cwl.evaluation_phase,  # 从 Contract 传递聚合阶段
             )
         )
     return steps

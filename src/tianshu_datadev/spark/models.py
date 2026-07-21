@@ -183,6 +183,8 @@ class SparkCaseWhenStep(StrictModel):
     output_alias: str  # 输出列别名
     branches: list[SparkCaseWhenBranch] = []  # WHEN 分支列表
     else_value: str | None = None  # ELSE 默认值
+    # ── 聚合阶段评估位置（从 CaseWhenLabelSpec.evaluation_phase 传递）──
+    evaluation_phase: Literal["pre_aggregate", "post_aggregate"] | None = None
 
 
 class SparkCaseWhenBranch(StrictModel):

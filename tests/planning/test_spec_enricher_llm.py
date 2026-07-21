@@ -612,3 +612,437 @@ class TestSpecEnricherParseLLM:
         result = enricher._parse_llm_response(raw, spec)
 
         assert len(result.inferred_computed_metrics) == 0
+
+    # ════════════════════════════════════════════
+    # CASE WHEN 推断测试（H11——Phase 8 替代）
+    # ════════════════════════════════════════════
+
+    def _build_case_when_spec(self) -> ParsedDeveloperSpec:
+        """构造含 varchar 输出列和业务描述的 Spec——用于 CASE WHEN 测试。
+
+        含 pickup_hour (int) 列，业务描述含 "高峰定义：7-10、17-20 为高峰，其余为平峰"。
+        """
+        return ParsedDeveloperSpec(
+            spec_id="test_cw",
+            spec_hash="cw123",
+            title="高峰时段标签",
+            description="高峰定义：7-10、17-20 为高峰，其余为平峰",
+            input_tables=[
+                InputTableDecl(
+                    table_alias="trips",
+                    source_table="test.trips",
+                    columns=[
+                        ColumnDecl(column_name="pickup_at", normalized_name="pickup_at",
+                                   data_type="timestamp"),
+                        ColumnDecl(column_name="pickup_hour", normalized_name="pickup_hour",
+                                   data_type="int"),
+                    ],
+                ),
+            ],
+            metrics=[],
+            dimensions=[],
+            output_spec=OutputSpecDecl(
+                columns=[OutputColumnDecl(name="peak_type", type="varchar")],
+                grain=["pickup_hour"],
+            ),
+        )
+
+    # ── 正常路径：多分支 + AND/OR ──
+
+    def test_case_when_multi_branch_and_or(self):
+        """多分支 CASE WHEN 含 AND/OR——解析成功，case_when_rules 含 1 条规则。"""
+        enricher = SpecEnricher()
+        raw = {
+            "inferred_metrics": [],
+            "inferred_window_metrics": [],
+            "inferred_computed_metrics": [],
+            "inferred_dimensions": [],
+            "inferred_post_window_filters": [],
+            "inferred_case_when": [
+                {
+                    "output_column": "peak_type",
+                    "branches": [
+                        {
+                            "condition": {
+                                "node_type": "OR",
+                                "children": [
+                                    {
+                                        "node_type": "AND",
+                                        "children": [
+                                            {
+                                                "node_type": "COMPARE",
+                                                "left": "pickup_hour",
+                                                "op": ">=",
+                                                "right": {
+                                                    "node_type": "LITERAL",
+                                                    "value": 7,
+                                                    "data_type": "number",
+                                                },
+                                            },
+                                            {
+                                                "node_type": "COMPARE",
+                                                "left": "pickup_hour",
+                                                "op": "<=",
+                                                "right": {
+                                                    "node_type": "LITERAL",
+                                                    "value": 10,
+                                                    "data_type": "number",
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    {
+                                        "node_type": "AND",
+                                        "children": [
+                                            {
+                                                "node_type": "COMPARE",
+                                                "left": "pickup_hour",
+                                                "op": ">=",
+                                                "right": {
+                                                    "node_type": "LITERAL",
+                                                    "value": 17,
+                                                    "data_type": "number",
+                                                },
+                                            },
+                                            {
+                                                "node_type": "COMPARE",
+                                                "left": "pickup_hour",
+                                                "op": "<=",
+                                                "right": {
+                                                    "node_type": "LITERAL",
+                                                    "value": 20,
+                                                    "data_type": "number",
+                                                },
+                                            },
+                                        ],
+                                    },
+                                ],
+                            },
+                            "then_label": "高峰",
+                            "evidence": "高峰定义：7-10、17-20 为高峰，其余为平峰",
+                        },
+                    ],
+                    "else_value": "平峰",
+                },
+            ],
+        }
+        spec = self._build_case_when_spec()
+
+        result = enricher._parse_llm_response(raw, spec)
+
+        assert result.enrichment_metadata["inferred_case_when_count"] == 1
+        assert len(result.enrichment_metadata["case_when_rules"]) == 1
+        cw = result.enrichment_metadata["case_when_rules"][0]
+        assert cw["output_column"] == "peak_type"
+        assert cw["else_value"] == "平峰"
+        assert len(cw["typed_branches"]) == 1
+        assert cw["typed_branches"][0]["then_label"] == "高峰"
+
+    # ── 非法列：FIELD_EXISTS 阻断 ──
+
+    def test_case_when_invalid_column_rejected(self):
+        """CASE WHEN 引用不存在的列 nonexistent_col——Validator FIELD_EXISTS 阻断。"""
+        enricher = SpecEnricher()
+        raw = {
+            "inferred_metrics": [],
+            "inferred_window_metrics": [],
+            "inferred_computed_metrics": [],
+            "inferred_dimensions": [],
+            "inferred_post_window_filters": [],
+            "inferred_case_when": [
+                {
+                    "output_column": "peak_type",
+                    "branches": [
+                        {
+                            "condition": {
+                                "node_type": "COMPARE",
+                                "left": "nonexistent_col",
+                                "op": ">=",
+                                "right": {
+                                    "node_type": "LITERAL",
+                                    "value": 7,
+                                    "data_type": "number",
+                                },
+                            },
+                            "then_label": "高峰",
+                            "evidence": "高峰定义：超过7为高峰，其余为平峰",
+                        },
+                    ],
+                    "else_value": "平峰",
+                },
+            ],
+        }
+        spec = self._build_case_when_spec()
+
+        result = enricher._parse_llm_response(raw, spec)
+
+        # 规则应被拒绝——FIELD_EXISTS 阻断
+        assert result.enrichment_metadata["inferred_case_when_count"] == 0
+        assert len(result.enrichment_metadata["case_when_rules"]) == 0
+        assert len(result.enrichment_metadata["unresolved_case_when"]) == 1
+        assert result.enrichment_metadata["unresolved_case_when"][0]["output_column"] == "peak_type"
+        ucw_str = str(result.enrichment_metadata["unresolved_case_when"][0])
+        assert "nonexistent_col" in ucw_str or "未知列" in ucw_str
+
+    # ── 非法谓词：LITERAL 根条件被 Pydantic discriminator 拒绝 ──
+
+    def test_case_when_literal_root_rejected(self):
+        """CASE WHEN 使用 LITERAL 作为根条件——Pydantic discriminator 拒绝。"""
+        enricher = SpecEnricher()
+        raw = {
+            "inferred_metrics": [],
+            "inferred_window_metrics": [],
+            "inferred_computed_metrics": [],
+            "inferred_dimensions": [],
+            "inferred_post_window_filters": [],
+            "inferred_case_when": [
+                {
+                    "output_column": "peak_type",
+                    "branches": [
+                        {
+                            "condition": {
+                                "node_type": "LITERAL",
+                                "value": True,
+                                "data_type": "boolean",
+                            },
+                            "then_label": "高峰",
+                            "evidence": "硬编码分支",
+                        },
+                    ],
+                    "else_value": "平峰",
+                },
+            ],
+        }
+        spec = self._build_case_when_spec()
+
+        result = enricher._parse_llm_response(raw, spec)
+
+        # 规则应被拒绝——LITERAL 不在 LabelPredicateCondition 的 6 种根类型中
+        assert result.enrichment_metadata["inferred_case_when_count"] == 0
+        assert len(result.enrichment_metadata["case_when_rules"]) == 0
+        assert len(result.enrichment_metadata["unresolved_case_when"]) >= 1
+        assert "AST" in str(
+            result.enrichment_metadata["unresolved_case_when"][0].get("reason", "")
+        )
+
+    # ── LLM 返回空：无 inferred_case_when ──
+
+    def test_case_when_empty_response(self):
+        """LLM 未返回 inferred_case_when——metadata 含空列表和 count=0。"""
+        enricher = SpecEnricher()
+        raw = {
+            "inferred_metrics": [],
+            "inferred_window_metrics": [],
+            "inferred_computed_metrics": [],
+            "inferred_dimensions": [],
+            "inferred_post_window_filters": [],
+        }
+        spec = self._build_case_when_spec()
+
+        result = enricher._parse_llm_response(raw, spec)
+
+        assert result.enrichment_metadata["inferred_case_when_count"] == 0
+        assert result.enrichment_metadata["case_when_rules"] == []
+        assert result.enrichment_metadata["unresolved_case_when"] == []
+
+    # ── AND 条件（多谓词组合）──
+
+    def test_case_when_and_condition(self):
+        """CASE WHEN 含 AND 条件——解析成功，条件保留为 AND 节点。"""
+        enricher = SpecEnricher()
+        raw = {
+            "inferred_metrics": [],
+            "inferred_window_metrics": [],
+            "inferred_computed_metrics": [],
+            "inferred_dimensions": [],
+            "inferred_post_window_filters": [],
+            "inferred_case_when": [
+                {
+                    "output_column": "peak_type",
+                    "branches": [
+                        {
+                            "condition": {
+                                "node_type": "AND",
+                                "children": [
+                                    {
+                                        "node_type": "COMPARE",
+                                        "left": "pickup_hour",
+                                        "op": ">=",
+                                        "right": {
+                                            "node_type": "LITERAL",
+                                            "value": 7,
+                                            "data_type": "number",
+                                        },
+                                    },
+                                    {
+                                        "node_type": "IS_NOT_NULL",
+                                        "column": "pickup_hour",
+                                    },
+                                ],
+                            },
+                            "then_label": "高峰",
+                            "evidence": "高峰定义：7-10、17-20 为高峰，其余为平峰",
+                        },
+                    ],
+                    "else_value": "平峰",
+                },
+            ],
+        }
+        spec = self._build_case_when_spec()
+
+        result = enricher._parse_llm_response(raw, spec)
+
+        assert result.enrichment_metadata["inferred_case_when_count"] == 1
+        cw = result.enrichment_metadata["case_when_rules"][0]
+        assert len(cw["typed_branches"]) == 1
+        # 验证条件为 AND 节点
+        cond = cw["typed_branches"][0]["condition"]
+        assert cond["node_type"] == "AND"
+        assert len(cond["children"]) == 2
+
+    # ── 集成测试：apply_enrichment 合并 CASE WHEN 到 spec.label_rules ──
+
+    def test_apply_enrichment_merges_case_when_to_label_rules(self):
+        """apply_enrichment 将 case_when_rules 合并到 spec.label_rules。"""
+        raw = {
+            "inferred_metrics": [],
+            "inferred_window_metrics": [],
+            "inferred_computed_metrics": [],
+            "inferred_dimensions": [],
+            "inferred_post_window_filters": [],
+            "inferred_case_when": [
+                {
+                    "output_column": "peak_type",
+                    "branches": [
+                        {
+                            "condition": {
+                                "node_type": "COMPARE",
+                                "left": "pickup_hour",
+                                "op": ">=",
+                                "right": {
+                                    "node_type": "LITERAL",
+                                    "value": 7,
+                                    "data_type": "number",
+                                },
+                            },
+                            "then_label": "高峰",
+                            "evidence": "高峰定义：7-10、17-20 为高峰，其余为平峰",
+                        },
+                    ],
+                    "else_value": "平峰",
+                },
+            ],
+        }
+        spec = self._build_case_when_spec()
+
+        # mock enrich 方法，直接返回解析后的 EnrichedSpec
+        class _MockEnricher(SpecEnricher):
+            def enrich(self, spec2, manifest):
+                return self._parse_llm_response(raw, spec2)
+
+        from tianshu_datadev.developer_spec.models import (
+            ManifestColumn,
+            ManifestTable,
+            SourceManifest,
+        )
+        manifest = SourceManifest(
+            manifest_id="test_manifest",
+            spec_hash="cw123",
+            tables=[
+                ManifestTable(
+                    table_ref="trips",
+                    source_table="test.trips",
+                    columns=[
+                        ManifestColumn(column_name="pickup_at", normalized_name="pickup_at",
+                                       data_type="timestamp"),
+                        ManifestColumn(column_name="pickup_hour", normalized_name="pickup_hour",
+                                       data_type="int"),
+                    ],
+                ),
+            ],
+        )
+
+        mock_enricher = _MockEnricher()
+        result_spec = mock_enricher.apply_enrichment(spec, manifest)
+
+        # 验证 label_rules 已合并
+        assert len(result_spec.label_rules) == 1
+        rule = result_spec.label_rules[0]
+        assert rule.output_column == "peak_type"
+        assert rule.else_value == "平峰"
+        assert len(rule.typed_branches) == 1
+        assert rule.typed_branches[0].then_label == "高峰"
+
+    # ── 未覆盖输出列 → OpenQuestion ──
+
+    def test_case_when_unresolved_creates_open_question(self):
+        """CASE WHEN 校验未通过时——apply_enrichment 生成 OpenQuestion。"""
+        raw = {
+            "inferred_metrics": [],
+            "inferred_window_metrics": [],
+            "inferred_computed_metrics": [],
+            "inferred_dimensions": [],
+            "inferred_post_window_filters": [],
+            "inferred_case_when": [
+                {
+                    "output_column": "peak_type",
+                    "branches": [
+                        {
+                            "condition": {
+                                "node_type": "COMPARE",
+                                "left": "bad_column",
+                                "op": ">=",
+                                "right": {
+                                    "node_type": "LITERAL",
+                                    "value": 7,
+                                    "data_type": "number",
+                                },
+                            },
+                            "then_label": "高峰",
+                            "evidence": "高峰定义：超过7为高峰，其余为平峰",
+                        },
+                    ],
+                    "else_value": "平峰",
+                },
+            ],
+        }
+        spec = self._build_case_when_spec()
+
+        class _MockEnricher2(SpecEnricher):
+            def enrich(self, spec3, manifest):
+                return self._parse_llm_response(raw, spec3)
+
+        from tianshu_datadev.developer_spec.models import (
+            ManifestColumn,
+            ManifestTable,
+            SourceManifest,
+        )
+        manifest = SourceManifest(
+            manifest_id="test_manifest",
+            spec_hash="cw123",
+            tables=[
+                ManifestTable(
+                    table_ref="trips",
+                    source_table="test.trips",
+                    columns=[
+                        ManifestColumn(column_name="pickup_at", normalized_name="pickup_at",
+                                       data_type="timestamp"),
+                        ManifestColumn(column_name="pickup_hour", normalized_name="pickup_hour",
+                                       data_type="int"),
+                    ],
+                ),
+            ],
+        )
+
+        mock_enricher = _MockEnricher2()
+        result_spec = mock_enricher.apply_enrichment(spec, manifest)
+
+        # 规则未通过，不应进入 label_rules
+        assert len(result_spec.label_rules) == 0
+        # 应生成 OpenQuestion
+        assert len(result_spec.open_questions) >= 1
+        q = result_spec.open_questions[0]
+        assert q.source == "spec_enricher"
+        assert q.field_ref == "peak_type"
+        assert "CASE WHEN" in q.description
+        assert not q.blocking

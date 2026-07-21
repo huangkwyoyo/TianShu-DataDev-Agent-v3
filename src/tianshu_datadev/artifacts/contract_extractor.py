@@ -743,11 +743,12 @@ class DataTransformContractExtractor:
         return [
             CaseWhenLabelSpec(
                 statement_id=statement_id,
-                output_alias=step.alias,  # 业务列名，非 step_id
+                output_alias=str(step.alias),  # 业务列名，非 step_id
                 branch_count=len(step.cases),
                 labels=labels,
                 else_label=else_label,
                 branches=branches_spec,
+                evaluation_phase=step.evaluation_phase,  # 从 CaseWhenStep 传递聚合阶段
             )
         ]
 

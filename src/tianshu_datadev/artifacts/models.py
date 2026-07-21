@@ -205,6 +205,8 @@ class CaseWhenLabelSpec(StrictModel):
     labels: list[str] = []  # 所有分支的标签值（从 WhenBranch.result 提取，兼容展示/审查用途）
     else_label: str | None = None  # ELSE 默认值（无 ELSE 时为 None）
     branches: list[CaseWhenBranchSpec] = []  # 完整条件分支（含结构化 condition）
+    # ── 聚合阶段评估位置（从 CaseWhenStep.evaluation_phase 传递）──
+    evaluation_phase: Literal["pre_aggregate", "post_aggregate"] | None = None
 
 
 class WindowSpecSummary(StrictModel):
