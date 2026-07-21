@@ -507,18 +507,23 @@ class TestLabelTableBuilderCompiler:
             f"错误信息应包含未解析列名，实际: {exc_info.value}"
         )
 
-    def test_detail_table_skips_label_defense(self):
-        """DETAIL_TABLE 跳过 label_table 防御检查——不抛异常。"""
+    def test_detail_table_unresolved_raises_error(self):
+        """DETAIL_TABLE 输出列无解析规则 → DerivedColumnRuleMissingError——所有类型统一门禁。"""
+        import pytest
+
         from tianshu_datadev.developer_spec.models import DatasetType
-        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+        from tianshu_datadev.planning.sql_build_plan import (
+            DerivedColumnRuleMissingError,
+            SqlBuildPlanBuilder,
+        )
 
         spec = self._make_label_spec()
-        # 改为 DETAIL_TABLE——防御检查应跳过
+        # 改为 DETAIL_TABLE——distance_category 无解析规则，触发错误
         object.__setattr__(spec, "dataset_type", DatasetType.DETAIL_TABLE)
         builder = SqlBuildPlanBuilder()
-        # 不应抛出 DerivedColumnRuleMissingError
-        plan, _ = builder.build(spec)
-        assert plan is not None
+        # 所有类型统一门禁——未解析列提前阻断
+        with pytest.raises(DerivedColumnRuleMissingError, match="distance_category"):
+            builder.build(spec)
 
 
 # ════════════════════════════════════════════

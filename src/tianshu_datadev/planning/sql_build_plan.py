@@ -1707,13 +1707,13 @@ class SqlBuildPlanBuilder:
         self,
         spec: ParsedDeveloperSpec,
     ) -> None:
-        """防御性检查——label_table 所有输出列必须有解析规则。
+        """防御性检查——所有输出列必须有解析规则，禁止回退为物理 ColumnRef。
 
-        仅对 DatasetType.LABEL_TABLE 执行——其他类型走原有指标/维度/物理列逻辑。
+        对所有 dataset_type 执行未解析列检测——在 build 阶段就暴露问题，
+        避免到 execute 阶段才以晦涩的 Binder Error 失败。
+
+        label_table 额外执行作用域门禁（单表、非聚合、禁止 NOT）。
         复用 _find_unresolved_derived_columns() 避免重复维护六类字段收集逻辑。
-
-        先调 validate_label_table_v1_scope 统一门禁（单表、非聚合、禁止 NOT），
-        再调 resolver 检查是否仍有未解析列。
 
         Args:
             spec: 已解析的 DeveloperSpec
@@ -1721,32 +1721,52 @@ class SqlBuildPlanBuilder:
         Raises:
             DerivedColumnRuleMissingError: 存在未解析的输出列或作用域约束违反
         """
-        if spec.dataset_type != DatasetType.LABEL_TABLE:
-            return
-
-        from tianshu_datadev.labels.label_scope import (
-            LabelScopeError,
-            validate_label_table_v1_scope,
-        )
         from tianshu_datadev.labels.resolver import _find_unresolved_derived_columns
 
-        # 1. 作用域门禁——单表、非聚合、禁止 NOT
-        try:
-            validate_label_table_v1_scope(spec)
-        except LabelScopeError as exc:
-            raise DerivedColumnRuleMissingError(
-                f"label_table v1 作用域约束违反——{exc}"
-            ) from exc
+        # 1. label_table 额外作用域门禁——单表、非聚合、禁止 NOT
+        if spec.dataset_type == DatasetType.LABEL_TABLE:
+            from tianshu_datadev.labels.label_scope import (
+                LabelScopeError,
+                validate_label_table_v1_scope,
+            )
+            try:
+                validate_label_table_v1_scope(spec)
+            except LabelScopeError as exc:
+                raise DerivedColumnRuleMissingError(
+                    f"label_table v1 作用域约束违反——{exc}"
+                ) from exc
 
-        # 2. 复用 resolver 检查未解析列（已在 labels/resolver.py 中维护六类来源）
+        # 2. 检查未解析输出列（所有 dataset_type 通用）
         unresolved_output = _find_unresolved_derived_columns(spec)
 
         if unresolved_output:
+            # 根据 spec 当前配置给出针对性修复指引
+            hints: list[str] = []
+            if not spec.metrics:
+                hints.append("缺少 metrics——聚合列（COUNT/SUM/AVG 等）需在 spec.metrics 中声明")
+            if not spec.dimensions:
+                hints.append("缺少 dimensions——分组键列需在 spec.dimensions 中声明")
+            if not spec.compute_steps:
+                hints.append(
+                    "缺少 compute_steps——派生表达式（如 HOUR(pickup_at)）、"
+                    "CASE WHEN 分支需在 spec.compute_steps 中声明"
+                )
+            if spec.dataset_type == DatasetType.LABEL_TABLE and not spec.label_rules:
+                hints.append(
+                    "缺少 label_rules——label_table 的标签列需通过 label_rules "
+                    "或 LLM 标签提取生成"
+                )
+            hint_text = "；".join(hints) if hints else (
+                "请检查 spec.metrics / dimensions / compute_steps / label_rules 配置"
+            )
+
             raise DerivedColumnRuleMissingError(
-                f"输出列无解析规则——以下列既不是源表物理列，也不是指标/维度/窗口指标/计算步骤/标签规则输出: "
-                f"{unresolved_output}。"
-                f"label_table 预处理应已将所有未解析列转换为 label_rules——"
-                f"此处抛出说明 Pipeline 门禁未起作用，禁止回退为物理 ColumnRef。"
+                f"输出列无解析规则——以下列既不是源表物理列，也不是指标/维度/窗口指标"
+                f"/计算步骤/标签规则输出: {unresolved_output}。"
+                f"修复指引: {hint_text}。"
+                f"这些列将在编译期被当作物理 ColumnRef 生成 SQL，"
+                f"执行时会因列不存在而报 Binder Error——"
+                f"此处提前阻断以给出清晰错误信息。"
             )
 
     def _build_single_table(self, spec: ParsedDeveloperSpec) -> list[StepNode]:

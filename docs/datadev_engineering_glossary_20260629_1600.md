@@ -312,17 +312,17 @@ DeveloperSpec 声明 `relationships: [{left_table: "u", right_table: "o", join_k
 
 ## 7. SqlBuildPlan
 
-**一句话解释**：类型化的 SQL 构建计划——用 9 种封闭 Step 类型描述查询逻辑，禁止自由 SQL 片段。
+**一句话解释**：类型化的 SQL 构建计划——用 10 种封闭 Step 类型描述查询逻辑，禁止自由 SQL 片段。
 
 **是什么**
 
-SqlBuildPlan 是系统的第二层 IR。它由一组有序的 StepNode 组成，每个步骤通过 discriminated union（判别器 step_type）确定类型。当前支持 9 种 Step：ScanStep、FilterStep、JoinStep、AggregateStep、ProjectStep、CaseWhenStep、WindowStep、SortStep、LimitStep。关键设计约束：禁止 `raw_sql`、`where_sql`、`join_on: str`、`expression: str` 及其他自由 SQL 片段字段——所有 SQL 逻辑必须由确定性 Compiler 从 Step 节点生成。
+SqlBuildPlan 是系统的第二层 IR。它由一组有序的 StepNode 组成，每个步骤通过 discriminated union（判别器 step_type）确定类型。Phase 4.6 起支持 10 种 Step：ScanStep、FilterStep、JoinStep、AggregateStep、ProjectStep、CaseWhenStep、WindowStep、SortStep、LimitStep、SubqueryStep。关键设计约束：禁止 `raw_sql`、`where_sql`、`join_on: str`、`expression: str` 及其他自由 SQL 片段字段——所有 SQL 逻辑必须由确定性 Compiler 从 Step 节点生成。
 
 **在当前项目中的位置**
 
 - `src/tianshu_datadev/planning/sql_build_plan.py:181` — SqlBuildPlan 定义
-- `src/tianshu_datadev/planning/sql_build_plan.py:44-176` — 9 个 Step 类
-- `src/tianshu_datadev/planning/sql_build_plan.py:237` — SqlBuildPlanBuilder（Fake，确定性）
+- `src/tianshu_datadev/planning/sql_build_plan.py:44-222` — 10 个 Step 类（含 SubqueryStep:188）
+- `src/tianshu_datadev/planning/sql_build_plan.py` — SqlBuildPlanBuilder
 - `src/tianshu_datadev/planning/models.py` — ColumnRef/Predicate/AggregateSpec/WindowExpr/SqlLiteral 等原子类型
 
 **输入是什么**
@@ -343,19 +343,19 @@ SqlBuildPlan 实例：含 `plan_id`、`steps: list[StepNode]`、`source_manifest
 
 **Owner 审查时应该问什么**
 
-1. "SqlBuildPlan 的 9 个 Step 类型中，哪些是 Phase 1-3 可用、哪些是 Phase 4+ 才开放的？"
-2. "如果需要在 SqlBuildPlan 中新增第 10 种 Step（如 UNION），需要改哪些文件？有哪些硬性规则？"
+1. "SqlBuildPlan 的 10 个 Step 类型中，哪些是 Phase 1-3 可用、哪些是 Phase 4+ 才开放的？"
+2. "如果需要在 SqlBuildPlan 中新增第 11 种 Step（如 UNION），需要改哪些文件？有哪些硬性规则？"
 3. "plan_id 的哈希计算覆盖了 steps 的哪些字段？改变 step_id 会改变 plan_id 吗？"
 
 ---
 
 ## 8. SqlBuildPlanValidator
 
-**一句话解释**：确定性的计划验证器——在编译前校验事实源引用、Join 门禁、禁则规则等 8 项检查。
+**一句话解释**：确定性的计划验证器——在编译前校验事实源引用、Join 门禁、禁则规则、子查询递归校验等检查。
 
 **是什么**
 
-SqlBuildPlanValidator 是编译前的最后一道结构安全门禁。它接收 SqlBuildPlan + SourceManifest + RelationshipHypothesis，执行 8 项确定性检查：空步骤拒绝、表引用校验、字段引用校验、Join key 类型兼容、WEAK/NONE Join 门禁、枚举值校验（Phase 1C）、时间过滤校验（大表必须有时间条件）、LIMIT 存在性（无聚合明细查询）。返回 passed: bool + questions: list[OpenQuestion]。
+SqlBuildPlanValidator 是编译前的最后一道结构安全门禁。它接收 SqlBuildPlan + SourceManifest + RelationshipHypothesis，执行确定性检查：空步骤拒绝、表引用校验、字段引用校验、Join key 类型兼容、WEAK/NONE Join 门禁、枚举值校验（Phase 1C）、时间过滤校验（大表必须有时间条件）、LIMIT 存在性（无聚合明细查询）、**子查询递归校验（V-010a~e 含嵌套 SqlBuildPlan 的五项规则）**。返回 passed: bool + questions: list[OpenQuestion]。
 
 **解决什么问题**
 
@@ -732,37 +732,56 @@ CompiledSql(compiled_sql="SELECT ... FROM dwd.order_fact WHERE ...") + table_pat
 
 ## 17. Pipeline（流水线编排器）
 
-**一句话解释**：串联 Parser → Enricher → Builder → Validator → Compiler → Executor → Contract → Packager 八阶段，提供 execute() 和 run_all() 两个入口，失败时保留中间产物并返回 pipeline_error。
+**一句话解释**：串联 Parser → Enricher → Builder → Validator → Compiler → Executor → Contract → Packager 八阶段（SQL 管线和 Label 分支）→ SparkPipeline 6 阶段（Spark 管线），提供 execute() / run_all() / run_all_full() 三个核心入口。
 
 **是什么**
 
-Pipeline 是系统的核心编排组件（类名 `Pipeline`，定义在 `src/tianshu_datadev/api/pipeline.py`）。它接收 DeveloperSpec 文本，按阶段依次调用各组件，返回结构化结果。在不接真实 LLM 的情况下，Planner 组件使用 Fake 实现（确定性规则代码替代 LLM 推理）。内部维护 `_results: dict[str, dict]` 和 `_timestamps: dict[str, float]` 作为请求级临时存储，带 TTL 过期自动清理（`_purge_expired()`）。
+Pipeline 是系统的核心编排组件（类名 `Pipeline`，定义在 `src/tianshu_datadev/api/pipeline.py`，约 5100 行）。它由两条独立管线组成：
 
-Pipeline 有两个核心入口方法：
+**SQL 管线**：接收 DeveloperSpec 文本，依次调用各组件，返回结构化结果。Fake 组件（确定性规则）替代 LLM 推理。内部维护 `_results: dict[str, dict]` 和 `_timestamps: dict[str, float]` 为请求级临时存储，带 TTL 自动清理（`_purge_expired()`）。
 
-- **`execute()`**（parser → enrich → build → compile → execute）：五阶段，产出 SQL 编译和执行结果。Validator 门禁内嵌在 build 阶段——blocking 问题直接阻断，不进入编译。
-- **`run_all()`**（parser → enrich → build → validate → compile → execute → contract → package）：八阶段，在 execute 基础上追加 DataTransformContract 抽取和 ReviewPackage 打包。
+SQL 管线两个核心入口：
+- **`execute()`**（parser → enrich → build → compile → execute）：五阶段，Validator 门禁内嵌在 build 阶段
+- **`run_all()`**（parser → enrich → build → validate → compile → execute → contract → package）：八阶段，追加 Contract 抽取和 ReviewPackage 打包
 
-两个方法内部都有**三条代码路径**，根据输入特征自动选择：
-1. **ComputeSteps 路径**——spec 中声明了 compute_steps，走 `build_from_steps → build_sql_program_from_compute_steps → compile_program → execute_program`
-2. **多跳链路径**——hypothesis 含多个候选 Join，走 `build_multi → build_sql_program_from_chain → compile_program → execute_program`
-3. **单 SQL 路径**——标准场景，走 `build → compile → execute`
+SQL 管线内部**三条代码路径**：
 
-**统一的错误处理**：三条路径共享相同的错误出口——Validator blocking 时返回 `validation_passed=false` + 具体问题列表；SQL 执行失败（RUNTIME_FAIL）时返回 `pipeline_error` + `pipeline_stages` 阶段状态；异常捕获时保留已完成产物到 `_results` 供事后查询。所有响应（成功和失败）都包含 `validation_passed` 和 `open_questions` 字段，调用方无需猜测链路状态。
+1. **ComputeSteps 路径**`build_from_steps → build_sql_program_from_compute_steps → compile_program → execute_program`
+2. **多跳链路径**`build_multi → build_sql_program_from_chain → compile_program → execute_program`
+3. **单 SQL 路径**`build → compile → execute`
+
+**Label 分支**（Phase 9A+ label_table v1）：Parser 识别 `type: label_table` → LlmLabelExtractor（LLM 提取标签规则，Gateway 文件持久化） → LabelRuleValidator v1（7 项检查） → Promotion（双空阻断） → Builder 追加 CaseWhenStep → 进入下游 SQL/Spark 管线。
+
+**Spark 管线**：提供 `run_all_full()`（同步）和 `run_all_full_stream()`（SSE 流式）入口。内部调用 SparkOrchestrator 的 6 阶段编排：
+
+| 阶段 | 组件 | 产出 |
+|------|------|------|
+| MAPPER | SparkPlanMapper | DataTransformContract → SparkPlan |
+| DEVELOPER | SparkDeveloperService | SparkPlan → PySpark transform() |
+| COMPILER | SparkCodeCompiler | PySpark 代码有效性校验 |
+| VALIDATOR | SparkValidator | 静态有效性和安全门禁 |
+| COMPARATOR | PlanComparator | SqlBuildPlan ↔ SparkPlan 结构等价判定 |
+| PHYSICAL_VERIFIER | PhysicalVerifier | DuckDB ↔ Spark 双引擎物理对比 |
+
+Spark 管线受 `_should_physical_verify()` 门禁保护——case_when UNSUPPORTED_COMPARISON 场景通过白名单放行，物理不一致时 `status="failed"`。
+
+**统一的错误处理**：Validator blocking 时返回 `validation_passed=false` + 具体问题列表；Linux 执行失败（RUNTIME_FAIL）时返回 `pipeline_error` + `pipeline_stages` 阶段状态；异常捕获时保留已完成产物供事后查询。所有响应均包含 `validation_passed` 和 `open_questions` 字段。
 
 **在当前项目中的位置**
 
-- `src/tianshu_datadev/api/pipeline.py` — Pipeline 类实现（~1400 行）
-- `src/tianshu_datadev/api/routes.py` — REST API 路由调用 Pipeline
-- `src/tianshu_datadev/api/models.py` — ExecuteResponse / RunAllResponse 响应模型
+- `src/tianshu_datadev/api/pipeline.py` — Pipeline 类实现（~5100 行）
+- `src/tianshu_datadev/api/routes.py` — REST API 路由调用
+- `src/tianshu_datadev/api/models.py` — ExecuteResponse/RunAllResponse/PlanRichResponse
+- `src/tianshu_datadev/spark/orchestrator.py` — SparkOrchestrator + SparkPipelineStage（6 阶段枚举）
+- `src/tianshu_datadev/labels/` — Label 分支组件（extractor/validator/promotion/scope）
 
 **输入是什么**
 
-DeveloperSpec 文本 + optional table_mapping（别名→物理表名，传给 Compiler）+ optional table_paths（表名→CSV 路径，传给 Executor）。
+DeveloperSpec 文本 + optional table_mapping + optional table_paths。Spark 管线额外需要 DataTransformContract（由 SQL 管线产出）或直接提供 Contract hash。
 
 **输出是什么**
 
-取决于调用方法：parse_only()→SpecParseResponse、build_plan()→PlanResponse、execute()→ExecuteResponse（含 validation_passed + execution_trace + result_summary）、run_all()→RunAllResponse（含 validation_passed + contract_id + package_id + execution_trace + result_summary + open_questions）、get_package()→PackageResponse。失败响应均为 HTTP 200 + pipeline_error + pipeline_stages。
+取决于调用方法：`execute()`→ExecuteResponse（含 validation_passed + execution_trace + result_summary）、`run_all()`→RunAllResponse、`run_all_full()`→PlanRichResponse（含 spark_ok + comparator_status + review_ready + requires_human_review + spark_stages[6 阶段状态]）。
 
 **出错会导致什么风险**
 
@@ -781,8 +800,9 @@ result2 = pipeline.run_all(developer_spec_text)
 
 **Owner 审查时应该问什么**
 
-1. "Pipeline 的三条代码路径（ComputeSteps / 多跳链 / 单 SQL）中，ComputeSteps 路径的返回值与其他两条路径的差异是什么？这些差异是否已记录在 RunAllResponse 模型中？"
-2. "如果 Validator 在 build 阶段产生 blocking 问题——execute() 和 run_all() 返回的 response 中分别包含哪些字段？前端如何区分'校验失败'和'执行失败'？"
+1. "Pipeline 的三条代码路径（ComputeSteps / 多跳链 / 单 SQL）中，ComputeSteps 路径的返回值与其他的差异是什么？"
+2. "run_all_full() 的 spark_ok 字段在什么条件下为 True？什么条件下为 False？spark_ok=False 时是否可以继续推进到生产？"
+3. "Spark 6 阶段中哪些阶段需要真实 LLM？哪些阶段使用确定性代码？"
 
 ---
 
@@ -2761,6 +2781,319 @@ Props：`stages: StageInfo[]`（每项含 stage 英文名、status: ok/failed/sk
 
 ---
 
+## 64. LabelPredicateNode / LabelPredicateCondition
+
+**一句话解释**：标签规则的谓词 AST 节点体系——8 种 LabelPredicateNode 子类构建条件树，6 种 LabelPredicateCondition 作为根条件，禁止 LITERAL/COLUMN_REF 作为 WHEN 根节点。
+
+**是什么**
+
+LabelPredicateNode 是标签规则条件 AST 的基类，8 个子类分为四层：
+
+1. **比较节点**：`LabelCompare(left, op, right)`——列名 + 操作符 + 字面量的比较三元组
+2. **空值节点**：`LabelIsNull(column)`、`LabelIsNotNull(column)`——列是否为空
+3. **布尔节点**：`LabelAnd(children)`（至少 2 子节点）、`LabelOr(children)`（至少 2 子节点）、`LabelNot(child)`（单子节点）
+4. **叶节点**：`LabelLiteral(value, data_type)`（仅允许作为 Compare.right 操作元）、`LabelColumnRef(column)`（仅允许作为 Compare.left 操作元）
+
+LabelPredicateCondition 是 LabelPredicateNode 的父类，限定了根节点只允许 COMPARE/IS_NULL/IS_NOT_NULL/AND/OR/NOT 六种——LITERAL 和 COLUMN_REF 不能作为 WHEN 根节点。
+
+**解决什么问题**
+
+确保标签规则的每个条件分支是可编译、可审查的结构化 AST，而非自由字符串。Compiler 确定性遍历 AST 生成 CASE WHEN 的 WHEN 子句。根条件约束防止 LLM 输出非法的条件树顶层结构。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/labels/models.py` — 8 个子类 + 根约束类型定义
+- `src/tianshu_datadev/labels/label_rule_validator.py` — AST_VALID 检查（_check_ast_valid）
+
+**输入是什么**
+
+LLM 提取（或 FakeLabelExtractor 模拟输出）的标签规则 JSON——经由 Gateway Schema 校验后成为 LabelRuleProposal.branches[i].condition。
+
+**输出是什么**
+
+根节点为 LabelPredicateCondition 子类的 AST 树——Compiler 确定性遍历生成 `WHEN amount > 100 THEN 'high'` 等 SQL 子句。
+
+**简单例子**
+
+`LabelCompare(left="amount", op=GT, right=LabelLiteral(value="100", data_type="numeric"))` → Compiler 渲染为 `WHEN amount > 100 THEN 'high'`
+
+**Owner 审查时应该问什么**
+
+1. "LabelPredicateCondition 的 6 种合法根节点中，哪些在 label_table v1 阶段可用，哪些在规划中？"
+2. "如果 LabelIsNull 的 column 不在 known_columns 中——Validator 会在 FIELD_EXISTS 检查的哪个阶段发现？"
+
+---
+
+## 65. LabelDomain / LabelDomainOutput
+
+**一句话解释**：标签值域——LLM 输出层（LabelDomainOutput）与系统层（LabelDomain）分离，domain_id 由系统确定性生成用于追溯。
+
+**是什么**
+
+LabelDomainOutput 是 LLM 的原始输出——含 values（标签值列表）、source_evidence（项目书原文证据）、is_exhaustive（是否穷举）、completeness_evidence（穷举性证明）。LabelDomain 是系统包装后的版本——在 LabelDomainOutput 基础上由系统生成 domain_id（确定性 SHA-256 hash）。Promotion 要求 label_domain 非空且 values 至少一个合法值，空 domain 被阻断。
+
+**解决什么问题**
+
+LLM 提取的"有哪些标签类别"需要与系统的"已注册标签类别"对齐。双层模型确保：LLM 原始提取结果保留在 LabelDomainOutput 中可审查，系统的 domain_id 用于跨 artifact 追溯。空 domain 阻断防止无标签值域的分类规则推进到 Builder。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/developer_spec/models.py:337` — LabelDomainOutput
+- `src/tianshu_datadev/developer_spec/models.py:371` — LabelDomain（含 domain_id）
+- `src/tianshu_datadev/labels/label_rule_validator.py` — _check_label_domain（空 domain 阻断）
+
+---
+
+## 66. LabelRuleValidator v1
+
+**一句话解释**：标签规则验证器——7 项确定性检查（FIELD_EXISTS → TYPE_COMPATIBLE → OPERATOR_VALID → AST_VALID → LABEL_DOMAIN → COVERAGE → NO_LABEL_NOT），passed 仅当 blocking_errors 和 human_review_items 均为空。
+
+**是什么**
+
+LabelRuleValidator 对 LabelRuleProposal 执行按序 7 项检查：
+
+1. **FIELD_EXISTS**——condition 中所有列引用在 known_columns 中存在
+2. **TYPE_COMPATIBLE**——操作符级别（string 仅支持 =/!=）+ 类型族级别（数值列+字符串字面量→BLOCKING）
+3. **OPERATOR_VALID**——操作合法、布尔节点子节点数合法
+4. **AST_VALID**——condition 为 LabelPredicateCondition 子类，非字符串
+5. **LABEL_DOMAIN**——label_domain 非空 + 所有标签值在域内
+6. **COVERAGE**——ELSE 非空 + evidence 最小长度 + 项目书正文可匹配
+7. **NO_LABEL_NOT**——label_table v1 暂不开放 LabelNot 节点
+
+仅当 blocking_errors 和 human_review_items 均为空时 passed=True。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/labels/label_rule_validator.py:84` — LabelRuleValidator 类
+- `src/tianshu_datadev/labels/models.py` — LabelValidationReport / LabelValidationCheck
+- `tests/labels/test_label_rules.py` — 测试
+
+**Owner 审查时应该问什么**
+
+1. "7 项检查中哪些是 BLOCKING 级别、哪些是 HUMAN_REVIEW 级别？COVERAGE 检查失败后的处理路径是什么？"
+2. "LABEL_DOMAIN 检查是否要求 domain.values 必须与 branches 的 then_label 和 else_value 完全一致？超出了会怎样？"
+
+---
+
+## 67. Promotion（标签规则推广）
+
+**一句话解释**：标签规则从 LLM 提取到系统使用的推广闸门——验证通过后生成 CaseWhenDecl，blocking_errors 或 human_review_items 非空均阻断。
+
+**是什么**
+
+Promotion 是 label_table 管线的关键闸门组件。它接收 LabelValidationReport（来自 LabelRuleValidator），当 passed=True（双空：blocking_errors 和 human_review_items 均为空）时，将验证通过的 LabelRuleProposal 推广为系统可消费的 CaseWhenDecl。CaseWhenDecl 包含 typed_branches（List[TypedLabelBranch]——每个分支含 condition、then_label、evidence）+ label_domain（含 domain_id）+ else_value。
+
+Promotion 的阻断条件：blocking_errors 非空 → 硬阻断（不可绕过）；human_review_items 非空 → 软阻断（需人审确认）；双空 → 自动推广。
+
+**解决什么问题**
+
+确保只有通过 7 项验证的标签规则才能进入 Builder 追加 CaseWhenStep。双空阻断防止"未通过但被静默推进"——避免 LLM 提取的噪声标签破坏数据分类的正确性。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/labels/promotion.py` — Promotion 实现
+- `tests/labels/test_label_rules.py` — Promotion 测试
+
+**Owner 审查时应该问什么**
+
+1. "Promotion 产出的 CaseWhenDecl 是否通过 spec_hash + promoted_rules_hash 双 hash 可追溯？"
+2. "如果 Promotion 产生阻断——错误消息是否能精确描述是哪一项检查失败？"
+
+---
+
+## 68. LlmLabelExtractor / FakeLabelExtractor
+
+**一句话解释**：标签规则的两种提取器——LlmLabelExtractor 走真实 LLM 路径（Gateway + PromptManager + 文件持久化），FakeLabelExtractor 走 pytest 确定性路径（硬编码 JSON）。
+
+**是什么**
+
+LlmLabelExtractor 是 label_table 管线的生产路径组件。它接收 ParsedDeveloperSpec（DatasetType.LABEL_TABLE），调用 LLMGateway（复用 PromptManager 加载标签提取 Prompt 模板、ProviderAdapter 调用 LLM），从 Gateway 的 response_root 文件读取结构化 JSON（LabelDomainOutput + LabelBranchProposalOutput），包装为 LabelRuleProposal（含系统生成的 proposal_id + 系统包装的 LabelDomain），供 LabelRuleValidator 验证。
+
+FakeLabelExtractor 是 pytest 测试用的确定性替代——task_fake_responses 表驱动，覆盖 ALL/COLUMN_REF/MIXED 三类标签域。
+
+**解决什么问题**
+
+分离"LLM 做提取"与"系统做验证"的职责——LLM 只负责从项目书自然语言中提取标签规则，系统负责结构化校验和阻断。Fake 用于离线测试，不依赖 API Key。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/labels/llm_label_extractor.py` — LlmLabelExtractor
+- `src/tianshu_datadev/labels/fake_label_extractor.py` — FakeLabelExtractor
+- `src/tianshu_datadev/labels/label_extractor_base.py` — LabelExtractor ABC
+- `tests/labels/test_label_rules.py` — Fake 路径测试
+- `tests/harness/test_label_extractor_smoke.py` — 真实 LLM 冒烟测试（需 --run-harness）
+
+**Owner 审查时应该问什么**
+
+1. "无 API Key 时 LlmLabelExtractor 的行为是什么？是否明确返回 CONFIG_ERROR 而非静默回退 Fake？"
+2. "response_root 目录的隔离性如何？多次请求之间的文件是否会相互污染？"
+
+---
+
+## 69. PhysicalVerifier（物理验证器）
+
+**一句话解释**：双引擎物理对比验证器——在相同快照上执行 DuckDB（基线引擎）和 Spark（目标引擎），对比行级执行结果判定物理一致性。
+
+**是什么**
+
+PhysicalVerifier 是 Spark 管线 6 阶段中最昂贵的阶段。它接收 DataTransformContractV1（含 ProgramCompiledSql）和 Snapshot，在冻结快照上分别执行 DuckDB SQL（基线）和 PySpark transform()（目标），对双引擎的执行结果进行逐行对比：
+
+- 行数一致 + 样本行一致 → RESULT_CONSISTENT
+- 浮点容差内一致 → CONSISTENT_WITH_WARN（CRE shadow 诊断）
+- 行数/内容不同 → RESULT_MISMATCH
+- 任一引擎执行失败 → NOT_EXECUTED
+
+Phase 9B+ 增强：0 行门禁（0 行不降级）、溢出降级（引擎内 count 计数 + 键对齐抽样对比替代全量 NOT_EXECUTED）、行数不匹配时 status="failed" 映射。CRE shadow 诊断并行执行在 production verify() 旁。
+
+**解决什么问题**
+
+DuckDB 作为"预期行为"的基线引擎，Spark 作为"目标实现"的执行引擎——物理验证是跨引擎正确性的最终防线。逻辑对比（PlanComparator）发现不了执行差异，物理验证通过实际执行发现。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/spark/physical_verifier.py:492` — PhysicalVerifier 类
+- `docs/CRE_v2_设计文档_20260713_1745.md` — 完整设计
+- `tests/spark/test_physical_verifier.py` — 191 passed / 11 skipped（含 CRE shadow）
+
+---
+
+## 70. PhysicalVerificationReport（物理验证报告）
+
+**一句话解释**：物理验证的完整结构化报告——双引擎执行结果（EngineExecutionResult）+ 差异明细（DiffDetail）+ 行级样本 + CRE shadow 诊断。
+
+**是什么**
+
+PhysicalVerificationReport 是 PhysicalVerifier.verify() 的完整产出。关键字段：
+
+- `status: PhysicalVerificationStatus`——5 种：RESULT_CONSISTENT / CONSISTENT_WITH_WARN / RESULT_MISMATCH / NOT_EXECUTED / ERROR
+- `duckdb_result / spark_result: EngineExecutionResult | None`——各引擎执行结果，含 success / sample_rows[:5] 等
+- `diffs: list[DiffDetail]`——差异逐行明细
+- `row_count_match / schema_match`——行数/列集合是否一致
+- `total_diff_count / diffs_truncated`——差异总数 + 是否截断
+- `cre_shadow_report: CreShadowReport | None`——CRE shadow 诊断报告（并行于 production verify）
+- `cdp_shadow_result: dict | None`——CDP v1 引擎侧摘要对比
+
+**解决什么问题**
+
+为物理验证的审查提供完整的结构化记录——人工审查者可以查看差异行样本、判断是正常容差还是真实 bug。CRE shadow 提供第二意见（编码比较体系）交叉验证生产验证结论。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/spark/physical_verifier.py:456` — PhysicalVerificationReport
+- `src/tianshu_datadev/spark/physical_verifier.py` — PhysicalVerificationStatus 枚举
+- `src/tianshu_datadev/spark/physical_verifier.py` — EngineExecutionResult / DiffDetail
+
+---
+
+## 71. CRE Shadow（双引擎编码比较诊断）
+
+**一句话解释**：双引擎编码比较诊断体系——在生产物理验证旁并行运行 CRE（Character-by-Character Encoding Comparison），提供第二意见的 CONSSITENT / MISMATCH / HUMAN_REVIEW 结论。
+
+**是什么**
+
+CRE（Character-by-Character Encoding Comparison）Shadow 是一套在 production PhysicalVerifier.verify() 旁并行运行的诊断体系，由 CreShadowRunner 和 CreShadowReport 组成。它使用独立于 production verify 的编码比较逻辑对双引擎结果进行逐字符级对比，输出包含：
+
+- `cre_status: CreShadowStatus`——CONSISTENT / CONSISTENT_WITH_WARN / MISMATCH / HUMAN_REVIEW / NOT_EXECUTED / ERROR
+- `legacy_status / status_consistent`——production verify 结论与此诊断结论的一致性标志
+- `warnings`——含 tolerated_ratio、affected_row_count、affected_cell_count 的详细警告
+- `human_review_recommended`——是否建议启动人工审查
+
+CRE shadow 可用时（diagnostic_available=True）与 production verify 并行消耗结果，不做为阻断依据——仅写入 PhysicalVerificationReport.cre_shadow_report 供后续分析。
+
+**解决什么问题**
+
+当 production verify 报告 RESULT_CONSISTENT 但双引擎结果有微妙差异时，CRE shadow 提供更精细的视角——区分"真的完全一致"和"在容差内一致"。在 RESULT_MISMATCH 时提供对比细节辅助差因定位。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/cre_models.py:200` — CreShadowReport
+- `src/tianshu_datadev/spark/cre.py` — CRE 编码比较实现
+- `src/tianshu_datadev/spark/cre_encoding.py` — 编码比较算法
+- `src/tianshu_datadev/artifacts/finalizer.py` — CRE shadow finalizer 写入
+- `docs/CRE_v2_设计文档_20260713_1745.md` — 设计文档
+
+---
+
+## 72. Physical Verification Whitelist（物理验证白名单）
+
+**一句话解释**：case_when UNSUPPORTED_COMPARISON 场景的物理验证门禁——允许 LOGIC_UNSUPPORTED + 仅 case_when UNSUPPORTED + 无 NOT_EQUIVALENT 通过 _should_physical_verify() 放行。
+
+**是什么**
+
+Pipeline._should_physical_verify() 是 PHYSICAL_VERIFIER 阶段的准入门禁。它接收 validator_ok + comparator_report，按以下规则判定：
+
+- Validator 未通过 → False
+- 无 comparator 报告 → False
+- LOGIC_EQUIVALENT → True（正常执行物理验证）
+- LOGIC_UNSUPPORTED → 检查所有 step_results：
+  - 无 NOT_EQUIVALENT → 继续
+  - 非 case_when 的 UNSUPPORTED_COMPARISON → False
+  - 至少一个 case_when UNSUPPORTED → True（白名单放行）
+- 其他 status（LOGIC_MISMATCH / NOT_COVERED）→ False
+
+白名单通过后，物理验证结果正常产出。物理不一致时 status 映射为 "failed"（非 "ok"）。
+
+**解决什么问题**
+
+case_when condition 的语义等价对比暂不可行（R-LT-1），但结构骨架（labels/else_value/alias）已验证一致。白名单允许在 condition 待人审的前提下双引擎物理验证正常执行——最大化验证覆盖，不因一个 UNSUPPORTED 拖死整条链路。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/api/pipeline.py` — Pipeline._should_physical_verify()（静态方法）
+- `src/tianshu_datadev/api/pipeline.py:3725` — run_spark_stage 物理不一致 status="failed"
+- `tests/api/test_pipeline_physical_verify_whitelist.py` — 9 场景测试
+
+---
+
+## 73. Snapshot Builder（快照构建器）
+
+**一句话解释**：冻结数据快照的确定性构建器——从 CSV/Parquet 源构建 DuckDB 可读快照，支持封闭时间范围过滤和一致性哈希。
+
+**是什么**
+
+Snapshot Builder 管理 Pipeline 的 `_snapshot_dir` 目录，从 `snapshots/` 目录或显式配置的 fixture 路径加载数据文件（CSV/Parquet），构建为 DuckDB 可注册的冻结快照。每个快照有确定性 snapshot_id（基于源文件集合的 SHA-256）。支持封闭时间范围过滤（通过 bound_time_ranges 在快照创建时按条件采样）和物理验证快照锚表生命周期管理。
+
+Phase 9B-P0 后集成到 Pipeline——通过可选注入方式使用，不改变现有 validate/snapshot API。
+
+**解决什么问题**
+
+物理验证需要在相同快照上执行 DuckDB 和 Spark——快照必须冻结（不可变），否则双引擎执行结果无法公平对比。确定性 snapshot_id 确保重现验证的可信度。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/spark/snapshot.py` — Snapshot Builder 实现（~373 行新代码）
+- `src/tianshu_datadev/api/pipeline.py` — Pipeline 集成 Snapshot Builder
+- `tests/spark/test_snapshot.py` — 测试（+426 lines）
+
+---
+
+## 74. ProcessGuard / SQL Executor Worker（子进程隔离执行）
+
+**一句话解释**：SQL 执行器的工作子进程隔离机制——Windows Job Object + 内存硬上限保护，防止 SQL 执行 OOM 击穿主进程。
+
+**是什么**
+
+ProcessGuard 是 Phase 9C 新增的安全组件。它在启动 SQL Worker 子进程前建立平台级资源边界：
+
+- **Windows**：创建 Windows Job Object（`CreateJobObjectW`）——当 Worker 进程（含子进程树）总内存超过上限时，系统自动终止整个 Job。Job Object 创建失败时抛出 ProcessGuardError（拒绝无保护执行，禁止降级）。
+- **Linux/macOS**：通过 `preexec_fn` 调用 `setrlimit(RLIMIT_AS)` 设置地址空间上限。
+
+SQL Worker 通过 `executor_worker.py` 子进程池执行 SQL——主进程将 CompiledSql + table_paths 序列化传给子进程，子进程在隔离环境中执行并返回结果。超时（默认 60s）由主进程监控，超时后强制终止进程树。
+
+**解决什么问题**
+
+DuckDB 执行恶意或过大 SQL 可能耗尽内存——如果不加进程隔离，OOM 直接击穿 Python 主进程导致服务不可用。ProcessGuard 确保 OOM 只杀死子进程，主进程继续服务。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/sql/process_guard.py:17` — ProcessGuard 类
+- `src/tianshu_datadev/sql/executor_worker.py` — SQL Worker 子进程入口
+- `src/tianshu_datadev/sql/executor.py` — DuckDBExecutor（父进程端调用 Worker）
+- `tests/sql/test_process_guard.py` — 测试
+- `tests/sql/test_executor.py` — Worker 集成测试
+
+---
+
 ## 63. 项目缩写速查
 
 | 缩写 | 全称 | 含义 |
@@ -2805,10 +3138,31 @@ Props：`stages: StageInfo[]`（每项含 stage 英文名、status: ok/failed/sk
 | **CS** | ComputeStep | 分步计算声明——Spec 扩展核心字段 |
 | **SDAG** | Spec DAG | 规格依赖图——从 ComputeStep.source 推导 |
 | **PSI** | PipelineStageIndicator | 流水线阶段指示灯——前端右上角可折叠组件 |
+| **SQ** | SubqueryStep | SqlBuildPlan 第 10 种 Step——FROM 子查询的递归 SqlBuildPlan |
+| **PLR** | PlanRichResponse | run_all_full 丰富响应——含 spark_ok + 6 阶段状态 |
+| **LPN** | LabelPredicateNode | 标签谓词 AST 节点基类——8 子类 |
+| **LPC** | LabelPredicateCondition | 标签谓词根条件——6 种合法根节点类型 |
+| **LD** | LabelDomain | 系统包装的标签值域——含 domain_id |
+| **LDO** | LabelDomainOutput | LLM 输出的原始标签值域 |
+| **LRV** | LabelRuleValidator | 标签规则验证器 v1——7 项检查 |
+| **PROMO** | Promotion | 标签规则推广——双空阻断（blocking_errors + human_review_items 均为空） |
+| **LLE** | LlmLabelExtractor | 生产路径标签提取器（真实 LLM） |
+| **FLE** | FakeLabelExtractor | pytest 确定性标签提取器（硬编码） |
+| **PhysVer** | PhysicalVerifier | 双引擎物理验证器——DuckDB ↔ Spark |
+| **PVR** | PhysicalVerificationReport | 物理验证完整报告——含样本行、差异明细、CRE shadow |
+| **CRS** | CreShadowReport | CRE shadow 诊断报告——双引擎编码比较体系 |
+| **SB** | Snapshot Builder | 快照构建器——冻结 CSV/Parquet 数据的确定性工具 |
+| **PG** | ProcessGuard | SQL 执行器子进程隔离——Windows Job Object + 内存硬上限 |
+| **CD** | CaseWhenDecl | 标签规则声明模型——用于 label_table 管线 |
 
 ---
 
-> 本文基于项目代码基线（2026-07-03）更新，覆盖 63 个核心工程术语。Pipeline 条目已从 FakePipeline 迁移至当前 Pipeline 类——含 execute/run_all 两条入口、三条代码路径、RUNTIME_FAIL 阻断和统一 validation_passed 响应。新增 ExpressionGuard（§58）表达式安全守卫条目。
+> 本文基于项目代码基线（2026-07-21）更新，覆盖 78 个核心工程术语。相比 v2026-07-03 更新内容：
+> - §7 SqlBuildPlan：更新为 10 种 Step（新增 SubqueryStep，Phase 4.6）
+> - §8 SqlBuildPlanValidator：新增子查询递归校验（V-010a~e）
+> - §17 Pipeline：重写为双管线架构（SQL 管线 + Spark 6 阶段）+ Label 分支 + run_all_full()
+> - 新增 §64-78：LabelPredicateNode 体系、LabelDomain 双层模型、LabelRuleValidator v1、Promotion、LlmLabelExtractor、PhysicalVerifier、PhysicalVerificationReport、CRE Shadow、物理验证白名单、Snapshot Builder、ProcessGuard/SQL Executor Worker 共 15 个新条目
+> - 缩写表新增 17 个缩写
+> 
 > 每个术语遵循"九件事"说明格式：名称→是什么→解决什么问题→项目位置→输入→输出→风险→例子→审查问题。
-> 参考：[[AGENTS.md]] | [[03-sql-ir-and-compiler-plan]] | [[01-target-architecture]] | 各 Phase Roadmap 文档
-> 关联文档：[[subquery-multihop-join-boundary_20260629_1500]] | [[phase-3-exit-report]]
+> 参考：[[AGENTS.md]] | [[03-sql-ir-and-compiler-plan]] | [[01-target-architecture]] | [[2026-07-15-label-table-design]] | [[CRE_v2_设计文档_20260713_1745]] | [[case_when条件对比边界说明_20260717_0908]]

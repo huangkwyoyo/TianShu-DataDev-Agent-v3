@@ -36,15 +36,18 @@ def _find_unresolved_derived_columns(
     # 收集所有已知列名
     known: set[str] = set()
 
-    # 1. 源表物理列
+    # 1. 源表物理列（columns + key_columns + business_columns 三类声明）
     for table in spec.input_tables:
-        for col in table.columns:
-            known.add(col.column_name)
-            known.add(col.normalized_name)
+        for col_list in (table.columns, table.key_columns, table.business_columns):
+            for col in col_list:
+                known.add(col.column_name)
+                known.add(col.normalized_name)
 
-    # 2. 指标输出名
+    # 2. 指标输出名（含 variant aliases——每个 variant 产生一个独立聚合列）
     for metric in spec.metrics:
         known.add(metric.alias)
+        for variant in metric.variants or ():
+            known.add(variant.alias)
 
     # 3. 维度输出名
     for dim in spec.dimensions:
@@ -52,7 +55,7 @@ def _find_unresolved_derived_columns(
 
     # 4. 窗口指标
     for wm in spec.inferred_window_metrics:
-        known.add(wm.name)
+        known.add(wm.metric_name)
 
     # 5. compute_steps 输出列名——从 metrics/expressions/case_when 收集
     if spec.compute_steps:

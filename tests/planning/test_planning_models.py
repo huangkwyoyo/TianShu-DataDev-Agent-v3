@@ -748,8 +748,10 @@ class TestDerivedColumnRuleMissingError:
         with pytest.raises(DerivedColumnRuleMissingError, match="unknown_col"):
             builder._build_single_table(spec)
 
-    def test_detail_table_skips_defense_check(self):
-        """DETAIL_TABLE 不触发输出列防御检查——仅 LABEL_TABLE 有此门禁。"""
+    def test_detail_table_unresolved_raises_error(self):
+        """DETAIL_TABLE 输出列无解析规则 → DerivedColumnRuleMissingError——所有类型统一门禁。"""
+        import pytest
+
         from tianshu_datadev.developer_spec.models import (
             ColumnDecl,
             DatasetType,
@@ -758,9 +760,12 @@ class TestDerivedColumnRuleMissingError:
             OutputSpecDecl,
             ParsedDeveloperSpec,
         )
-        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+        from tianshu_datadev.planning.sql_build_plan import (
+            DerivedColumnRuleMissingError,
+            SqlBuildPlanBuilder,
+        )
 
-        # 构造 DETAIL_TABLE spec——输出列 unknown_col 无解析规则
+        # 构造 DETAIL_TABLE spec——输出列 unknown_col 无解析规则（不是物理列也没有其他声明）
         spec = ParsedDeveloperSpec(
             spec_id="test", spec_hash="h2", title="t", description="",
             dataset_type=DatasetType.DETAIL_TABLE,
@@ -783,7 +788,45 @@ class TestDerivedColumnRuleMissingError:
         )
 
         builder = SqlBuildPlanBuilder()
-        # DETAIL_TABLE 不触发防御检查——会正常构建（将 unknown_col 当物理列引用）
+        # 所有类型统一门禁——未解析列提前阻断，避免到 execute 阶段才报 Binder Error
+        with pytest.raises(DerivedColumnRuleMissingError, match="unknown_col"):
+            builder._build_single_table(spec)
+
+    def test_detail_table_resolved_passes(self):
+        """DETAIL_TABLE 输出列均为物理列 → 防御检查通过（所有类型统一门禁）。"""
+        from tianshu_datadev.developer_spec.models import (
+            ColumnDecl,
+            DatasetType,
+            InputTableDecl,
+            OutputColumnDecl,
+            OutputSpecDecl,
+            ParsedDeveloperSpec,
+        )
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        # 构造 DETAIL_TABLE spec——输出列 col1 是源表物理列
+        spec = ParsedDeveloperSpec(
+            spec_id="test", spec_hash="h2r", title="t", description="",
+            dataset_type=DatasetType.DETAIL_TABLE,
+            input_tables=[
+                InputTableDecl(
+                    table_alias="tf", source_table="fact",
+                    columns=[
+                        ColumnDecl(column_name="col1", normalized_name="col1",
+                                   data_type="double"),
+                    ],
+                    key_columns=[], business_columns=[],
+                ),
+            ],
+            metrics=[], dimensions=[],
+            output_spec=OutputSpecDecl(
+                columns=[OutputColumnDecl(name="col1", type="double")],
+                grain=[],
+            ),
+            time_range=None,
+        )
+
+        builder = SqlBuildPlanBuilder()
         plan = builder._build_single_table(spec)
         assert plan is not None
 

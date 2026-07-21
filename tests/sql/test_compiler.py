@@ -2583,6 +2583,7 @@ class TestWindowPipelineE2E:
     def test_builder_includes_window_step_in_single_table_plan(self):
         """单表路径：Builder 将 WindowStep 插入聚合后、投影前。"""
         from tianshu_datadev.developer_spec.models import (
+            ColumnDecl,
             InputTableDecl,
             OutputColumnDecl,
             OutputSpecDecl,
@@ -2599,7 +2600,15 @@ class TestWindowPipelineE2E:
             input_tables=[
                 InputTableDecl(
                     table_alias="t", source_table="db.t",
-                    columns=[], key_columns=[], business_columns=[],
+                    columns=[
+                        ColumnDecl(column_name="id", normalized_name="id",
+                                   data_type="int"),
+                        ColumnDecl(column_name="dept", normalized_name="dept",
+                                   data_type="varchar"),
+                        ColumnDecl(column_name="salary", normalized_name="salary",
+                                   data_type="double"),
+                    ],
+                    key_columns=[], business_columns=[],
                 ),
             ],
             metrics=[],
@@ -2641,6 +2650,7 @@ class TestWindowPipelineE2E:
     def test_window_deterministic_compilation(self):
         """相同窗口指标产生确定性 WindowStep 和 SQL。"""
         from tianshu_datadev.developer_spec.models import (
+            ColumnDecl,
             InputTableDecl,
             OutputColumnDecl,
             OutputSpecDecl,
@@ -2657,7 +2667,15 @@ class TestWindowPipelineE2E:
             input_tables=[
                 InputTableDecl(
                     table_alias="t", source_table="db.t",
-                    columns=[], key_columns=[], business_columns=[],
+                    columns=[
+                        ColumnDecl(column_name="id", normalized_name="id",
+                                   data_type="int"),
+                        ColumnDecl(column_name="dept", normalized_name="dept",
+                                   data_type="varchar"),
+                        ColumnDecl(column_name="salary", normalized_name="salary",
+                                   data_type="double"),
+                    ],
+                    key_columns=[], business_columns=[],
                 ),
             ],
             metrics=[],
