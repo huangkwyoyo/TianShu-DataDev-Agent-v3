@@ -1,6 +1,4 @@
 """Task 3 — TimeTransform 模型测试（Contract 侧 + Spark 侧）。"""
-import pytest
-from pydantic import ValidationError
 
 from tianshu_datadev.artifacts.models import (
     ContractTimeTransform,
@@ -8,9 +6,9 @@ from tianshu_datadev.artifacts.models import (
     DataTransformContractV1,
 )
 from tianshu_datadev.spark.models import (
-    SparkTimeTransformExpr,
-    SparkAggregateStep,
     SparkAggregateSpec,
+    SparkAggregateStep,
+    SparkTimeTransformExpr,
 )
 
 
