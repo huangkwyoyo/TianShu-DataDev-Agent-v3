@@ -222,26 +222,30 @@ class DataTransformContractExtractor:
         Returns:
             合并后的 output_columns（包含派生列）
         """
-        existing_names = {oc.column_name for oc in output_columns}
+        # 按 alias 去重——_extract_project 将源列名存入 column_name、
+        # 别名存入 alias，两者可能不同（如维度映射：column_name="source_col",
+        # alias="peak_type"）。CASE WHEN 的 output_alias 与输出别名一致，
+        # 按 alias 去重才能正确识别已存在的输出列。
+        existing_aliases = {oc.alias for oc in output_columns}
         result = list(output_columns)
 
         for cw in case_when_labels:
-            if cw.output_alias and cw.output_alias not in existing_names:
+            if cw.output_alias and cw.output_alias not in existing_aliases:
                 result.append(ContractOutputColumn(
                     column_name=cw.output_alias,
                     alias=cw.output_alias,
                     data_type="unknown",
                 ))
-                existing_names.add(cw.output_alias)
+                existing_aliases.add(cw.output_alias)
 
         for ws in window_specs:
-            if ws.alias and ws.alias not in existing_names:
+            if ws.alias and ws.alias not in existing_aliases:
                 result.append(ContractOutputColumn(
                     column_name=ws.alias,
                     alias=ws.alias,
                     data_type="unknown",
                 ))
-                existing_names.add(ws.alias)
+                existing_aliases.add(ws.alias)
 
         return result
 

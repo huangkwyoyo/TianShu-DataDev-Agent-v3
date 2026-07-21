@@ -641,6 +641,34 @@ class DuckDbSqlCompiler:
                     from_parts.append(sub_sql)
 
         # ── 合并 SELECT 列：基础列 + CASE WHEN + 窗口函数 ──
+        # 去重：CASE WHEN 表达式（如 "CASE ... END AS peak_type"）的别名
+        # 可能与 select_cols 中的裸列引用（来自 Aggregate group_keys 的
+        # extra_group_keys）冲突。CASE WHEN 表达式优先——裸列引用仅是引用，
+        # CASE WHEN 是实际计算。同时处理窗口函数别名冲突。
+        cw_window_aliases: set[str] = set()
+        for cw_expr in case_when_cols + window_cols:
+            # 提取 "AS <alias>" 后缀中的别名
+            as_idx = cw_expr.rfind(" AS ")
+            if as_idx != -1:
+                alias = cw_expr[as_idx + 4:].strip()
+                cw_window_aliases.add(alias)
+
+        if cw_window_aliases:
+            deduped_select: list[str] = []
+            for col_expr in select_cols:
+                # 裸列引用（无 "AS" 且名称在冲突集中）→ 移除
+                col_stripped = col_expr.strip()
+                if " AS " not in col_expr and col_stripped in cw_window_aliases:
+                    continue
+                # 有 "AS" 的列——检查别名是否冲突
+                col_as_idx = col_expr.rfind(" AS ")
+                if col_as_idx != -1:
+                    col_alias = col_expr[col_as_idx + 4:].strip()
+                    if col_alias in cw_window_aliases:
+                        continue
+                deduped_select.append(col_expr)
+            select_cols = deduped_select
+
         all_select_cols = select_cols + case_when_cols + window_cols
 
         # ── 组装 SQL ──
