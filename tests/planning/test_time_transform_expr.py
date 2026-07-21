@@ -92,9 +92,14 @@ class TestPredicateWithTimeTransform:
 # ════════════════════════════════════════════
 
 from tianshu_datadev.developer_spec.models import (
+    ColumnDecl,
+    DatasetType,
     DerivedDimensionDecl,
     CaseWhenBranch,
     CaseWhenRule,
+    InputTableDecl,
+    OutputColumnDecl,
+    OutputSpecDecl,
     UncertaintyEntry,
     RequirementPlannerOutput,
     RequirementProposal,
@@ -297,3 +302,298 @@ class TestFlatSqlGroupByWithDerivedGroupKey:
         # GROUP BY 不含 AS alias
         assert "GROUP BY" in sql
         assert "HOUR(ft.pickup_at)" in sql
+
+
+# ════════════════════════════════════════════
+# Task 5: SqlBuildPlanBuilder 测试
+# ════════════════════════════════════════════
+
+from tianshu_datadev.planning.sql_build_plan import (
+    CaseWhenStep,
+    DerivedGroupKey,
+    ScanStep,
+    SqlBuildPlanBuilder,
+)
+
+
+class TestBuildAggregateStepWithDerivedDimensions:
+    """_build_aggregate_step 生成 DerivedGroupKey。"""
+
+    def test_derived_dimension_becomes_derived_group_key(self):
+        """spec.derived_dimensions → DerivedGroupKey 在 group_keys 中。"""
+        spec = ParsedDeveloperSpec(
+            spec_id="test", spec_hash="test",
+            title="测试",
+            description="测试派生维度",
+            dataset_type=DatasetType.AGGREGATE_TABLE,
+            input_tables=[
+                InputTableDecl(
+                    table_alias="ft",
+                    source_table="fact_table",
+                    columns=[ColumnDecl(
+                        column_name="pickup_at", data_type="timestamp",
+                        normalized_name="pickup_at",
+                    )],
+                    key_columns=[],
+                    business_columns=[],
+                ),
+            ],
+            dimensions=[
+                DimensionDecl(
+                    dimension_name="borough",
+                    column_ref="borough",
+                    source_table="tz",
+                ),
+            ],
+            derived_dimensions=[
+                DerivedDimensionDecl(
+                    dimension_name="pickup_hour",
+                    source_column="pickup_at",
+                    source_table="ft",
+                    time_function="HOUR",
+                ),
+            ],
+            metrics=[
+                MetricDecl(
+                    metric_name="trip_count",
+                    aggregation=AggregationType.COUNT,
+                    alias="trip_count",
+                ),
+            ],
+            output_spec=OutputSpecDecl(
+                columns=[
+                    OutputColumnDecl(name="pickup_hour"),
+                    OutputColumnDecl(name="borough"),
+                    OutputColumnDecl(name="trip_count"),
+                ],
+                grain=[],
+            ),
+            time_range=None,
+        )
+        builder = SqlBuildPlanBuilder()
+        agg = builder._build_aggregate_step(spec, primary_table="ft")
+        derived_keys = [
+            gk for gk in agg.group_keys if isinstance(gk, DerivedGroupKey)
+        ]
+        assert len(derived_keys) == 1
+        assert derived_keys[0].alias == "pickup_hour"
+        assert derived_keys[0].expr.time_function == "HOUR"
+
+    def test_grain_dedup_with_derived_and_column_ref(self):
+        """grain 去重兼容 ColumnRef 和 DerivedGroupKey。"""
+        spec = ParsedDeveloperSpec(
+            spec_id="test2", spec_hash="test2",
+            title="测试",
+            description="测试 grain 去重",
+            dataset_type=DatasetType.AGGREGATE_TABLE,
+            input_tables=[
+                InputTableDecl(
+                    table_alias="ft",
+                    source_table="fact_table",
+                    columns=[ColumnDecl(
+                        column_name="pickup_at", data_type="timestamp",
+                        normalized_name="pickup_at",
+                    )],
+                    key_columns=[],
+                    business_columns=[],
+                ),
+            ],
+            dimensions=[],
+            derived_dimensions=[
+                DerivedDimensionDecl(
+                    dimension_name="pickup_hour",
+                    source_column="pickup_at",
+                    source_table="ft",
+                    time_function="HOUR",
+                ),
+            ],
+            metrics=[
+                MetricDecl(
+                    metric_name="trip_count",
+                    aggregation=AggregationType.COUNT,
+                    alias="trip_count",
+                ),
+            ],
+            output_spec=OutputSpecDecl(
+                columns=[OutputColumnDecl(name="pickup_hour")],
+                grain=["pickup_hour"],  # grain 与派生维度同名——应去重
+            ),
+            time_range=None,
+        )
+        builder = SqlBuildPlanBuilder()
+        agg = builder._build_aggregate_step(spec, primary_table="ft")
+        derived_keys = [
+            gk for gk in agg.group_keys if isinstance(gk, DerivedGroupKey)
+        ]
+        assert len(derived_keys) == 1, (
+            f"grain 不应重复添加派生维度——实际 {len(derived_keys)} 个"
+        )
+        # 验证总 group_keys 数量——1 个 DerivedGroupKey
+        assert len(agg.group_keys) == 1
+
+
+class TestBuildCaseWhenStepsWithCaseWhenRules:
+    """_build_case_when_steps 处理 case_when_rules。"""
+
+    def test_case_when_rule_generates_step_with_dict_condition(self):
+        """case_when_rules 中 dict 条件→Predicate。"""
+        spec = ParsedDeveloperSpec(
+            spec_id="test_cw", spec_hash="test_cw",
+            title="测试",
+            description="测试 case_when_rules",
+            dataset_type=DatasetType.AGGREGATE_TABLE,
+            input_tables=[
+                InputTableDecl(
+                    table_alias="ft",
+                    source_table="fact_table",
+                    columns=[ColumnDecl(
+                        column_name="pickup_at", data_type="timestamp",
+                        normalized_name="pickup_at",
+                    )],
+                    key_columns=[],
+                    business_columns=[],
+                ),
+            ],
+            dimensions=[],
+            derived_dimensions=[
+                DerivedDimensionDecl(
+                    dimension_name="pickup_hour",
+                    source_column="pickup_at",
+                    source_table="ft",
+                    time_function="HOUR",
+                ),
+            ],
+            metrics=[],
+            output_spec=OutputSpecDecl(
+                columns=[OutputColumnDecl(name="peak_type")],
+                grain=[],
+            ),
+            case_when_rules=[
+                CaseWhenRule(
+                    output_column="peak_type",
+                    branches=[
+                        CaseWhenBranch(
+                            condition={
+                                "node_type": "COMPARE",
+                                "left": "pickup_hour",
+                                "op": "IN",
+                                "right": {
+                                    "node_type": "LITERAL",
+                                    "value": [7, 8, 9],
+                                    "data_type": "number",
+                                },
+                            },
+                            then_value="高峰",
+                        ),
+                    ],
+                    else_value="平峰",
+                ),
+            ],
+            time_range=None,
+        )
+        builder = SqlBuildPlanBuilder()
+        steps = builder._build_case_when_steps(spec)
+        assert len(steps) == 1
+        step = steps[0]
+        assert step.step_type == "case_when"
+        assert step.alias == "peak_type"
+        assert len(step.cases) == 1
+        # 验证 Predicate.left 被解析为 TimeTransformExpr（非 ColumnRef）
+        from tianshu_datadev.planning.models import TimeTransformExpr
+        assert isinstance(step.cases[0].condition.left, TimeTransformExpr), (
+            "派生维度别名应解析为 TimeTransformExpr"
+        )
+        assert step.else_value.value == "平峰"
+
+    def test_case_when_rules_empty_returns_empty(self):
+        """无 case_when_rules 时返回空列表——不影响现有 label_rules 行为。"""
+        spec = ParsedDeveloperSpec(
+            spec_id="test_empty", spec_hash="test_empty",
+            title="测试",
+            description="空 case_when_rules",
+            dataset_type=DatasetType.AGGREGATE_TABLE,
+            input_tables=[
+                InputTableDecl(
+                    table_alias="ft",
+                    source_table="fact_table",
+                    columns=[],
+                    key_columns=[],
+                    business_columns=[],
+                ),
+            ],
+            dimensions=[],
+            derived_dimensions=[],
+            metrics=[],
+            output_spec=OutputSpecDecl(
+                columns=[OutputColumnDecl(name="col")],
+                grain=[],
+            ),
+            case_when_rules=[],
+            time_range=None,
+        )
+        builder = SqlBuildPlanBuilder()
+        steps = builder._build_case_when_steps(spec)
+        assert steps == []
+
+
+class TestBuildSingleTableWithDerivedDimensions:
+    """_build_single_table 整合派生维度和 case_when_rules。"""
+
+    def test_scan_includes_derived_source_column(self):
+        """派生维度的 source_column 应在 Scan 中。"""
+        spec = ParsedDeveloperSpec(
+            spec_id="test_scan", spec_hash="test_scan",
+            title="测试",
+            description="测试派生维度源列",
+            dataset_type=DatasetType.AGGREGATE_TABLE,
+            input_tables=[
+                InputTableDecl(
+                    table_alias="ft",
+                    source_table="fact_table",
+                    columns=[ColumnDecl(
+                        column_name="pickup_at", data_type="timestamp",
+                        normalized_name="pickup_at",
+                    )],
+                    key_columns=[],
+                    business_columns=[],
+                ),
+            ],
+            dimensions=[],
+            derived_dimensions=[
+                DerivedDimensionDecl(
+                    dimension_name="pickup_hour",
+                    source_column="pickup_at",
+                    source_table="ft",
+                    time_function="HOUR",
+                ),
+            ],
+            metrics=[
+                MetricDecl(
+                    metric_name="trip_count",
+                    aggregation=AggregationType.COUNT,
+                    alias="trip_count",
+                ),
+            ],
+            output_spec=OutputSpecDecl(
+                columns=[
+                    OutputColumnDecl(name="pickup_hour"),
+                    OutputColumnDecl(name="trip_count"),
+                ],
+                grain=[],
+            ),
+            time_range=None,
+        )
+        builder = SqlBuildPlanBuilder()
+        steps = builder._build_single_table(spec)
+        scan = next(s for s in steps if isinstance(s, ScanStep))
+        scan_col_names = [str(c.column_name) for c in scan.required_columns]
+        assert "pickup_at" in scan_col_names, (
+            f"派生维度源列 pickup_at 应在 Scan 中: {scan_col_names}"
+        )
+        # 验证 AggregateStep 含 DerivedGroupKey
+        agg = next(s for s in steps if s.step_type == "aggregate")
+        derived_keys = [
+            gk for gk in agg.group_keys if isinstance(gk, DerivedGroupKey)
+        ]
+        assert len(derived_keys) == 1
+        assert derived_keys[0].alias == "pickup_hour"

@@ -25,6 +25,8 @@ def _find_unresolved_derived_columns(
     4. 窗口指标输出名（inferred_window_metrics）
     5. compute_steps 输出名
     6. 已有 label_rules 输出名
+    7. 派生维度输出名（derived_dimensions）
+    8. case_when_rules 输出名
 
     Args:
         spec: 已解析的 DeveloperSpec
@@ -71,7 +73,15 @@ def _find_unresolved_derived_columns(
     for rule in spec.label_rules:
         known.add(rule.output_column)
 
-    # 7. Manifest schema（如果有）
+    # 7. 派生维度输出名（v3.1 RequirementPlanner）
+    for dd in spec.derived_dimensions:
+        known.add(dd.dimension_name)
+
+    # 8. case_when_rules 输出列名（v3.1 RequirementPlanner）
+    for rule in spec.case_when_rules:
+        known.add(rule.output_column)
+
+    # 9. Manifest schema（如果有）
     if manifest is not None:
         for schema_col in manifest.schema or []:
             known.add(schema_col.get("name", ""))
