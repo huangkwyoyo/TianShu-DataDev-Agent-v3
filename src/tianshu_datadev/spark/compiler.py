@@ -426,6 +426,18 @@ class SparkCompiler:
         input_alias = resolved.input_vars[0]
         out_alias = resolved.output_var
 
+        # 受控派生键在聚合表达式内部计算，不增加额外 SparkPlan 节点。
+        aggregate_input = input_alias
+        for derived in step.derived_group_keys:
+            output_col = self.renderer.validate_identifier(
+                derived.output_column, "DerivedGroupKey.output_column"
+            )
+            source_col = self.renderer.render_column(derived.source_column)
+            if derived.date_part == "HOUR":
+                aggregate_input += (
+                    f'.withColumn("{output_col}", F.hour({source_col}))'
+                )
+
         # Group key 列引用
         group_cols = ", ".join(
             self.renderer.render_column(k) for k in step.group_keys
@@ -449,9 +461,9 @@ class SparkCompiler:
         agg_str = ", ".join(agg_parts)
 
         if group_cols:
-            raw = f"{out_alias} = {input_alias}.groupBy({group_cols}).agg({agg_str})"
+            raw = f"{out_alias} = {aggregate_input}.groupBy({group_cols}).agg({agg_str})"
         else:
-            raw = f"{out_alias} = {input_alias}.agg({agg_str})"
+            raw = f"{out_alias} = {aggregate_input}.agg({agg_str})"
 
         metrics_desc = ", ".join(
             f"{m.function.value}({m.input_column or '*'}) AS {m.alias}"
@@ -587,6 +599,8 @@ class SparkCompiler:
             col = self.renderer.render_column(
                 condition.normalized_name or condition.table_ref
             )
+            if condition.date_part == "HOUR":
+                col = f"F.hour({col})"
             py_op = self.renderer.render_operator(op)
             val = self.renderer.render_literal(condition.value)
             return f"{col} {py_op} F.lit({val})"

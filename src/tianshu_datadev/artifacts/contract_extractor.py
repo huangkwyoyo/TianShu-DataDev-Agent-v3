@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from tianshu_datadev.planning.models import ColumnRef
+from tianshu_datadev.planning.models import ColumnRef, DatePartExpression
 from tianshu_datadev.planning.relationship_hypothesis import RelationshipEvidence
 from tianshu_datadev.planning.sql_build_plan import (
     AggregateStep,
@@ -29,6 +29,7 @@ from .models import (
     CaseWhenLabelSpec,
     ContractAggregation,
     ContractColumn,
+    ContractDerivedColumn,
     ContractInputTable,
     ContractJoin,
     ContractLimit,
@@ -94,6 +95,7 @@ class DataTransformContractExtractor:
         join_relationships: list[ContractJoin] = []
         filters: list[ContractPredicate] = []
         aggregations: list[ContractAggregation] = []
+        derived_columns: list[ContractDerivedColumn] = []
         grouping_keys: list[str] = []
         output_columns: list[ContractOutputColumn] = []
         sort_spec: list[ContractSort] | None = None
@@ -127,10 +129,11 @@ class DataTransformContractExtractor:
                     join_relationships.append(join_rel)
 
             elif isinstance(step, AggregateStep):
-                aggs, groups, biz_keys = self._extract_aggregate(step)
+                aggs, groups, biz_keys, derived = self._extract_aggregate(step)
                 aggregations.extend(aggs)
                 grouping_keys.extend(groups)
                 business_keys.extend(biz_keys)
+                derived_columns.extend(derived)
 
             elif isinstance(step, ProjectStep):
                 output_columns = self._extract_project(step)
@@ -178,6 +181,7 @@ class DataTransformContractExtractor:
             join_relationships=join_relationships,
             filters=filters,
             aggregations=aggregations,
+            derived_columns=derived_columns,
             grouping_keys=grouping_keys,
             output_columns=output_columns,
             output_grain=(
@@ -366,11 +370,17 @@ class DataTransformContractExtractor:
     @staticmethod
     def _extract_aggregate(
         step: AggregateStep,
-    ) -> tuple[list[ContractAggregation], list[str], list[str]]:
+    ) -> tuple[
+        list[ContractAggregation],
+        list[str],
+        list[str],
+        list[ContractDerivedColumn],
+    ]:
         """从 AggregateStep 提取聚合、分组键和业务键。"""
         aggs: list[ContractAggregation] = []
         groups: list[str] = []
         biz_keys: list[str] = []
+        derived: list[ContractDerivedColumn] = []
 
         # 聚合指标
         for m in step.metrics:
@@ -386,8 +396,15 @@ class DataTransformContractExtractor:
         for gk in step.group_keys:
             groups.append(gk.normalized_name)
             biz_keys.append(gk.normalized_name)
+            if isinstance(gk, DatePartExpression) and gk.alias:
+                derived.append(ContractDerivedColumn(
+                    output_column=gk.alias,
+                    source_column=gk.column.column_name,
+                    source_table_ref=gk.column.table_ref,
+                    date_part=gk.part,
+                ))
 
-        return aggs, groups, biz_keys
+        return aggs, groups, biz_keys, derived
 
     @staticmethod
     def _extract_project(
@@ -550,6 +567,7 @@ class DataTransformContractExtractor:
         join_relationships: list[ContractJoin] = []
         filters: list[ContractPredicate] = []
         aggregations: list[ContractAggregation] = []
+        derived_columns: list[ContractDerivedColumn] = []
         grouping_keys: list[str] = []
         output_columns: list[ContractOutputColumn] = []
         sort_spec: list[ContractSort] | None = None
@@ -607,10 +625,11 @@ class DataTransformContractExtractor:
                     if join_rel:
                         join_relationships.append(join_rel)
                 elif isinstance(step, AggregateStep):
-                    aggs, groups, biz_keys = self._extract_aggregate(step)
+                    aggs, groups, biz_keys, derived = self._extract_aggregate(step)
                     aggregations.extend(aggs)
                     grouping_keys.extend(groups)
                     business_keys.extend(biz_keys)
+                    derived_columns.extend(derived)
                 elif isinstance(step, ProjectStep):
                     output_columns = self._extract_project(
                         step,
@@ -664,6 +683,7 @@ class DataTransformContractExtractor:
             join_relationships=join_relationships,
             filters=filters,
             aggregations=aggregations,
+            derived_columns=derived_columns,
             grouping_keys=grouping_keys,
             output_columns=output_columns,
             output_grain=(
@@ -817,7 +837,12 @@ class DataTransformContractExtractor:
 
         # 二元比较——右侧必须是 SqlLiteral（字面量），不支持列-列比较
         if op in ("EQ", "NEQ", "GT", "GTE", "LT", "LTE"):
-            table, name = DataTransformContractExtractor._extract_column_ref(pred.left)
+            date_part = None
+            left_operand = pred.left
+            if isinstance(left_operand, DatePartExpression):
+                date_part = left_operand.part
+                left_operand = left_operand.column
+            table, name = DataTransformContractExtractor._extract_column_ref(left_operand)
             if not hasattr(pred.right, "value"):
                 raise ValueError(
                     f"CASE WHEN 条件 operator='{op}' 右侧必须是 SqlLiteral（字面量），"
@@ -825,7 +850,11 @@ class DataTransformContractExtractor:
                 )
             val = DataTransformContractExtractor._extract_literal_value(pred.right)
             return CaseWhenCondition(
-                operator=op, table_ref=table, normalized_name=name, value=val,
+                operator=op,
+                table_ref=table,
+                normalized_name=name,
+                value=val,
+                date_part=date_part,
             )
 
         # 逻辑组合

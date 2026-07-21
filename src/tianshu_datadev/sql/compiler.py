@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 from tianshu_datadev.developer_spec.models import AggregationType
 from tianshu_datadev.planning.models import (
+    DatePartExpression,
     Predicate,
     PredicateOperator,
     SqlLiteral,
@@ -531,6 +532,8 @@ class DuckDbSqlCompiler:
             return self._render_predicate_with_prefix(operand, prefix)
         if isinstance(operand, SqlLiteral):
             return self._render_literal(operand)
+        if isinstance(operand, DatePartExpression):
+            return f"EXTRACT({operand.part} FROM {prefix}.{operand.column.column_name})"
         if hasattr(operand, "column_name"):
             col = operand.column_name
             return f"{prefix}.{col}"
@@ -586,7 +589,9 @@ class DuckDbSqlCompiler:
                     has_aggregation = True  # 标记已聚合，后续 ProjectStep 不覆盖
                 # GROUP BY
                 for gk in step.group_keys:
-                    if gk.table_ref:
+                    if isinstance(gk, DatePartExpression):
+                        group_by_parts.append(self._render_predicate_operand(gk))
+                    elif gk.table_ref:
                         group_by_parts.append(f"{gk.table_ref}.{gk.column_name}")
                     else:
                         group_by_parts.append(gk.column_name)
@@ -747,7 +752,12 @@ class DuckDbSqlCompiler:
 
         # GROUP BY 列
         for gk in step.group_keys:
-            if gk.table_ref:
+            if isinstance(gk, DatePartExpression):
+                expression = self._render_predicate_operand(gk)
+                cols.append(
+                    f"{expression} AS {gk.alias}" if gk.alias else expression
+                )
+            elif gk.table_ref:
                 cols.append(f"{gk.table_ref}.{gk.column_name}")
             else:
                 cols.append(gk.column_name)
@@ -836,6 +846,9 @@ class DuckDbSqlCompiler:
                 col_expr = self._render_window_expr(expr)
                 if col_expr:
                     cols.append(col_expr)
+            elif isinstance(expr, DatePartExpression):
+                col_expr = self._render_predicate_operand(expr)
+                cols.append(f"{col_expr} AS {ae.alias}")
             elif isinstance(expr, SqlRawExpression):
                 # Phase 7A：安全原始 SQL 表达式——经校验后直接渲染
                 _validate_raw_expression(expr.sql_fragment)
@@ -909,6 +922,8 @@ class DuckDbSqlCompiler:
         expr = ae.expression
         if isinstance(expr, WindowExpr):
             return self._render_window_expr(expr)
+        elif isinstance(expr, DatePartExpression):
+            return f"{self._render_predicate_operand(expr)} AS {ae.alias}"
         elif isinstance(expr, SqlRawExpression):
             # 安全校验后直接渲染原始 SQL 片段
             _validate_raw_expression(expr.sql_fragment)
@@ -1169,6 +1184,9 @@ class DuckDbSqlCompiler:
             return self._render_predicate(operand)
         if isinstance(operand, SqlLiteral):
             return self._render_literal(operand)
+        if isinstance(operand, DatePartExpression):
+            column = self._render_predicate_operand(operand.column)
+            return f"EXTRACT({operand.part} FROM {column})"
         # ColumnRef
         if hasattr(operand, "table_ref") and hasattr(operand, "column_name"):
             table = operand.table_ref

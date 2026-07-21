@@ -258,10 +258,18 @@ class LabelTypedLiteral(StrictModel):
     data_type: Literal["string", "number", "boolean", "null"]
 
 
+class LabelDatePartRef(StrictModel):
+    """受控日期部分引用——当前仅开放业务分类常用的小时提取。"""
+
+    node_type: Literal["DATE_PART"] = "DATE_PART"
+    part: Literal["HOUR"]
+    column_name: str
+
+
 class LabelCompare(StrictModel):
     """二元比较：left OP right。"""
     node_type: Literal["COMPARE"] = "COMPARE"
-    left: str
+    left: str | LabelDatePartRef
     op: CompareOp
     right: LabelTypedLiteral
 
@@ -572,6 +580,8 @@ class DimensionDecl(StrictModel):
     dimension_name: str
     column_ref: str
     source_table: str | None = None  # 可选——单表场景无需指定
+    date_part: Literal["HOUR"] | None = None
+    """受控日期部件派生；None 表示直接引用物理列。"""
 
 
 class JoinDecl(StrictModel):

@@ -479,7 +479,7 @@ class TestUnresolvablePhase:
             label_rules=[],
             output_spec=OutputSpecDecl(
                 columns=[OutputColumnDecl(name="mystery_label", type="varchar")],
-                grain=[],
+                grain=["pickup_hour", "peak_type"],
             ),
         )
 
@@ -681,6 +681,225 @@ class TestErrorPlanStillBlocked:
             or "FIELD_EXISTS" in str(u.get("blocking_errors", []))
             for u in unresolved
         ), f"阻断原因应包含 FIELD_EXISTS，实际: {unresolved}"
+
+
+class TestHourDerivedDimensionFromMinimalInput:
+    """用户只声明 timestamp 字段和业务描述时仍可生成双引擎代码。"""
+
+    def test_hour_case_when_flows_through_sql_and_spark(self):
+        """DATE_PART(HOUR) 不要求前端虚构 pickup_hour 物理列。"""
+        from tianshu_datadev.artifacts.contract_extractor import (
+            DataTransformContractExtractor,
+        )
+        from tianshu_datadev.developer_spec.models import (
+            ManifestColumn,
+            ManifestTable,
+            SourceManifest,
+        )
+        from tianshu_datadev.planning.program_factory import build_sql_program
+        from tianshu_datadev.spark.compiler import SparkCompiler
+        from tianshu_datadev.spark.mapper import map_contract_to_spark_plan
+        from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
+        from tianshu_datadev.sql.validator import SqlBuildPlanValidator
+
+        description = "高峰定义：7-10、17-20 为高峰，其余为平峰"
+        spec = ParsedDeveloperSpec(
+            spec_id="minimal_hour_case",
+            spec_hash="minimal_hour_case_hash",
+            title="按高峰类型汇总",
+            description=description,
+            input_tables=[
+                InputTableDecl(
+                    table_alias="trips",
+                    source_table="test.trips",
+                    columns=[
+                        ColumnDecl(
+                            column_name="pickup_at",
+                            normalized_name="pickup_at",
+                            data_type="timestamp",
+                        ),
+                        ColumnDecl(
+                            column_name="trip_id",
+                            normalized_name="trip_id",
+                            data_type="bigint",
+                        ),
+                    ],
+                ),
+            ],
+            metrics=[
+                MetricDecl(
+                    metric_name="trip_count",
+                    alias="trip_count",
+                    aggregation="COUNT",
+                    input_column="trip_id",
+                ),
+            ],
+            dimensions=[],
+            output_spec=OutputSpecDecl(
+                columns=[
+                    OutputColumnDecl(name="pickup_hour", type="integer"),
+                    OutputColumnDecl(name="peak_type", type="varchar"),
+                    OutputColumnDecl(name="trip_count", type="bigint"),
+                ],
+                grain=["pickup_hour", "peak_type"],
+            ),
+        )
+        raw = {
+            "inferred_metrics": [],
+            "inferred_window_metrics": [],
+            "inferred_computed_metrics": [],
+            "inferred_dimensions": [
+                {
+                    "dimension_name": "pickup_hour",
+                    "column_ref": "pickup_at",
+                    "source_table": "trips",
+                    "date_part": "HOUR",
+                },
+            ],
+            "inferred_post_window_filters": [],
+            "inferred_case_when": [
+                {
+                    "output_column": "peak_type",
+                    "branches": [
+                        {
+                            "condition": {
+                                "node_type": "OR",
+                                "children": [
+                                    {
+                                        "node_type": "AND",
+                                        "children": [
+                                            {
+                                                "node_type": "COMPARE",
+                                                "left": {
+                                                    "node_type": "DATE_PART",
+                                                    "part": "HOUR",
+                                                    "column_name": "pickup_at",
+                                                },
+                                                "op": ">=",
+                                                "right": {
+                                                    "node_type": "LITERAL",
+                                                    "value": 7,
+                                                    "data_type": "number",
+                                                },
+                                            },
+                                            {
+                                                "node_type": "COMPARE",
+                                                "left": {
+                                                    "node_type": "DATE_PART",
+                                                    "part": "HOUR",
+                                                    "column_name": "pickup_at",
+                                                },
+                                                "op": "<=",
+                                                "right": {
+                                                    "node_type": "LITERAL",
+                                                    "value": 10,
+                                                    "data_type": "number",
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    {
+                                        "node_type": "AND",
+                                        "children": [
+                                            {
+                                                "node_type": "COMPARE",
+                                                "left": {
+                                                    "node_type": "DATE_PART",
+                                                    "part": "HOUR",
+                                                    "column_name": "pickup_at",
+                                                },
+                                                "op": ">=",
+                                                "right": {
+                                                    "node_type": "LITERAL",
+                                                    "value": 17,
+                                                    "data_type": "number",
+                                                },
+                                            },
+                                            {
+                                                "node_type": "COMPARE",
+                                                "left": {
+                                                    "node_type": "DATE_PART",
+                                                    "part": "HOUR",
+                                                    "column_name": "pickup_at",
+                                                },
+                                                "op": "<=",
+                                                "right": {
+                                                    "node_type": "LITERAL",
+                                                    "value": 20,
+                                                    "data_type": "number",
+                                                },
+                                            },
+                                        ],
+                                    },
+                                ],
+                            },
+                            "then_label": "高峰",
+                            "evidence": description,
+                        },
+                    ],
+                    "else_value": "平峰",
+                    "evaluation_phase": "pre_aggregate",
+                },
+            ],
+        }
+
+        enriched = SpecEnricher()._parse_llm_response(raw, spec)
+        rules = enriched.enrichment_metadata["case_when_rules"]
+        assert len(rules) == 1
+        resolved_spec = spec.model_copy(update={
+            # 模拟 LLM 同时把 CASE 输出误报为普通维度；Builder 必须以 CASE 为准。
+            "dimensions": enriched.inferred_dimensions + [
+                DimensionDecl(
+                    dimension_name="peak_type",
+                    column_ref="peak_type",
+                    source_table="trips",
+                ),
+            ],
+            "label_rules": [CaseWhenDecl(**rules[0])],
+        })
+        assert resolved_spec.dimensions[0].date_part == "HOUR"
+
+        plan, _ = SqlBuildPlanBuilder().build(resolved_spec)
+        manifest = SourceManifest(
+            manifest_id="minimal_hour_manifest",
+            spec_hash=spec.spec_hash,
+            tables=[
+                ManifestTable(
+                    table_ref="trips",
+                    source_table="test.trips",
+                    columns=[
+                        ManifestColumn(
+                            column_name="pickup_at",
+                            normalized_name="pickup_at",
+                            data_type="timestamp",
+                        ),
+                        ManifestColumn(
+                            column_name="trip_id",
+                            normalized_name="trip_id",
+                            data_type="bigint",
+                        ),
+                    ],
+                ),
+            ],
+        )
+        passed, questions = SqlBuildPlanValidator().validate(plan, manifest)
+        assert passed, [q.description for q in questions if q.blocking]
+
+        sql = DuckDbSqlCompiler(
+            table_mapping={"trips": "test.trips"},
+        ).compile(plan).sql
+        assert "EXTRACT(HOUR FROM trips.pickup_at)" in sql
+        assert "AS pickup_hour" in sql
+        assert "GROUP BY\n  EXTRACT(HOUR FROM trips.pickup_at), peak_type" in sql
+
+        contract = DataTransformContractExtractor().extract_v1(
+            build_sql_program(plan, spec.spec_hash),
+        )
+        mapping = map_contract_to_spark_plan(contract)
+        assert mapping.success
+        spark = SparkCompiler().compile(mapping.spark_plan).raw_pyspark
+        assert 'F.hour(F.col("pickup_at"))' in spark
+        assert 'groupBy(F.col("pickup_hour"), F.col("peak_type"))' in spark
 
 
 # ════════════════════════════════════════════

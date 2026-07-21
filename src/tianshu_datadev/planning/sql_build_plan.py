@@ -23,6 +23,7 @@ from tianshu_datadev.developer_spec.models import (
     InputTableDecl,
     LabelAnd,
     LabelCompare,
+    LabelDatePartRef,
     LabelIsNotNull,
     LabelIsNull,
     LabelNot,
@@ -37,6 +38,7 @@ from .models import (
     AggregateSpec,
     AliasExpr,
     ColumnRef,
+    DatePartExpression,
     JoinType,
     Predicate,
     PredicateOperator,
@@ -122,7 +124,7 @@ class AggregateStep(StrictModel):
 
     step_type: Literal["aggregate"] = "aggregate"
     step_id: str
-    group_keys: list[ColumnRef]  # GROUP BY 列
+    group_keys: list[ColumnRef | DatePartExpression]  # GROUP BY 列或受控派生键
     metrics: list[AggregateSpec]  # 聚合规格
     having: Predicate | None = None  # HAVING 条件（封闭 AST）
 
@@ -1562,17 +1564,28 @@ class SqlBuildPlanBuilder:
         self, node: LabelCompare, table_alias: str,
     ) -> Predicate:
         """将 LabelCompare 转换为 Predicate。"""
-        normalized = self._normalizer.normalize(node.left)
+        source_column = (
+            node.left.column_name
+            if isinstance(node.left, LabelDatePartRef)
+            else node.left
+        )
+        normalized = self._normalizer.normalize(source_column)
         col_ref = ColumnRef(
             table_ref=SafeIdentifier(table_alias),
-            column_name=SafeIdentifier(node.left),
+            column_name=SafeIdentifier(source_column),
             normalized_name=SafeIdentifier(normalized),
         )
+        left_operand: ColumnRef | DatePartExpression = col_ref
+        if isinstance(node.left, LabelDatePartRef):
+            left_operand = DatePartExpression(
+                part=node.left.part,
+                column=col_ref,
+            )
         op = self._COMPARE_OP_MAP.get(node.op)
         if op is None:
             raise ValueError(f"不支持的比较操作符: {node.op}")
         sql_lit = self._literal_from_label(node.right)
-        return Predicate(left=col_ref, operator=op, right=sql_lit)
+        return Predicate(left=left_operand, operator=op, right=sql_lit)
 
     def _predicate_from_is_null(
         self, node: LabelIsNull, table_alias: str,
@@ -1651,7 +1664,11 @@ class SqlBuildPlanBuilder:
             collected: 输出集合——收集到的列名加入此集合
         """
         if isinstance(node, LabelCompare):
-            collected.add(node.left)
+            collected.add(
+                node.left.column_name
+                if isinstance(node.left, LabelDatePartRef)
+                else node.left
+            )
         elif isinstance(node, (LabelIsNull, LabelIsNotNull)):
             collected.add(node.column)
         elif isinstance(node, (LabelAnd, LabelOr)):
@@ -2686,21 +2703,54 @@ class SqlBuildPlanBuilder:
                 需要作为 GROUP BY 键（不带 table_ref）。
         """
         # group_keys 从 dimensions 构建
-        group_cols: list[ColumnRef] = []
+        group_cols: list[ColumnRef | DatePartExpression] = []
         for d in spec.dimensions:
+            if extra_group_keys and d.dimension_name in extra_group_keys:
+                # CASE 输出是上游派生列；同名维度不能重新解释为源表物理列。
+                continue
             normalized = self._normalizer.normalize(d.column_ref)
-            group_cols.append(
-                ColumnRef(
-                    table_ref=d.source_table or primary_table,
-                    column_name=d.column_ref,
-                    normalized_name=normalized,
-                )
+            source = ColumnRef(
+                table_ref=d.source_table or primary_table,
+                column_name=d.column_ref,
+                normalized_name=normalized,
             )
+            if d.date_part:
+                group_cols.append(
+                    DatePartExpression(
+                        part=d.date_part,
+                        column=source,
+                        alias=SafeIdentifier(d.dimension_name),
+                    )
+                )
+            else:
+                group_cols.append(source)
 
         # 如果 output_spec.grain 提供了额外粒度键
         for grain_col in spec.output_spec.grain:
+            if extra_group_keys and grain_col in extra_group_keys:
+                # 同名 CASE 输出由下方派生键分支统一加入，禁止绑定到源表。
+                continue
             normalized = self._normalizer.normalize(grain_col)
             if not any(g.normalized_name == normalized for g in group_cols):
+                derived = next(
+                    (d for d in spec.dimensions if d.dimension_name == grain_col),
+                    None,
+                )
+                if derived and derived.date_part:
+                    group_cols.append(
+                        DatePartExpression(
+                            part=derived.date_part,
+                            column=ColumnRef(
+                                table_ref=derived.source_table or primary_table,
+                                column_name=derived.column_ref,
+                                normalized_name=self._normalizer.normalize(
+                                    derived.column_ref
+                                ),
+                            ),
+                            alias=SafeIdentifier(derived.dimension_name),
+                        )
+                    )
+                    continue
                 group_cols.append(
                     ColumnRef(
                         table_ref=primary_table,
@@ -2732,7 +2782,7 @@ class SqlBuildPlanBuilder:
             ))
 
         step_id_content = {
-            "groups": [g.normalized_name for g in group_cols],
+            "groups": [str(g.normalized_name) for g in group_cols],
             "metrics": [m.alias for m in agg_metrics],
         }
         return AggregateStep(
@@ -2765,12 +2815,16 @@ class SqlBuildPlanBuilder:
             dim_source_map[d.dimension_name] = (d.column_ref, table_ref)
 
         overrides = column_table_overrides or {}
+        label_output_names = {rule.output_column for rule in spec.label_rules}
 
         proj_cols: list[AliasExpr] = []
         for col in spec.output_spec.columns:
             col_name = col.name
             # 解析源列名和表别名
-            if col_name in dim_source_map:
+            if col_name in label_output_names:
+                source_col = col_name
+                table_ref = ""
+            elif col_name in dim_source_map:
                 source_col, dim_table = dim_source_map[col_name]
                 # 维度声明的 source_table 可被 overrides 覆盖
                 table_ref = overrides.get(col_name, dim_table or default_table_ref)
@@ -2778,13 +2832,37 @@ class SqlBuildPlanBuilder:
                 source_col = col_name
                 table_ref = overrides.get(col_name, default_table_ref)
             normalized = self._normalizer.normalize(source_col)
+            dimension = next(
+                (d for d in spec.dimensions if d.dimension_name == col_name),
+                None,
+            )
+            source_ref = ColumnRef(
+                table_ref=table_ref,
+                column_name=source_col,
+                normalized_name=normalized,
+            )
+            if dimension and dimension.date_part and spec.metrics:
+                # 聚合步骤已经以派生别名输出该分组键，最终投影只引用结果列。
+                expression = ColumnRef(
+                    table_ref="",
+                    column_name=SafeIdentifier(col_name),
+                    normalized_name=SafeIdentifier(
+                        self._normalizer.normalize(col_name)
+                    ),
+                )
+            else:
+                expression = (
+                    DatePartExpression(
+                        part=dimension.date_part,
+                        column=source_ref,
+                        alias=SafeIdentifier(col_name),
+                    )
+                    if dimension and dimension.date_part
+                    else source_ref
+                )
             proj_cols.append(
                 AliasExpr(
-                    expression=ColumnRef(
-                        table_ref=table_ref,
-                        column_name=source_col,
-                        normalized_name=normalized,
-                    ),
+                    expression=expression,
                     alias=col_name,
                 )
             )

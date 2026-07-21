@@ -22,6 +22,7 @@ import re as _re
 from tianshu_datadev.artifacts.models import (
     CaseWhenLabelSpec,
     ContractAggregation,
+    ContractDerivedColumn,
     ContractInputTable,
     ContractJoin,
     ContractLimit,
@@ -38,6 +39,7 @@ from .models import (
     SparkAggregateStep,
     SparkCaseWhenBranch,
     SparkCaseWhenStep,
+    SparkDerivedGroupKey,
     SparkFilterStep,
     SparkJoinStep,
     SparkJoinType,
@@ -147,7 +149,11 @@ def map_contract_to_spark_plan(
 
     # ── Step 4：聚合 → AggregateStep ──
     agg_result = _map_aggregations(
-        contract.aggregations, contract.grouping_keys, unsupported, gaps,
+        contract.aggregations,
+        contract.grouping_keys,
+        contract.derived_columns,
+        unsupported,
+        gaps,
     )
     if isinstance(agg_result, ContractGap):
         gaps.append(agg_result)
@@ -396,6 +402,7 @@ def _map_joins(
 def _map_aggregations(
     aggregations: list[ContractAggregation],
     grouping_keys: list[str],
+    derived_columns: list[ContractDerivedColumn],
     unsupported: list[UnsupportedPattern],
     gaps: list[ContractGap],
 ) -> list[SparkAggregateStep] | ContractGap | UnsupportedPattern:
@@ -462,6 +469,15 @@ def _map_aggregations(
         SparkAggregateStep(
             input_alias=input_alias,
             group_keys=grouping_keys,
+            derived_group_keys=[
+                SparkDerivedGroupKey(
+                    output_column=item.output_column,
+                    source_column=item.source_column,
+                    date_part=item.date_part,
+                )
+                for item in derived_columns
+                if item.output_column in grouping_keys
+            ],
             metrics=metrics,
         )
     ]

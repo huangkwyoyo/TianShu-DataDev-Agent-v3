@@ -15,6 +15,7 @@ from tianshu_datadev.developer_spec.models import (
     CompareOp,
     LabelAnd,
     LabelCompare,
+    LabelDatePartRef,
     LabelIsNotNull,
     LabelIsNull,
     LabelNot,
@@ -34,6 +35,9 @@ _NUMERIC_TYPES = frozenset({
 })
 _STRING_TYPES = frozenset({
     "string", "varchar", "text", "char", "nvarchar", "nchar",
+})
+_TEMPORAL_TYPES = frozenset({
+    "date", "datetime", "timestamp", "timestamp_ntz", "timestamp_ltz",
 })
 _BOOLEAN_TYPES = frozenset({"boolean", "bool"})
 
@@ -96,6 +100,8 @@ class LabelRuleValidator:
         self,
         proposal: LabelRuleProposal,
         spec: ParsedDeveloperSpec,
+        *,
+        strict_evidence: bool = True,
     ) -> LabelValidationReport:
         """对单个 Proposal 执行全部六项检查。
 
@@ -133,7 +139,14 @@ class LabelRuleValidator:
         # 5. LABEL_DOMAIN（空 domain 阻断）
         self._check_label_domain(proposal, checks, blocking)
         # 6. COVERAGE（ELSE + evidence 锚定检查）
-        self._check_coverage(proposal, spec, checks, human_review)
+        self._check_coverage(
+            proposal,
+            spec,
+            checks,
+            human_review,
+            warnings,
+            strict_evidence=strict_evidence,
+        )
         # 7. NO_LABEL_NOT——label_table v1 暂时拒绝 LabelNot
         self._check_no_label_not(proposal, checks, blocking)
 
@@ -256,7 +269,16 @@ class LabelRuleValidator:
                 detail="所有标签值在域内",
             ))
 
-    def _check_coverage(self, proposal, spec, checks, human_review):
+    def _check_coverage(
+        self,
+        proposal,
+        spec,
+        checks,
+        human_review,
+        warnings,
+        *,
+        strict_evidence: bool,
+    ):
         """6. COVERAGE——ELSE 非空 + evidence 锚定项目书正文。
 
         Task 11.5 改进：evidence 必须满足最小长度要求——
@@ -297,10 +319,15 @@ class LabelRuleValidator:
                 )
         if issues:
             checks.append(LabelValidationCheck(
-                check_name="COVERAGE", passed=False, level="HUMAN_REVIEW",
+                check_name="COVERAGE",
+                passed=not strict_evidence,
+                level="HUMAN_REVIEW" if strict_evidence else "WARNING",
                 detail=f"evidence 锚定检查失败: {issues}",
             ))
-            human_review.extend(issues)
+            if strict_evidence:
+                human_review.extend(issues)
+            else:
+                warnings.extend(issues)
         else:
             checks.append(LabelValidationCheck(
                 check_name="COVERAGE", passed=True, level="BLOCKING",
@@ -349,8 +376,13 @@ class LabelRuleValidator:
     def _collect_column_refs(self, node, known, missing):
         """递归收集节点树中所有列引用——不在 known 中的添加到 missing。"""
         if isinstance(node, LabelCompare):
-            if node.left not in known:
-                missing.append(node.left)
+            column_name = (
+                node.left.column_name
+                if isinstance(node.left, LabelDatePartRef)
+                else node.left
+            )
+            if column_name not in known:
+                missing.append(column_name)
         elif isinstance(node, (LabelIsNull, LabelIsNotNull)):
             if node.column not in known:
                 missing.append(node.column)
@@ -369,17 +401,37 @@ class LabelRuleValidator:
         b) 类型族级别（Task 11.5 新增）：数值列 + 字符串字面量 → 不兼容
         """
         if isinstance(node, LabelCompare):
+            column_name = (
+                node.left.column_name
+                if isinstance(node.left, LabelDatePartRef)
+                else node.left
+            )
+            display_left = (
+                f"{node.left.part}({column_name})"
+                if isinstance(node.left, LabelDatePartRef)
+                else column_name
+            )
+            if isinstance(node.left, LabelDatePartRef):
+                source_type = (column_types.get(column_name) or "").lower()
+                if source_type not in _TEMPORAL_TYPES:
+                    errors.append(
+                        f"{display_left} 的源列类型必须是日期或时间，实际为 {source_type or 'unknown'}"
+                    )
             # a) 操作符级别检查
             if node.right.data_type == "string" and node.op not in (CompareOp.EQ, CompareOp.NEQ):
                 errors.append(
-                    f"{node.left} {node.op.value} '{node.right.value}'——"
+                    f"{display_left} {node.op.value} '{node.right.value}'——"
                     f"string 类型仅支持 =/!="
                 )
             # b) 类型族级别检查（Task 11.5 新增）
-            col_type = column_types.get(node.left)
+            col_type = (
+                "number"
+                if isinstance(node.left, LabelDatePartRef)
+                else column_types.get(column_name)
+            )
             if not _same_type_family(col_type, node.right.data_type):
                 errors.append(
-                    f"{node.left}（类型={col_type}）与 "
+                    f"{display_left}（类型={col_type}）与 "
                     f"'{node.right.value}'（类型={node.right.data_type}）类型族不兼容"
                 )
         elif isinstance(node, (LabelAnd, LabelOr)):

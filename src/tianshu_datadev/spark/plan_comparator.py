@@ -969,6 +969,9 @@ class PlanComparator:
             flat_groups: list[str] = []
             for g in raw_groups:
                 if isinstance(g, dict):
+                    if g.get("part") and g.get("column"):
+                        flat_groups.append(str(g.get("alias") or ""))
+                        continue
                     flat_groups.append(
                         str(g.get("normalized_name") or g.get("column_name", ""))
                     )

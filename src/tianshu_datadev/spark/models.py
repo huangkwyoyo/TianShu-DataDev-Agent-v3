@@ -141,7 +141,16 @@ class SparkAggregateStep(StrictModel):
     step_type: SparkStepType = SparkStepType.AGGREGATE
     input_alias: str  # 输入 DataFrame 别名
     group_keys: list[str] = []  # 分组键（归一化字段名列表）
+    derived_group_keys: list["SparkDerivedGroupKey"] = []
     metrics: list[SparkAggregateSpec] = []  # 聚合指标
+
+
+class SparkDerivedGroupKey(StrictModel):
+    """聚合前计算的受控分组键。"""
+
+    output_column: str
+    source_column: str
+    date_part: Literal["HOUR"]
 
 
 class SparkAggregateSpec(StrictModel):

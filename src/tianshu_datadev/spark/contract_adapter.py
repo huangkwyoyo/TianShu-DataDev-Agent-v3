@@ -72,6 +72,7 @@ def adapt_lite_to_v1(
         join_relationships=lite.join_relationships,
         filters=lite.filters,
         aggregations=lite.aggregations,
+        derived_columns=getattr(lite, "derived_columns", None) or [],
         grouping_keys=lite.grouping_keys,
         output_columns=lite.output_columns,
         output_grain=lite.output_grain,
