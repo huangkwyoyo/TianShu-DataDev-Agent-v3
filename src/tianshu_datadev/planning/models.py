@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import AfterValidator, model_validator
 
@@ -177,9 +177,33 @@ class Predicate(StrictModel):
     IN 操作符时 right 为 list[SqlLiteral]。
     """
 
-    left: ColumnRef | Predicate
+    left: ColumnRef | Predicate | TimeTransformExpr
     operator: PredicateOperator
     right: ColumnRef | Predicate | SqlLiteral | list[SqlLiteral] | None = None
+
+
+# ── TimeTransformExpr + DerivedGroupKey（v3.1 新增）──
+
+class TimeTransformExpr(StrictModel):
+    """封闭时间变换表达式——HOUR(source_table.source_column)。
+
+    可复用：DerivedGroupKey 持有它，Predicate.left 允许引用它，
+    SQL SELECT / GROUP BY / CASE WHEN 共享 _render_time_transform() 渲染器。
+    禁止转为 SqlRawExpression——Compiler 直接渲染为 HOUR(col) 或 hour(col)。
+    """
+    source_column: SafeIdentifier
+    source_table: SafeIdentifier
+    time_function: Literal["HOUR"]  # MVP 仅 HOUR
+
+
+class DerivedGroupKey(StrictModel):
+    """派生分组键——alias + TimeTransformExpr 的绑定。
+
+    在 AggregateStep.group_keys 中使用。
+    alias 是聚合后的列引用名——CASE WHEN 和 Project 通过此名引用。
+    """
+    alias: str
+    expr: TimeTransformExpr
 
 
 class AggregateSpec(StrictModel):
