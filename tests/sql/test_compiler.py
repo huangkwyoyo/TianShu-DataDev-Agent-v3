@@ -2,7 +2,6 @@
 
 import os
 
-from tests._test_utils import read_fixture
 from tianshu_datadev.developer_spec.models import (
     AggregationType,
     InferredWindowMetric,
@@ -2708,3 +2707,61 @@ class TestWindowPipelineE2E:
         sql2 = compiler2.compile(plan2).sql
 
         assert sql1 == sql2, "相同输入应产生相同 SQL（确定性编译）"
+
+
+# ════════════════════════════════════════════
+# v3.1 DerivedGroupKey 编译回归测试
+# ════════════════════════════════════════════
+
+
+class TestDerivedGroupKeyCompile:
+    """DerivedGroupKey 编译回归测试——time_transforms 正确渲染 GROUP BY。"""
+
+    def test_aggregate_step_with_derived_group_key_compiles(self):
+        """含 DerivedGroupKey 的 AggregateStep 应正确编译，GROUP BY 不含 AS alias。"""
+        spec = _parse_spec("fixtures/golden/golden_no_time_range.md")
+
+        # 追加一个派生维度——模拟 Planner→Promotion 后的 Spec
+        from tianshu_datadev.developer_spec.models import (
+            DerivedDimensionDecl,
+            OutputColumnDecl,
+        )
+        spec.derived_dimensions.append(
+            DerivedDimensionDecl(
+                dimension_name="pickup_hour",
+                source_column="event_time",
+                source_table="tf",
+                time_function="HOUR",
+            )
+        )
+        # 将 pickup_hour 加入输出列——使其出现在 SELECT 中
+        spec.output_spec.columns.append(
+            OutputColumnDecl(name="pickup_hour", type="int")
+        )
+        spec.output_spec.grain = list(spec.output_spec.grain) + ["pickup_hour"]
+
+        builder = SqlBuildPlanBuilder()
+        plan, _ = builder.build(spec)
+
+        compiler = DuckDbSqlCompiler()
+        compiled = compiler.compile(plan)
+
+        # SELECT 中应包含 HOUR(tf.event_time) AS pickup_hour
+        assert "HOUR(tf.event_time) AS pickup_hour" in compiled.sql, (
+            f"SELECT 应含 HOUR 表达式 AS alias，实际 SQL:\n{compiled.sql}"
+        )
+
+        # GROUP BY 中应包含 HOUR(tf.event_time)（不含 AS pickup_hour）
+        assert "GROUP BY" in compiled.sql
+        sql_upper = compiled.sql.upper()
+        group_pos = sql_upper.index("GROUP BY")
+        group_by_section = sql_upper[group_pos:]
+        assert "HOUR(TF.EVENT_TIME)" in group_by_section, (
+            f"GROUP BY 应含 HOUR(tf.event_time)，实际:\n{group_by_section}"
+        )
+        assert "AS PICKUP_HOUR" not in group_by_section, (
+            f"GROUP BY 不应含 AS 别名:\n{group_by_section}"
+        )
+
+        # 编译正常完成——不抛异常
+        assert compiled.sql != ""

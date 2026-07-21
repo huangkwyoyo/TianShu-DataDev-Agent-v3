@@ -6,14 +6,13 @@ import tempfile
 import pytest
 from fastapi.testclient import TestClient
 
+from tests._test_utils import read_fixture as _read_fixture
 from tianshu_datadev.api.app import create_app
 from tianshu_datadev.api.pipeline import Pipeline
+from tianshu_datadev.llm.adapters.fake_adapter import FakeLLMAdapter
 
 # 项目根目录（相对于本文件）
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-
-
-from tests._test_utils import read_fixture as _read_fixture
 
 
 @pytest.fixture
@@ -51,3 +50,9 @@ def csv_path():
 def golden_spec_passing():
     """读取 golden fixture——golden_passing.md（行数低于阈值，可通过 Validator 校验）。"""
     return _read_fixture("fixtures/golden/golden_passing.md")
+
+
+@pytest.fixture
+def fake_requirement_adapter():
+    """FakeLLMAdapter——用于 RequirementPlanner 管线集成测试。"""
+    return FakeLLMAdapter()

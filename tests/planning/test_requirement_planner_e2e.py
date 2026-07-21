@@ -212,3 +212,62 @@ class TestRequirementPlanner:
         assert len(output.metrics) == 0
         assert len(output.case_when_rules) == 0
         assert len(output.uncertainties) == 0
+
+    def test_golden_chain_planner_to_builder(self):
+        """Golden chain: FakeAdapter→Planner→Validator→Promotion→Builder 全链路。"""
+        import uuid
+
+        from tianshu_datadev.developer_spec.models import RequirementProposal
+        from tianshu_datadev.planning.proposal_promotion import ProposalPromotion
+        from tianshu_datadev.planning.proposal_validator import ProposalValidator
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        fake = FakeLLMAdapter()
+        fake.register_default_for_task(
+            task="requirement_planner",
+            output=self._make_expected_response(),
+        )
+        planner = RequirementPlanner(adapter=fake)
+        spec = self._make_spec()
+        manifest = self._make_manifest()
+
+        # 1. Planner
+        output = planner.plan(spec, manifest)
+        assert len(output.derived_dimensions) == 1
+
+        # 2. Proposal
+        proposal = RequirementProposal(
+            proposal_id=uuid.uuid4().hex[:12],
+            spec_hash=spec.spec_hash,
+            dimensions=output.dimensions,
+            derived_dimensions=output.derived_dimensions,
+            metrics=output.metrics,
+            case_when_rules=output.case_when_rules,
+            uncertainties=output.uncertainties,
+            llm_model="fake",
+            inference_time_ms=0,
+            total_inferred=3,
+        )
+
+        # 3. Validator
+        validator = ProposalValidator()
+        valid, questions = validator.validate(proposal, spec, manifest)
+        assert valid, f"Validator 应通过: {questions}"
+
+        # 4. Promotion
+        promotion = ProposalPromotion()
+        spec = promotion.promote(proposal, spec)
+        assert len(spec.derived_dimensions) == 1
+        assert len(spec.case_when_rules) == 1
+
+        # 5. Builder——验证全链路到 SqlBuildPlan
+        builder = SqlBuildPlanBuilder()
+        plan, plan_questions = builder.build(spec)
+
+        # 验证 AggregateStep 含 DerivedGroupKey
+        agg_steps = [s for s in plan.steps if s.__class__.__name__ == "AggregateStep"]
+        assert len(agg_steps) > 0
+        agg = agg_steps[0]
+        derived_keys = [k for k in agg.group_keys if hasattr(k, "alias") and hasattr(k, "expr")]
+        assert len(derived_keys) >= 1
+        assert derived_keys[0].alias == "pickup_hour"

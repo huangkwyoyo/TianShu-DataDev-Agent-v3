@@ -1815,3 +1815,110 @@ class TestAnnotationsRemovable:
         ann_stripped = _strip_comments(result.annotated_pyspark)
 
         assert raw_stripped == ann_stripped
+
+
+# ════════════════════════════════════════════
+# v3.1 time_transforms 编译回归测试
+# ════════════════════════════════════════════
+
+
+class TestCompileTimeTransforms:
+    """SparkAggregateStep time_transforms 编译回归测试。"""
+
+    def test_aggregate_step_with_time_transforms_compiles(self):
+        """含 time_transforms 的 SparkAggregateStep 应正确编译。"""
+        from tianshu_datadev.spark.models import SparkTimeTransformExpr
+
+        step = SparkAggregateStep(
+            input_alias="ft",
+            group_keys=["borough"],
+            metrics=[
+                SparkAggregateSpec(
+                    function=SparkAggFunction.COUNT,
+                    input_column=None,
+                    alias="trip_count",
+                ),
+            ],
+            time_transforms=[
+                SparkTimeTransformExpr(
+                    source_column="pickup_at",
+                    source_table="ft",
+                    time_function="hour",
+                    alias="pickup_hour",
+                ),
+            ],
+        )
+        plan = _make_plan(
+            SparkReadStep(alias="ft", source_name="fact_trips", input_key="ft"),
+            step,
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        # GROUP BY 应含 F.hour(F.col("ft.pickup_at")).alias("pickup_hour")
+        assert 'F.hour(F.col("ft.pickup_at")).alias("pickup_hour")' in result.raw_pyspark, (
+            f"time_transform 应编译为 F.hour(...).alias(...)，实际:\n{result.raw_pyspark}"
+        )
+
+        # agg 中应引用 time_transform 别名确保输出列存在
+        assert 'F.col("pickup_hour")' in result.raw_pyspark, (
+            f"agg 应引用 time_transform 别名:\n{result.raw_pyspark}"
+        )
+
+        # 正常编译 — 不抛异常
+        assert len(result.step_ids) == 2
+        assert result.raw_pyspark != ""
+
+    def test_aggregate_step_empty_time_transforms_baseline(self):
+        """time_transforms=[] 时编译结果与现有基线一致（向后兼容）。"""
+        baseline_step = SparkAggregateStep(
+            input_alias="ft",
+            group_keys=["borough"],
+            metrics=[
+                SparkAggregateSpec(
+                    function=SparkAggFunction.COUNT,
+                    input_column=None,
+                    alias="trip_count",
+                ),
+            ],
+            # 无 time_transforms（兼容旧路径）
+        )
+        with_transforms_step = SparkAggregateStep(
+            input_alias="ft",
+            group_keys=["borough"],
+            metrics=[
+                SparkAggregateSpec(
+                    function=SparkAggFunction.COUNT,
+                    input_column=None,
+                    alias="trip_count",
+                ),
+            ],
+            time_transforms=[],  # 显式空列表
+        )
+
+        compiler = SparkCompiler()
+
+        plan_baseline = _make_plan(
+            SparkReadStep(alias="ft", source_name="fact_trips", input_key="ft"),
+            baseline_step,
+        )
+        plan_with = _make_plan(
+            SparkReadStep(alias="ft", source_name="fact_trips", input_key="ft"),
+            with_transforms_step,
+        )
+
+        baseline_result = compiler.compile(plan_baseline)
+        with_result = compiler.compile(plan_with)
+
+        # 编译结果应完全一致
+        assert baseline_result.raw_pyspark == with_result.raw_pyspark, (
+            "time_transforms=[] 应与无 time_transforms 时输出一致"
+        )
+        assert baseline_result.raw_hash == with_result.raw_hash, (
+            "time_transforms=[] 不应改变编译 hash"
+        )
+
+        # 基线验证：不含 F.hour
+        assert "F.hour(" not in baseline_result.raw_pyspark, (
+            f"无 time_transforms 时不应含 F.hour:\n{baseline_result.raw_pyspark}"
+        )
