@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from tianshu_datadev.planning.models import ColumnRef
+from tianshu_datadev.planning.models import ColumnRef, DerivedGroupKey, TimeTransformExpr
 from tianshu_datadev.planning.relationship_hypothesis import RelationshipEvidence
 from tianshu_datadev.planning.sql_build_plan import (
     AggregateStep,
@@ -35,6 +35,7 @@ from .models import (
     ContractOutputColumn,
     ContractPredicate,
     ContractSort,
+    ContractTimeTransform,
     DataTransformContractLite,
     DataTransformContractV1,
     WindowSpecSummary,
@@ -99,6 +100,7 @@ class DataTransformContractExtractor:
         sort_spec: list[ContractSort] | None = None
         limit_spec: ContractLimit | None = None
         business_keys: list[str] = []
+        time_transforms: list[ContractTimeTransform] = []
         # ── Phase 3B 字段——lite 路径也需要提取以通过 adapt_lite_to_v1 传递 ──
         case_when_labels: list[CaseWhenLabelSpec] = []
         window_specs: list[WindowSpecSummary] = []
@@ -127,7 +129,7 @@ class DataTransformContractExtractor:
                     join_relationships.append(join_rel)
 
             elif isinstance(step, AggregateStep):
-                aggs, groups, biz_keys = self._extract_aggregate(step)
+                aggs, groups, biz_keys, time_transforms = self._extract_aggregate(step)
                 aggregations.extend(aggs)
                 grouping_keys.extend(groups)
                 business_keys.extend(biz_keys)
@@ -186,6 +188,7 @@ class DataTransformContractExtractor:
             sort_spec=sort_spec,
             limit_spec=limit_spec,
             business_keys=business_keys,
+            time_transforms=time_transforms,
             semantic_policy_ref="",
             case_when_labels=case_when_labels,
             window_specs=window_specs,
@@ -366,11 +369,12 @@ class DataTransformContractExtractor:
     @staticmethod
     def _extract_aggregate(
         step: AggregateStep,
-    ) -> tuple[list[ContractAggregation], list[str], list[str]]:
-        """从 AggregateStep 提取聚合、分组键和业务键。"""
+    ) -> tuple[list[ContractAggregation], list[str], list[str], list[ContractTimeTransform]]:
+        """从 AggregateStep 提取聚合、分组键、业务键和时间变换。"""
         aggs: list[ContractAggregation] = []
         groups: list[str] = []
         biz_keys: list[str] = []
+        time_transforms: list[ContractTimeTransform] = []
 
         # 聚合指标
         for m in step.metrics:
@@ -382,12 +386,24 @@ class DataTransformContractExtractor:
                 )
             )
 
-        # 分组键（归一化名）
+        # 分组键：DerivedGroupKey → time_transform + alias key
+        # ColumnRef → normalized_name + business_key
         for gk in step.group_keys:
-            groups.append(gk.normalized_name)
-            biz_keys.append(gk.normalized_name)
+            if isinstance(gk, DerivedGroupKey):
+                groups.append(gk.alias)
+                time_transforms.append(
+                    ContractTimeTransform(
+                        source_column=gk.expr.source_column,
+                        source_table=gk.expr.source_table,
+                        time_function=gk.expr.time_function,
+                        alias=gk.alias,
+                    )
+                )
+            elif isinstance(gk, ColumnRef):
+                groups.append(gk.normalized_name)
+                biz_keys.append(gk.normalized_name)
 
-        return aggs, groups, biz_keys
+        return aggs, groups, biz_keys, time_transforms
 
     @staticmethod
     def _extract_project(
@@ -496,6 +512,9 @@ class DataTransformContractExtractor:
             if table:
                 return f"{table}.{col}"
             return col
+        # TimeTransformExpr（v3.1 新增）
+        if hasattr(operand, "time_function") and hasattr(operand, "source_column"):
+            return f"{operand.time_function}({operand.source_table}.{operand.source_column})"
         # SqlLiteral
         if hasattr(operand, "value"):
             v = operand.value
@@ -555,6 +574,7 @@ class DataTransformContractExtractor:
         sort_spec: list[ContractSort] | None = None
         limit_spec: ContractLimit | None = None
         business_keys: list[str] = []
+        time_transforms: list[ContractTimeTransform] = []
 
         seen_tables: set[str] = set()
         seen_columns: set[tuple[str, str]] = set()
@@ -607,7 +627,7 @@ class DataTransformContractExtractor:
                     if join_rel:
                         join_relationships.append(join_rel)
                 elif isinstance(step, AggregateStep):
-                    aggs, groups, biz_keys = self._extract_aggregate(step)
+                    aggs, groups, biz_keys, time_transforms = self._extract_aggregate(step)
                     aggregations.extend(aggs)
                     grouping_keys.extend(groups)
                     business_keys.extend(biz_keys)
@@ -672,6 +692,7 @@ class DataTransformContractExtractor:
             sort_spec=sort_spec,
             limit_spec=limit_spec,
             business_keys=business_keys,
+            time_transforms=time_transforms,
             semantic_policy_ref="",
             step_dag=step_dag,
             temp_tables=temp_tables,
@@ -790,7 +811,10 @@ class DataTransformContractExtractor:
         )
 
     @staticmethod
-    def _predicate_to_case_when_condition(pred) -> CaseWhenCondition:
+    def _predicate_to_case_when_condition(
+        pred,
+        derived_expr_map: dict | None = None,
+    ) -> CaseWhenCondition:
         """将 Predicate AST 递归转换为 CaseWhenCondition 扁平表示。
 
         支持：EQ/NEQ/GT/GTE/LT/LTE/IS_NULL/IS_NOT_NULL/AND/OR。
@@ -798,6 +822,8 @@ class DataTransformContractExtractor:
 
         Args:
             pred: planning.models.Predicate 实例
+            derived_expr_map: {alias: TimeTransformExpr} 映射，用于将
+                             TimeTransformExpr 操作数反查为 alias 列名
 
         Returns:
             CaseWhenCondition——扁平序列化表示
@@ -807,16 +833,43 @@ class DataTransformContractExtractor:
         """
         op = pred.operator.value if hasattr(pred.operator, "value") else str(pred.operator)
 
+        # 解析 left 操作数：TimeTransformExpr → alias（v3.1 新增）
+        left_operand = pred.left
+        if isinstance(left_operand, TimeTransformExpr):
+            derived_expr_map = derived_expr_map or {}
+            # 构建 TimeTransformExpr → alias 反向映射
+            expr_to_alias: dict[tuple, str] = {}
+            for alias, expr in derived_expr_map.items():
+                if hasattr(expr, "source_table") and hasattr(expr, "source_column"):
+                    k = (str(expr.source_table), str(expr.source_column), expr.time_function)
+                    expr_to_alias[k] = alias
+            tte_key = (
+                str(left_operand.source_table),
+                str(left_operand.source_column),
+                left_operand.time_function,
+            )
+            alias = expr_to_alias.get(tte_key)
+            if alias is None:
+                raise ValueError(
+                    f"TimeTransformExpr({tte_key}) 在 derived_expr_map 中无对应 alias"
+                )
+            # 用 alias 合成 ColumnRef 使下游逻辑不改动
+            left_operand = ColumnRef(
+                table_ref=left_operand.source_table,
+                column_name=alias,
+                normalized_name=alias,
+            )
+
         # 一元操作符
         if op in ("IS_NULL", "IS_NOT_NULL"):
-            table, name = DataTransformContractExtractor._extract_column_ref(pred.left)
+            table, name = DataTransformContractExtractor._extract_column_ref(left_operand)
             return CaseWhenCondition(
                 operator=op, table_ref=table, normalized_name=name,
             )
 
         # 二元比较——右侧必须是 SqlLiteral（字面量），不支持列-列比较
         if op in ("EQ", "NEQ", "GT", "GTE", "LT", "LTE"):
-            table, name = DataTransformContractExtractor._extract_column_ref(pred.left)
+            table, name = DataTransformContractExtractor._extract_column_ref(left_operand)
             if not hasattr(pred.right, "value"):
                 raise ValueError(
                     f"CASE WHEN 条件 operator='{op}' 右侧必须是 SqlLiteral（字面量），"
@@ -831,9 +884,11 @@ class DataTransformContractExtractor:
         if op in ("AND", "OR"):
             left_c = DataTransformContractExtractor._predicate_to_case_when_condition(
                 pred.left,
+                derived_expr_map,
             )
             right_c = DataTransformContractExtractor._predicate_to_case_when_condition(
                 pred.right,
+                derived_expr_map,
             )
             return CaseWhenCondition(operator=op, left=left_c, right=right_c)
 

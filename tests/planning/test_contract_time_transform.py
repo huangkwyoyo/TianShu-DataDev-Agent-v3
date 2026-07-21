@@ -1,4 +1,4 @@
-"""Task 3 — TimeTransform 模型测试（Contract 侧 + Spark 侧）。"""
+"""Task 3 — TimeTransform 模型测试（Contract 侧 + Spark 侧）+ Task 6 Contract 提取器测试。"""
 
 from tianshu_datadev.artifacts.models import (
     ContractTimeTransform,
@@ -92,3 +92,65 @@ class TestSparkAggregateStepWithTimeTransforms:
         )
         assert len(step.time_transforms) == 1
         assert step.time_transforms[0].alias == "pickup_hour"
+
+
+# ════════════════════════════════════════════
+# Task 6: Contract 提取器测试
+# ════════════════════════════════════════════
+
+from tianshu_datadev.artifacts.contract_extractor import DataTransformContractExtractor
+from tianshu_datadev.developer_spec.models import AggregationType
+from tianshu_datadev.planning.models import (
+    AggregateSpec,
+    DerivedGroupKey,
+    TimeTransformExpr,
+)
+from tianshu_datadev.planning.sql_build_plan import AggregateStep
+
+
+class TestExtractAggregateWithDerivedGroupKey:
+    """_extract_aggregate 处理 DerivedGroupKey。"""
+
+    def test_derived_key_produces_time_transform(self):
+        """DerivedGroupKey → ContractTimeTransform + grouping_key alias。"""
+        agg = AggregateStep(
+            step_id="agg_1",
+            group_keys=[
+                DerivedGroupKey(
+                    alias="pickup_hour",
+                    expr=TimeTransformExpr(
+                        source_column="pickup_at",
+                        source_table="ft",
+                        time_function="HOUR",
+                    ),
+                ),
+            ],
+            metrics=[
+                AggregateSpec(
+                    aggregation=AggregationType.COUNT,
+                    input_column=None,
+                    alias="trip_count",
+                ),
+            ],
+        )
+        aggs, groups, biz_keys, time_transforms = (
+            DataTransformContractExtractor._extract_aggregate(agg)
+        )
+        assert "pickup_hour" in groups
+        assert len(time_transforms) == 1
+        assert time_transforms[0].alias == "pickup_hour"
+        assert time_transforms[0].time_function == "HOUR"
+
+
+class TestRenderOperandWithTimeTransform:
+    """_render_operand 处理 TimeTransformExpr。"""
+
+    def test_render_time_transform_operand(self):
+        """TimeTransformExpr → 'HOUR(ft.pickup_at)'。"""
+        expr = TimeTransformExpr(
+            source_column="pickup_at",
+            source_table="ft",
+            time_function="HOUR",
+        )
+        result = DataTransformContractExtractor._render_operand(expr)
+        assert result == "HOUR(ft.pickup_at)"
