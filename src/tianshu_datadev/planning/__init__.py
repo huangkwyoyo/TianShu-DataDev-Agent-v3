@@ -56,6 +56,9 @@ from .relationship_validator import RelationshipValidator
 # ── SpecEnricher（Phase 4D 指标推断） ──
 from .spec_enricher import FakeSpecEnricher, SpecEnricher
 
+# ── RequirementPlanner（Phase 4 Planner 核心三件套之一） ──
+from .requirement_planner import RequirementPlanner
+
 # ── SqlBuildPlan ──
 from .sql_build_plan import (
     AggregateStep,
@@ -148,6 +151,8 @@ __all__ = [
     # SpecEnricher（Phase 4D 指标推断）
     "FakeSpecEnricher",
     "SpecEnricher",
+    # RequirementPlanner（Phase 4 Planner 核心三件套之一）
+    "RequirementPlanner",
     # 交叉验证（Phase 4E 指标↔Join 一致性）
     "cross_validate",
     # SqlProgram 工厂
