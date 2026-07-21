@@ -37,6 +37,7 @@ from .models import (
     AggregateSpec,
     AliasExpr,
     ColumnRef,
+    DerivedGroupKey,
     JoinType,
     Predicate,
     PredicateOperator,
@@ -122,7 +123,7 @@ class AggregateStep(StrictModel):
 
     step_type: Literal["aggregate"] = "aggregate"
     step_id: str
-    group_keys: list[ColumnRef]  # GROUP BY 列
+    group_keys: list[ColumnRef | DerivedGroupKey]  # GROUP BY 列
     metrics: list[AggregateSpec]  # 聚合规格
     having: Predicate | None = None  # HAVING 条件（封闭 AST）
 

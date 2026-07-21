@@ -19,10 +19,13 @@ from dataclasses import dataclass
 
 from tianshu_datadev.developer_spec.models import AggregationType
 from tianshu_datadev.planning.models import (
+    ColumnRef,
+    DerivedGroupKey,
     Predicate,
     PredicateOperator,
     SqlLiteral,
     SqlRawExpression,
+    TimeTransformExpr,
     WindowExpr,
 )
 from tianshu_datadev.planning.sql_build_plan import (
@@ -584,12 +587,18 @@ class DuckDbSqlCompiler:
                 if agg_cols:
                     select_cols = agg_cols  # 聚合覆盖 select
                     has_aggregation = True  # 标记已聚合，后续 ProjectStep 不覆盖
-                # GROUP BY
+                # GROUP BY——显式处理 DerivedGroupKey
                 for gk in step.group_keys:
-                    if gk.table_ref:
-                        group_by_parts.append(f"{gk.table_ref}.{gk.column_name}")
-                    else:
-                        group_by_parts.append(gk.column_name)
+                    if isinstance(gk, DerivedGroupKey):
+                        # 复用同一渲染器——GROUP BY 不带 "AS alias"
+                        group_by_parts.append(
+                            self._render_time_transform(gk.expr)
+                        )
+                    elif isinstance(gk, ColumnRef):
+                        if gk.table_ref:
+                            group_by_parts.append(f"{gk.table_ref}.{gk.column_name}")
+                        else:
+                            group_by_parts.append(gk.column_name)
                 # HAVING
                 if step.having:
                     having_clause = self._render_predicate(step.having)
@@ -735,6 +744,14 @@ class DuckDbSqlCompiler:
         on_clause = " AND ".join(on_parts)
         return f"{join_type} JOIN\n  {right_table} AS {step.right_table_ref}\n  ON {on_clause}"
 
+    @staticmethod
+    def _render_time_transform(expr: TimeTransformExpr) -> str:
+        """TimeTransformExpr → SQL 函数调用字符串。
+
+        SELECT / GROUP BY / CASE WHEN 共享此渲染器。
+        """
+        return f"{expr.time_function}({expr.source_table}.{expr.source_column})"
+
     def _render_aggregate(self, step: AggregateStep) -> list[str]:
         """渲染聚合步骤为 SELECT 列列表。
 
@@ -745,12 +762,17 @@ class DuckDbSqlCompiler:
         """
         cols: list[str] = []
 
-        # GROUP BY 列
+        # GROUP BY 列——显式处理 DerivedGroupKey
         for gk in step.group_keys:
-            if gk.table_ref:
-                cols.append(f"{gk.table_ref}.{gk.column_name}")
-            else:
-                cols.append(gk.column_name)
+            if isinstance(gk, DerivedGroupKey):
+                # 复用同一渲染器——SELECT 用 "AS alias"
+                rendered = self._render_time_transform(gk.expr)
+                cols.append(f"{rendered} AS {gk.alias}")
+            elif isinstance(gk, ColumnRef):
+                if gk.table_ref:
+                    cols.append(f"{gk.table_ref}.{gk.column_name}")
+                else:
+                    cols.append(gk.column_name)
 
         # 聚合指标
         for m in step.metrics:
@@ -1405,7 +1427,10 @@ class DuckDbSqlCompiler:
             )
             return f"与 {step.right_table_ref} 按 {keys} 关联"
         elif isinstance(step, AggregateStep):
-            keys = ", ".join(gk.column_name for gk in step.group_keys)
+            keys = ", ".join(
+                gk.alias if isinstance(gk, DerivedGroupKey) else gk.column_name
+                for gk in step.group_keys
+            )
             n_metrics = len(step.metrics)
             return f"按 {keys} 分组，聚合 {n_metrics} 个指标"
         elif isinstance(step, WindowStep):

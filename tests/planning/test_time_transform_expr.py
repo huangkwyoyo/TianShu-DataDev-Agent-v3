@@ -180,3 +180,120 @@ class TestRequirementProposal:
         assert proposal.llm_model == ""
         assert proposal.inference_time_ms == 0
         assert proposal.total_inferred == 0
+
+
+# ════════════════════════════════════════════
+# Task 4: SQL Compiler 测试
+# ════════════════════════════════════════════
+
+from tianshu_datadev.planning.sql_build_plan import (
+    AggregateStep,
+    ScanStep,
+    SqlBuildPlan,
+)
+from tianshu_datadev.planning.models import (
+    AggregateSpec,
+)
+from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
+
+
+class TestRenderTimeTransform:
+    """_render_time_transform 共享渲染器测试。"""
+
+    def test_render_hour_expr(self):
+        """渲染 HOUR(ft.pickup_at)。"""
+        expr = TimeTransformExpr(
+            source_column=SafeIdentifier("pickup_at"),
+            source_table=SafeIdentifier("ft"),
+            time_function="HOUR",
+        )
+        result = DuckDbSqlCompiler._render_time_transform(expr)
+        assert result == "HOUR(ft.pickup_at)"
+
+
+class TestRenderAggregateWithDerivedGroupKey:
+    """_render_aggregate 处理 DerivedGroupKey。"""
+
+    def test_select_with_derived_group_key(self):
+        """SELECT 应含 'HOUR(ft.pickup_at) AS pickup_hour'。"""
+        agg = AggregateStep(
+            step_id="agg_1",
+            group_keys=[
+                DerivedGroupKey(
+                    alias="pickup_hour",
+                    expr=TimeTransformExpr(
+                        source_column=SafeIdentifier("pickup_at"),
+                        source_table=SafeIdentifier("ft"),
+                        time_function="HOUR",
+                    ),
+                ),
+                ColumnRef(
+                    table_ref=SafeIdentifier("tz"),
+                    column_name=SafeIdentifier("borough"),
+                    normalized_name=SafeIdentifier("borough"),
+                ),
+            ],
+            metrics=[
+                AggregateSpec(
+                    aggregation=AggregationType.COUNT,
+                    input_column=None,
+                    alias=SafeIdentifier("trip_count"),
+                ),
+            ],
+        )
+        compiler = DuckDbSqlCompiler()
+        cols = compiler._render_aggregate(agg)
+        assert "HOUR(ft.pickup_at) AS pickup_hour" in cols
+        assert "tz.borough" in cols
+
+
+class TestFlatSqlGroupByWithDerivedGroupKey:
+    """_render_flat_sql GROUP BY 处理 DerivedGroupKey——集成验证。"""
+
+    def test_group_by_uses_time_transform_without_alias(self):
+        """GROUP BY 应使用 HOUR(ft.pickup_at) 不带 AS alias。"""
+        plan = SqlBuildPlan(
+            plan_id="test_plan",
+            spec_hash="test_hash",
+            steps=[
+                ScanStep(
+                    step_id="scan_1",
+                    table_ref=SafeIdentifier("ft"),
+                    required_columns=[
+                        ColumnRef(
+                            table_ref=SafeIdentifier("ft"),
+                            column_name=SafeIdentifier("pickup_at"),
+                            normalized_name=SafeIdentifier("pickup_at"),
+                        ),
+                    ],
+                ),
+                AggregateStep(
+                    step_id="agg_1",
+                    group_keys=[
+                        DerivedGroupKey(
+                            alias="pickup_hour",
+                            expr=TimeTransformExpr(
+                                source_column=SafeIdentifier("pickup_at"),
+                                source_table=SafeIdentifier("ft"),
+                                time_function="HOUR",
+                            ),
+                        ),
+                    ],
+                    metrics=[
+                        AggregateSpec(
+                            aggregation=AggregationType.COUNT,
+                            input_column=None,
+                            alias=SafeIdentifier("trip_count"),
+                        ),
+                    ],
+                ),
+            ],
+        )
+        compiler = DuckDbSqlCompiler()
+        compiled = compiler.compile(plan)
+        sql = compiled.sql
+        # SELECT 含 AS alias
+        assert "HOUR(ft.pickup_at) AS pickup_hour" in sql
+        # GROUP BY 不含 AS alias
+        assert "GROUP BY" in sql
+        assert "HOUR(ft.pickup_at)" in sql
