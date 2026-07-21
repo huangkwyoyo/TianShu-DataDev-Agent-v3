@@ -574,6 +574,61 @@ class DimensionDecl(StrictModel):
     source_table: str | None = None  # 可选——单表场景无需指定
 
 
+# ════════════════════════════════════════════
+# RequirementPlanner 模型（v3.1 新增）
+# ════════════════════════════════════════════
+
+class DerivedDimensionDecl(StrictModel):
+    """派生维度——LLM 输出格式，Promotion 后成为 DerivedGroupKey 的输入。"""
+    dimension_name: str
+    source_column: str
+    source_table: str
+    time_function: Literal["HOUR"]
+
+
+class CaseWhenBranch(StrictModel):
+    """类型化 CASE WHEN 分支——条件为 dict（LLM JSON Schema 兼容）。"""
+    condition: dict
+    then_value: str
+
+
+class CaseWhenRule(StrictModel):
+    """CASE WHEN 规则——对应一条 CaseWhenStep。"""
+    output_column: str
+    branches: list[CaseWhenBranch] = Field(default_factory=list)
+    else_value: str = ""
+
+
+class UncertaintyEntry(StrictModel):
+    """LLM 不确定项——仅 field_ref + description + candidates。"""
+    field_ref: str
+    description: str
+    candidates: list[str] = Field(default_factory=list)
+
+
+class RequirementPlannerOutput(StrictModel):
+    """LLM 原始输出——所有列表使用 default_factory=list。"""
+    dimensions: list[DimensionDecl] = Field(default_factory=list)
+    derived_dimensions: list[DerivedDimensionDecl] = Field(default_factory=list)
+    metrics: list[MetricDecl] = Field(default_factory=list)
+    case_when_rules: list[CaseWhenRule] = Field(default_factory=list)
+    uncertainties: list[UncertaintyEntry] = Field(default_factory=list)
+
+
+class RequirementProposal(StrictModel):
+    """系统 Artifact——元数据全部由系统生成。"""
+    proposal_id: str
+    spec_hash: str
+    dimensions: list[DimensionDecl] = Field(default_factory=list)
+    derived_dimensions: list[DerivedDimensionDecl] = Field(default_factory=list)
+    metrics: list[MetricDecl] = Field(default_factory=list)
+    case_when_rules: list[CaseWhenRule] = Field(default_factory=list)
+    uncertainties: list[UncertaintyEntry] = Field(default_factory=list)
+    llm_model: str = ""
+    inference_time_ms: int = 0
+    total_inferred: int = 0
+
+
 class JoinDecl(StrictModel):
     """程序员显式声明的 Join 关系——可选，缺失时由 RelationshipHypothesis 推理。"""
 
@@ -953,6 +1008,9 @@ class ParsedDeveloperSpec(StrictModel):
     dataset_type: DatasetType = DatasetType.UNSPECIFIED  # 数据产品类型——Label Extractor 推断
     # 已提升的 CASE WHEN 标签规则——仅 LABEL_TABLE 时非空；Proposal 仅保存在 Artifact
     label_rules: list[CaseWhenDecl] = []
+    # ── RequirementPlanner 模型（v3.1 新增）──
+    derived_dimensions: list[DerivedDimensionDecl] = Field(default_factory=list)
+    case_when_rules: list[CaseWhenRule] = Field(default_factory=list)
     open_questions: list[OpenQuestion] = []
     parse_warnings: list[ParseWarning] = []
 
