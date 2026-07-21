@@ -38,6 +38,9 @@ from .program_factory import (
     build_sql_program_from_compute_steps,
 )
 
+# ── ProposalPromotion（Phase 4 Planner 核心三件套之三） ──
+from .proposal_promotion import ProposalPromotion
+
 # ── Join 推测模型 ──
 from .relationship_hypothesis import (
     EvidenceAction,
@@ -53,11 +56,11 @@ from .relationship_planner import FakeRelationshipPlanner, RelationshipPlanner
 # ── 证据评级器 ──
 from .relationship_validator import RelationshipValidator
 
-# ── SpecEnricher（Phase 4D 指标推断） ──
-from .spec_enricher import FakeSpecEnricher, SpecEnricher
-
 # ── RequirementPlanner（Phase 4 Planner 核心三件套之一） ──
 from .requirement_planner import RequirementPlanner
+
+# ── SpecEnricher（Phase 4D 指标推断） ──
+from .spec_enricher import FakeSpecEnricher, SpecEnricher
 
 # ── SqlBuildPlan ──
 from .sql_build_plan import (
@@ -153,6 +156,8 @@ __all__ = [
     "SpecEnricher",
     # RequirementPlanner（Phase 4 Planner 核心三件套之一）
     "RequirementPlanner",
+    # ProposalPromotion（Phase 4 Planner 核心三件套之三）
+    "ProposalPromotion",
     # 交叉验证（Phase 4E 指标↔Join 一致性）
     "cross_validate",
     # SqlProgram 工厂
