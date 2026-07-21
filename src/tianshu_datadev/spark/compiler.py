@@ -426,10 +426,18 @@ class SparkCompiler:
         input_alias = resolved.input_vars[0]
         out_alias = resolved.output_var
 
-        # Group key 列引用
-        group_cols = ", ".join(
+        # Group key 列引用——构建列表以支持追加 time_transforms
+        group_col_parts: list[str] = [
             self.renderer.render_column(k) for k in step.group_keys
-        )
+        ]
+
+        # time_transforms（v3.1 新增）
+        for tt in step.time_transforms:
+            func = tt.time_function  # "hour"
+            src = f'F.col("{tt.source_table}.{tt.source_column}")'
+            group_col_parts.append(f'F.{func}({src}).alias("{tt.alias}")')
+
+        group_cols = ", ".join(group_col_parts)
 
         # 聚合指标表达式
         agg_parts: list[str] = []
@@ -445,6 +453,10 @@ class SparkCompiler:
                 m.alias, "AggregateSpec.alias"
             )
             agg_parts.append(f'{agg_expr}.alias("{alias}")')
+
+        # time_transforms 别名——在 agg 中引用，确保输出列存在
+        for tt in step.time_transforms:
+            agg_parts.append(f'F.col("{tt.alias}")')
 
         agg_str = ", ".join(agg_parts)
 

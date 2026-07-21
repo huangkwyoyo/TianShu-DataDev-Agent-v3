@@ -27,6 +27,7 @@ from tianshu_datadev.artifacts.models import (
     ContractLimit,
     ContractOutputColumn,
     ContractSort,
+    ContractTimeTransform,
     DataTransformContractV1,
     WindowSpecSummary,
 )
@@ -50,6 +51,7 @@ from .models import (
     SparkSortDirection,
     SparkSortSpec,
     SparkSortStep,
+    SparkTimeTransformExpr,
     SparkWindowExpr,
     SparkWindowFunction,
     SparkWindowStep,
@@ -147,7 +149,9 @@ def map_contract_to_spark_plan(
 
     # ── Step 4：聚合 → AggregateStep ──
     agg_result = _map_aggregations(
-        contract.aggregations, contract.grouping_keys, unsupported, gaps,
+        contract.aggregations, contract.grouping_keys,
+        time_transforms=contract.time_transforms,
+        unsupported=unsupported, gaps=gaps,
     )
     if isinstance(agg_result, ContractGap):
         gaps.append(agg_result)
@@ -389,17 +393,20 @@ def _map_joins(
 def _map_aggregations(
     aggregations: list[ContractAggregation],
     grouping_keys: list[str],
-    unsupported: list[UnsupportedPattern],
-    gaps: list[ContractGap],
+    time_transforms: list[ContractTimeTransform] | None = None,
+    unsupported: list[UnsupportedPattern] | None = None,
+    gaps: list[ContractGap] | None = None,
 ) -> list[SparkAggregateStep] | ContractGap | UnsupportedPattern:
     """将 Contract 的 aggregations 和 grouping_keys 映射为 AggregateStep。
 
     聚合本质上是一个步骤——所有 metrics 合并到一个 SparkAggregateStep 中。
     若没有聚合，返回空列表（不是错误——明细查询无聚合）。
+    time_transforms（v3.1）：同名 alias 的 group_key 用 transform 替换 plain key。
 
     Args:
         aggregations: ContractAggregation 列表
         grouping_keys: 分组键列表
+        time_transforms: ContractTimeTransform 列表（可选，v3.1 新增）
         unsupported: 累积的 UnsupportedPattern 列表
         gaps: 累积的 ContractGap 列表
 
@@ -408,6 +415,12 @@ def _map_aggregations(
     """
     if not aggregations:
         return []
+
+    # 安全初始化——测试路径可能不传 unsupported/gaps
+    if unsupported is None:
+        unsupported = []
+    if gaps is None:
+        gaps = []
 
     # 检查聚合函数是否在白名单内
     unknown_funcs: list[str] = []
@@ -437,6 +450,23 @@ def _map_aggregations(
             )
         )
 
+    # Contract 不变量——同名 alias 的 group_key 用 time_transform 替换
+    transform_map = {tt.alias: tt for tt in (time_transforms or [])}
+    spark_group_keys: list[str] = []
+    spark_time_transforms: list[SparkTimeTransformExpr] = []
+
+    for key in grouping_keys:
+        if key in transform_map:
+            tt = transform_map[key]
+            spark_time_transforms.append(SparkTimeTransformExpr(
+                source_column=tt.source_column,
+                source_table=tt.source_table,
+                time_function=tt.time_function.lower(),
+                alias=tt.alias,
+            ))
+        else:
+            spark_group_keys.append(key)
+
     # input_alias 不从此处推断——由 _chain_input_aliases 统一填充
     # 禁止从 Contract 列名前缀（如 "ft_filtered.some_col"）提取旧式派生别名，
     # 否则会导致新 _alias_resolver 无法解析（它只追踪 Read alias + 稳定 lineage key）
@@ -454,8 +484,9 @@ def _map_aggregations(
     return [
         SparkAggregateStep(
             input_alias=input_alias,
-            group_keys=grouping_keys,
+            group_keys=spark_group_keys,
             metrics=metrics,
+            time_transforms=spark_time_transforms,
         )
     ]
 

@@ -84,5 +84,6 @@ def adapt_lite_to_v1(
         temp_tables=[],
         case_when_labels=getattr(lite, "case_when_labels", None) or [],
         window_specs=getattr(lite, "window_specs", None) or [],
+        time_transforms=getattr(lite, "time_transforms", None) or [],
         write_spec=None,
     )

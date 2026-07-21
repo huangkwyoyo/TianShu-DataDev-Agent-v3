@@ -154,3 +154,131 @@ class TestRenderOperandWithTimeTransform:
         )
         result = DataTransformContractExtractor._render_operand(expr)
         assert result == "HOUR(ft.pickup_at)"
+
+
+# ════════════════════════════════════════════
+# Task 7: Spark 链路测试
+# ════════════════════════════════════════════
+
+from tianshu_datadev.spark.mapper import _map_aggregations
+from tianshu_datadev.spark.compiler import SparkCompiler
+from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+from tianshu_datadev.artifacts.models import (
+    ContractAggregation,
+    ContractTimeTransform,
+)
+
+
+class TestMapAggregationsWithTimeTransforms:
+    """Mapper——Contract 不变量应用。"""
+
+    def test_mapper_replaces_group_key_with_transform(self):
+        """同名 alias → 从 group_keys 移除，加入 time_transforms。"""
+        result = _map_aggregations(
+            aggregations=[
+                ContractAggregation(function="COUNT", alias="trip_count"),
+            ],
+            grouping_keys=["pickup_hour", "borough"],
+            time_transforms=[
+                ContractTimeTransform(
+                    source_column="pickup_at",
+                    source_table="ft",
+                    time_function="HOUR",
+                    alias="pickup_hour",
+                ),
+            ],
+        )
+        step = result[0]
+        # pickup_hour 从 group_keys 移除
+        assert "pickup_hour" not in step.group_keys
+        assert "borough" in step.group_keys
+        # 加入 time_transforms
+        assert len(step.time_transforms) == 1
+        assert step.time_transforms[0].alias == "pickup_hour"
+
+    def test_mapper_empty_time_transforms(self):
+        """空 time_transforms——group_keys 保持不变。"""
+        result = _map_aggregations(
+            aggregations=[
+                ContractAggregation(function="COUNT", alias="trip_count"),
+            ],
+            grouping_keys=["borough"],
+            time_transforms=[],
+        )
+        step = result[0]
+        assert step.group_keys == ["borough"]
+        assert step.time_transforms == []
+
+
+class TestAdaptLiteToV1TimeTransforms:
+    """lite→v1 adapter 透传 time_transforms。"""
+
+    def test_adapt_preserves_time_transforms(self):
+        """time_transforms 应从 Lite 透传到 V1。"""
+        from tianshu_datadev.artifacts.models import DataTransformContractLite
+        lite = DataTransformContractLite(
+            contract_id="test",
+            source_sqlbuildplan_hash="abc",
+            grouping_keys=["pickup_hour"],
+            time_transforms=[
+                ContractTimeTransform(
+                    source_column="pickup_at",
+                    source_table="ft",
+                    time_function="HOUR",
+                    alias="pickup_hour",
+                ),
+            ],
+        )
+        v1 = adapt_lite_to_v1(lite)
+        assert len(v1.time_transforms) == 1
+        assert v1.time_transforms[0].alias == "pickup_hour"
+
+
+class TestCompileAggregateWithTimeTransforms:
+    """_compile_aggregate 渲染 time_transforms——集成验证。"""
+
+    def test_compile_generates_hour_in_groupby(self):
+        """编译产物应包含 F.hour(...).alias(...) 在 groupBy 中。"""
+        from tianshu_datadev.spark.models import (
+            SparkAggFunction,
+            SparkPlan,
+            SparkReadStep,
+            SparkTimeTransformExpr,
+        )
+        plan = SparkPlan(
+            plan_id="test",
+            source_contract_hash="abc",
+            steps=[
+                SparkReadStep(
+                    source_name="ft",
+                    alias="ft",
+                    input_key="ft",
+                ),
+                SparkAggregateStep(
+                    input_alias="ft",
+                    group_keys=["borough"],
+                    metrics=[
+                        SparkAggregateSpec(
+                            function=SparkAggFunction.COUNT,
+                            input_column=None,
+                            alias="trip_count",
+                        ),
+                    ],
+                    time_transforms=[
+                        SparkTimeTransformExpr(
+                            source_column="pickup_at",
+                            source_table="ft",
+                            time_function="hour",
+                            alias="pickup_hour",
+                        ),
+                    ],
+                ),
+            ],
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+        code = result.raw_pyspark
+        # groupBy 中应有 F.hour(...).alias("pickup_hour")
+        assert 'F.hour(F.col("ft.pickup_at")).alias("pickup_hour")' in code
+        # select 中应有 F.col("pickup_hour")——禁止 F.hour 再次出现
+        assert 'F.col("pickup_hour")' in code

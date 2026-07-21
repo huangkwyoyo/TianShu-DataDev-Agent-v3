@@ -957,24 +957,43 @@ class PlanComparator:
         """扁平化 AggregateStep——group_keys ColumnRef → 字符串，metrics aggregation → function。
 
         SQL AggregateStep 模型：
-        - group_keys: list[ColumnRef] → 需转为字符串列表
+        - group_keys: list[ColumnRef/DerivedGroupKey] → 需转为字符串列表
+          DerivedGroupKey（alias + expr.time_function）→ 提取为 time_transforms，从 group_keys 移除
         - metrics: list[AggregateSpec]，其中函数名字段为 "aggregation" → 需重命名为 "function"
           （Spark 侧 SparkAggregateSpec 使用 "function" 字段名）
+        - time_transforms: 已序列化的 SparkTimeTransformExpr（Spark 侧保留）
         """
         result = dict(step_dict)
 
-        # 扁平化 group_keys: ColumnRef dict → 字符串
+        # 扁平化 group_keys: ColumnRef dict → 字符串；DerivedGroupKey → time_transforms
         raw_groups = result.get("group_keys", [])
         if raw_groups:
             flat_groups: list[str] = []
+            time_transforms: list[dict[str, Any]] = []
             for g in raw_groups:
                 if isinstance(g, dict):
-                    flat_groups.append(
-                        str(g.get("normalized_name") or g.get("column_name", ""))
-                    )
+                    # DerivedGroupKey：含 alias + expr.time_function
+                    if "alias" in g and "expr" in g:
+                        expr = g.get("expr", {})
+                        if isinstance(expr, dict) and "time_function" in expr:
+                            time_transforms.append({
+                                "source_column": expr.get("source_column", ""),
+                                "source_table": expr.get("source_table", ""),
+                                "time_function": str(expr.get("time_function", "")).lower(),
+                                "alias": g["alias"],
+                            })
+                    else:
+                        # 普通 ColumnRef
+                        flat_groups.append(
+                            str(g.get("normalized_name") or g.get("column_name", ""))
+                        )
                 else:
                     flat_groups.append(str(g))
             result["group_keys"] = flat_groups
+            if time_transforms:
+                # 合并已存在的 time_transforms（Spark 侧）与新提取的（SQL 侧）
+                existing_tt = result.get("time_transforms", []) or []
+                result["time_transforms"] = existing_tt + time_transforms
 
         # 扁平化 metrics: aggregation → function（SQL/Spark 侧命名统一）
         raw_metrics = result.get("metrics", [])
