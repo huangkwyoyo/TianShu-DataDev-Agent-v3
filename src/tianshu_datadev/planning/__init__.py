@@ -41,6 +41,9 @@ from .program_factory import (
 # ── ProposalPromotion（Phase 4 Planner 核心三件套之三） ──
 from .proposal_promotion import ProposalPromotion
 
+# ── ProposalValidator（Phase 4 Planner 核心三件套之二）──
+from .proposal_validator import ProposalValidator
+
 # ── Join 推测模型 ──
 from .relationship_hypothesis import (
     EvidenceAction,
@@ -156,6 +159,8 @@ __all__ = [
     "SpecEnricher",
     # RequirementPlanner（Phase 4 Planner 核心三件套之一）
     "RequirementPlanner",
+    # ProposalValidator（Phase 4 Planner 核心三件套之二）
+    "ProposalValidator",
     # ProposalPromotion（Phase 4 Planner 核心三件套之三）
     "ProposalPromotion",
     # 交叉验证（Phase 4E 指标↔Join 一致性）

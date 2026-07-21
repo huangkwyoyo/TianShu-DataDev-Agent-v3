@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -23,6 +24,7 @@ from tianshu_datadev.artifacts.packager import PackageInputs, ReviewPackageBuild
 from tianshu_datadev.developer_spec.models import (
     DatasetType,
     ParsedDeveloperSpec,
+    RequirementProposal,
     StrictModel,
 )
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
@@ -36,7 +38,10 @@ from tianshu_datadev.planning.program_factory import (
     build_sql_program_from_chain,
     build_sql_program_from_compute_steps,
 )
+from tianshu_datadev.planning.proposal_promotion import ProposalPromotion
+from tianshu_datadev.planning.proposal_validator import ProposalValidator
 from tianshu_datadev.planning.relationship_planner import RelationshipPlanner
+from tianshu_datadev.planning.requirement_planner import RequirementPlanner
 from tianshu_datadev.planning.spec_enricher import SpecEnricher
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan, SqlBuildPlanBuilder
 from tianshu_datadev.planning.sql_program import SqlProgram
@@ -184,6 +189,15 @@ class LabelTableConfigError(Exception):
     """
 
 
+class ConfigError(Exception):
+    """Pipeline 配置错误——缺少 LLM Adapter 或 Planner 后仍有未解析列导致的阻断。"""
+
+
+def _gen_uuid() -> str:
+    """生成确定性短 UUID——用于 Proposal 标识。"""
+    return uuid.uuid4().hex[:12]
+
+
 class Pipeline:
     """执行流水线——确定性串联全部 6 个组件。
 
@@ -213,25 +227,30 @@ class Pipeline:
         developer_service=None,  # SparkDeveloperService | None，None → SKIPPED
         # ── v4-light 最终版: LabelExtractor 注入（label_table 必需）──
         label_extractor=None,  # LabelExtractor | None——None 时 label_table 请求报错
+        # ── v3.1: RequirementPlanner 注入（可选）──
+        requirement_planner: RequirementPlanner | None = None,
     ):
         """初始化流水线。
 
         Args:
             base_output_dir: ReviewPackage 输出根目录
             adapter: LLM Provider 适配器——None 时全链路确定性运行（Fake 模式），
-                     注入后 RelationshipPlanner + SpecEnricher 均走 LLM 推断。
+                     注入后 RequirementPlanner + RelationshipPlanner + SpecEnricher 均走 LLM 推断。
             default_table_paths: 默认表名→CSV 路径映射——当 API 调用未显式传入
                                  table_paths 时使用此回退值。E2E 测试环境用。
             duckdb_path: 外部 DuckDB 数据库文件路径——ATTACH 后自动创建 schema VIEW
                          桥接，使模板引用的 gold/silver 表可直接查询
             label_extractor: 标签提取器——label_table 类型 Spec 的处理入口。
                             None 时 label_table 请求返回结构化错误（禁止静默回退）。
+            requirement_planner: RequirementPlanner 实例——None 时跳过 Planner 阶段。
         """
         self._base_output_dir = base_output_dir
         self._results: dict[str, dict] = {}  # request_id → 内部产物
         self._packages: dict[str, object] = {}  # request_id → ReviewPackageManifest
         self._timestamps: dict[str, float] = {}  # request_id → 写入时间戳（用于 TTL 过期清理）
         self._ttl_seconds: int = 1800  # 缓存过期时间（秒），默认 30 分钟
+        # ── v3.1: 保存 adapter 引用——供 ConfigError 的条件判断 ──
+        self._adapter = adapter
         # adapter=None 时退化为纯规则/显式声明模式（确定性）
         self._relationship_planner = RelationshipPlanner(adapter=adapter)
         self._spec_enricher = SpecEnricher(adapter=adapter)
@@ -252,6 +271,10 @@ class Pipeline:
         self._llm_traces: dict[str, dict[str, LlmTraceNode]] = {}
         # ── 标签 Artifact 追踪——独立存储，不被 _store_result 覆盖 ──
         self._label_artifacts: dict[str, dict] = {}
+        # ── v3.1: RequirementPlanner 管线集成 ──
+        self._requirement_planner = requirement_planner
+        self._proposal_validator = ProposalValidator()
+        self._proposal_promotion = ProposalPromotion()
 
     def inject_snapshot_deps(
         self,
@@ -576,9 +599,10 @@ class Pipeline:
         manifest: SourceManifest,
         table_mapping: dict | None = None,
     ) -> tuple[ParsedDeveloperSpec, RelationshipHypothesis | None, list[OpenQuestion], dict[str, str]]:
-        """统一入口：SpecEnricher → RelationshipPlanner → 交叉验证。
+        """统一入口：RequirementPlanner → SpecEnricher(full) → unresolved 检查 → RelationshipPlanner。
 
-        消除 5 个入口点中重复的 15 行代码块。
+        v3.1 执行顺序反转——RequirementPlanner 先执行解出派生列，SpecEnricher 后执行完整 scope，
+        最后统一 unresolved 检查 + 交叉验证。
 
         Args:
             spec: 已解析的 DeveloperSpec
@@ -592,21 +616,86 @@ class Pipeline:
         if not table_mapping:
             table_mapping = _auto_table_mapping(spec)
 
-        # SpecEnricher：从业务描述推断缺失指标
-        spec = self._spec_enricher.apply_enrichment(spec, manifest)
-
-        # RelationshipPlanner：多表时生成 Join 推测
         extra_questions: list[OpenQuestion] = []
+
+        # ── 1. RequirementPlanner：有 Adapter 时先执行（v3.1 反转）──
+        if (self._requirement_planner is not None
+                and spec.dataset_type != DatasetType.LABEL_TABLE):
+            unresolved_before = _find_unresolved_derived_columns(spec)
+            if unresolved_before:
+                spec, planner_questions = self._run_requirement_planner(spec, manifest)
+                extra_questions.extend(planner_questions)
+
+        # ── 2. SpecEnricher：完整 scope，后执行 ──
+        if spec.dataset_type != DatasetType.LABEL_TABLE:
+            spec = self._spec_enricher.apply_enrichment(spec, manifest)
+
+        # ── 3. 统一 unresolved 检查（跳过有 compute_steps 的 spec——build 阶段自行解析）──
+        unresolved_after = _find_unresolved_derived_columns(spec)
+        has_compute_steps = bool(spec.compute_steps)
+        if unresolved_after and not has_compute_steps:
+            if self._adapter is None:
+                raise ConfigError(
+                    f"以下输出列无法解析且无 LLM Adapter 可用：{unresolved_after}"
+                )
+            else:
+                raise ConfigError(
+                    f"RequirementPlanner + SpecEnricher 后仍存在未解析列: {unresolved_after}"
+                )
+
+        # ── 4. RelationshipPlanner ──
         hypothesis = None
         if len(spec.input_tables) > 1:
-            hypothesis, extra_questions = self._relationship_planner.plan(spec, manifest)
-
-        # 交叉验证——指标推断 vs Join 推断一致性检查
-        if hypothesis:
-            xv_questions = cross_validate(spec, hypothesis, manifest)
-            extra_questions.extend(xv_questions)
+            hypothesis, rel_questions = self._relationship_planner.plan(spec, manifest)
+            extra_questions.extend(rel_questions)
+            # 交叉验证——指标推断 vs Join 推断一致性检查
+            if hypothesis:
+                xv_questions = cross_validate(spec, hypothesis, manifest)
+                extra_questions.extend(xv_questions)
 
         return spec, hypothesis, extra_questions, table_mapping or {}
+
+    def _run_requirement_planner(
+        self,
+        spec: ParsedDeveloperSpec,
+        manifest: SourceManifest,
+    ) -> tuple[ParsedDeveloperSpec, list[OpenQuestion]]:
+        """执行 RequirementPlanner → ProposalValidator → ProposalPromotion 流水线。
+
+        Args:
+            spec: 已解析的 DeveloperSpec
+            manifest: 源数据清单
+
+        Returns:
+            (更新后的 spec, 验证产生的 OpenQuestion 列表)
+        """
+        t0 = time.monotonic()
+
+        planner_output = self._requirement_planner.plan(spec, manifest)
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+        proposal = RequirementProposal(
+            proposal_id=_gen_uuid(),
+            spec_hash=spec.spec_hash,
+            dimensions=planner_output.dimensions,
+            derived_dimensions=planner_output.derived_dimensions,
+            metrics=planner_output.metrics,
+            case_when_rules=planner_output.case_when_rules,
+            uncertainties=planner_output.uncertainties,
+            llm_model=self._adapter.provider_name() if self._adapter else "",
+            inference_time_ms=elapsed_ms,
+            total_inferred=(len(planner_output.dimensions)
+                            + len(planner_output.derived_dimensions)
+                            + len(planner_output.metrics)
+                            + len(planner_output.case_when_rules)),
+        )
+
+        valid, questions = self._proposal_validator.validate(proposal, spec, manifest)
+        if not valid:
+            return spec, questions
+
+        spec = self._proposal_promotion.promote(proposal, spec)
+        return spec, questions
 
     def _parse_and_enrich(
         self,

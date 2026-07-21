@@ -132,6 +132,7 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
 
     from tianshu_datadev.config import load_dotenv
     from tianshu_datadev.llm.adapters.anthropic_adapter import AnthropicAdapter
+    from tianshu_datadev.planning.requirement_planner import RequirementPlanner
     from tianshu_datadev.prompts.manager import PromptManager
     from tianshu_datadev.spark.developer import SparkDeveloperService
 
@@ -220,6 +221,9 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
     # HTTP 监控中间件——记录请求事件，异常时 bare raise
     app.add_middleware(MonitorMiddleware)
 
+    # ── v3.1: 创建 RequirementPlanner（与 SpecEnricher 共享 adapter）──
+    requirement_planner = RequirementPlanner(adapter=planning_adapter) if planning_adapter else None
+
     # 注入流水线——未显式传入时仅在 E2E 测试模式下自动发现 CSV fixture 文件
     # 生产路径不扫描 tests/fixtures/，避免测试数据泄漏到生产环境
     if pipeline is None:
@@ -234,6 +238,7 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
                 duckdb_path=db_path,
                 developer_service=spark_developer_service,
                 label_extractor=llm_label_extractor,
+                requirement_planner=requirement_planner,
             )
             # ── 注入 SnapshotBuilder + SnapshotSourceProvider（仅当存在显式配置时）──
             # 白名单仅来自显式发现的 CSV fixture 文件，禁止自动扫描目录全量加入
@@ -244,6 +249,7 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
                 duckdb_path=db_path,
                 developer_service=spark_developer_service,
                 label_extractor=llm_label_extractor,
+                requirement_planner=requirement_planner,
             )
     app.state.pipeline = pipeline
     app.state.spark_developer_service = spark_developer_service
