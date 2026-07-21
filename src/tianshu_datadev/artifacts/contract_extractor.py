@@ -129,10 +129,11 @@ class DataTransformContractExtractor:
                     join_relationships.append(join_rel)
 
             elif isinstance(step, AggregateStep):
-                aggs, groups, biz_keys, time_transforms = self._extract_aggregate(step)
+                aggs, groups, biz_keys, _tts = self._extract_aggregate(step)
                 aggregations.extend(aggs)
                 grouping_keys.extend(groups)
                 business_keys.extend(biz_keys)
+                time_transforms.extend(_tts)
 
             elif isinstance(step, ProjectStep):
                 output_columns = self._extract_project(step)
@@ -627,10 +628,11 @@ class DataTransformContractExtractor:
                     if join_rel:
                         join_relationships.append(join_rel)
                 elif isinstance(step, AggregateStep):
-                    aggs, groups, biz_keys, time_transforms = self._extract_aggregate(step)
+                    aggs, groups, biz_keys, _tts = self._extract_aggregate(step)
                     aggregations.extend(aggs)
                     grouping_keys.extend(groups)
                     business_keys.extend(biz_keys)
+                    time_transforms.extend(_tts)
                 elif isinstance(step, ProjectStep):
                     output_columns = self._extract_project(
                         step,
