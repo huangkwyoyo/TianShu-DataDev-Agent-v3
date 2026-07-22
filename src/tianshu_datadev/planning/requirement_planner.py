@@ -412,6 +412,8 @@ class RequirementPlanner:
                 output_col = rule.get("output_column", "<unknown>")
                 uncertainties.append(UncertaintyEntry(
                     field_ref=f"case_when_rules.parse_error.{output_col}",
+                    output_column=output_col if output_col != "<unknown>" else None,
+                    output_kind="LABEL",
                     description=f"CASE WHEN 规则 '{output_col}' 解析失败：{e}",
                 ))
 
