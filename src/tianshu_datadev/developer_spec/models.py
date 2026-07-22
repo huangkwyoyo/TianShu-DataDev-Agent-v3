@@ -1061,6 +1061,8 @@ class ParsedDeveloperSpec(StrictModel):
     # ── RequirementPlanner 模型（v3.1 新增）──
     derived_dimensions: list[DerivedDimensionDecl] = Field(default_factory=list)
     case_when_rules: list[CaseWhenRule] = Field(default_factory=list)
+    # ── Planner 不确定性分类（v3.2 新增）──
+    uncertainties: list[UncertaintyEntry] = Field(default_factory=list)
     open_questions: list[OpenQuestion] = []
     parse_warnings: list[ParseWarning] = []
 
