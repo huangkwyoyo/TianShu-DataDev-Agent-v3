@@ -1908,7 +1908,9 @@ class SpecEnricher:
         # ── 合并 CASE WHEN 标签规则（H11）──
         case_when_data: list[dict] = meta.get("case_when_rules", [])
         new_case_when: list[CaseWhenDecl] = []
+        # 收集 Planner 已覆盖的输出列——SpecEnricher 不重复生成
         existing_label_cols = {r.output_column for r in spec.label_rules}
+        existing_label_cols.update(r.output_column for r in spec.case_when_rules)
         # 从 parser 层传递的 unresolved_case_when（校验失败 / AST 非法等）
         unresolved_cw: list[dict] = list(meta.get("unresolved_case_when", []))
         for cw_dict in case_when_data:
