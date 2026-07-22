@@ -536,168 +536,6 @@ class Pipeline:
 
     # ── 核心管线方法 ──────────────────────────────
 
-    def _prepare_spec_for_planning(
-        self, spec: ParsedDeveloperSpec,
-    ) -> ParsedDeveloperSpec:
-        """label_table 预处理——在 Enrich 之前执行标签提取+验证+提升。
-
-        仅处理 dataset_type == LABEL_TABLE 的 Spec。
-        其他类型直接返回原 spec。
-
-        Raises:
-            LabelTableConfigError: label_table 缺少配置、提取失败或无候选规则——
-                                   禁止静默回退，必须返回结构化错误
-        """
-        if spec.dataset_type != DatasetType.LABEL_TABLE:
-            return spec
-
-        # 1. 查找未解析的派生列——全部已解析（如 compute_steps）则无需标签提取
-        unresolved = _find_unresolved_derived_columns(spec)
-        if not unresolved:
-            return spec
-
-        # ── 2. label_table v1 作用域门禁——仅标签提取链路需要校验 ──
-        from tianshu_datadev.labels.label_scope import (
-            LabelScopeError,
-            validate_label_table_v1_scope,
-        )
-        try:
-            validate_label_table_v1_scope(spec)
-        except LabelScopeError as exc:
-            raise LabelTableConfigError(str(exc)) from exc
-
-        # 3. 标签提取——缺少配置时禁止静默回退
-        if self._label_extractor is None:
-            raise LabelTableConfigError(
-                "label_table 请求需要 LlmLabelExtractor，但未配置——"
-                "请设置 DEEPSEEK_API_KEY 环境变量，"
-                "或通过 Pipeline(label_extractor=...) 注入"
-            )
-
-        try:
-            # 诊断日志——追踪标签提取失败根因
-            _label_logger = logging.getLogger(__name__)
-            _label_logger.info(
-                "_handle_label_table: spec_id=%s, unresolved=%s, "
-                "description_len=%s, description_head=%s",
-                spec.spec_id,
-                unresolved,
-                len(spec.description),
-                spec.description[:300] if spec.description else "(empty)",
-            )
-            proposals, extraction_artifact = self._label_extractor.extract(
-                spec, unresolved,
-            )
-        except LabelTableConfigError:
-            raise
-        except Exception as exc:
-            raise LabelTableConfigError(
-                f"标签提取失败——LLM 调用异常: {exc}"
-            ) from exc
-
-        if not proposals:
-            raise LabelTableConfigError(
-                "标签提取失败——LLM 未返回任何标签规则候选，"
-                "请检查项目书正文是否包含标签分类逻辑"
-            )
-
-        # 4. 逐条验证
-        from tianshu_datadev.labels.label_rule_validator import LabelRuleValidator
-        validator = LabelRuleValidator()
-        reports = [validator.validate(p, spec) for p in proposals]
-
-        # 5. Promotion——双空阻断
-        from tianshu_datadev.labels.promotion import Promotion
-        promoter = Promotion()
-        promoted_rules, promotion_artifact = promoter.promote(
-            spec.spec_hash, proposals, reports, extraction_artifact,
-        )
-
-        # 6. 先保存 artifacts——确保门禁失败时仍可追溯提取和提升过程
-        request_id = self._gen_request_id(spec)
-        self._label_artifacts[request_id] = {
-            "extraction": extraction_artifact,
-            "promotion": promotion_artifact,
-        }
-
-        # 7. 标签规则集合门禁——promoted output 必须与 unresolved 完全一致
-        self._validate_label_rule_set(promoted_rules, unresolved)
-
-        # 8. 将 CaseWhenDecl 直接附加到 spec.label_rules——不追加 Proposal
-        spec.label_rules.extend(promoted_rules)
-
-        # 9. Promotion 后重新运行 resolver——仍有未解析列则结构化阻断
-        unresolved_after = _find_unresolved_derived_columns(spec)
-        if unresolved_after:
-            raise LabelTableConfigError(
-                "标签提升后仍存在未解析输出列——"
-                f"已提升 {len(promoted_rules)} 条规则，"
-                f"但以下列仍未解析: {unresolved_after}。"
-                "请检查 promoted_rules 的 output_column 是否覆盖了所有输出列。"
-            )
-
-        return spec
-
-    @staticmethod
-    def _validate_label_rule_set(
-        promoted_rules: list,
-        unresolved: list[str],
-    ) -> None:
-        """验证 promoted 输出列集合与 unresolved 列集合完全一致。
-
-        三项检查：
-        1. 缺失列——unresolved 中有但 promoted 中无 → 阻断
-        2. 额外列——promoted 中有但 unresolved 中无 → 阻断
-        3. 重复列——同一 output_column 出现多次 → 阻断
-
-        Args:
-            promoted_rules: 成功提升的 CaseWhenDecl 列表
-            unresolved: 原始未解析列名列表
-
-        Raises:
-            LabelTableConfigError: 集合门禁失败时
-        """
-        unresolved_set = set(unresolved)
-        promoted_cols: list[str] = [r.output_column for r in promoted_rules]
-        promoted_set = set(promoted_cols)
-
-        errors: list[str] = []
-
-        # 缺失列——unresolved 有要求但 promoted 未覆盖
-        missing = unresolved_set - promoted_set
-        if missing:
-            errors.append(
-                f"缺失标签规则——以下未解析列未被任何 promoted rule 覆盖: "
-                f"{sorted(missing)}"
-            )
-
-        # 额外列——promoted 产出了 unresolved 未要求的列
-        extra = promoted_set - unresolved_set
-        if extra:
-            errors.append(
-                f"额外标签输出列——以下 promoted output_column 不在 unresolved 列表中: "
-                f"{sorted(extra)}"
-            )
-
-        # 重复列——同一输出列被多条规则覆盖
-        seen: set[str] = set()
-        dupes: set[str] = set()
-        for col in promoted_cols:
-            if col in seen:
-                dupes.add(col)
-            seen.add(col)
-        if dupes:
-            errors.append(
-                f"重复标签输出列——以下 output_column 被多条规则覆盖: "
-                f"{sorted(dupes)}"
-            )
-
-        if errors:
-            raise LabelTableConfigError(
-                "标签规则集合门禁失败——"
-                + "；".join(errors)
-            )
-
     @staticmethod
     def _gen_request_id(spec: ParsedDeveloperSpec) -> str:
         """从 spec_hash 生成确定性 request_id。"""
@@ -737,6 +575,9 @@ class Pipeline:
 
         # ── 2. SpecEnricher：完整 scope，后执行 ──
         spec = self._spec_enricher.apply_enrichment(spec, manifest)
+
+        # ── 2.5. 标签规则处理——合并候选 + Extractor + Validator + Promotion
+        spec = self._prepare_labels(spec, manifest)
 
         # ── 3. 统一 unresolved 检查（跳过有 compute_steps 的 spec——build 阶段自行解析）──
         unresolved_after = _find_unresolved_derived_columns(spec)
@@ -810,6 +651,86 @@ class Pipeline:
         spec = self._proposal_promotion.promote(proposal, spec)
         return spec, questions
 
+    def _prepare_labels(
+        self, spec: ParsedDeveloperSpec, manifest,
+    ) -> ParsedDeveloperSpec:
+        """统一标签规则处理——在 Planner/Enricher 之后执行。
+
+        两条独立路径：
+        A) case_when_rules → ProposalValidator → spec.case_when_rules（已在 Planner 中处理）
+        B) LabelExtractor Proposal → LabelRuleValidator → Promotion → spec.label_rules
+
+        LabelExtractor 仅在以下条件全部满足时调用（修正 I1）：
+        1. dataset_type == LABEL_TABLE
+        2. Planner 标记 output_kind=LABEL
+        3. 列仍 unresolved
+        4. Planner 未生成该列的 case_when_rules
+
+        最后做覆盖冲突检查——同 output_column 两条规则 → blocking OpenQuestion。
+        """
+        # ── 路径 A：case_when_rules 已由 Planner 写入——无需额外处理
+
+        # ── 路径 B：LabelExtractor fallback（严格兜底条件）
+        if spec.dataset_type == DatasetType.LABEL_TABLE:
+            unresolved = _find_unresolved_derived_columns(spec)
+            if unresolved:
+                # 获取 Planner 已覆盖的输出列集合
+                planner_covered_cols = {r.output_column for r in spec.case_when_rules}
+                planner_covered_cols.update(r.output_column for r in spec.label_rules)
+
+                # 仅处理 Planner 标记为 LABEL、仍 unresolved、且 Planner 未生成规则的列
+                label_candidates = [
+                    col for col in unresolved
+                    if _get_output_kind(col, spec.uncertainties) == "LABEL"
+                    and col not in planner_covered_cols
+                ]
+                if label_candidates:
+                    if self._label_extractor is None:
+                        raise LabelTableConfigError(
+                            "label_table 需要 LlmLabelExtractor，但未配置——"
+                            "请设置 DEEPSEEK_API_KEY 环境变量"
+                        )
+                    proposals, extraction_artifact = self._label_extractor.extract(
+                        spec, label_candidates,
+                    )
+                    if proposals:
+                        from tianshu_datadev.labels.label_rule_validator import (
+                            LabelRuleValidator,
+                        )
+                        from tianshu_datadev.labels.promotion import Promotion
+                        validator = LabelRuleValidator()
+                        reports = [validator.validate(p, spec) for p in proposals]
+                        promoter = Promotion()
+                        promoted, promotion_artifact = promoter.promote(
+                            spec.spec_hash, proposals, reports, extraction_artifact,
+                        )
+                        spec = spec.model_copy(update={
+                            "label_rules": spec.label_rules + promoted,
+                        })
+                        request_id = self._gen_request_id(spec)
+                        self._label_artifacts[request_id] = {
+                            "extraction": extraction_artifact,
+                            "promotion": promotion_artifact,
+                        }
+
+        # ── 覆盖冲突检查——同 output_column 两条规则 → blocking OpenQuestion
+        conflict_questions = _check_label_rule_conflicts(spec)
+        if conflict_questions:
+            spec = spec.model_copy(update={
+                "open_questions": spec.open_questions + conflict_questions,
+            })
+
+        # ── label_table 门禁：至少一个合法标签列
+        if spec.dataset_type == DatasetType.LABEL_TABLE:
+            has_labels = bool(spec.label_rules) or bool(spec.case_when_rules)
+            if not has_labels:
+                raise LabelTableConfigError(
+                    "label_table 至少需要一个合法标签列——"
+                    "label_rules 和 case_when_rules 均为空"
+                )
+
+        return spec
+
     def _parse_and_enrich(
         self,
         method: str,
@@ -844,8 +765,6 @@ class Pipeline:
                 spec = parser.parse(markdown_text)
                 ctx.set_result(artifact_path=f"spec/{spec.spec_hash[:12]}")
             manifest = build_manifest_from_spec(spec)
-            # ── label_table 预处理（v4-light 最终版）──
-            spec = self._prepare_spec_for_planning(spec)
         except Exception as e:
             self._log_stage_failure(method, "parser", e)
             error_info = self._capture_error("parser", e)
