@@ -64,6 +64,8 @@ class ProposalValidator:
             available_names.add(d.dimension_name)
         for dd in spec.derived_dimensions:
             available_names.add(dd.dimension_name)
+        for m in spec.metrics:
+            available_names.add(m.alias)
         for d in proposal.dimensions:
             available_names.add(d.dimension_name)
         for dd in proposal.derived_dimensions:

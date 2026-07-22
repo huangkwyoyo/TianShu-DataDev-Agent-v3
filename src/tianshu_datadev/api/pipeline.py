@@ -382,7 +382,11 @@ class Pipeline:
         # ── 标签 Artifact 追踪——独立存储，不被 _store_result 覆盖 ──
         self._label_artifacts: dict[str, dict] = {}
         # ── v3.1: RequirementPlanner 管线集成 ──
-        self._requirement_planner = requirement_planner
+        # 注入 adapter 时自动创建 RequirementPlanner（与 RelationshipPlanner/SpecEnricher 一致）
+        if requirement_planner is None and adapter is not None:
+            self._requirement_planner = RequirementPlanner(adapter=adapter)
+        else:
+            self._requirement_planner = requirement_planner
         self._proposal_validator = ProposalValidator()
         self._proposal_promotion = ProposalPromotion()
 
@@ -732,6 +736,64 @@ class Pipeline:
                 )
 
         return spec
+
+    # ── 集成测试入口：对已解析 Spec 直接执行 Enrich + Plan ──
+
+    def run_parse_and_enrich(
+        self,
+        spec: ParsedDeveloperSpec,
+        table_mapping: dict[str, str] | None = None,
+    ) -> dict:
+        """对已解析的 Spec 直接执行 Enrich + Plan 阶段——集成测试入口。
+
+        跳过 Parser 阶段（spec 已解析），从 Enrich/Plan 阶段开始执行。
+        本方法不传 markdown_text，仅用于 pytest 直接构建 ParsedDeveloperSpec
+        的场景（如 test_label_table_unified.py 中的 _make_label_spec 辅助函数）。
+
+        Args:
+            spec: 已解析的 DeveloperSpec
+            table_mapping: 表名映射（None 时自动从 spec 推断）
+
+        Returns:
+            含 spec、hypothesis、open_questions 等信息的 dict
+        """
+        manifest = build_manifest_from_spec(spec)
+        if not table_mapping:
+            table_mapping = _auto_table_mapping(spec)
+
+        try:
+            enriched_spec, hypothesis, extra_questions, resolved_mapping = (
+                self._enrich_and_plan(spec, manifest, table_mapping)
+            )
+            blocking_questions = [q for q in extra_questions if q.blocking]
+            return {
+                "spec": enriched_spec,
+                "hypothesis": hypothesis,
+                "open_questions": _summarize_open_questions(extra_questions),
+                "validation_passed": len(blocking_questions) == 0,
+                "table_mapping": resolved_mapping,
+            }
+        except ConfigError as e:
+            # 仍有未解析列——完成 enrich 但标记阻断
+            blocking = _summarize_open_questions(spec.open_questions)
+            return {
+                "spec": spec,
+                "hypothesis": None,
+                "open_questions": blocking,
+                "validation_passed": False,
+                "error": str(e),
+                "table_mapping": table_mapping or {},
+            }
+        except LabelTableConfigError as e:
+            # label_table 配置错误——阻断
+            return {
+                "spec": spec,
+                "hypothesis": None,
+                "open_questions": _summarize_open_questions(spec.open_questions),
+                "validation_passed": False,
+                "error": str(e),
+                "table_mapping": table_mapping or {},
+            }
 
     def _parse_and_enrich(
         self,
