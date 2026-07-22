@@ -28,6 +28,7 @@ from tianshu_datadev.developer_spec.models import (
     RequirementPlannerOutput,
     RequirementProposal,
     StrictModel,
+    UncertaintyEntry,
 )
 from tianshu_datadev.developer_spec.parser import DeveloperSpecParser
 from tianshu_datadev.developer_spec.source_manifest import build_manifest_from_spec
@@ -199,6 +200,90 @@ class ConfigError(Exception):
 def _gen_uuid() -> str:
     """生成确定性短 UUID——用于 Proposal 标识。"""
     return uuid.uuid4().hex[:12]
+
+
+def _get_output_kind(
+    column_name: str,
+    uncertainties: list[UncertaintyEntry],
+) -> str:
+    """查询 Planner 对未解析列的分类。默认返回 "UNKNOWN"。
+
+    路由规则：
+    1. 精确匹配 output_column（路由主键）
+    2. output_column 为 None → 跳过
+    3. 不解析 field_ref 字符串
+    4. 无匹配 → "UNKNOWN"
+    """
+    for u in uncertainties:
+        if u.output_column is not None and u.output_column == column_name:
+            return u.output_kind
+    return "UNKNOWN"
+
+
+def _check_label_rule_conflicts(spec: ParsedDeveloperSpec) -> list[OpenQuestion]:
+    """检查 label_rules 和 case_when_rules 的 output_column 冲突。
+
+    同一 output_column 出现两条不同规则 → blocking OpenQuestion。
+    不根据 evaluation_phase 猜测来源——每条冲突都必须人工裁决。
+    """
+    label_cols = {r.output_column for r in spec.label_rules}
+    cw_cols = {r.output_column for r in spec.case_when_rules}
+    overlap = label_cols & cw_cols
+
+    if not overlap:
+        return []
+
+    return [
+        OpenQuestion(
+            question_id=f"LABEL_CONFLICT_{col}",
+            source="label_conflict",
+            field_ref=col,
+            description=(
+                f"输出列 '{col}' 在 label_rules 和 case_when_rules "
+                f"中存在两条不同规则——需人工裁决保留哪一条"
+            ),
+            blocking=True,
+        )
+        for col in sorted(overlap)
+    ]
+
+
+def _merge_uncertainties(
+    existing: list[UncertaintyEntry],
+    incoming: list[UncertaintyEntry],
+) -> list[UncertaintyEntry]:
+    """确定性合并 uncertainties——按 (output_column, field_ref) 去重。
+
+    新项覆盖同键旧项（Planner 最新输出优先），保留其他旧项。
+    不整体覆盖——避免丢弃与其他组件写入的诊断信息。
+    """
+    if not incoming:
+        return list(existing)
+
+    merged: dict[tuple[str | None, str], UncertaintyEntry] = {}
+    for u in existing:
+        key = (u.output_column, u.field_ref)
+        merged[key] = u
+    for u in incoming:
+        key = (u.output_column, u.field_ref)
+        merged[key] = u  # 同键覆盖
+
+    return list(merged.values())
+
+
+def _apply_uncertainties_to_spec(
+    spec: ParsedDeveloperSpec,
+    uncertainties: list[UncertaintyEntry],
+) -> ParsedDeveloperSpec:
+    """确定性合并 Planner 分类结果到 spec。
+
+    即使 Validator 失败也保留——artifact 审查需要分类证据。
+    使用 _merge_uncertainties 而非整体覆盖。
+    """
+    if not uncertainties:
+        return spec
+    merged = _merge_uncertainties(spec.uncertainties, uncertainties)
+    return spec.model_copy(update={"uncertainties": merged})
 
 
 def _extract_case_when_parse_errors(
