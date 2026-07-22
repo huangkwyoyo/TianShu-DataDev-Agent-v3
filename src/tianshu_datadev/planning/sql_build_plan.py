@@ -2040,7 +2040,6 @@ class SqlBuildPlanBuilder:
         对所有 dataset_type 执行未解析列检测——在 build 阶段就暴露问题，
         避免到 execute 阶段才以晦涩的 Binder Error 失败。
 
-        label_table 额外执行作用域门禁（单表、非聚合、禁止 NOT）。
         复用 _find_unresolved_derived_columns() 避免重复维护六类字段收集逻辑。
 
         Args:
@@ -2051,20 +2050,7 @@ class SqlBuildPlanBuilder:
         """
         from tianshu_datadev.labels.resolver import _find_unresolved_derived_columns
 
-        # 1. label_table 额外作用域门禁——单表、非聚合、禁止 NOT
-        if spec.dataset_type == DatasetType.LABEL_TABLE:
-            from tianshu_datadev.labels.label_scope import (
-                LabelScopeError,
-                validate_label_table_v1_scope,
-            )
-            try:
-                validate_label_table_v1_scope(spec)
-            except LabelScopeError as exc:
-                raise DerivedColumnRuleMissingError(
-                    f"label_table v1 作用域约束违反——{exc}"
-                ) from exc
-
-        # 2. 检查未解析输出列（所有 dataset_type 通用）
+        # 1. 检查未解析输出列（所有 dataset_type 通用）
         unresolved_output = _find_unresolved_derived_columns(spec)
 
         if unresolved_output:
