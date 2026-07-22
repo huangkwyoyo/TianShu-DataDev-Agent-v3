@@ -35,6 +35,7 @@ from tianshu_datadev.labels.resolver import _find_unresolved_derived_columns
 from tianshu_datadev.llm.models import LlmResponse, LlmTraceNode
 from tianshu_datadev.monitor import get_collector
 from tianshu_datadev.planning.cross_validator import cross_validate
+from tianshu_datadev.planning.models import ColumnRef
 from tianshu_datadev.planning.program_factory import (
     build_sql_program,
     build_sql_program_from_chain,
@@ -3118,7 +3119,7 @@ class Pipeline:
             keys = [f"{lk.column_name}={rk.column_name}" for lk, rk in step.join_keys]
             desc_parts.append(f"Join {step.right_table_ref} ({step.join_type}) ON {', '.join(keys)}")
         elif stype == "aggregate":
-            gk = [k.column_name for k in step.group_keys]
+            gk = [k.column_name if isinstance(k, ColumnRef) else k.alias for k in step.group_keys]
             ms = [m.alias for m in step.metrics]
             desc_parts.append(f"按 {', '.join(gk)} 分组，聚合: {', '.join(ms)}")
         elif stype == "project":

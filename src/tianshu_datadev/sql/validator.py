@@ -28,6 +28,7 @@ from tianshu_datadev.planning.relationship_hypothesis import (
     JoinEvidenceLevel,
     RelationshipHypothesis,
 )
+from tianshu_datadev.planning.models import ColumnRef
 from tianshu_datadev.planning.sql_build_plan import (
     AggregateStep,
     CaseWhenStep,
@@ -697,9 +698,11 @@ class SqlBuildPlanValidator:
             return
 
         # 收集所有 AggregateStep 的 group_keys 中的列名（归一化名）
+        # 兼容 ColumnRef / DatePartExpression / DerivedGroupKey 三种分组键类型
         for agg_step in ctx.aggregate_steps:
             actual_grain: set[str] = {
-                gk.normalized_name for gk in agg_step.group_keys
+                gk.normalized_name if isinstance(gk, ColumnRef) else gk.alias
+                for gk in agg_step.group_keys
             }
             missing = declared_dimensions - actual_grain
             if missing:
@@ -815,11 +818,15 @@ class SqlBuildPlanValidator:
 
         for step in ctx.plan.steps:
             if isinstance(step, AggregateStep):
-                available = {
-                    name
-                    for key in step.group_keys
-                    for name in (key.column_name, key.normalized_name)
-                }
+                available = set()
+                for key in step.group_keys:
+                    if isinstance(key, ColumnRef):
+                        available.add(key.column_name)
+                        available.add(key.normalized_name)
+                    else:
+                        # DatePartExpression / DerivedGroupKey——只暴露 alias
+                        available.add(key.alias)
+                available.discard("")
                 available.update(metric.alias for metric in step.metrics)
                 continue
 

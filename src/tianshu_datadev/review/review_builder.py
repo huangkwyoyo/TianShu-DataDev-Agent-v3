@@ -15,6 +15,7 @@ from tianshu_datadev.developer_spec.models import (
     SourceManifest,
 )
 from tianshu_datadev.planning.models import (
+    ColumnRef,
     Predicate,
     WindowExpr,
 )
@@ -453,7 +454,10 @@ class ReviewBuilder:
                 for m in step.metrics:
                     columns.append(m.alias)
                 for gk in step.group_keys:
-                    columns.append(gk.column_name)
+                    # 兼容 ColumnRef / DatePartExpression / DerivedGroupKey
+                    columns.append(
+                        gk.column_name if isinstance(gk, ColumnRef) else gk.alias
+                    )
 
         return columns
 
