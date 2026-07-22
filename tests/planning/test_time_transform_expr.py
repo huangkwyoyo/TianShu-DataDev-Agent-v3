@@ -431,6 +431,90 @@ class TestBuildAggregateStepWithDerivedDimensions:
         # 验证总 group_keys 数量——1 个 DerivedGroupKey
         assert len(agg.group_keys) == 1
 
+    def test_dimensions_date_part_dedup_with_derived_dimensions(self):
+        """dimensions 已有 DatePartExpression(alias="pickup_hour") 时，
+        derived_dimensions 中同名的 DerivedGroupKey 应被跳过——
+        防止 Builder→Contract→Mapper→Compiler 链路产生重复
+        time_transform 导致 Spark groupBy/agg 中同一列出现多次。"""
+        from tianshu_datadev.planning.models import DatePartExpression
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = ParsedDeveloperSpec(
+            spec_id="test_dedup", spec_hash="h_dedup",
+            title="测试去重",
+            description="dimensions+derived_dimensions 同名 date_part",
+            dataset_type=DatasetType.AGGREGATE_TABLE,
+            input_tables=[InputTableDecl(
+                table_alias="ft", source_table="fact_table",
+                columns=[ColumnDecl(
+                    column_name="pickup_at", normalized_name="pickup_at",
+                    data_type="timestamp",
+                )],
+                key_columns=[], business_columns=[],
+            )],
+            # dimensions 中已有 date_part="HOUR"——Builder 会生成
+            # DatePartExpression(part="HOUR", alias="pickup_hour")
+            dimensions=[DimensionDecl(
+                dimension_name="pickup_hour",
+                column_ref="pickup_at",
+                source_table="ft",
+                date_part="HOUR",
+            )],
+            # derived_dimensions 中又声明了同名 HOUR 派生维度——
+            # Builder 会生成 DerivedGroupKey(alias="pickup_hour")
+            derived_dimensions=[DerivedDimensionDecl(
+                dimension_name="pickup_hour",
+                source_column="pickup_at",
+                source_table="ft",
+                time_function="HOUR",
+            )],
+            metrics=[MetricDecl(
+                metric_name="trip_count",
+                aggregation=AggregationType.COUNT,
+                alias="trip_count",
+            )],
+            output_spec=OutputSpecDecl(
+                columns=[
+                    OutputColumnDecl(name="pickup_hour"),
+                    OutputColumnDecl(name="trip_count"),
+                ],
+                grain=[],
+            ),
+            time_range=None,
+        )
+
+        builder = SqlBuildPlanBuilder()
+        agg = builder._build_aggregate_step(spec, primary_table="ft")
+
+        # 验证：pickup_hour 相关的 group_key 仅有一条
+        pickup_keys = [
+            gk for gk in agg.group_keys
+            if (
+                (isinstance(gk, DatePartExpression) and gk.alias == "pickup_hour")
+                or (isinstance(gk, DerivedGroupKey) and gk.alias == "pickup_hour")
+            )
+        ]
+        assert len(pickup_keys) == 1, (
+            f"pickup_hour 应在 group_keys 中仅出现一次，"
+            f"实际={[(type(g).__name__, getattr(g, 'alias', None)) for g in pickup_keys]}"
+        )
+
+        # 验证：保留的是 DatePartExpression（dimensions 优先于 derived_dimensions）
+        assert isinstance(pickup_keys[0], DatePartExpression), (
+            f"应保留 dimensions 的 DatePartExpression，"
+            f"实际类型={type(pickup_keys[0]).__name__}"
+        )
+
+        # 验证：不应存在 DerivedGroupKey(alias="pickup_hour")
+        derived_pickup = [
+            gk for gk in agg.group_keys
+            if isinstance(gk, DerivedGroupKey) and gk.alias == "pickup_hour"
+        ]
+        assert len(derived_pickup) == 0, (
+            f"DerivedGroupKey(pickup_hour) 应被去重跳过，"
+            f"实际={[(g.alias, g.expr.time_function) for g in derived_pickup]}"
+        )
+
 
 class TestBuildCaseWhenStepsWithCaseWhenRules:
     """_build_case_when_steps 处理 case_when_rules。"""

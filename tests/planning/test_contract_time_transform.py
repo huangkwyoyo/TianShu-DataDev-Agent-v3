@@ -102,6 +102,8 @@ from tianshu_datadev.artifacts.contract_extractor import DataTransformContractEx
 from tianshu_datadev.developer_spec.models import AggregationType
 from tianshu_datadev.planning.models import (
     AggregateSpec,
+    ColumnRef,
+    DatePartExpression,
     DerivedGroupKey,
     TimeTransformExpr,
 )
@@ -281,3 +283,55 @@ class TestCompileAggregateWithTimeTransforms:
         assert 'F.hour(F.col("ft.pickup_at")).alias("pickup_hour")' in code
         # select 中应有 F.col("pickup_hour")——禁止 F.hour 再次出现
         assert 'F.col("pickup_hour")' in code
+
+
+class TestExtractAggregateDedupDatePartAndDerivedGroupKey:
+    """_extract_aggregate 去重：DatePartExpression + DerivedGroupKey 共存时
+    不应产生重复的 time_transform 和 group 条目。"""
+
+    def test_dedup_prevents_duplicate_time_transforms(self):
+        """同一 alias 的 DatePartExpression + DerivedGroupKey →
+        groups 和 time_transforms 各仅一条。"""
+        agg = AggregateStep(
+            step_id="agg_dedup",
+            group_keys=[
+                # 场景：dimensions 中有 date_part="HOUR" 的 DatePartExpression
+                DatePartExpression(
+                    part="HOUR",
+                    column=ColumnRef(
+                        table_ref="ft",
+                        column_name="pickup_at",
+                        normalized_name="pickup_at",
+                    ),
+                    alias="pickup_hour",
+                ),
+                # derived_dimensions 中有同名的 DerivedGroupKey
+                DerivedGroupKey(
+                    alias="pickup_hour",
+                    expr=TimeTransformExpr(
+                        source_column="pickup_at",
+                        source_table="ft",
+                        time_function="HOUR",
+                    ),
+                ),
+            ],
+            metrics=[
+                AggregateSpec(
+                    aggregation=AggregationType.COUNT,
+                    input_column=None,
+                    alias="trip_count",
+                ),
+            ],
+        )
+        aggs, groups, biz_keys, time_transforms, derived_columns = (
+            DataTransformContractExtractor._extract_aggregate(agg)
+        )
+        # groups 中 "pickup_hour" 仅出现一次
+        assert groups.count("pickup_hour") == 1, (
+            f"groups 中 pickup_hour 应仅一次，实际={groups}"
+        )
+        # time_transforms 中 pickup_hour 仅出现一次
+        pickup_tt = [tt for tt in time_transforms if tt.alias == "pickup_hour"]
+        assert len(pickup_tt) == 1, (
+            f"time_transforms 中 pickup_hour 应仅一条，实际={len(pickup_tt)}"
+        )

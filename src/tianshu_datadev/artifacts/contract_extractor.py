@@ -412,20 +412,32 @@ class DataTransformContractExtractor:
 
         # 分组键：DerivedGroupKey → time_transform + alias key
         # ColumnRef → normalized_name + business_key
+        # 防御纵深：DatePartExpression 和 DerivedGroupKey 可能共存于 group_keys
+        # （上游 Builder 已做去重，此处兜底），防止 Contract→Mapper 链路产生重复
+        # time_transform 导致 Spark groupBy/agg 中同一列出现多次。
+        seen_groups: set[str] = set()
+        seen_transforms: set[str] = set()
         for gk in step.group_keys:
             if isinstance(gk, DerivedGroupKey):
-                groups.append(gk.alias)
-                time_transforms.append(
-                    ContractTimeTransform(
-                        source_column=gk.expr.source_column,
-                        source_table=gk.expr.source_table,
-                        time_function=gk.expr.time_function,
-                        alias=gk.alias,
+                if gk.alias not in seen_groups:
+                    groups.append(gk.alias)
+                    seen_groups.add(gk.alias)
+                if gk.alias not in seen_transforms:
+                    time_transforms.append(
+                        ContractTimeTransform(
+                            source_column=gk.expr.source_column,
+                            source_table=gk.expr.source_table,
+                            time_function=gk.expr.time_function,
+                            alias=gk.alias,
+                        )
                     )
-                )
+                    seen_transforms.add(gk.alias)
             elif isinstance(gk, DatePartExpression):
-                groups.append(gk.normalized_name)
-                biz_keys.append(gk.normalized_name)
+                key = gk.normalized_name
+                if key not in seen_groups:
+                    groups.append(key)
+                    seen_groups.add(key)
+                biz_keys.append(key)
                 if gk.alias:
                     derived.append(ContractDerivedColumn(
                         output_column=gk.alias,
@@ -434,8 +446,11 @@ class DataTransformContractExtractor:
                         date_part=gk.part,
                     ))
             elif isinstance(gk, ColumnRef):
-                groups.append(gk.normalized_name)
-                biz_keys.append(gk.normalized_name)
+                key = gk.normalized_name
+                if key not in seen_groups:
+                    groups.append(key)
+                    seen_groups.add(key)
+                biz_keys.append(key)
 
         return aggs, groups, biz_keys, time_transforms, derived
 

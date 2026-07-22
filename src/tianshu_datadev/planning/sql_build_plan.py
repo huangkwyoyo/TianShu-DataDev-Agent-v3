@@ -3064,7 +3064,17 @@ class SqlBuildPlanBuilder:
                 group_cols.append(source)
 
         # 派生维度 → DerivedGroupKey（含 TimeTransformExpr）
+        # 去重：若 dimensions 中已有同名 DatePartExpression（相同语义、不同模型），
+        # DerivedGroupKey 会被 Contract→Mapper→Compiler 链路重复追加为
+        # time_transform，导致 Spark 的 groupBy/agg 中出现重复列引用。
+        existing_aliases = {
+            g.alias
+            for g in group_cols
+            if isinstance(g, (DatePartExpression, DerivedGroupKey))
+        }
         for dd in spec.derived_dimensions:
+            if dd.dimension_name in existing_aliases:
+                continue
             group_cols.append(DerivedGroupKey(
                 alias=dd.dimension_name,
                 expr=TimeTransformExpr(
