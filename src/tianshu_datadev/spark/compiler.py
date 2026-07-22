@@ -464,6 +464,11 @@ class SparkCompiler:
                 # 仅在无 FILTER 时触发——有 FILTER 时 F.when() 已推导类型。
                 if fn_name in ("F.sum",) and not m.filter:
                     inner = f"{inner}.cast('double')"
+                # AVG 对 DECIMAL 列精度受限——Spark 返回 DecimalType(38,6)
+                # 仅 6 位小数，而 DuckDB 隐式转 DOUBLE 后返回全精度 ~15 位。
+                # 统一 cast 为 double 消除跨引擎 ~1e-7 AVG 差异。
+                if fn_name in ("F.avg",):
+                    inner = f"{inner}.cast('double')"
             else:
                 # COUNT(*) → F.lit(1)
                 inner = "F.lit(1)"
