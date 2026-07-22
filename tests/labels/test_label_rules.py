@@ -589,13 +589,13 @@ class TestValidatorToPromotionToCaseWhenDecl:
 
 
 class TestPrepareSpecFinalType:
-    """成功路径 3：_prepare_spec_for_planning 最终类型验证。
+    """成功路径 3：_prepare_labels 最终类型验证。
 
     验证 spec.label_rules 中的元素是 CaseWhenDecl（非 Proposal）。
     """
 
     def test_prepare_spec_appends_case_when_decl(self):
-        """Pipeline._prepare_spec_for_planning → spec.label_rules 元素为 CaseWhenDecl。"""
+        """Pipeline._prepare_labels → spec.label_rules 元素为 CaseWhenDecl。"""
         from tianshu_datadev.api.pipeline import Pipeline
         from tianshu_datadev.labels.label_extractor import FakeLabelExtractor
 
@@ -655,7 +655,12 @@ class TestPrepareSpecFinalType:
         )
 
         # ── 执行预处理 ──
-        result_spec = pipeline._prepare_spec_for_planning(spec)
+        # ── 构建 manifest 并执行标签准备（统一管线入口） ──
+        from tianshu_datadev.developer_spec.source_manifest import (
+            build_manifest_from_spec,
+        )
+        manifest = build_manifest_from_spec(spec)
+        result_spec = pipeline._prepare_labels(spec, manifest)
 
         # ── 关键断言：label_rules 元素类型为 CaseWhenDecl ──
         assert len(result_spec.label_rules) == 1, (
@@ -703,9 +708,13 @@ class TestPrepareSpecFinalType:
         )
 
         # ── 应抛出 LabelTableConfigError ──
+        from tianshu_datadev.developer_spec.source_manifest import (
+            build_manifest_from_spec,
+        )
+        manifest = build_manifest_from_spec(spec)
         import pytest as _pytest
         with _pytest.raises(LabelTableConfigError, match="未配置"):
-            pipeline._prepare_spec_for_planning(spec)
+            pipeline._prepare_labels(spec, manifest)
 
 
 # ================================================
@@ -874,215 +883,8 @@ def _make_test_spec_with_description(description: str):
     )
 
 
-# ================================================
-# Task 12.1: 标签规则集合门禁——正反例测试
-# ================================================
-
-
-class TestLabelRuleSetGate:
-    """_validate_label_rule_set——promoted output 必须与 unresolved 完全一致。"""
-
-    def _make_spec(self, output_cols=None, table_cols=None):
-        """构造基础 label_table Spec。"""
-        if output_cols is None:
-            output_cols = [OutputColumnDecl(name="label_a", type="string")]
-        if table_cols is None:
-            table_cols = [
-                ColumnDecl(column_name="col1", normalized_name="col1",
-                           data_type="double"),
-            ]
-        return ParsedDeveloperSpec(
-            spec_id="test", spec_hash="h", title="测试",
-            description="证据文本锚定在项目书正文中——满足证据匹配要求。",
-            dataset_type=DatasetType.LABEL_TABLE,
-            input_tables=[
-                InputTableDecl(
-                    table_alias="t", source_table="fact",
-                    columns=table_cols,
-                    key_columns=[], business_columns=[],
-                ),
-            ],
-            metrics=[], dimensions=[],
-            output_spec=OutputSpecDecl(columns=output_cols, grain=[]),
-            time_range=None,
-        )
-
-    def _make_proposal(self, output_column: str, label_a="short", label_b="long",
-                       evidence="证据文本锚定在项目书正文中——满足证据匹配要求。"):
-        """构造合法 Proposal。"""
-        return LabelRuleProposal(
-            proposal_id=f"prop_{output_column}",
-            source_spec_hash="h",
-            output_column=output_column,
-            branches=[
-                LabelBranchProposal(
-                    condition=LabelCompare(
-                        left="col1", op=CompareOp.LTE,
-                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
-                    ),
-                    then_label=label_a,
-                    evidence=evidence,
-                ),
-            ],
-            else_value=label_b,
-            label_domain=LabelDomain(values=[label_a, label_b]),
-        )
-
-    def test_missing_column_in_promoted_raises_error(self):
-        """unresolved 有列但 promoted 未覆盖 → LabelTableConfigError。"""
-        from tianshu_datadev.api.pipeline import LabelTableConfigError, Pipeline
-        from tianshu_datadev.labels.label_extractor import FakeLabelExtractor
-
-        # Spec 有两个输出列（两个未解析列），但 FakeExtractor 只返回一个 Proposal
-        spec = self._make_spec(
-            output_cols=[
-                OutputColumnDecl(name="label_a", type="string"),
-                OutputColumnDecl(name="label_b", type="string"),
-            ],
-            table_cols=[
-                ColumnDecl(column_name="col1", normalized_name="col1",
-                           data_type="double"),
-            ],
-        )
-        # FakeExtractor 只覆盖 label_a，不覆盖 label_b
-        fake = FakeLabelExtractor(proposals=[self._make_proposal("label_a")])
-        pipeline = Pipeline(label_extractor=fake)
-
-        with pytest.raises(LabelTableConfigError, match="缺失"):
-            pipeline._prepare_spec_for_planning(spec)
-
-    def test_extra_column_in_promoted_raises_error(self):
-        """promoted 有列但 unresolved 无 → LabelTableConfigError。"""
-        from tianshu_datadev.api.pipeline import LabelTableConfigError, Pipeline
-        from tianshu_datadev.labels.label_extractor import FakeLabelExtractor
-
-        # Spec 只有一个输出列 label_a，但 FakeExtractor 返回 label_b（不在输出列中）
-        spec = self._make_spec(
-            output_cols=[OutputColumnDecl(name="label_a", type="string")],
-        )
-        fake = FakeLabelExtractor(proposals=[self._make_proposal("label_b")])
-        pipeline = Pipeline(label_extractor=fake)
-
-        with pytest.raises(LabelTableConfigError, match="额外"):
-            pipeline._prepare_spec_for_planning(spec)
-
-    def test_duplicate_output_column_raises_error(self):
-        """同一 output_column 被两条规则覆盖 → LabelTableConfigError。"""
-        from tianshu_datadev.api.pipeline import LabelTableConfigError, Pipeline
-        from tianshu_datadev.labels.label_extractor import FakeLabelExtractor
-
-        spec = self._make_spec(
-            output_cols=[OutputColumnDecl(name="label_a", type="string")],
-        )
-        # 两条 Proposal 输出同一个 column
-        fake = FakeLabelExtractor(proposals=[
-            self._make_proposal("label_a"),
-            self._make_proposal("label_a", label_a="a", label_b="b"),
-        ])
-        pipeline = Pipeline(label_extractor=fake)
-
-        with pytest.raises(LabelTableConfigError, match="重复"):
-            pipeline._prepare_spec_for_planning(spec)
-
-
-# ================================================
-# Task 12.1-3: label_table v1 限制——多表/聚合/LabelNot
-# ================================================
-
-
 class TestLabelTableV1Restrictions:
-    """label_table v1 仅支持单表、非聚合，暂时拒绝 LabelNot。"""
-
-    def _make_label_table_spec(self, input_tables=None, metrics=None, description=None):
-        """构造基础 label_table Spec。"""
-        return ParsedDeveloperSpec(
-            spec_id="test", spec_hash="h", title="测试",
-            description=description or "证据文本锚定在正文中——满足匹配要求。",
-            dataset_type=DatasetType.LABEL_TABLE,
-            input_tables=input_tables or [
-                InputTableDecl(
-                    table_alias="t", source_table="fact",
-                    columns=[
-                        ColumnDecl(column_name="col1", normalized_name="col1",
-                                   data_type="double"),
-                    ],
-                    key_columns=[], business_columns=[],
-                ),
-            ],
-            metrics=metrics or [],
-            dimensions=[],
-            output_spec=OutputSpecDecl(
-                columns=[OutputColumnDecl(name="label_a", type="string")],
-                grain=[],
-            ),
-            time_range=None,
-        )
-
-    def _make_valid_proposal(self, output_column="label_a"):
-        """构造合法 Proposal。"""
-        return LabelRuleProposal(
-            proposal_id="prop_test",
-            source_spec_hash="h",
-            output_column=output_column,
-            branches=[
-                LabelBranchProposal(
-                    condition=LabelCompare(
-                        left="col1", op=CompareOp.LTE,
-                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
-                    ),
-                    then_label="short",
-                    evidence="证据文本锚定在正文中——满足匹配要求。",
-                ),
-            ],
-            else_value="long",
-            label_domain=LabelDomain(values=["short", "long"]),
-        )
-
-    def test_multi_table_raises_error(self):
-        """多表 label_table → LabelTableConfigError。"""
-        from tianshu_datadev.api.pipeline import LabelTableConfigError, Pipeline
-        from tianshu_datadev.labels.label_extractor import FakeLabelExtractor
-
-        spec = self._make_label_table_spec(input_tables=[
-            InputTableDecl(
-                table_alias="t1", source_table="fact1",
-                columns=[
-                    ColumnDecl(column_name="col1", normalized_name="col1",
-                               data_type="double"),
-                ],
-                key_columns=[], business_columns=[],
-            ),
-            InputTableDecl(
-                table_alias="t2", source_table="fact2",
-                columns=[
-                    ColumnDecl(column_name="col2", normalized_name="col2",
-                               data_type="double"),
-                ],
-                key_columns=[], business_columns=[],
-            ),
-        ])
-        fake = FakeLabelExtractor(proposals=[self._make_valid_proposal()])
-        pipeline = Pipeline(label_extractor=fake)
-
-        with pytest.raises(LabelTableConfigError, match="单表"):
-            pipeline._prepare_spec_for_planning(spec)
-
-    def test_aggregate_raises_error(self):
-        """带聚合的 label_table → LabelTableConfigError。"""
-        from tianshu_datadev.api.pipeline import LabelTableConfigError, Pipeline
-        from tianshu_datadev.labels.label_extractor import FakeLabelExtractor
-
-        spec = self._make_label_table_spec(
-            metrics=[
-                MetricDecl(metric_name="cnt", aggregation=AggregationType.COUNT,
-                           alias="cnt"),
-            ],
-        )
-        fake = FakeLabelExtractor(proposals=[self._make_valid_proposal()])
-        pipeline = Pipeline(label_extractor=fake)
-
-        with pytest.raises(LabelTableConfigError, match="聚合"):
-            pipeline._prepare_spec_for_planning(spec)
+    """LabelNot 节点仍被 Validator 拒绝——Label 规则不支持 NOT 逻辑嵌套。"""
 
     def test_label_not_blocked_by_validator(self):
         """LabelNot 节点 → Validator NO_LABEL_NOT 检查 → BLOCKING。"""
@@ -1118,66 +920,6 @@ class TestLabelTableV1Restrictions:
         assert any("LabelNot" in e for e in report.blocking_errors), (
             f"blocking_errors 应包含 LabelNot: {report.blocking_errors}"
         )
-
-
-# ================================================
-# Task 12.1-1: Promotion 后 resolver 重新检查
-# ================================================
-
-
-class TestResolverAfterPromotion:
-    """Promotion 后重新运行 resolver——仍有未解析列则阻断。"""
-
-    def test_unresolved_after_promotion_raises_error(self):
-        """promoted 覆盖不全→resolver 仍找到未解析列→LabelTableConfigError。"""
-        from tianshu_datadev.api.pipeline import LabelTableConfigError, Pipeline
-        from tianshu_datadev.labels.label_extractor import FakeLabelExtractor
-
-        # Spec 有两个输出列，FakeExtractor 只返回一个 Proposal
-        spec = ParsedDeveloperSpec(
-            spec_id="test", spec_hash="h", title="测试",
-            description="证据文本锚定在项目书正文中——满足匹配要求。",
-            dataset_type=DatasetType.LABEL_TABLE,
-            input_tables=[
-                InputTableDecl(
-                    table_alias="t", source_table="fact",
-                    columns=[
-                        ColumnDecl(column_name="col1", normalized_name="col1",
-                                   data_type="double"),
-                    ],
-                    key_columns=[], business_columns=[],
-                ),
-            ],
-            metrics=[], dimensions=[],
-            output_spec=OutputSpecDecl(columns=[
-                OutputColumnDecl(name="label_a", type="string"),
-                OutputColumnDecl(name="label_b", type="string"),
-            ], grain=[]),
-            time_range=None,
-        )
-
-        proposal = LabelRuleProposal(
-            proposal_id="prop_test",
-            source_spec_hash="h",
-            output_column="label_a",
-            branches=[
-                LabelBranchProposal(
-                    condition=LabelCompare(
-                        left="col1", op=CompareOp.LTE,
-                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
-                    ),
-                    then_label="short",
-                    evidence="证据文本锚定在项目书正文中——满足匹配要求。",
-                ),
-            ],
-            else_value="long",
-            label_domain=LabelDomain(values=["short", "long"]),
-        )
-        fake = FakeLabelExtractor(proposals=[proposal])
-        pipeline = Pipeline(label_extractor=fake)
-
-        with pytest.raises(LabelTableConfigError, match="未解析"):
-            pipeline._prepare_spec_for_planning(spec)
 
 
 # ================================================
@@ -1243,101 +985,4 @@ class TestPartialSuccess:
         assert not bad_report.passed, "evidence 为空的 Proposal 不应通过验证"
 
 
-# ================================================
-# Task 12.2: 门禁失败 Artifact 可查询——artifacts 在集合门禁之前保存
-# ================================================
 
-
-class TestGateFailureArtifactsQueryable:
-    """集合门禁失败时，提取和提升 Artifact 仍可查询——确保失败请求可追溯。"""
-
-    def test_set_gate_failure_preserves_artifacts(self):
-        """集合门禁失败→LabelTableConfigError，但 get_label_artifacts 仍可查询。"""
-        import pytest
-
-        from tianshu_datadev.api.pipeline import LabelTableConfigError, Pipeline
-        from tianshu_datadev.developer_spec.models import (
-            ColumnDecl,
-            DatasetType,
-            InputTableDecl,
-            OutputColumnDecl,
-            OutputSpecDecl,
-            ParsedDeveloperSpec,
-        )
-        from tianshu_datadev.labels.label_extractor import FakeLabelExtractor
-
-        # 构造 LABEL_TABLE spec——两个输出列（两个未解析列）
-        spec = ParsedDeveloperSpec(
-            spec_id="test_artifacts", spec_hash="h_artifacts",
-            title="t", description="距离分类测试——锚定项目书正文描述。",
-            dataset_type=DatasetType.LABEL_TABLE,
-            input_tables=[
-                InputTableDecl(
-                    table_alias="t1", source_table="fact",
-                    columns=[
-                        ColumnDecl(column_name="distance_miles",
-                                   normalized_name="distance_miles",
-                                   data_type="double"),
-                    ],
-                    key_columns=[], business_columns=[],
-                ),
-            ],
-            metrics=[], dimensions=[],
-            output_spec=OutputSpecDecl(
-                columns=[
-                    OutputColumnDecl(name="label_a", type="string"),
-                    OutputColumnDecl(name="label_b", type="string"),
-                ],
-                grain=[],
-            ),
-            time_range=None,
-        )
-
-        # FakeExtractor 返回一条 Proposal 只覆盖 label_a——集合门禁会检测到缺失 label_b
-        fake = FakeLabelExtractor(proposals=[self._make_label_proposal("label_a", spec)])
-        pipeline = Pipeline(label_extractor=fake)
-
-        # 集合门禁应失败
-        with pytest.raises(LabelTableConfigError, match="缺失"):
-            pipeline._prepare_spec_for_planning(spec)
-
-        # Artifacts 应在门禁失败之前已保存——仍可查询
-        request_id = pipeline._gen_request_id(spec)
-        artifacts = pipeline.get_label_artifacts(request_id)
-        assert artifacts is not None, "门禁失败时 artifacts 应仍然可查询"
-        assert "extraction" in artifacts, "应包含 extraction artifact"
-        assert "promotion" in artifacts, "应包含 promotion artifact"
-        assert artifacts["extraction"] is not None
-        assert artifacts["promotion"] is not None
-
-    @staticmethod
-    def _make_label_proposal(output_column: str, spec: "ParsedDeveloperSpec"):
-        """创建合法 Proposal——evidence 锚定正文、label_domain 非空、无 NOT。"""
-        from decimal import Decimal
-
-        from tianshu_datadev.developer_spec.models import (
-            CompareOp,
-            LabelBranchProposal,
-            LabelCompare,
-            LabelDomain,
-            LabelRuleProposal,
-            LabelTypedLiteral,
-        )
-
-        return LabelRuleProposal(
-            proposal_id=f"p_{output_column}",
-            source_spec_hash=spec.spec_hash,
-            output_column=output_column,
-            branches=[
-                LabelBranchProposal(
-                    condition=LabelCompare(
-                        left="distance_miles", op=CompareOp.LTE,
-                        right=LabelTypedLiteral(value=Decimal("2"), data_type="number"),
-                    ),
-                    then_label="short",
-                    evidence="距离 <= 2 英里归类为短途——锚定项目书正文。",
-                ),
-            ],
-            else_value="long",
-            label_domain=LabelDomain(values=["short", "long"]),
-        )

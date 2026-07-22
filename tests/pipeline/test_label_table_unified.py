@@ -358,10 +358,15 @@ def test_i6_label_kind_triggers_extractor():
     assert call_count[0] == 1, f"Extractor 应被调用 1 次，实际 {call_count[0]} 次"
 
 
-# ═══ I7: UNKNOWN 不调用 Extractor ═══
+# ═══ I7: UNKNOWN 兜底调用 Extractor ═══
 
 def test_i7_unknown_kind_no_extractor():
-    """output_kind=UNKNOWN → unresolved 检查阻断，Extractor 不执行。"""
+    """output_kind=UNKNOWN 但无已有规则 → 兜底逻辑调用 Extractor（向后兼容）。
+
+    兜底逻辑：当 Planner 未标记任何 LABEL 列、且 label_rules/case_when_rules
+    均为空时，对所有 unresolved 列调用 LabelExtractor。
+    Extractor 返回空 proposals → 门禁检查失败 → LabelTableConfigError。
+    """
     spec = _make_label_spec(
         input_tables=[{"name": "t", "key_columns": ["id"], "columns": [("id", "int"), ("val", "double")]}],
         output_columns=["val", "unknown_col"],
@@ -390,10 +395,12 @@ def test_i7_unknown_kind_no_extractor():
         adapter=adapter,
         label_extractor=CountingFakeExtractor(proposals=[]),
     )
-    # UNKNOWN → unresolved 检查应阻断，Pipeline 返回错误但不抛异常
+    # 兜底逻辑触发 Extractor 调用，但空 proposals 导致门禁失败
     result = pipeline.run_parse_and_enrich(spec)
-    # Extractor 不应被调用（UNKNOWN 不走 LabelExtractor）
-    assert call_count[0] == 0
+    # Extractor 被兜底逻辑调用了一次
+    assert call_count[0] == 1
+    # 门禁失败——空规则 + 仍有 unresolved 列
+    assert result["validation_passed"] is False
 
 
 # ═══ I8: 非 label_table 的 Planner CASE WHEN 正常 ═══
