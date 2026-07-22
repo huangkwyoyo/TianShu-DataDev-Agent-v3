@@ -335,3 +335,67 @@ class TestExtractAggregateDedupDatePartAndDerivedGroupKey:
         assert len(pickup_tt) == 1, (
             f"time_transforms 中 pickup_hour 应仅一条，实际={len(pickup_tt)}"
         )
+
+
+class TestExtractAggregateWithMetricFilter:
+    """_extract_aggregate 透传 MetricFilterDecl filter。"""
+
+    def test_metric_filter_propagated_to_contract_aggregation(self):
+        """带 filter 的 AggregateSpec -> ContractAggregation.filter 非空。"""
+        from tianshu_datadev.developer_spec.models import MetricFilterDecl
+
+        agg = AggregateStep(
+            step_id="agg_filter",
+            group_keys=[
+                ColumnRef(
+                    table_ref="ft",
+                    column_name="borough",
+                    normalized_name="borough",
+                ),
+            ],
+            metrics=[
+                AggregateSpec(
+                    aggregation=AggregationType.COUNT,
+                    input_column=None,
+                    alias="anomaly_trip_count",
+                    filter=MetricFilterDecl(
+                        column="is_time_anomaly",
+                        operator="eq",
+                        value="true",
+                    ),
+                ),
+            ],
+        )
+        aggs, groups, biz_keys, time_transforms, derived_columns = (
+            DataTransformContractExtractor._extract_aggregate(agg)
+        )
+        assert len(aggs) == 1
+        assert aggs[0].filter is not None
+        assert aggs[0].filter.column == "is_time_anomaly"
+        assert aggs[0].filter.operator == "eq"
+        assert aggs[0].filter.value == "true"
+
+    def test_metric_filter_none_when_not_set(self):
+        """无 filter 的 AggregateSpec -> ContractAggregation.filter 为 None。"""
+        agg = AggregateStep(
+            step_id="agg_no_filter",
+            group_keys=[
+                ColumnRef(
+                    table_ref="ft",
+                    column_name="borough",
+                    normalized_name="borough",
+                ),
+            ],
+            metrics=[
+                AggregateSpec(
+                    aggregation=AggregationType.COUNT,
+                    input_column=None,
+                    alias="trip_count",
+                ),
+            ],
+        )
+        aggs, groups, biz_keys, time_transforms, derived_columns = (
+            DataTransformContractExtractor._extract_aggregate(agg)
+        )
+        assert len(aggs) == 1
+        assert aggs[0].filter is None

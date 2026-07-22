@@ -457,10 +457,15 @@ class SparkCompiler:
             fn_name = self.renderer.render_agg_function(m.function)
             if m.input_column:
                 col_ref = self.renderer.render_column(m.input_column)
-                agg_expr = f"{fn_name}({col_ref})"
+                inner = col_ref
             else:
-                # COUNT(*) → F.count(F.lit(1))
-                agg_expr = f"{fn_name}(F.lit(1))"
+                # COUNT(*) → F.lit(1)
+                inner = "F.lit(1)"
+            # 条件聚合 FILTER——F.when(condition, inner) 包装
+            if m.filter:
+                cond = self._render_metric_filter_spark(m.filter)
+                inner = f"F.when({cond}, {inner})"
+            agg_expr = f"{fn_name}({inner})"
             alias = self.renderer.validate_identifier(
                 m.alias, "AggregateSpec.alias"
             )
@@ -840,6 +845,40 @@ class SparkCompiler:
         r = self.renderer
         detail = r.render_comment_text(annotation.intent_detail)
         return f"{comment}\n# {detail}"
+
+    def _render_metric_filter_spark(self, filter_decl) -> str:
+        """渲染 MetricFilterDecl 为 PySpark 条件表达式——用于 F.when()。
+
+        操作符映射与 SQL compiler _render_metric_filter 语义一致：
+          eq -> ==, neq -> !=, gt -> >, gte -> >=, lt -> <, lte -> <=,
+          in -> .isin(...), is_null -> .isNull(), is_not_null -> .isNotNull()
+        """
+        col = f'F.col("{filter_decl.column}")'
+        op = filter_decl.operator
+        val = filter_decl.value
+
+        if op == "eq":
+            return f'{col} == F.lit("{val}")'
+        elif op == "neq":
+            return f'{col} != F.lit("{val}")'
+        elif op == "gt":
+            return f'{col} > F.lit("{val}")'
+        elif op == "gte":
+            return f'{col} >= F.lit("{val}")'
+        elif op == "lt":
+            return f'{col} < F.lit("{val}")'
+        elif op == "lte":
+            return f'{col} <= F.lit("{val}")'
+        elif op == "in":
+            # value 是逗号分隔的字符串，拆分为列表
+            items = [f'F.lit("{v.strip()}")' for v in val.split(",")]
+            return f'{col}.isin({", ".join(items)})'
+        elif op == "is_null":
+            return f'{col}.isNull()'
+        elif op == "is_not_null":
+            return f'{col}.isNotNull()'
+        else:
+            raise ValueError(f"不支持的 MetricFilterDecl 操作符: {op!r}")
 
     @staticmethod
     def _verify_no_comment_injection(raw: str, annotated: str) -> None:

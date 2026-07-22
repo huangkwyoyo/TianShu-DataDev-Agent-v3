@@ -18,7 +18,7 @@ from tianshu_datadev.cre_models import CreShadowReport
 # CreShadowReport 从 spark.cre_models 导入——cre_models 仅依赖 developer_spec.models，
 # 不形成 spark/__init__ → spark/models → artifacts/models → spark/cre_models 的循环。
 # 已验证：运行时导入安全。
-from tianshu_datadev.developer_spec.models import StrictModel
+from tianshu_datadev.developer_spec.models import MetricFilterDecl, StrictModel
 
 # ── ReviewFeedback 路由 target 字面量类型 ──
 # Pydantic 在构造时强制校验，非法值直接 ValidationError
@@ -86,6 +86,7 @@ class ContractAggregation(StrictModel):
     function: str  # COUNT / SUM / AVG / MIN / MAX / COUNT_DISTINCT
     input_column: str | None = None  # None 表示 COUNT(*)
     alias: str  # 输出别名
+    filter: MetricFilterDecl | None = None  # 条件聚合 FILTER (WHERE ...)
 
 
 class ContractDerivedColumn(StrictModel):

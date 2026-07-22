@@ -407,6 +407,7 @@ class DataTransformContractExtractor:
                     function=m.aggregation if isinstance(m.aggregation, str) else m.aggregation,
                     input_column=m.input_column,
                     alias=m.alias,
+                    filter=m.filter,  # 透传条件聚合 FILTER
                 )
             )
 

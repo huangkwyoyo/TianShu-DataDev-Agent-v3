@@ -488,6 +488,7 @@ def _map_aggregations(
             function=_AGG_FUNCTION_MAP[a.function.upper()],
             input_column=a.input_column,
             alias=a.alias,
+            filter=a.filter,  # 透传条件聚合 FILTER
         )
         for a in aggregations
     ]

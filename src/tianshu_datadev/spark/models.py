@@ -20,7 +20,7 @@ from typing import Literal
 from pydantic import Field
 
 from tianshu_datadev.artifacts.models import CaseWhenCondition
-from tianshu_datadev.developer_spec.models import StrictModel
+from tianshu_datadev.developer_spec.models import MetricFilterDecl, StrictModel
 
 # ════════════════════════════════════════════
 # SparkPlan 顶层容器
@@ -160,6 +160,7 @@ class SparkAggregateSpec(StrictModel):
     function: SparkAggFunction  # 聚合函数
     input_column: str | None = None  # 输入列（COUNT(*) 时为 None）
     alias: str  # 输出列别名
+    filter: MetricFilterDecl | None = None  # 条件聚合 FILTER (WHERE ...)
 
 
 class SparkTimeTransformExpr(StrictModel):
