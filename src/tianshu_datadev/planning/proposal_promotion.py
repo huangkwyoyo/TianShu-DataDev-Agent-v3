@@ -63,4 +63,11 @@ class ProposalPromotion:
                     result.case_when_rules.append(rule)
                     existing_cols.add(rule.output_column)
 
+        # ── uncertainties 透传——确定性合并，不整体覆盖 ──
+        if proposal.uncertainties:
+            from tianshu_datadev.api.pipeline import _merge_uncertainties
+
+            merged = _merge_uncertainties(result.uncertainties, proposal.uncertainties)
+            result = result.model_copy(update={"uncertainties": merged})
+
         return result
