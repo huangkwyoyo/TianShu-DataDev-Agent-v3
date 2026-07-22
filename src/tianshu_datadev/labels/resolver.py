@@ -55,9 +55,9 @@ def _find_unresolved_derived_columns(
     for dim in spec.dimensions:
         known.add(dim.dimension_name)
 
-    # 4. 窗口指标
+    # 4. 窗口指标——使用 alias（输出列名），而非 metric_name（语义化名称）
     for wm in spec.inferred_window_metrics:
-        known.add(wm.metric_name)
+        known.add(wm.alias)
 
     # 5. compute_steps 输出列名——从 metrics/expressions/case_when 收集
     if spec.compute_steps:

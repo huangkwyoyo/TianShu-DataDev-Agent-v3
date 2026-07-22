@@ -208,3 +208,22 @@ class TestPlannerSpecEnricherDivision:
         assert "peak_type" in unresolved
         assert "anomaly_trip_count" in unresolved
         assert "rank_by_trip_count" in unresolved
+
+    def test_window_metric_alias_resolves_column(self):
+        """InferredWindowMetric 的 alias（而非 metric_name）应能使列被解析。"""
+        from tianshu_datadev.developer_spec.models import InferredWindowMetric
+        spec = self._make_spec_with_mixed_outputs()
+        # 模拟 SpecEnricher 产出窗口指标——alias=输出列名, metric_name≠alias
+        spec.inferred_window_metrics.append(InferredWindowMetric(
+            metric_name="Trip Count Rank",
+            window_function="RANK",
+            input_column="trip_count",
+            partition_by=["borough"],
+            order_by=["trip_count DESC"],
+            alias="rank_by_trip_count",
+        ))
+        unresolved = _find_unresolved_derived_columns(spec)
+        # rank_by_trip_count 应已被 alias 匹配，不在 unresolved 中
+        assert "rank_by_trip_count" not in unresolved
+        # anomaly_trip_count 仍为 unresolved（未添加为指标/窗口指标）
+        assert "anomaly_trip_count" in unresolved

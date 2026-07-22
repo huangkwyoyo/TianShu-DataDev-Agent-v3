@@ -719,18 +719,22 @@ class SqlBuildPlanBuilder:
                                 col_sources[name] = []
                             col_sources[name].append(src)
                     # 逐列修正 GROUP BY 表前缀——仅重叠列需要消歧
-                    agg.group_keys = [
-                        ColumnRef(
+                    def _rebuild_group_key(gk):
+                        """修正 GROUP BY 列的表前缀——仅 ColumnRef 需要重映射。"""
+                        if isinstance(gk, DerivedGroupKey):
+                            return gk  # 派生键无 table_ref，直接透传
+                        # ColumnRef 或 DatePartExpression——两者都有 column_name/normalized_name
+                        src = gk.column_name
+                        return ColumnRef(
                             table_ref=(
-                                make_temp_name(chain_id, col_sources[gk.column_name][0])
-                                if len(col_sources.get(gk.column_name, [])) > 1
+                                make_temp_name(chain_id, col_sources[src][0])
+                                if len(col_sources.get(src, [])) > 1
                                 else ""
                             ),
-                            column_name=gk.column_name,
+                            column_name=src,
                             normalized_name=gk.normalized_name,
                         )
-                        for gk in agg.group_keys
-                    ]
+                    agg.group_keys = [_rebuild_group_key(gk) for gk in agg.group_keys]
                 else:
                     st = "" if isinstance(cs.source, list) else (
                         cs.source if cs.source != "input" else ""
@@ -1145,7 +1149,7 @@ class SqlBuildPlanBuilder:
 
         step_id_content = {
             "step": cs.step_name,
-            "groups": [g.normalized_name for g in group_cols],
+            "groups": [g.normalized_name if isinstance(g, ColumnRef) else g.alias for g in group_cols],
             "metrics": [m.alias for m in agg_metrics],
         }
         return AggregateStep(
@@ -3113,10 +3117,16 @@ class SqlBuildPlanBuilder:
 
         # pre-aggregate CASE WHEN 派生列——这些列在聚合前由 CaseWhenStep 计算，
         # 需要作为 GROUP BY 键（不带 table_ref，因为它们是派生列而非源表物理列）
+        def _group_has_key(g, key: str) -> bool:
+            """检查分组键是否等于 key——兼容 ColumnRef / DatePartExpression / DerivedGroupKey。"""
+            if isinstance(g, ColumnRef):
+                return g.column_name == key or g.normalized_name == key
+            # DatePartExpression 和 DerivedGroupKey 都有 alias
+            return g.alias == key
         if extra_group_keys:
             for key in sorted(extra_group_keys):
                 if not any(
-                    g.column_name == key or g.normalized_name == key
+                    _group_has_key(g, key)
                     for g in group_cols
                 ):
                     normalized = self._normalizer.normalize(key)

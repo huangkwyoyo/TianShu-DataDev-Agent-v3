@@ -597,3 +597,46 @@ class TestBuildSingleTableWithDerivedDimensions:
         ]
         assert len(derived_keys) == 1
         assert derived_keys[0].alias == "pickup_hour"
+
+
+class TestBuildAggregateStepWithDerivedGroupKey:
+    """_build_aggregate_step 不应对 DerivedGroupKey 抛 AttributeError。"""
+
+    def test_derived_dimension_in_group_keys_no_attribute_error(self):
+        """spec 包含 derived_dimensions → group_keys 含 DerivedGroupKey → 不抛异常。"""
+        from tianshu_datadev.planning.sql_build_plan import SqlBuildPlanBuilder
+
+        spec = ParsedDeveloperSpec(
+            spec_id="test_derived", spec_hash="h_derived",
+            title="测试派生维度", description="",
+            dataset_type=DatasetType.AGGREGATE_TABLE,
+            input_tables=[InputTableDecl(
+                table_alias="ft", source_table="fact_table",
+                columns=[ColumnDecl(column_name="pickup_at", normalized_name="pickup_at",
+                                    data_type="timestamp")],
+                key_columns=[], business_columns=[],
+            )],
+            metrics=[],
+            dimensions=[DimensionDecl(
+                dimension_name="borough", column_ref="pickup_at", source_table="ft",
+            )],
+            derived_dimensions=[DerivedDimensionDecl(
+                dimension_name="pickup_hour",
+                source_column="pickup_at",
+                source_table="ft",
+                time_function="HOUR",
+            )],
+            output_spec=OutputSpecDecl(
+                columns=[OutputColumnDecl(name="pickup_hour")],
+                grain=["pickup_hour"],
+            ),
+            time_range=None,
+        )
+
+        builder = SqlBuildPlanBuilder()
+        # 传入 extra_group_keys 以触发 L3118-3120 的 column_name 检查
+        agg = builder._build_aggregate_step(spec, "ft", extra_group_keys={"other_col"})
+        # 验证 group_keys 包含 DerivedGroupKey
+        derived = [g for g in agg.group_keys if isinstance(g, DerivedGroupKey)]
+        assert len(derived) == 1
+        assert derived[0].alias == "pickup_hour"
