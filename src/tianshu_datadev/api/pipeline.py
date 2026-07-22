@@ -690,6 +690,13 @@ class Pipeline:
                     if _get_output_kind(col, spec.uncertainties) == "LABEL"
                     and col not in planner_covered_cols
                 ]
+
+                # ── 兜底：Planner 未标记任何 LABEL 列，但仍需标签规则时，
+                #     对所有 unresolved 列调用 LabelExtractor（向后兼容）
+                has_rules = bool(spec.label_rules) or bool(spec.case_when_rules)
+                if not label_candidates and not has_rules:
+                    label_candidates = list(unresolved)
+
                 if label_candidates:
                     if self._label_extractor is None:
                         raise LabelTableConfigError(
@@ -727,13 +734,18 @@ class Pipeline:
             })
 
         # ── label_table 门禁：至少一个合法标签列
+        # 仅当存在 unresolved 列（即有待提取/生成的列）时才要求有标签规则；
+        # 所有输出列均为源表透传时（如原始数据采样），视为纯透传 label_table，
+        # 不需要标签规则或 CASE WHEN 规则。
         if spec.dataset_type == DatasetType.LABEL_TABLE:
             has_labels = bool(spec.label_rules) or bool(spec.case_when_rules)
             if not has_labels:
-                raise LabelTableConfigError(
-                    "label_table 至少需要一个合法标签列——"
-                    "label_rules 和 case_when_rules 均为空"
-                )
+                unresolved = _find_unresolved_derived_columns(spec)
+                if unresolved:
+                    raise LabelTableConfigError(
+                        "label_table 至少需要一个合法标签列——"
+                        "label_rules 和 case_when_rules 均为空"
+                    )
 
         return spec
 
