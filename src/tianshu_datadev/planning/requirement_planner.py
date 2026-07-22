@@ -51,15 +51,29 @@ H4. CASE WHEN 条件必须使用类型化 Predicate 树。
     不要使用 NOT 节点——用反向比较操作符（!=、IS_NULL vs IS_NOT_NULL）代替。
     THEN 值为纯字符串字面量。
 
-H5. 不确定时写入 uncertainties。只写 field_ref + description + candidates。
-    不写 category——阻断级别由系统确定性规则决定。
+H5. 不确定时写入 uncertainties。每条包含：
+    - field_ref: 诊断标识（自由文本，仅用于日志）
+    - output_column: 输出列名（路由主键——必须填写，否则按 UNKNOWN 处理）
+    - description: 为什么不确定
+    - candidates: 可能的解析方案（可为空列表）
+    - output_kind: 该列的业务性质——LABEL | METRIC | DERIVED_DIMENSION | UNKNOWN
+      判断依据（互斥——每列只能匹配一条）：
+      · LABEL: 条件分支产出的有限值分类（如 risk_level, peak_type, 安全等级）
+        特征：输出依赖 WHEN/THEN 逻辑，不能仅用确定性函数从单一源列推导
+      · METRIC: 聚合或聚合后数值计算（如 avg_xxx, total_xxx, rate）
+      · DERIVED_DIMENSION: 对源字段做直接确定性变换（如 HOUR(pickup_at) → pickup_hour）
+        特征：单输入 + 确定性函数 → 单输出，无分支
+      · UNKNOWN: 完全无法判断——系统将阻断并请求人工裁决
 
 H6. 不要覆盖 [Existing Declarations] 中程序员已手写的字段。
 
-H7. label_table 类型不在你的职责范围——返回全空输出。
+H8. 窗口函数、比率指标、跨粒度依赖不在你的处理范围——
+    不给这些字段生成任何输出，也不生成 uncertainty。
 
-H8. 窗口函数、比率指标、跨粒度依赖不在你的职责范围——
-    不给这些字段生成任何输出，也不生成 uncertainty。"""
+H9. 遇到白名单外聚合函数（如 MODE、MEDIAN、STDDEV 等）时：
+    不要尝试构造 MetricDecl——Schema 会拒绝。
+    输出一条 uncertainty：output_kind=METRIC，output_column=目标列名，
+    description 说明"聚合函数 MODE 不在白名单 COUNT|SUM|AVG|MIN|MAX|COUNT_DISTINCT 中"。"""
 
 # ════════════════════════════════════════════
 # JSON Schema（v3.1——predicate_root 不含 NOT）
@@ -142,13 +156,18 @@ _REQUIREMENT_PLANNER_JSON_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "field_ref": {"type": "string"},
+                    "output_column": {"type": ["string", "null"]},
+                    "output_kind": {
+                        "type": "string",
+                        "enum": ["LABEL", "METRIC", "DERIVED_DIMENSION", "UNKNOWN"]
+                    },
                     "description": {"type": "string"},
                     "candidates": {
                         "type": "array",
                         "items": {"type": "string"},
                     },
                 },
-                "required": ["field_ref", "description"],
+                "required": ["field_ref", "output_column", "output_kind", "description"],
                 "additionalProperties": False,
             },
         },
