@@ -685,7 +685,11 @@ class SqlBuildPlanValidator:
             for dim in dims:
                 col_ref = getattr(dim, "column_ref", None)
                 if col_ref:
-                    declared_dimensions.add(col_ref)
+                    declared_dimensions.add(
+                        dim.dimension_name
+                        if getattr(dim, "date_part", None)
+                        else col_ref
+                    )
         except Exception:
             return  # spec 结构不符预期——跳过，不误报
 

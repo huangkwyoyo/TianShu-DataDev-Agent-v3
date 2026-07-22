@@ -23,6 +23,7 @@ from tianshu_datadev.developer_spec.models import (
     InputTableDecl,
     LabelAnd,
     LabelCompare,
+    LabelDatePartRef,
     LabelIsNotNull,
     LabelIsNull,
     LabelNot,
@@ -37,6 +38,7 @@ from .models import (
     AggregateSpec,
     AliasExpr,
     ColumnRef,
+    DatePartExpression,
     DerivedGroupKey,
     JoinType,
     Predicate,
@@ -124,7 +126,7 @@ class AggregateStep(StrictModel):
 
     step_type: Literal["aggregate"] = "aggregate"
     step_id: str
-    group_keys: list[ColumnRef | DerivedGroupKey]  # GROUP BY 列
+    group_keys: list[ColumnRef | DatePartExpression | DerivedGroupKey]  # GROUP BY 列或受控派生键
     metrics: list[AggregateSpec]  # 聚合规格
     having: Predicate | None = None  # HAVING 条件（封闭 AST）
 
@@ -149,6 +151,8 @@ class CaseWhenStep(StrictModel):
     cases: list[WhenBranch] = []  # CASE WHEN 分支列表
     else_value: SqlLiteral | None = None  # 默认值（ELSE 子句）
     alias: SafeIdentifier = ""  # 输出列别名——SafeIdentifier 防注入（空字符串表示无别名）
+    # ── 聚合阶段评估位置（从 CaseWhenDecl.evaluation_phase 传递）──
+    evaluation_phase: Literal["pre_aggregate", "post_aggregate"] | None = None
 
 
 class WindowStep(StrictModel):
@@ -1583,17 +1587,28 @@ class SqlBuildPlanBuilder:
         self, node: LabelCompare, table_alias: str,
     ) -> Predicate:
         """将 LabelCompare 转换为 Predicate。"""
-        normalized = self._normalizer.normalize(node.left)
+        source_column = (
+            node.left.column_name
+            if isinstance(node.left, LabelDatePartRef)
+            else node.left
+        )
+        normalized = self._normalizer.normalize(source_column)
         col_ref = ColumnRef(
             table_ref=SafeIdentifier(table_alias),
-            column_name=SafeIdentifier(node.left),
+            column_name=SafeIdentifier(source_column),
             normalized_name=SafeIdentifier(normalized),
         )
+        left_operand: ColumnRef | DatePartExpression = col_ref
+        if isinstance(node.left, LabelDatePartRef):
+            left_operand = DatePartExpression(
+                part=node.left.part,
+                column=col_ref,
+            )
         op = self._COMPARE_OP_MAP.get(node.op)
         if op is None:
             raise ValueError(f"不支持的比较操作符: {node.op}")
         sql_lit = self._literal_from_label(node.right)
-        return Predicate(left=col_ref, operator=op, right=sql_lit)
+        return Predicate(left=left_operand, operator=op, right=sql_lit)
 
     def _predicate_from_is_null(
         self, node: LabelIsNull, table_alias: str,
@@ -1679,7 +1694,11 @@ class SqlBuildPlanBuilder:
             collected: 输出集合——收集到的列名加入此集合
         """
         if isinstance(node, LabelCompare):
-            collected.add(node.left)
+            collected.add(
+                node.left.column_name
+                if isinstance(node.left, LabelDatePartRef)
+                else node.left
+            )
         elif isinstance(node, (LabelIsNull, LabelIsNotNull)):
             collected.add(node.column)
         elif isinstance(node, (LabelAnd, LabelOr)):
@@ -1925,6 +1944,7 @@ class SqlBuildPlanBuilder:
                 cases=cases,
                 else_value=else_val,
                 alias=SafeIdentifier(rule.output_column),
+                evaluation_phase=rule.evaluation_phase,  # 从 CaseWhenDecl 传递聚合阶段
             )
             steps.append(step)
 
@@ -2022,10 +2042,13 @@ class SqlBuildPlanBuilder:
             )
 
     def _build_single_table(self, spec: ParsedDeveloperSpec) -> list[StepNode]:
-        """单表构建：Scan → (Filter*) → (Aggregate) → (CaseWhen*) → (Window) → Project → (Sort) → (Limit)。
+        """单表构建管线。
 
-        label_table 类型：CaseWhenStep 在 Aggregate 之后、Window 之前插入——
-        标签列由 CASE WHEN 表达式计算，不从源表直接投影。
+        Scan → Filter* → (pre-aggregate CaseWhen*) → Aggregate
+        → (post-aggregate CaseWhen*) → Window → Project → Sort → Limit。
+
+        pre-aggregate CASE WHEN 输出列自动加入 GROUP BY——派生维度在聚合前计算。
+        post-aggregate CASE WHEN 在聚合后计算——条件可引用聚合指标。
         """
         steps: list[StepNode] = []
         table = spec.input_tables[0]
@@ -2114,14 +2137,28 @@ class SqlBuildPlanBuilder:
         tr_filters = self._build_time_range_filter(spec, table.table_alias)
         steps.extend(tr_filters)
 
-        # 3. AggregateStep——如果有指标
+        # 3. pre-aggregate CaseWhenSteps——派生维度在聚合前计算
+        #    输出列自动加入 GROUP BY，条件引用源表物理列（非聚合指标）
+        all_case_when_steps = self._build_case_when_steps(spec)
+        pre_agg_cw = [s for s in all_case_when_steps
+                       if s.evaluation_phase == "pre_aggregate"]
+        post_agg_cw = [s for s in all_case_when_steps
+                        if s.evaluation_phase != "pre_aggregate"]
+        steps.extend(pre_agg_cw)
+
+        # 3a. pre-aggregate CASE WHEN 输出列 → 自动加入 group_by
+        pre_agg_cw_aliases: set[str] = {str(s.alias) for s in pre_agg_cw if s.alias}
+
+        # 4. AggregateStep——如果有指标（group_keys 自动包含 pre_agg_cw 输出列）
         if spec.metrics:
-            agg = self._build_aggregate_step(spec, table.table_alias)
+            agg = self._build_aggregate_step(
+                spec, table.table_alias,
+                extra_group_keys=pre_agg_cw_aliases,
+            )
             steps.append(agg)
 
-        # 3b. CaseWhenSteps——label_table 标签列生成（聚合后、窗口前）
-        case_when_steps = self._build_case_when_steps(spec)
-        steps.extend(case_when_steps)
+        # 4b. post-aggregate CaseWhenSteps——标签列在聚合后计算（条件可引用聚合指标）
+        steps.extend(post_agg_cw)
 
         # 3c. WindowStep——如果有窗口指标（聚合后、投影前）
         window = self._build_window_step(spec, table.table_alias)
@@ -2230,10 +2267,13 @@ class SqlBuildPlanBuilder:
         spec: ParsedDeveloperSpec,
         hypothesis: RelationshipHypothesis,
     ) -> list[StepNode]:
-        """两表构建管线：Scan→(Filter)→Join→(Aggregate)→(Window)→Project→(Sort)→(Limit)。
+        """两表构建管线。
 
-        Phase 1B 仅处理第一个 Join 候选的两表场景。
-        Phase 5 新增：自引用检测——left_table == right_table 时自动生成不同别名。
+        Scan → Filter* → Join → (pre-aggregate CaseWhen*) → Aggregate
+        → (post-aggregate CaseWhen*) → Window → Project → Sort → Limit。
+
+        pre-aggregate CASE WHEN 输出列自动加入 GROUP BY——在 Join 后、聚合前计算。
+        post-aggregate CASE WHEN 在聚合后计算——条件可引用聚合指标。
         """
         steps: list[StepNode] = []
         table_map = {t.table_alias: t for t in spec.input_tables}
@@ -2340,30 +2380,50 @@ class SqlBuildPlanBuilder:
         )
         steps.append(join_step)
 
-        # 5. AggregateStep——如果有指标
-        # 多表 JOIN 后用空 table_ref 让 DuckDB 从 JOIN 结果中自动解析列引用，
-        # 避免左表别名引用右表列（如 ft.borough）的问题。
-        # 自引用例外：必须使用左别名消除同名列歧义（左右表列名完全相同）
+        # 4b. pre-aggregate CaseWhenSteps——派生维度在 Join 后、聚合前计算
+        #     输出列自动加入 GROUP BY（多表场景同单表逻辑）
+        all_case_when_steps = self._build_case_when_steps(spec)
+        pre_agg_cw = [s for s in all_case_when_steps
+                       if s.evaluation_phase == "pre_aggregate"]
+        post_agg_cw = [s for s in all_case_when_steps
+                        if s.evaluation_phase != "pre_aggregate"]
+        steps.extend(pre_agg_cw)
+
+        # 5. AggregateStep——如果有指标（多表——group_keys 自动包含 pre_agg_cw 输出列）
+        pre_agg_cw_aliases: set[str] = {str(s.alias) for s in pre_agg_cw if s.alias}
         if spec.metrics:
             agg_table_ref = left_alias if is_self_join else ""
-            agg = self._build_aggregate_step(spec, agg_table_ref)
+            agg = self._build_aggregate_step(
+                spec, agg_table_ref,
+                extra_group_keys=pre_agg_cw_aliases,
+            )
             steps.append(agg)
 
-        # 5b. WindowStep——如果有窗口指标（聚合后、投影前）
+        # 5b. post-aggregate CaseWhenSteps——标签列在聚合后计算（多表场景）
+        steps.extend(post_agg_cw)
+
+        # 5c. WindowStep——如果有窗口指标（聚合后、投影前）
         window = self._build_window_step(spec, "")
         if window:
             steps.append(window)
             steps.extend(self._build_post_window_filter_steps(spec))
 
-        # 6. ProjectStep（排除窗口函数已产出的别名）
+        # 6. ProjectStep（排除窗口函数已产出的别名 + CASE WHEN 标签列）
         # 自引用时用左别名消除列歧义——左右表列名完全相同，DuckDB 无法自动解析
         proj_table_ref = left_alias if is_self_join else ""
         project = self._build_project_step(spec, default_table_ref=proj_table_ref)
+        excluded_aliases: set[str] = set()
         if window:
-            win_aliases = {str(w.alias) for w in window.window_exprs if w.alias}
+            excluded_aliases.update(
+                str(w.alias) for w in window.window_exprs if w.alias
+            )
+        # 排除所有 CASE WHEN 输出列——这些列由 CaseWhenStep 产生，不在源表中
+        label_output_columns = {rule.output_column for rule in spec.label_rules}
+        excluded_aliases.update(label_output_columns)
+        if excluded_aliases:
             filtered_cols = [
                 c for c in project.columns
-                if c.alias not in win_aliases
+                if c.alias not in excluded_aliases
             ]
             project = ProjectStep(
                 step_id=project.step_id,
@@ -2949,20 +3009,40 @@ class SqlBuildPlanBuilder:
         )
 
     def _build_aggregate_step(
-        self, spec: ParsedDeveloperSpec, primary_table: str
+        self, spec: ParsedDeveloperSpec, primary_table: str,
+        extra_group_keys: set[str] | None = None,
     ) -> AggregateStep:
-        """从 spec 构建 AggregateStep——支持派生维度 DerivedGroupKey。"""
+        """从 spec 构建 AggregateStep——支持派生维度 DerivedGroupKey 和 DatePartExpression。
+
+        Args:
+            spec: 已解析的 DeveloperSpec
+            primary_table: 主表别名
+            extra_group_keys: pre-aggregate CASE WHEN 派生列名——
+                这些列不是源表物理列，由 CaseWhenStep 在聚合前产生，
+                需要作为 GROUP BY 键（不带 table_ref）。
+        """
         # group_keys 从 dimensions 构建
-        group_cols: list[ColumnRef | DerivedGroupKey] = []
+        group_cols: list[ColumnRef | DatePartExpression | DerivedGroupKey] = []
         for d in spec.dimensions:
+            if extra_group_keys and d.dimension_name in extra_group_keys:
+                # CASE 输出是上游派生列；同名维度不能重新解释为源表物理列。
+                continue
             normalized = self._normalizer.normalize(d.column_ref)
-            group_cols.append(
-                ColumnRef(
-                    table_ref=d.source_table or primary_table,
-                    column_name=d.column_ref,
-                    normalized_name=normalized,
-                )
+            source = ColumnRef(
+                table_ref=d.source_table or primary_table,
+                column_name=d.column_ref,
+                normalized_name=normalized,
             )
+            if d.date_part:
+                group_cols.append(
+                    DatePartExpression(
+                        part=d.date_part,
+                        column=source,
+                        alias=SafeIdentifier(d.dimension_name),
+                    )
+                )
+            else:
+                group_cols.append(source)
 
         # 派生维度 → DerivedGroupKey（含 TimeTransformExpr）
         for dd in spec.derived_dimensions:
@@ -2982,9 +3062,32 @@ class SqlBuildPlanBuilder:
             for g in group_cols
         }
         for grain_col in spec.output_spec.grain:
+            if extra_group_keys and grain_col in extra_group_keys:
+                # 同名 CASE 输出由下方派生键分支统一加入，禁止绑定到源表。
+                continue
             normalized = self._normalizer.normalize(grain_col)
             if normalized not in existing_grains:
                 existing_grains.add(normalized)
+                # 检查是否为 date_part 派生列——需 DatePartExpression 而非裸 ColumnRef
+                derived = next(
+                    (d for d in spec.dimensions if d.dimension_name == grain_col),
+                    None,
+                )
+                if derived and derived.date_part:
+                    group_cols.append(
+                        DatePartExpression(
+                            part=derived.date_part,
+                            column=ColumnRef(
+                                table_ref=derived.source_table or primary_table,
+                                column_name=derived.column_ref,
+                                normalized_name=self._normalizer.normalize(
+                                    derived.column_ref
+                                ),
+                            ),
+                            alias=SafeIdentifier(derived.dimension_name),
+                        )
+                    )
+                    continue
                 group_cols.append(
                     ColumnRef(
                         table_ref=primary_table,
@@ -2992,6 +3095,21 @@ class SqlBuildPlanBuilder:
                         normalized_name=normalized,
                     )
                 )
+
+        # pre-aggregate CASE WHEN 派生列——这些列在聚合前由 CaseWhenStep 计算，
+        # 需要作为 GROUP BY 键（不带 table_ref，因为它们是派生列而非源表物理列）
+        if extra_group_keys:
+            for key in sorted(extra_group_keys):
+                if not any(
+                    g.column_name == key or g.normalized_name == key
+                    for g in group_cols
+                ):
+                    normalized = self._normalizer.normalize(key)
+                    group_cols.append(ColumnRef(
+                        table_ref="",  # 派生列无 table_ref
+                        column_name=SafeIdentifier(key),
+                        normalized_name=SafeIdentifier(normalized),
+                    ))
 
         # metrics——展开 MetricDecl + variants 为多个 AggregateSpec
         agg_metrics: list[AggregateSpec] = []
@@ -3039,12 +3157,16 @@ class SqlBuildPlanBuilder:
             dim_source_map[d.dimension_name] = (d.column_ref, table_ref)
 
         overrides = column_table_overrides or {}
+        label_output_names = {rule.output_column for rule in spec.label_rules}
 
         proj_cols: list[AliasExpr] = []
         for col in spec.output_spec.columns:
             col_name = col.name
             # 解析源列名和表别名
-            if col_name in dim_source_map:
+            if col_name in label_output_names:
+                source_col = col_name
+                table_ref = ""
+            elif col_name in dim_source_map:
                 source_col, dim_table = dim_source_map[col_name]
                 # 维度声明的 source_table 可被 overrides 覆盖
                 table_ref = overrides.get(col_name, dim_table or default_table_ref)
@@ -3052,13 +3174,37 @@ class SqlBuildPlanBuilder:
                 source_col = col_name
                 table_ref = overrides.get(col_name, default_table_ref)
             normalized = self._normalizer.normalize(source_col)
+            dimension = next(
+                (d for d in spec.dimensions if d.dimension_name == col_name),
+                None,
+            )
+            source_ref = ColumnRef(
+                table_ref=table_ref,
+                column_name=source_col,
+                normalized_name=normalized,
+            )
+            if dimension and dimension.date_part and spec.metrics:
+                # 聚合步骤已经以派生别名输出该分组键，最终投影只引用结果列。
+                expression = ColumnRef(
+                    table_ref="",
+                    column_name=SafeIdentifier(col_name),
+                    normalized_name=SafeIdentifier(
+                        self._normalizer.normalize(col_name)
+                    ),
+                )
+            else:
+                expression = (
+                    DatePartExpression(
+                        part=dimension.date_part,
+                        column=source_ref,
+                        alias=SafeIdentifier(col_name),
+                    )
+                    if dimension and dimension.date_part
+                    else source_ref
+                )
             proj_cols.append(
                 AliasExpr(
-                    expression=ColumnRef(
-                        table_ref=table_ref,
-                        column_name=source_col,
-                        normalized_name=normalized,
-                    ),
+                    expression=expression,
                     alias=col_name,
                 )
             )

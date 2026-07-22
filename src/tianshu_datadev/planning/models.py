@@ -152,6 +152,28 @@ class ColumnRef(StrictModel):
     normalized_name: SafeIdentifier
 
 
+class DatePartExpression(StrictModel):
+    """封闭日期部分表达式——避免把函数调用作为自由 SQL 传入。"""
+
+    part: Literal["HOUR"]
+    column: ColumnRef
+    alias: SafeIdentifier | None = None
+
+    @property
+    def column_name(self) -> SafeIdentifier:
+        """对通用分组键消费者暴露派生结果名。"""
+        return self.alias or self.column.column_name
+
+    @property
+    def normalized_name(self) -> SafeIdentifier:
+        return self.alias or self.column.normalized_name
+
+    @property
+    def table_ref(self) -> str:
+        # 派生结果不属于源表物理列。
+        return ""
+
+
 class SqlLiteral(StrictModel):
     """字面量值——SQL 中的常量表达式。
 
@@ -177,7 +199,7 @@ class Predicate(StrictModel):
     IN 操作符时 right 为 list[SqlLiteral]。
     """
 
-    left: ColumnRef | Predicate | TimeTransformExpr
+    left: ColumnRef | Predicate | TimeTransformExpr | DatePartExpression
     operator: PredicateOperator
     right: ColumnRef | Predicate | SqlLiteral | list[SqlLiteral] | None = None
 
@@ -313,7 +335,7 @@ class AliasExpr(StrictModel):
     Phase 7A 扩展支持 SqlRawExpression（派生表达式——安全原始 SQL 片段）。
     """
 
-    expression: ColumnRef | WindowExpr | SqlRawExpression
+    expression: ColumnRef | DatePartExpression | WindowExpr | SqlRawExpression
     alias: SafeIdentifier  # 输出列别名——SafeIdentifier 防止 AS 子句注入
 
 

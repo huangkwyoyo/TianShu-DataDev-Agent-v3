@@ -88,6 +88,15 @@ class ContractAggregation(StrictModel):
     alias: str  # 输出别名
 
 
+class ContractDerivedColumn(StrictModel):
+    """Contract 中的受控派生列，不携带自由表达式。"""
+
+    output_column: str
+    source_column: str
+    source_table_ref: str = ""
+    date_part: Literal["HOUR"]
+
+
 class ContractTimeTransform(StrictModel):
     """Contract 侧时间变换——禁止 dict 逃生口。"""
     type: Literal["time_transform"] = "time_transform"
@@ -139,6 +148,7 @@ class DataTransformContractLite(StrictModel):
     join_relationships: list[ContractJoin] = []  # Join 关系（含证据链）
     filters: list[ContractPredicate] = []  # 过滤条件
     aggregations: list[ContractAggregation] = []  # 聚合定义
+    derived_columns: list[ContractDerivedColumn] = []  # 受控派生列
     grouping_keys: list[str] = []  # 分组键（归一化字段名列表）
     output_columns: list[ContractOutputColumn] = []  # 输出列
     output_grain: list[str] = []  # 输出粒度（归一化字段名列表）
@@ -195,6 +205,7 @@ class CaseWhenCondition(StrictModel):
     table_ref: str = ""          # 列所属表别名（来自 ColumnRef.table_ref）
     normalized_name: str = ""    # 归一化列名（来自 ColumnRef.normalized_name）
     value: str | int | float | bool | None = None  # 叶子节点：字面量值，保留原始类型
+    date_part: Literal["HOUR"] | None = None  # 受控日期部分；None 表示直接列引用
     left: "CaseWhenCondition | None" = None   # 逻辑节点左子树
     right: "CaseWhenCondition | None" = None  # 逻辑节点右子树
 
@@ -215,6 +226,8 @@ class CaseWhenLabelSpec(StrictModel):
     labels: list[str] = []  # 所有分支的标签值（从 WhenBranch.result 提取，兼容展示/审查用途）
     else_label: str | None = None  # ELSE 默认值（无 ELSE 时为 None）
     branches: list[CaseWhenBranchSpec] = []  # 完整条件分支（含结构化 condition）
+    # ── 聚合阶段评估位置（从 CaseWhenStep.evaluation_phase 传递）──
+    evaluation_phase: Literal["pre_aggregate", "post_aggregate"] | None = None
 
 
 class WindowSpecSummary(StrictModel):
@@ -258,6 +271,7 @@ class DataTransformContractV1(StrictModel):
     join_relationships: list[ContractJoin] = []
     filters: list[ContractPredicate] = []
     aggregations: list[ContractAggregation] = []
+    derived_columns: list[ContractDerivedColumn] = []
     grouping_keys: list[str] = []
     output_columns: list[ContractOutputColumn] = []
     output_grain: list[str] = []

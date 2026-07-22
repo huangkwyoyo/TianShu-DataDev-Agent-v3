@@ -141,8 +141,17 @@ class SparkAggregateStep(StrictModel):
     step_type: SparkStepType = SparkStepType.AGGREGATE
     input_alias: str  # 输入 DataFrame 别名
     group_keys: list[str] = []  # 分组键（归一化字段名列表）
+    derived_group_keys: list["SparkDerivedGroupKey"] = []
     metrics: list[SparkAggregateSpec] = []  # 聚合指标
     time_transforms: list[SparkTimeTransformExpr] = Field(default_factory=list)
+
+
+class SparkDerivedGroupKey(StrictModel):
+    """聚合前计算的受控分组键。"""
+
+    output_column: str
+    source_column: str
+    date_part: Literal["HOUR"]
 
 
 class SparkAggregateSpec(StrictModel):
@@ -192,6 +201,8 @@ class SparkCaseWhenStep(StrictModel):
     output_alias: str  # 输出列别名
     branches: list[SparkCaseWhenBranch] = []  # WHEN 分支列表
     else_value: str | None = None  # ELSE 默认值
+    # ── 聚合阶段评估位置（从 CaseWhenLabelSpec.evaluation_phase 传递）──
+    evaluation_phase: Literal["pre_aggregate", "post_aggregate"] | None = None
 
 
 class SparkCaseWhenBranch(StrictModel):

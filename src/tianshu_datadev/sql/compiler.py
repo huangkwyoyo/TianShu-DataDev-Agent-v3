@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from tianshu_datadev.developer_spec.models import AggregationType
 from tianshu_datadev.planning.models import (
     ColumnRef,
+    DatePartExpression,
     DerivedGroupKey,
     Predicate,
     PredicateOperator,
@@ -534,6 +535,8 @@ class DuckDbSqlCompiler:
             return self._render_predicate_with_prefix(operand, prefix)
         if isinstance(operand, SqlLiteral):
             return self._render_literal(operand)
+        if isinstance(operand, DatePartExpression):
+            return f"EXTRACT({operand.part} FROM {prefix}.{operand.column.column_name})"
         if hasattr(operand, "column_name"):
             col = operand.column_name
             return f"{prefix}.{col}"
@@ -594,6 +597,8 @@ class DuckDbSqlCompiler:
                         group_by_parts.append(
                             self._render_time_transform(gk.expr)
                         )
+                    elif isinstance(gk, DatePartExpression):
+                        group_by_parts.append(self._render_predicate_operand(gk))
                     elif isinstance(gk, ColumnRef):
                         if gk.table_ref:
                             group_by_parts.append(f"{gk.table_ref}.{gk.column_name}")
@@ -645,6 +650,34 @@ class DuckDbSqlCompiler:
                     from_parts.append(sub_sql)
 
         # ── 合并 SELECT 列：基础列 + CASE WHEN + 窗口函数 ──
+        # 去重：CASE WHEN 表达式（如 "CASE ... END AS peak_type"）的别名
+        # 可能与 select_cols 中的裸列引用（来自 Aggregate group_keys 的
+        # extra_group_keys）冲突。CASE WHEN 表达式优先——裸列引用仅是引用，
+        # CASE WHEN 是实际计算。同时处理窗口函数别名冲突。
+        cw_window_aliases: set[str] = set()
+        for cw_expr in case_when_cols + window_cols:
+            # 提取 "AS <alias>" 后缀中的别名
+            as_idx = cw_expr.rfind(" AS ")
+            if as_idx != -1:
+                alias = cw_expr[as_idx + 4:].strip()
+                cw_window_aliases.add(alias)
+
+        if cw_window_aliases:
+            deduped_select: list[str] = []
+            for col_expr in select_cols:
+                # 裸列引用（无 "AS" 且名称在冲突集中）→ 移除
+                col_stripped = col_expr.strip()
+                if " AS " not in col_expr and col_stripped in cw_window_aliases:
+                    continue
+                # 有 "AS" 的列——检查别名是否冲突
+                col_as_idx = col_expr.rfind(" AS ")
+                if col_as_idx != -1:
+                    col_alias = col_expr[col_as_idx + 4:].strip()
+                    if col_alias in cw_window_aliases:
+                        continue
+                deduped_select.append(col_expr)
+            select_cols = deduped_select
+
         all_select_cols = select_cols + case_when_cols + window_cols
 
         # ── 组装 SQL ──
@@ -768,6 +801,11 @@ class DuckDbSqlCompiler:
                 # 复用同一渲染器——SELECT 用 "AS alias"
                 rendered = self._render_time_transform(gk.expr)
                 cols.append(f"{rendered} AS {gk.alias}")
+            elif isinstance(gk, DatePartExpression):
+                expression = self._render_predicate_operand(gk)
+                cols.append(
+                    f"{expression} AS {gk.alias}" if gk.alias else expression
+                )
             elif isinstance(gk, ColumnRef):
                 if gk.table_ref:
                     cols.append(f"{gk.table_ref}.{gk.column_name}")
@@ -858,6 +896,9 @@ class DuckDbSqlCompiler:
                 col_expr = self._render_window_expr(expr)
                 if col_expr:
                     cols.append(col_expr)
+            elif isinstance(expr, DatePartExpression):
+                col_expr = self._render_predicate_operand(expr)
+                cols.append(f"{col_expr} AS {ae.alias}")
             elif isinstance(expr, SqlRawExpression):
                 # Phase 7A：安全原始 SQL 表达式——经校验后直接渲染
                 _validate_raw_expression(expr.sql_fragment)
@@ -931,6 +972,8 @@ class DuckDbSqlCompiler:
         expr = ae.expression
         if isinstance(expr, WindowExpr):
             return self._render_window_expr(expr)
+        elif isinstance(expr, DatePartExpression):
+            return f"{self._render_predicate_operand(expr)} AS {ae.alias}"
         elif isinstance(expr, SqlRawExpression):
             # 安全校验后直接渲染原始 SQL 片段
             _validate_raw_expression(expr.sql_fragment)
@@ -1191,6 +1234,9 @@ class DuckDbSqlCompiler:
             return self._render_predicate(operand)
         if isinstance(operand, SqlLiteral):
             return self._render_literal(operand)
+        if isinstance(operand, DatePartExpression):
+            column = self._render_predicate_operand(operand.column)
+            return f"EXTRACT({operand.part} FROM {column})"
         # ColumnRef
         if hasattr(operand, "table_ref") and hasattr(operand, "column_name"):
             table = operand.table_ref

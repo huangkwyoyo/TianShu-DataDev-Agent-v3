@@ -258,10 +258,18 @@ class LabelTypedLiteral(StrictModel):
     data_type: Literal["string", "number", "boolean", "null"]
 
 
+class LabelDatePartRef(StrictModel):
+    """受控日期部分引用——当前仅开放业务分类常用的小时提取。"""
+
+    node_type: Literal["DATE_PART"] = "DATE_PART"
+    part: Literal["HOUR"]
+    column_name: str
+
+
 class LabelCompare(StrictModel):
     """二元比较：left OP right。"""
     node_type: Literal["COMPARE"] = "COMPARE"
-    left: str
+    left: str | LabelDatePartRef
     op: CompareOp
     right: LabelTypedLiteral
 
@@ -572,6 +580,8 @@ class DimensionDecl(StrictModel):
     dimension_name: str
     column_ref: str
     source_table: str | None = None  # 可选——单表场景无需指定
+    date_part: Literal["HOUR"] | None = None
+    """受控日期部件派生；None 表示直接引用物理列。"""
 
 
 # ════════════════════════════════════════════
@@ -804,6 +814,12 @@ class CaseWhenDecl(StrictModel):
     output_column: str = ""  # 输出列别名（对应 output_spec.columns 中的列名）
     # ── v4-light 最终版: 类型化的标签分支（Label Extractor 填充）──
     typed_branches: list[LabelPredicateBranch] = []  # 类型化 WHEN-THEN 分支
+    # ── 聚合阶段评估位置 ──
+    # pre_aggregate：派生维度——在 GROUP BY 前计算，输出列自动加入 group_by
+    # post_aggregate：标签列——在 GROUP BY 后计算，条件可引用聚合指标
+    # None：未判定——由 SpecEnricher.apply_enrichment 根据上下文判定，
+    #        无法判定时产生 OpenQuestion 而非静默默认值
+    evaluation_phase: Literal["pre_aggregate", "post_aggregate"] | None = None
 
 
 # ════════════════════════════════════════════

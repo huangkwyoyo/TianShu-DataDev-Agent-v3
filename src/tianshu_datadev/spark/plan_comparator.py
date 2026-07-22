@@ -972,7 +972,7 @@ class PlanComparator:
             time_transforms: list[dict[str, Any]] = []
             for g in raw_groups:
                 if isinstance(g, dict):
-                    # DerivedGroupKey：含 alias + expr.time_function
+                    # DerivedGroupKey：含 alias + expr.time_function（HEAD 路径）
                     if "alias" in g and "expr" in g:
                         expr = g.get("expr", {})
                         if isinstance(expr, dict) and "time_function" in expr:
@@ -982,6 +982,10 @@ class PlanComparator:
                                 "time_function": str(expr.get("time_function", "")).lower(),
                                 "alias": g["alias"],
                             })
+                    elif g.get("part") and g.get("column"):
+                        # DerivedGroupKey：含 part + column（origin/main 路径）
+                        flat_groups.append(str(g.get("alias") or ""))
+                        continue
                     else:
                         # 普通 ColumnRef
                         flat_groups.append(
