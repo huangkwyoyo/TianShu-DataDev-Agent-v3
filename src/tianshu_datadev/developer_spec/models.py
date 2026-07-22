@@ -610,8 +610,42 @@ class CaseWhenRule(StrictModel):
 
 
 class UncertaintyEntry(StrictModel):
-    """LLM 不确定项——仅 field_ref + description + candidates。"""
+    """LLM 不确定项——分类 + 路由信息。
+
+    output_column 是路由主键——管线仅读取此字段决定后续处理路径。
+    field_ref 仅用于诊断日志，不得解析字符串猜测 output_column。
+    缺少 output_column 时直接按 UNKNOWN 处理。
+    """
+
     field_ref: str
+    """诊断标识——可能是 "case_when_rules.parse_error.risk_level" 等路径形式，
+    仅用于日志和 artifact 审查，不作为路由依据。"""
+
+    output_column: str | None = None
+    """路由主键——输出列名。Planner 必须填写此字段，管线据此匹配。
+    为 None 时一律按 UNKNOWN 处理。"""
+
+    output_kind: Literal["LABEL", "METRIC", "DERIVED_DIMENSION", "UNKNOWN"] = "UNKNOWN"
+    """Planner 对该列业务性质的判断。分类规则（互斥——每列只能匹配一条）：
+
+    LABEL:
+      由条件分支产出的有限值分类。输出值取决于 WHEN/THEN 逻辑判断，
+      而非对源字段的确定性函数变换。示例：risk_level（CASE WHEN score>...）、
+      peak_type（CASE WHEN hour BETWEEN...）。
+      关键特征：输出值不能仅通过一个确定性函数从单一源列推导。
+
+    DERIVED_DIMENSION:
+      对源字段做直接确定性变换（单输入→单输出，无分支）。
+      示例：pickup_hour = HOUR(pickup_at)、pickup_date = DATE(pickup_at)。
+      关键特征：一个输入列 + 一个确定性函数 → 一个输出值。
+
+    METRIC:
+      聚合或聚合后数值计算。依赖 GROUP BY 后的 COUNT/SUM/AVG 等。
+      示例：avg_fare、total_trips、conversion_rate。
+
+    UNKNOWN:
+      无法判断——系统将阻断并请求人工裁决。"""
+
     description: str
     candidates: list[str] = Field(default_factory=list)
 
