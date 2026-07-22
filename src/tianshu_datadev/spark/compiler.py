@@ -459,6 +459,11 @@ class SparkCompiler:
             if m.input_column:
                 col_ref = self.renderer.render_column(m.input_column)
                 inner = col_ref
+                # SUM 对非数值列（如 boolean）自动 cast 为 double，
+                # 匹配 DuckDB 隐式类型转换行为（Spark 拒绝 SUM(boolean)）。
+                # 仅在无 FILTER 时触发——有 FILTER 时 F.when() 已推导类型。
+                if fn_name in ("F.sum",) and not m.filter:
+                    inner = f"{inner}.cast('double')"
             else:
                 # COUNT(*) → F.lit(1)
                 inner = "F.lit(1)"

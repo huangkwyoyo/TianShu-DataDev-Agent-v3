@@ -1824,10 +1824,20 @@ class PhysicalVerifier:
             return False  # float 列不匹配且不满足容差 → 不等价
 
         # Decimal → quantize 精确比较
+        # 先做浮点容差检查——避免 DuckDB Decimal 与 PySpark Double 的末位差异
+        #（~1e-15）在 quantize 舍入边界处产生误报（如 10.525000000000001
+        # vs 10.524999999999999 → quantize 后 10.53 vs 10.52）。
         if dtype and "decimal" in dtype:
             try:
                 dd = _Decimal(duckdb_val)
                 sd = _Decimal(spark_val)
+                # 容差足够近 → 视为等价，跳过 quantize 比较
+                if math.isclose(
+                    float(dd), float(sd),
+                    rel_tol=config.float_rel_tolerance,
+                    abs_tol=config.float_abs_tolerance,
+                ):
+                    return True
                 scale = PhysicalVerifier._parse_decimal_scale(dtype)
                 if scale is not None:
                     quantize_str = "0." + "0" * scale if scale > 0 else "1"

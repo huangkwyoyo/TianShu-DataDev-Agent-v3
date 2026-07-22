@@ -11,7 +11,9 @@
 from __future__ import annotations
 
 from tianshu_datadev.developer_spec.models import (
+    CaseWhenBranch,
     CaseWhenDecl,
+    CaseWhenRule,
     ColumnDecl,
     DatasetType,
     DimensionDecl,
@@ -936,4 +938,492 @@ class TestCaseWhenDeclDefaultPhase:
         dumped = cw.model_dump(mode="json")
         assert dumped.get("evaluation_phase") == "post_aggregate", (
             f"model_dump 应包含 evaluation_phase，实际: {dumped.keys()}"
+        )
+
+
+# ════════════════════════════════════════════
+# 测试：CASE WHEN 别名被聚合指标引用——嵌入表达式避免 Binder Error
+# ════════════════════════════════════════════
+
+
+class TestCaseWhenAliasInAggregation:
+    """指标 input_column 引用 CASE WHEN 别名时，编译器应嵌入 CASE WHEN 表达式。"""
+
+    def test_sum_of_case_when_alias_embeds_expression(self):
+        """SUM(anomaly_flag) 应嵌入 CASE WHEN 而非直接引用别名。"""
+        from tianshu_datadev.developer_spec.models import LabelPredicateBranch
+        from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
+
+        # 构造 CASE WHEN: anomaly_flag = CASE WHEN distance > 10 THEN 1 ELSE 0 END
+        rule = CaseWhenDecl(
+            output_column="anomaly_flag",
+            else_value="0",
+            evaluation_phase="pre_aggregate",
+            typed_branches=[
+                LabelPredicateBranch(
+                    condition=LabelCompare(
+                        left="distance_miles",
+                        op=">",
+                        right={"node_type": "LITERAL", "value": 10,
+                               "data_type": "number"},
+                    ),
+                    then_label="1",
+                ),
+            ],
+        )
+
+        import re
+
+        spec = ParsedDeveloperSpec(
+            spec_id="test_cw_agg",
+            spec_hash="cw_agg_hash",
+            title="CASE WHEN 聚合测试",
+            description="验证 SUM(CASE WHEN ...) 嵌入而非引用别名",
+            input_tables=[
+                InputTableDecl(
+                    table_alias="trips",
+                    source_table="test.trips",
+                    columns=[
+                        ColumnDecl(column_name="trip_id",
+                                   normalized_name="trip_id", data_type="bigint"),
+                        ColumnDecl(column_name="distance_miles",
+                                   normalized_name="distance_miles", data_type="double"),
+                    ],
+                ),
+            ],
+            metrics=[
+                MetricDecl(metric_name="anomaly_trip_count",
+                            alias="anomaly_trip_count",
+                            aggregation="SUM",
+                            input_column="anomaly_flag"),  # 引用 CASE WHEN 别名！
+            ],
+            dimensions=[],
+            label_rules=[rule],
+            output_spec=OutputSpecDecl(
+                columns=[
+                    OutputColumnDecl(name="anomaly_trip_count", type="bigint"),
+                ],
+                grain=[],
+            ),
+        )
+
+        builder = SqlBuildPlanBuilder()
+        plan, _ = builder.build(spec)
+
+        # 编译为 DuckDB SQL
+        compiler = DuckDbSqlCompiler(table_mapping={"trips": "test.trips"})
+        sql = compiler.compile(plan).sql
+
+        # 关键断言 1：SUM 中嵌入了 CASE WHEN 表达式而非裸列引用
+        assert re.search(
+            r"SUM\(\s*CASE\b", sql,
+        ), (
+            f"SUM 应嵌入 CASE WHEN 表达式而非引用别名，"
+            f"实际 SQL:\n{sql}"
+        )
+        # 关键断言 2：不包含 SUM(anomaly_flag) 裸列引用（根因修复）
+        assert "SUM(anomaly_flag)" not in sql, (
+            f"SQL 不应包含 SUM(anomaly_flag) 裸列引用——"
+            f"anomaly_flag 不是物理列，会导致 Binder Error，"
+            f"实际 SQL:\n{sql}"
+        )
+        # 关键断言 3：GROUP BY anomaly_flag 仍然存在（派生维度是分组键）
+        assert "GROUP BY\n  anomaly_flag" in sql, (
+            f"GROUP BY 应包含 anomaly_flag 派生维度，"
+            f"实际 SQL:\n{sql}"
+        )
+
+
+# ════════════════════════════════════════════
+# 测试：label_rules 与 case_when_rules 去重
+# ════════════════════════════════════════════
+
+
+class TestCaseWhenDedupBetweenLabelAndCaseWhenRules:
+    """label_rules 与 case_when_rules 同名时，优先保留 label_rules（携带
+    evaluation_phase），跳过 case_when_rules 中的重复规则，避免 SQL 中
+    生成重复的 peak_type / peak_type_1 列。
+
+    根因：RequirementPlanner 将 CASE WHEN 写入 spec.case_when_rules，
+    SpecEnricher.apply_enrichment 将其提升到 spec.label_rules，但未清空
+    case_when_rules。Builder 同时处理两套列表产生重复 CaseWhenStep。
+    """
+
+    def test_duplicate_output_column_skipped_in_case_when_rules(self):
+        """label_rules 已有 peak_type → case_when_rules 同名规则被跳过。"""
+        from tianshu_datadev.planning.sql_build_plan import CaseWhenStep
+
+        rule_in_labels = CaseWhenDecl(
+            output_column="peak_type",
+            else_value="平峰",
+            evaluation_phase="pre_aggregate",
+            typed_branches=[
+                LabelPredicateBranch(
+                    condition=LabelCompare(
+                        left="pickup_hour",
+                        op=">=",
+                        right={"node_type": "LITERAL", "value": 7,
+                               "data_type": "number"},
+                    ),
+                    then_label="高峰",
+                ),
+            ],
+        )
+
+        rule_in_case_when = CaseWhenRule(
+            output_column="peak_type",  # 同名！
+            else_value="平峰",
+            branches=[
+                CaseWhenBranch(
+                    condition={
+                        "node_type": "COMPARE",
+                        "left": "pickup_hour",
+                        "op": ">=",
+                        "right": {"node_type": "LITERAL", "value": 7,
+                                  "data_type": "number"},
+                    },
+                    then_value="高峰",
+                ),
+            ],
+        )
+
+        spec = ParsedDeveloperSpec(
+            spec_id="test_dedup",
+            spec_hash="dedup_hash",
+            title="去重测试",
+            description="验证 label_rules 与 case_when_rules 去重",
+            input_tables=[
+                InputTableDecl(
+                    table_alias="trips",
+                    source_table="test.trips",
+                    columns=[
+                        ColumnDecl(column_name="pickup_hour",
+                                   normalized_name="pickup_hour", data_type="int"),
+                        ColumnDecl(column_name="trip_id",
+                                   normalized_name="trip_id", data_type="bigint"),
+                    ],
+                ),
+            ],
+            metrics=[
+                MetricDecl(metric_name="trip_count", alias="trip_count",
+                            aggregation="COUNT", input_column="trip_id"),
+            ],
+            dimensions=[
+                DimensionDecl(dimension_name="peak_type", column_ref="peak_type"),
+            ],
+            label_rules=[rule_in_labels],
+            case_when_rules=[rule_in_case_when],  # 同名规则
+            output_spec=OutputSpecDecl(
+                columns=[
+                    OutputColumnDecl(name="peak_type", type="varchar"),
+                    OutputColumnDecl(name="trip_count", type="bigint"),
+                ],
+                grain=["peak_type"],
+            ),
+        )
+
+        builder = SqlBuildPlanBuilder()
+        plan, _ = builder.build(spec)
+
+        # 收集所有 CaseWhenStep
+        cw_steps = [s for s in plan.steps
+                    if isinstance(s, CaseWhenStep)]
+        peak_type_steps = [s for s in cw_steps
+                           if str(s.alias) == "peak_type"]
+
+        # 关键断言：只有 1 个 peak_type CaseWhenStep
+        assert len(peak_type_steps) == 1, (
+            f"同名 CASE WHEN 应去重为 1 个，"
+            f"实际 peak_type 步骤数: {len(peak_type_steps)}"
+        )
+
+        # 保留的步骤应来自 label_rules（有 evaluation_phase）
+        retained = peak_type_steps[0]
+        assert retained.evaluation_phase == "pre_aggregate", (
+            f"应保留 label_rules 的规则（携带 evaluation_phase），"
+            f"实际 evaluation_phase: {retained.evaluation_phase}"
+        )
+
+    def test_distinct_output_columns_both_kept(self):
+        """不同 output_column 的规则各自保留，不互相去重。"""
+        from tianshu_datadev.planning.sql_build_plan import CaseWhenStep
+
+        rule_a = CaseWhenDecl(
+            output_column="peak_type",
+            else_value="平峰",
+            evaluation_phase="pre_aggregate",
+            typed_branches=[
+                LabelPredicateBranch(
+                    condition=LabelCompare(
+                        left="pickup_hour", op=">=",
+                        right={"node_type": "LITERAL", "value": 7,
+                               "data_type": "number"},
+                    ),
+                    then_label="高峰",
+                ),
+            ],
+        )
+
+        rule_b = CaseWhenRule(
+            output_column="value_tier",  # 不同名
+            else_value="低",
+            branches=[
+                CaseWhenBranch(
+                    condition={
+                        "node_type": "COMPARE",
+                        "left": "trip_count", "op": ">=",
+                        "right": {"node_type": "LITERAL", "value": 100,
+                                  "data_type": "number"},
+                    },
+                    then_value="高",
+                ),
+            ],
+        )
+
+        spec = ParsedDeveloperSpec(
+            spec_id="test_distinct",
+            spec_hash="distinct_hash",
+            title="不重名测试",
+            description="不同输出列应各自保留",
+            input_tables=[
+                InputTableDecl(
+                    table_alias="trips",
+                    source_table="test.trips",
+                    columns=[
+                        ColumnDecl(column_name="pickup_hour",
+                                   normalized_name="pickup_hour", data_type="int"),
+                        ColumnDecl(column_name="trip_id",
+                                   normalized_name="trip_id", data_type="bigint"),
+                    ],
+                ),
+            ],
+            metrics=[
+                MetricDecl(metric_name="trip_count", alias="trip_count",
+                            aggregation="COUNT", input_column="trip_id"),
+            ],
+            dimensions=[
+                DimensionDecl(dimension_name="peak_type", column_ref="peak_type"),
+            ],
+            label_rules=[rule_a],
+            case_when_rules=[rule_b],  # 不同名
+            output_spec=OutputSpecDecl(
+                columns=[
+                    OutputColumnDecl(name="peak_type", type="varchar"),
+                    OutputColumnDecl(name="value_tier", type="varchar"),
+                    OutputColumnDecl(name="trip_count", type="bigint"),
+                ],
+                grain=["peak_type"],
+            ),
+        )
+
+        builder = SqlBuildPlanBuilder()
+        plan, _ = builder.build(spec)
+
+        cw_steps = [s for s in plan.steps
+                    if isinstance(s, CaseWhenStep)]
+        aliases = {str(s.alias) for s in cw_steps}
+
+        assert "peak_type" in aliases, "peak_type 应保留"
+        assert "value_tier" in aliases, "value_tier 应保留"
+        assert len(cw_steps) == 2, (
+            f"两个不同名规则应各自保留，实际步骤数: {len(cw_steps)}"
+        )
+
+
+# ════════════════════════════════════════════
+# 测试：label_rules 内部去重
+# ════════════════════════════════════════════
+
+
+class TestCaseWhenDedupWithinLabelRules:
+    """label_rules 内部出现同名规则时（如 spec 同时包含 pre_aggregate 和
+    不带 evaluation_phase 的 peak_type），应只保留第一条，避免 SQL 中
+    生成重复列（DuckDB 自动重命名为 peak_type_1 → schema 不一致）。
+
+    真实场景：SpecEnricher 将 RequirementPlanner 的 case_when_rules
+    提升为 label_rules 时，可能与已有 label_rules 产生同名列。
+    """
+
+    def test_duplicate_within_label_rules_keeps_first(self):
+        """label_rules 内两个 peak_type → 只保留第一条 CaseWhenStep。"""
+        from tianshu_datadev.planning.sql_build_plan import CaseWhenStep
+
+        # 第一条：有 evaluation_phase（pre_aggregate）
+        rule_pre_agg = CaseWhenDecl(
+            output_column="peak_type",
+            else_value="平峰",
+            evaluation_phase="pre_aggregate",
+            typed_branches=[
+                LabelPredicateBranch(
+                    condition=LabelCompare(
+                        left="pickup_hour",
+                        op=">=",
+                        right={"node_type": "LITERAL", "value": 7,
+                               "data_type": "number"},
+                    ),
+                    then_label="高峰",
+                ),
+            ],
+        )
+
+        # 第二条：同名，无 evaluation_phase → 模拟 SpecEnricher 提升后
+        # label_rules 中同时存在两条 peak_type 的场景
+        rule_no_phase = CaseWhenDecl(
+            output_column="peak_type",  # 同名！
+            else_value="平峰",
+            evaluation_phase=None,  # 无聚合阶段信息
+            typed_branches=[
+                LabelPredicateBranch(
+                    condition=LabelCompare(
+                        left="pickup_hour",
+                        op="=",
+                        right={"node_type": "LITERAL", "value": 7,
+                               "data_type": "number"},
+                    ),
+                    then_label="高峰",
+                ),
+            ],
+        )
+
+        spec = ParsedDeveloperSpec(
+            spec_id="test_dedup_within_labels",
+            spec_hash="dedup_within_hash",
+            title="label_rules 内部去重测试",
+            description="验证 label_rules 内同名列只保留第一条",
+            input_tables=[
+                InputTableDecl(
+                    table_alias="trips",
+                    source_table="test.trips",
+                    columns=[
+                        ColumnDecl(column_name="pickup_hour",
+                                   normalized_name="pickup_hour", data_type="int"),
+                        ColumnDecl(column_name="trip_id",
+                                   normalized_name="trip_id", data_type="bigint"),
+                    ],
+                ),
+            ],
+            metrics=[
+                MetricDecl(metric_name="trip_count", alias="trip_count",
+                            aggregation="COUNT", input_column="trip_id"),
+            ],
+            dimensions=[
+                DimensionDecl(dimension_name="peak_type", column_ref="peak_type"),
+            ],
+            label_rules=[rule_pre_agg, rule_no_phase],  # 两条同名规则
+            case_when_rules=[],  # 无额外规则
+            output_spec=OutputSpecDecl(
+                columns=[
+                    OutputColumnDecl(name="peak_type", type="varchar"),
+                    OutputColumnDecl(name="trip_count", type="bigint"),
+                ],
+                grain=["peak_type"],
+            ),
+        )
+
+        builder = SqlBuildPlanBuilder()
+        plan, _ = builder.build(spec)
+
+        cw_steps = [s for s in plan.steps
+                    if isinstance(s, CaseWhenStep)]
+        peak_type_steps = [s for s in cw_steps
+                           if str(s.alias) == "peak_type"]
+
+        # 关键断言：只有 1 个 peak_type CaseWhenStep
+        assert len(peak_type_steps) == 1, (
+            f"label_rules 内同名列应去重为 1 个，"
+            f"实际 peak_type 步骤数: {len(peak_type_steps)}"
+        )
+
+        # 保留的应是第一条（有 evaluation_phase）
+        retained = peak_type_steps[0]
+        assert retained.evaluation_phase == "pre_aggregate", (
+            f"应保留第一条（有 evaluation_phase），"
+            f"实际 evaluation_phase: {retained.evaluation_phase}"
+        )
+
+    def test_distinct_columns_within_label_rules_both_kept(self):
+        """label_rules 内不同 output_column → 各自保留。"""
+        from tianshu_datadev.planning.sql_build_plan import CaseWhenStep
+
+        rule_a = CaseWhenDecl(
+            output_column="peak_type",
+            else_value="平峰",
+            evaluation_phase="pre_aggregate",
+            typed_branches=[
+                LabelPredicateBranch(
+                    condition=LabelCompare(
+                        left="pickup_hour", op=">=",
+                        right={"node_type": "LITERAL", "value": 7,
+                               "data_type": "number"},
+                    ),
+                    then_label="高峰",
+                ),
+            ],
+        )
+
+        rule_b = CaseWhenDecl(
+            output_column="value_tier",  # 不同名
+            else_value="低",
+            evaluation_phase="post_aggregate",
+            typed_branches=[
+                LabelPredicateBranch(
+                    condition=LabelCompare(
+                        left="amount", op=">",
+                        right={"node_type": "LITERAL", "value": 100,
+                               "data_type": "number"},
+                    ),
+                    then_label="高",
+                ),
+            ],
+        )
+
+        spec = ParsedDeveloperSpec(
+            spec_id="test_distinct_within_labels",
+            spec_hash="distinct_within_hash",
+            title="label_rules 不同名测试",
+            description="验证 label_rules 内不同名列各自保留",
+            input_tables=[
+                InputTableDecl(
+                    table_alias="trips",
+                    source_table="test.trips",
+                    columns=[
+                        ColumnDecl(column_name="pickup_hour",
+                                   normalized_name="pickup_hour", data_type="int"),
+                        ColumnDecl(column_name="amount",
+                                   normalized_name="amount", data_type="decimal(12,2)"),
+                        ColumnDecl(column_name="trip_id",
+                                   normalized_name="trip_id", data_type="bigint"),
+                    ],
+                ),
+            ],
+            metrics=[
+                MetricDecl(metric_name="trip_count", alias="trip_count",
+                            aggregation="COUNT", input_column="trip_id"),
+            ],
+            dimensions=[
+                DimensionDecl(dimension_name="peak_type", column_ref="peak_type"),
+            ],
+            label_rules=[rule_a, rule_b],  # 不同名——都应保留
+            case_when_rules=[],
+            output_spec=OutputSpecDecl(
+                columns=[
+                    OutputColumnDecl(name="peak_type", type="varchar"),
+                    OutputColumnDecl(name="value_tier", type="varchar"),
+                    OutputColumnDecl(name="trip_count", type="bigint"),
+                ],
+                grain=["peak_type"],
+            ),
+        )
+
+        builder = SqlBuildPlanBuilder()
+        plan, _ = builder.build(spec)
+
+        cw_steps = [s for s in plan.steps
+                    if isinstance(s, CaseWhenStep)]
+        aliases = {str(s.alias) for s in cw_steps}
+
+        assert "peak_type" in aliases, "peak_type 应保留"
+        assert "value_tier" in aliases, "value_tier 应保留"
+        assert len(cw_steps) == 2, (
+            f"两个不同名规则应各自保留，实际步骤数: {len(cw_steps)}"
         )

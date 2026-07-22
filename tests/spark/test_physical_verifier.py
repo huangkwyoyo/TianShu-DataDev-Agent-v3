@@ -1627,6 +1627,50 @@ class TestNormalizationConfig:
         # str 比较： "1266.70" != "1266.7" → 差异
         assert total_count >= 1
 
+    def test_decimal_quantize_boundary_equivalent(self):
+        """Decimal quantize 舍入边界——末位差异 ~1e-15 不应产生误报。
+
+        真实场景：DuckDB Decimal AVG 与 Spark Double AVG 的末位差异
+        （如 10.525000000000001 vs 10.524999999999999），
+        quantize 默认 ROUND_HALF_EVEN → 10.53 vs 10.52 → 误报 0.01 差异。
+        修复后 math.isclose 容差检查应拦截此场景。
+        """
+        config = NormalizationConfig(
+            output_columns=[
+                NormalizationColumn(column_name="avg_fare", data_type="decimal(12,2)"),
+            ],
+        )
+        # 模拟 DuckDB Decimal vs Spark Double 的末位差异
+        duckdb_rows = [{"id": "1", "avg_fare": "10.525000000000001"}]
+        spark_rows = [{"id": "1", "avg_fare": "10.524999999999999"}]
+
+        diffs, total_count, truncated = PhysicalVerifier._compute_diffs(
+            duckdb_rows, spark_rows, config=config,
+        )
+        # 差异 ~2e-15 < abs_tol=1e-12 → 应视为等价
+        assert total_count == 0, (
+            f"quantize 舍入边界应通过 math.isclose 容差消除，"
+            f"实际差异数: {total_count}"
+        )
+
+    def test_decimal_quantize_boundary_tolerates_small_diff(self):
+        """Decimal 差异在 1e-12 内——应视为等价（不依赖 quantize 舍入方向）。"""
+        config = NormalizationConfig(
+            output_columns=[
+                NormalizationColumn(column_name="amount", data_type="decimal(18,4)"),
+            ],
+        )
+        # 两值差异 ~1e-13，小于 abs_tol=1e-12
+        duckdb_rows = [{"id": "1", "amount": "50.123450000000001"}]
+        spark_rows = [{"id": "1", "amount": "50.123449999999999"}]
+
+        diffs, total_count, truncated = PhysicalVerifier._compute_diffs(
+            duckdb_rows, spark_rows, config=config,
+        )
+        assert total_count == 0, (
+            f"1e-13 级差异应在容差内视为等价，实际差异数: {total_count}"
+        )
+
     # ── 权威 schema NULL 补齐测试 ──
 
     def test_missing_column_filled_from_schema(self):

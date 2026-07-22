@@ -1909,6 +1909,25 @@ class SqlBuildPlanBuilder:
                 child, derived_expr_map, physical_collected,
             )
 
+    @staticmethod
+    def _resolve_derived_source_table(
+        dd_source_table: str, spec: ParsedDeveloperSpec,
+    ) -> str:
+        """将 LLM 输出的物理表名映射为表别名。
+
+        RequirementPlanner LLM 输出的 source_table 是物理表名
+        （如 gold.fact_trips / gold.dim_taxi_zone），
+        但 ColumnRef.table_ref / TimeTransformExpr.source_table 等字段
+        需要表别名（如 ft / dtz）。
+        此方法通过 spec.input_tables 的 source_table→table_alias 做映射。
+
+        适用范围：DerivedDimensionDecl.source_table 和 DimensionDecl.source_table。
+        """
+        for t in spec.input_tables:
+            if t.source_table == dd_source_table:
+                return t.table_alias
+        return dd_source_table  # 兜底：直接返回（单表别名即表名场景）
+
     def _build_case_when_steps(self, spec: ParsedDeveloperSpec) -> list:
         """从 spec.label_rules 和 spec.case_when_rules 生成 CaseWhenStep 列表。
 
@@ -1936,14 +1955,26 @@ class SqlBuildPlanBuilder:
         derived_expr_map: dict[str, TimeTransformExpr] = {
             dd.dimension_name: TimeTransformExpr(
                 source_column=SafeIdentifier(dd.source_column),
-                source_table=SafeIdentifier(dd.source_table),
+                source_table=SafeIdentifier(
+                    self._resolve_derived_source_table(dd.source_table, spec)
+                ),
                 time_function=dd.time_function,
             )
             for dd in spec.derived_dimensions
         }
 
+        # ── 已处理的输出列名——label_rules 优先级更高（携带 evaluation_phase），
+        #     case_when_rules 中的同名规则应被跳过，避免重复生成 CaseWhenStep。
+        seen_aliases: set[str] = set()
+
         # ── 处理 label_rules（v4-light 标签表路径）──
+        #     同时检查 label_rules 内部的重复——同名列只保留第一条。
+        #     典型场景：spec 同时包含 pre_aggregate 和 post_aggregate 的
+        #     peak_type 规则时，第二条通过 withColumn 覆盖写入是正确行为，
+        #     但 SQL 不允许 SELECT 列重名，必须在构建阶段去重。
         for rule in spec.label_rules:
+            if rule.output_column in seen_aliases:
+                continue
             cases: list[WhenBranch] = []
             for tb in rule.typed_branches:
                 predicate = self._predicate_from_label_node(
@@ -1966,9 +1997,14 @@ class SqlBuildPlanBuilder:
                 evaluation_phase=rule.evaluation_phase,  # 从 CaseWhenDecl 传递聚合阶段
             )
             steps.append(step)
+            seen_aliases.add(rule.output_column)
 
         # ── 处理 case_when_rules（v3.1 RequirementPlanner 路径）──
+        #     跳过与 label_rules 同名的规则——label_rules 携带 evaluation_phase，
+        #     信息更完整，优先保留。
         for rule in spec.case_when_rules:
+            if rule.output_column in seen_aliases:
+                continue
             cases: list[WhenBranch] = []
             for branch in rule.branches:
                 predicate = self._predicate_from_label_node(
@@ -1989,6 +2025,7 @@ class SqlBuildPlanBuilder:
                 alias=SafeIdentifier(rule.output_column),
             )
             steps.append(step)
+            seen_aliases.add(rule.output_column)
 
         return steps
 
@@ -2118,7 +2155,9 @@ class SqlBuildPlanBuilder:
             cw_derived_map: dict[str, TimeTransformExpr] = {
                 dd.dimension_name: TimeTransformExpr(
                     source_column=SafeIdentifier(dd.source_column),
-                    source_table=SafeIdentifier(dd.source_table),
+                    source_table=SafeIdentifier(
+                        self._resolve_derived_source_table(dd.source_table, spec)
+                    ),
                     time_function=dd.time_function,
                 )
                 for dd in spec.derived_dimensions
@@ -3047,8 +3086,13 @@ class SqlBuildPlanBuilder:
                 # CASE 输出是上游派生列；同名维度不能重新解释为源表物理列。
                 continue
             normalized = self._normalizer.normalize(d.column_ref)
+            # LLM 输出的 source_table 可能是物理表名（如 gold.dim_taxi_zone），
+            # 需映射为表别名（如 dtz）才能通过 SafeIdentifier 校验。
+            dim_table_ref = primary_table
+            if d.source_table:
+                dim_table_ref = self._resolve_derived_source_table(d.source_table, spec)
             source = ColumnRef(
-                table_ref=d.source_table or primary_table,
+                table_ref=dim_table_ref,
                 column_name=d.column_ref,
                 normalized_name=normalized,
             )
@@ -3074,12 +3118,30 @@ class SqlBuildPlanBuilder:
         }
         for dd in spec.derived_dimensions:
             if dd.dimension_name in existing_aliases:
+                # 去重：dimensions.date_part 已生成同名 DatePartExpression，
+                # 但 CASE WHEN 条件中的 TimeTransformExpr 反向查找 alias
+                # 需要此条目。保留为影子条目——不参与 SQL/Spark 渲染，
+                # 仅供 Contract 提取器的 derived_expr_map 使用。
+                dgk = DerivedGroupKey(
+                    alias=dd.dimension_name,
+                    expr=TimeTransformExpr(
+                        source_column=SafeIdentifier(dd.source_column),
+                        source_table=SafeIdentifier(
+                            self._resolve_derived_source_table(dd.source_table, spec)
+                        ),
+                        time_function=dd.time_function,
+                    ),
+                )
+                dgk._shadow = True
+                group_cols.append(dgk)
                 continue
             group_cols.append(DerivedGroupKey(
                 alias=dd.dimension_name,
                 expr=TimeTransformExpr(
                     source_column=SafeIdentifier(dd.source_column),
-                    source_table=SafeIdentifier(dd.source_table),
+                    source_table=SafeIdentifier(
+                        self._resolve_derived_source_table(dd.source_table, spec)
+                    ),
                     time_function=dd.time_function,
                 ),
             ))
@@ -3103,11 +3165,17 @@ class SqlBuildPlanBuilder:
                     None,
                 )
                 if derived and derived.date_part:
+                    # LLM 输出的 source_table 可能是物理表名，需映射为表别名。
+                    grain_table_ref = primary_table
+                    if derived.source_table:
+                        grain_table_ref = self._resolve_derived_source_table(
+                            derived.source_table, spec
+                        )
                     group_cols.append(
                         DatePartExpression(
                             part=derived.date_part,
                             column=ColumnRef(
-                                table_ref=derived.source_table or primary_table,
+                                table_ref=grain_table_ref,
                                 column_name=derived.column_ref,
                                 normalized_name=self._normalizer.normalize(
                                     derived.column_ref
@@ -3188,7 +3256,12 @@ class SqlBuildPlanBuilder:
         # ── 构建维度名→(源列, 源表) 的映射 ──
         dim_source_map: dict[str, tuple[str, str]] = {}
         for d in spec.dimensions:
-            table_ref = d.source_table or ""
+            # LLM 输出的 source_table 可能是物理表名，需映射为表别名。
+            table_ref = (
+                self._resolve_derived_source_table(d.source_table, spec)
+                if d.source_table
+                else ""
+            )
             dim_source_map[d.dimension_name] = (d.column_ref, table_ref)
 
         overrides = column_table_overrides or {}

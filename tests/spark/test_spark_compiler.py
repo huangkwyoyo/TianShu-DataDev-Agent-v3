@@ -675,7 +675,7 @@ class TestCompileAggregate:
         assert ".agg(" in result.raw_pyspark
         assert 'F.col("region")' in result.raw_pyspark
         assert "F.count(F.lit(1))" in result.raw_pyspark
-        assert 'F.sum(F.col("amount"))' in result.raw_pyspark
+        assert 'F.sum(F.col("amount").cast(\'double\'))' in result.raw_pyspark
         assert '.alias("cnt")' in result.raw_pyspark
         assert '.alias("total_amount")' in result.raw_pyspark
 
@@ -782,6 +782,80 @@ class TestCompileAggregate:
         assert "F.avg" in result.raw_pyspark
         assert "F.min" in result.raw_pyspark
         assert "F.max" in result.raw_pyspark
+
+    def test_sum_without_filter_casts_to_double(self):
+        """SUM 无 filter 时自动 cast('double')——兼容 boolean 等非数值列。"""
+        plan = _make_plan(
+            SparkReadStep(alias="df", source_name="default_table", input_key="default"),
+            SparkAggregateStep(
+                input_alias="df",
+                group_keys=["region"],
+                metrics=[
+                    SparkAggregateSpec(
+                        function=SparkAggFunction.SUM,
+                        input_column="is_anomaly",
+                        alias="anomaly_count",
+                    ),
+                ],
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        # 关键断言：SUM 无 filter 时列引用被 cast('double') 包裹
+        assert "F.sum(F.col(\"is_anomaly\").cast('double'))" in result.raw_pyspark
+
+    def test_sum_with_filter_no_cast(self):
+        """SUM 有 filter 时不追加 cast——F.when() 已推导类型。"""
+        from tianshu_datadev.developer_spec.models import MetricFilterDecl
+
+        plan = _make_plan(
+            SparkReadStep(alias="df", source_name="default_table", input_key="default"),
+            SparkAggregateStep(
+                input_alias="df",
+                group_keys=["region"],
+                metrics=[
+                    SparkAggregateSpec(
+                        function=SparkAggFunction.SUM,
+                        input_column="amount",
+                        alias="filtered_total",
+                        filter=MetricFilterDecl(
+                            column="status",
+                            operator="eq",
+                            value="active",
+                        ),
+                    ),
+                ],
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        # 有 filter 时不追加 cast
+        assert "F.when(" in result.raw_pyspark
+        assert ".cast('double')" not in result.raw_pyspark
+
+    def test_avg_without_filter_no_cast(self):
+        """AVG 无 filter 时不追加 cast——仅 SUM 触发此行为。"""
+        plan = _make_plan(
+            SparkReadStep(alias="df", source_name="default_table", input_key="default"),
+            SparkAggregateStep(
+                input_alias="df",
+                group_keys=["region"],
+                metrics=[
+                    SparkAggregateSpec(
+                        function=SparkAggFunction.AVG,
+                        input_column="is_anomaly",
+                        alias="avg_anomaly",
+                    ),
+                ],
+            ),
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+
+        # AVG 不应追加 cast
+        assert ".cast('double')" not in result.raw_pyspark
 
 
 class TestCompileJoin:
