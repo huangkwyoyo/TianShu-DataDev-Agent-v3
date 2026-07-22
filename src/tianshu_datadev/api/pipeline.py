@@ -642,10 +642,12 @@ class Pipeline:
         # CASE WHEN 逐规则解析失败 → 阻断级 OpenQuestion
         case_when_parse_errors = _extract_case_when_parse_errors(planner_output)
         if case_when_parse_errors:
+            spec = _apply_uncertainties_to_spec(spec, planner_output.uncertainties)
             return spec, case_when_parse_errors
 
         valid, questions = self._proposal_validator.validate(proposal, spec, manifest)
         if not valid:
+            spec = _apply_uncertainties_to_spec(spec, proposal.uncertainties)
             return spec, questions
 
         spec = self._proposal_promotion.promote(proposal, spec)
