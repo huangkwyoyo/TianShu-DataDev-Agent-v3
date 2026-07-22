@@ -537,6 +537,8 @@ class DuckDbSqlCompiler:
             return self._render_literal(operand)
         if isinstance(operand, DatePartExpression):
             return f"EXTRACT({operand.part} FROM {prefix}.{operand.column.column_name})"
+        if isinstance(operand, TimeTransformExpr):
+            return f"{operand.time_function}({prefix}.{operand.source_column})"
         if hasattr(operand, "column_name"):
             col = operand.column_name
             return f"{prefix}.{col}"
@@ -560,6 +562,12 @@ class DuckDbSqlCompiler:
         # CASE WHEN 列和窗口函数列（Phase 3B）
         case_when_cols: list[str] = []
         window_cols: list[str] = []
+
+        # ── 构建 CASE WHEN 别名→步骤映射（供聚合嵌入使用）──
+        case_when_map: dict[str, CaseWhenStep] = {}
+        for step in plan.steps:
+            if isinstance(step, CaseWhenStep) and step.alias:
+                case_when_map[str(step.alias)] = step
 
         for step in plan.steps:
             if isinstance(step, ScanStep):
@@ -585,14 +593,16 @@ class DuckDbSqlCompiler:
                     join_parts.append(join_clause)
 
             elif isinstance(step, AggregateStep):
-                # 聚合函数渲染
-                agg_cols = self._render_aggregate(step)
+                # 聚合函数渲染——传入 case_when_map 以嵌入 CASE WHEN 表达式
+                agg_cols = self._render_aggregate(step, case_when_map=case_when_map)
                 if agg_cols:
                     select_cols = agg_cols  # 聚合覆盖 select
                     has_aggregation = True  # 标记已聚合，后续 ProjectStep 不覆盖
                 # GROUP BY——显式处理 DerivedGroupKey
                 for gk in step.group_keys:
                     if isinstance(gk, DerivedGroupKey):
+                        if gk._shadow:
+                            continue  # 影子条目——仅用于 Contract 反查，不渲染
                         # 复用同一渲染器——GROUP BY 不带 "AS alias"
                         group_by_parts.append(
                             self._render_time_transform(gk.expr)
@@ -785,19 +795,29 @@ class DuckDbSqlCompiler:
         """
         return f"{expr.time_function}({expr.source_table}.{expr.source_column})"
 
-    def _render_aggregate(self, step: AggregateStep) -> list[str]:
+    def _render_aggregate(
+        self, step: AggregateStep,
+        case_when_map: dict[str, CaseWhenStep] | None = None,
+    ) -> list[str]:
         """渲染聚合步骤为 SELECT 列列表。
 
         Phase 4D 扩展：
         - distinct=True → SUM(DISTINCT col) 等去重聚合
         - input_expression → 多字段表达式（如 "quantity * unit_price"）
         - filter → FILTER (WHERE ...) 条件聚合
+
+        当 input_column 匹配 case_when_map 中某个 CaseWhenStep 的别名时，
+        将完整的 CASE WHEN 表达式（不带 AS alias）嵌入聚合函数内部，
+        避免同层 SELECT 引用别名导致 Binder Error。
         """
         cols: list[str] = []
+        cw_map = case_when_map or {}
 
         # GROUP BY 列——显式处理 DerivedGroupKey
         for gk in step.group_keys:
             if isinstance(gk, DerivedGroupKey):
+                if gk._shadow:
+                    continue  # 影子条目——仅用于 Contract 反查，不渲染
                 # 复用同一渲染器——SELECT 用 "AS alias"
                 rendered = self._render_time_transform(gk.expr)
                 cols.append(f"{rendered} AS {gk.alias}")
@@ -823,7 +843,16 @@ class DuckDbSqlCompiler:
                 # 多字段表达式——如 "quantity * unit_price"（不加前缀，已是完整表达式）
                 input_part = m.input_expression
             elif m.input_column:
-                if m.distinct and m.aggregation != AggregationType.COUNT_DISTINCT:
+                # ── CASE WHEN 别名检测——嵌入完整表达式避免同层引用 ──
+                cw_step = cw_map.get(m.input_column)
+                if cw_step is not None:
+                    # 渲染 CASE WHEN 表达式（不带 AS alias）
+                    case_body = self._render_case_when(cw_step, include_alias=False)
+                    if m.distinct and m.aggregation != AggregationType.COUNT_DISTINCT:
+                        input_part = f"DISTINCT {case_body}"
+                    else:
+                        input_part = case_body
+                elif m.distinct and m.aggregation != AggregationType.COUNT_DISTINCT:
                     # SUM(DISTINCT col) 等去重聚合（COUNT_DISTINCT 已独立处理）
                     input_part = f"DISTINCT {col_prefix}{m.input_column}"
                 else:
@@ -834,7 +863,13 @@ class DuckDbSqlCompiler:
             # 渲染聚合函数
             agg_func = m.aggregation
             if agg_func == AggregationType.COUNT_DISTINCT:
-                if m.input_column:
+                if m.input_column and m.input_column in cw_map:
+                    # CASE WHEN 嵌入 COUNT(DISTINCT ...)
+                    case_body = self._render_case_when(
+                        cw_map[m.input_column], include_alias=False,
+                    )
+                    agg_expr = f"COUNT(DISTINCT {case_body})"
+                elif m.input_column:
                     agg_expr = f"COUNT(DISTINCT {col_prefix}{m.input_column})"
                 else:
                     agg_expr = "COUNT(DISTINCT *)"
@@ -994,7 +1029,7 @@ class DuckDbSqlCompiler:
 
     # ── Phase 3B：CASE WHEN 渲染 ──
 
-    def _render_case_when(self, step: CaseWhenStep) -> str:
+    def _render_case_when(self, step: CaseWhenStep, include_alias: bool = True) -> str:
         """渲染 CaseWhenStep 为 CASE WHEN SQL 表达式。
 
         输出格式：
@@ -1002,13 +1037,14 @@ class DuckDbSqlCompiler:
               WHEN <condition> THEN <result>
               [WHEN <condition> THEN <result> ...]
               [ELSE <else_value>]
-            END AS <alias>
+            END [AS <alias>]
 
         Args:
             step: CASE WHEN 步骤
+            include_alias: 是否追加 AS alias 后缀。聚合函数内部嵌入时设为 False。
 
         Returns:
-            完整的 CASE WHEN ... END AS alias SQL 表达式
+            CASE WHEN ... END [AS alias] SQL 表达式
         """
         if not step.cases:
             return ""
@@ -1035,7 +1071,7 @@ class DuckDbSqlCompiler:
         parts.append("END")
 
         case_expr = "\n".join(parts)
-        if step.alias:
+        if include_alias and step.alias:
             return f"{case_expr} AS {step.alias}"
         return case_expr
 
@@ -1237,6 +1273,8 @@ class DuckDbSqlCompiler:
         if isinstance(operand, DatePartExpression):
             column = self._render_predicate_operand(operand.column)
             return f"EXTRACT({operand.part} FROM {column})"
+        if isinstance(operand, TimeTransformExpr):
+            return self._render_time_transform(operand)
         # ColumnRef
         if hasattr(operand, "table_ref") and hasattr(operand, "column_name"):
             table = operand.table_ref
@@ -1476,6 +1514,7 @@ class DuckDbSqlCompiler:
             keys = ", ".join(
                 gk.alias if isinstance(gk, DerivedGroupKey) else gk.column_name
                 for gk in step.group_keys
+                if not (isinstance(gk, DerivedGroupKey) and gk._shadow)
             )
             n_metrics = len(step.metrics)
             return f"按 {keys} 分组，聚合 {n_metrics} 个指标"

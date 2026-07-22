@@ -420,6 +420,8 @@ class DataTransformContractExtractor:
         seen_transforms: set[str] = set()
         for gk in step.group_keys:
             if isinstance(gk, DerivedGroupKey):
+                if gk._shadow:
+                    continue  # 影子条目——仅用于 derived_expr_map 反查，不进入 Contract 输出
                 if gk.alias not in seen_groups:
                     groups.append(gk.alias)
                     seen_groups.add(gk.alias)
@@ -936,10 +938,21 @@ class DataTransformContractExtractor:
         # 二元比较——右侧必须是 SqlLiteral（字面量），不支持列-列比较
         if op in ("EQ", "NEQ", "GT", "GTE", "LT", "LTE"):
             date_part = None
-            left_operand = pred.left
-            if isinstance(left_operand, DatePartExpression):
-                date_part = left_operand.part
-                left_operand = left_operand.column
+            # 从原始 left 提取 DatePartExpression 的 date_part；
+            # TimeTransformExpr 已在 Section 1 解析为 alias ColumnRef
+            # （normalized_name=alias, 如 pickup_hour），
+            # 不应重新读取 pred.left 覆盖已解析结果——
+            # 否则 _extract_column_ref 返回基表列名 pickup_at 而非别名，
+            # 且 date_part 未设置，Spark 侧生成 F.col("pickup_at") 在
+            # 聚合后列已不存在的 DataFrame 上报 AnalysisException。
+            original_left = pred.left
+            if isinstance(original_left, DatePartExpression):
+                date_part = original_left.part
+                left_operand = original_left.column
+            elif not isinstance(original_left, TimeTransformExpr):
+                # ColumnRef 等常规左操作数——使用原始值
+                left_operand = original_left
+            # else: TimeTransformExpr → 使用 Section 1 已解析的 left_operand（alias ColumnRef）
             table, name = DataTransformContractExtractor._extract_column_ref(left_operand)
             if not hasattr(pred.right, "value"):
                 raise ValueError(

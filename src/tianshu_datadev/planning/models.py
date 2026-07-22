@@ -13,7 +13,7 @@ import re
 from enum import Enum
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, model_validator
+from pydantic import AfterValidator, PrivateAttr, model_validator
 
 from tianshu_datadev.developer_spec.models import (
     AggregationType,
@@ -223,9 +223,15 @@ class DerivedGroupKey(StrictModel):
 
     在 AggregateStep.group_keys 中使用。
     alias 是聚合后的列引用名——CASE WHEN 和 Project 通过此名引用。
+
+    _shadow=True 表示此条目仅用于 Contract 提取器的 derived_expr_map 反查，
+    不参与 SQL/Spark 的 GROUP BY / SELECT 渲染。当 dimensions.date_part
+    与 derived_dimensions 产生同名 alias 时，Builder 去重保留此影子条目，
+    避免 Contract 侧 TimeTransformExpr→alias 反向查找失败。
     """
     alias: str
     expr: TimeTransformExpr
+    _shadow: bool = PrivateAttr(default=False)
 
 
 class AggregateSpec(StrictModel):

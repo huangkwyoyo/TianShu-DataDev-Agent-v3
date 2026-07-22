@@ -1330,6 +1330,20 @@ class TestSingleStatementV1Regression:
         assert len(result.case_when_labels) == 1
         cw = result.case_when_labels[0]
         assert cw.output_alias == "peak_type"
+        # 回归验证：TimeTransformExpr → alias 解析正确，
+        # normalized_name 应为派生别名 pickup_hour 而非基表列名 pickup_at
+        assert len(cw.branches) == 1
+        branch_cond = cw.branches[0].condition
+        # GTE 叶子节点应在第一个 AND/OR 之前——此处为单条件，直接是叶子
+        assert branch_cond.normalized_name == "pickup_hour", (
+            f"TimeTransformExpr 条件应解析为 alias 'pickup_hour'，"
+            f"实际 normalized_name={branch_cond.normalized_name!r}"
+        )
+        # date_part 应为 None——alias 已是 HOUR 值，Spark 编译器不应再包 F.hour()
+        assert branch_cond.date_part is None, (
+            f"alias 条件不应设置 date_part（已是 HOUR 值），"
+            f"实际 date_part={branch_cond.date_part!r}"
+        )
 
     def test_window_step_single_statement_v1_path(self):
         """WindowStep 单语句：build_sql_program + extract_v1 必须捕获 window_specs。"""
