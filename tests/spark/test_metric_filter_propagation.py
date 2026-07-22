@@ -1,5 +1,7 @@
 """MetricFilterDecl filter 全链路传播测试——Mapper + Compiler。"""
 
+import pytest
+
 from tianshu_datadev.artifacts.models import ContractAggregation
 from tianshu_datadev.developer_spec.models import MetricFilterDecl
 from tianshu_datadev.spark.compiler import SparkCompiler
@@ -85,7 +87,7 @@ class TestCompileAggregateWithFilter:
         code = result.raw_pyspark
         # 应包含 F.when(condition, F.lit(1)) 条件聚合
         assert "F.when(" in code
-        assert 'F.col("is_time_anomaly")' in code
+        assert 'F.col("is_time_anomaly") == F.lit("true")' in code
         assert "anomaly_trip_count" in code
 
     def test_compile_no_filter_no_when(self):
@@ -114,3 +116,49 @@ class TestCompileAggregateWithFilter:
         # 无 filter 时不生成 F.when
         assert "F.when(" not in code
         assert "trip_count" in code
+
+    @pytest.mark.parametrize(
+        "operator,value,expected",
+        [
+            ("eq", "true", 'F.col("col") == F.lit("true")'),
+            ("neq", "STANDARD", 'F.col("col") != F.lit("STANDARD")'),
+            ("gt", "100", 'F.col("col") > F.lit("100")'),
+            ("gte", "0", 'F.col("col") >= F.lit("0")'),
+            ("lt", "100", 'F.col("col") < F.lit("100")'),
+            ("lte", "100", 'F.col("col") <= F.lit("100")'),
+            ("in", "A,B,C", 'F.col("col").isin(F.lit("A"), F.lit("B"), F.lit("C"))'),
+            ("is_null", "", "F.col(\"col\").isNull()"),
+            ("is_not_null", "", "F.col(\"col\").isNotNull()"),
+        ],
+    )
+    def test_all_operators_generate_correct_pyspark(self, operator, value, expected):
+        """覆盖全部 9 种操作符——验证每个操作符生成正确的 PySpark 条件表达式。"""
+        plan = SparkPlan(
+            plan_id="test_all_ops",
+            source_contract_hash="abc",
+            steps=[
+                SparkReadStep(source_name="ft", alias="ft", input_key="ft"),
+                SparkAggregateStep(
+                    input_alias="ft",
+                    group_keys=["borough"],
+                    metrics=[
+                        SparkAggregateSpec(
+                            function=SparkAggFunction.COUNT,
+                            input_column=None,
+                            alias="filtered_count",
+                            filter=MetricFilterDecl(
+                                column="col",
+                                operator=operator,
+                                value=value,
+                            ),
+                        ),
+                    ],
+                ),
+            ],
+        )
+        compiler = SparkCompiler()
+        result = compiler.compile(plan)
+        code = result.raw_pyspark
+        assert "F.when(" in code
+        assert expected in code
+        assert "filtered_count" in code

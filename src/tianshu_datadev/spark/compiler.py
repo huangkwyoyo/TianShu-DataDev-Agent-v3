@@ -11,6 +11,7 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 
+from tianshu_datadev.developer_spec.models import MetricFilterDecl
 from tianshu_datadev.spark._alias_resolver import (
     ResolvedStep,
     resolve_codegen_aliases,
@@ -495,6 +496,47 @@ class SparkCompiler:
         )
         return raw, comment
 
+    def _render_metric_filter_spark(self, filter_decl: MetricFilterDecl) -> str:
+        """渲染 MetricFilterDecl 为 PySpark 条件表达式——用于 F.when()。
+
+        操作符映射与 SQL compiler _render_metric_filter 语义一致：
+          eq -> ==, neq -> !=, gt -> >, gte -> >=, lt -> <, lte -> <=,
+          in -> .isin(...), is_null -> .isNull(), is_not_null -> .isNotNull()
+        """
+        col = f'F.col("{filter_decl.column}")'
+        op = filter_decl.operator
+        val = filter_decl.value
+
+        if op == "eq":
+            # 转义值中的双引号，防止生成的 PySpark 代码语法错误
+            val_escaped = str(val).replace('"', '\\"')
+            return f'{col} == F.lit("{val_escaped}")'
+        elif op == "neq":
+            val_escaped = str(val).replace('"', '\\"')
+            return f'{col} != F.lit("{val_escaped}")'
+        elif op == "gt":
+            val_escaped = str(val).replace('"', '\\"')
+            return f'{col} > F.lit("{val_escaped}")'
+        elif op == "gte":
+            val_escaped = str(val).replace('"', '\\"')
+            return f'{col} >= F.lit("{val_escaped}")'
+        elif op == "lt":
+            val_escaped = str(val).replace('"', '\\"')
+            return f'{col} < F.lit("{val_escaped}")'
+        elif op == "lte":
+            val_escaped = str(val).replace('"', '\\"')
+            return f'{col} <= F.lit("{val_escaped}")'
+        elif op == "in":
+            # value 是逗号分隔的字符串，拆分为列表
+            items = [f'F.lit("{v.strip()}")' for v in val.split(",")]
+            return f'{col}.isin({", ".join(items)})'
+        elif op == "is_null":
+            return f'{col}.isNull()'
+        elif op == "is_not_null":
+            return f'{col}.isNotNull()'
+        else:
+            raise ValueError(f"不支持的 MetricFilterDecl 操作符: {op!r}")
+
     def _compile_case_when(
         self, resolved: ResolvedStep, step_id: str, index: int, total: int,
     ) -> tuple[str, str]:
@@ -846,39 +888,6 @@ class SparkCompiler:
         detail = r.render_comment_text(annotation.intent_detail)
         return f"{comment}\n# {detail}"
 
-    def _render_metric_filter_spark(self, filter_decl) -> str:
-        """渲染 MetricFilterDecl 为 PySpark 条件表达式——用于 F.when()。
-
-        操作符映射与 SQL compiler _render_metric_filter 语义一致：
-          eq -> ==, neq -> !=, gt -> >, gte -> >=, lt -> <, lte -> <=,
-          in -> .isin(...), is_null -> .isNull(), is_not_null -> .isNotNull()
-        """
-        col = f'F.col("{filter_decl.column}")'
-        op = filter_decl.operator
-        val = filter_decl.value
-
-        if op == "eq":
-            return f'{col} == F.lit("{val}")'
-        elif op == "neq":
-            return f'{col} != F.lit("{val}")'
-        elif op == "gt":
-            return f'{col} > F.lit("{val}")'
-        elif op == "gte":
-            return f'{col} >= F.lit("{val}")'
-        elif op == "lt":
-            return f'{col} < F.lit("{val}")'
-        elif op == "lte":
-            return f'{col} <= F.lit("{val}")'
-        elif op == "in":
-            # value 是逗号分隔的字符串，拆分为列表
-            items = [f'F.lit("{v.strip()}")' for v in val.split(",")]
-            return f'{col}.isin({", ".join(items)})'
-        elif op == "is_null":
-            return f'{col}.isNull()'
-        elif op == "is_not_null":
-            return f'{col}.isNotNull()'
-        else:
-            raise ValueError(f"不支持的 MetricFilterDecl 操作符: {op!r}")
 
     @staticmethod
     def _verify_no_comment_injection(raw: str, annotated: str) -> None:
