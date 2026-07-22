@@ -287,3 +287,83 @@ class TestRequirementPlanner:
         assert str(condition_left.source_column) == "pickup_at"
         assert str(condition_left.source_table) == "ft"
         assert condition_left.time_function == "HOUR"
+
+    def test_case_when_per_rule_parse_errors_become_uncertainties(self):
+        """单条 CASE WHEN 解析失败 → UncertaintyEntry，不静默清空整个列表。"""
+        fake = FakeLLMAdapter()
+        response = self._make_expected_response()
+        # 注入一条畸形规则——branches 中缺少必填字段 then_value
+        response["case_when_rules"].append({
+            "output_column": "bad_rule",
+            "branches": [
+                {
+                    "condition": {
+                        "node_type": "COMPARE",
+                        "left": "pickup_hour",
+                        "op": "GT",
+                        "right": {"node_type": "LITERAL", "value": 10, "data_type": "number"},
+                    },
+                    # 缺少 then_value → CaseWhenBranch 构造失败
+                },
+            ],
+            "else_value": "默认",
+        })
+        fake.register_default_for_task(
+            task="requirement_planner",
+            output=response,
+        )
+
+        planner = RequirementPlanner(adapter=fake)
+        spec = self._make_spec()
+        manifest = self._make_manifest()
+        output = planner.plan(spec, manifest)
+
+        # 成功规则（peak_type）保留
+        assert len(output.case_when_rules) == 1
+        assert output.case_when_rules[0].output_column == "peak_type"
+
+        # 失败规则生成 UncertaintyEntry
+        parse_errors = [
+            u for u in output.uncertainties
+            if u.field_ref.startswith("case_when_rules.parse_error.")
+        ]
+        assert len(parse_errors) == 1
+        assert "bad_rule" in parse_errors[0].field_ref
+        desc_lower = parse_errors[0].description.lower()
+        assert "then_value" in desc_lower or "casewhenbranch" in desc_lower
+
+    def test_all_case_when_rules_fail_still_produces_uncertainties(self):
+        """全部 CASE WHEN 规则解析失败时 uncertainties 非空，case_when_rules 为空。"""
+        fake = FakeLLMAdapter()
+        response = self._make_expected_response()
+        # 全部规则都是畸形的
+        response["case_when_rules"] = [
+            {
+                "output_column": "bad_1",
+                "branches": [{"condition": {"node_type": "LITERAL", "value": 1, "data_type": "number"}}],
+                "else_value": "默认",
+            },
+            {
+                "output_column": "bad_2",
+                "branches": [{"condition": {"node_type": "LITERAL", "value": 2, "data_type": "number"}}],
+                "else_value": "默认",
+            },
+        ]
+        fake.register_default_for_task(
+            task="requirement_planner",
+            output=response,
+        )
+
+        planner = RequirementPlanner(adapter=fake)
+        spec = self._make_spec()
+        manifest = self._make_manifest()
+        output = planner.plan(spec, manifest)
+
+        # 无成功规则
+        assert len(output.case_when_rules) == 0
+        # 但每条失败都有 UncertaintyEntry
+        parse_errors = [
+            u for u in output.uncertainties
+            if u.field_ref.startswith("case_when_rules.parse_error.")
+        ]
+        assert len(parse_errors) == 2

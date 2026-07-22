@@ -23,7 +23,9 @@ from tianshu_datadev.artifacts.contract_extractor import DataTransformContractEx
 from tianshu_datadev.artifacts.packager import PackageInputs, ReviewPackageBuilder
 from tianshu_datadev.developer_spec.models import (
     DatasetType,
+    OpenQuestion,
     ParsedDeveloperSpec,
+    RequirementPlannerOutput,
     RequirementProposal,
     StrictModel,
 )
@@ -196,6 +198,28 @@ class ConfigError(Exception):
 def _gen_uuid() -> str:
     """生成确定性短 UUID——用于 Proposal 标识。"""
     return uuid.uuid4().hex[:12]
+
+
+def _extract_case_when_parse_errors(
+    planner_output: RequirementPlannerOutput,
+) -> list[OpenQuestion]:
+    """从 Planner 输出的 uncertainties 中提取 CASE WHEN 解析失败，转为阻断 OpenQuestion。
+
+    约定：_parse_response 在逐规则解析 CASE WHEN 时，将失败规则的 UncertaintyEntry
+    以 field_ref="case_when_rules.parse_error.<output_column>" 格式记录。
+    此函数提取这些条目并转为阻断级 OpenQuestion。
+    """
+    questions: list[OpenQuestion] = []
+    for u in planner_output.uncertainties:
+        if u.field_ref.startswith("case_when_rules.parse_error."):
+            questions.append(OpenQuestion(
+                question_id="CW_PARSE_ERROR",
+                source="requirement_planner",
+                field_ref=u.field_ref,
+                description=u.description,
+                blocking=True,
+            ))
+    return questions
 
 
 class Pipeline:
@@ -689,6 +713,11 @@ class Pipeline:
                             + len(planner_output.metrics)
                             + len(planner_output.case_when_rules)),
         )
+
+        # CASE WHEN 逐规则解析失败 → 阻断级 OpenQuestion
+        case_when_parse_errors = _extract_case_when_parse_errors(planner_output)
+        if case_when_parse_errors:
+            return spec, case_when_parse_errors
 
         valid, questions = self._proposal_validator.validate(proposal, spec, manifest)
         if not valid:

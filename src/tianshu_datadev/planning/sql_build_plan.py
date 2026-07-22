@@ -1550,15 +1550,30 @@ class SqlBuildPlanBuilder:
             return self._predicate_from_dict(node, table_alias, derived_expr_map)
 
         if isinstance(node, LabelCompare):
-            left_name = node.left
-            if left_name in derived_expr_map:
-                # 派生命名列——使用 TimeTransformExpr 而非 ColumnRef
-                left = derived_expr_map[left_name]
+            left = node.left
+            # LabelDatePartRef → DatePartExpression（origin/main 新增类型）
+            if isinstance(left, LabelDatePartRef):
+                col_ref = ColumnRef(
+                    table_ref=table_alias,
+                    column_name=left.column_name,
+                    normalized_name=self._normalizer.normalize(left.column_name),
+                )
+                date_part = DatePartExpression(
+                    part=left.part,
+                    column=col_ref,
+                )
                 op = self._COMPARE_OP_MAP.get(node.op)
                 if op is None:
                     raise ValueError(f"不支持的比较操作符: {node.op}")
                 sql_lit = self._literal_from_label(node.right)
-                return Predicate(left=left, operator=op, right=sql_lit)
+                return Predicate(left=date_part, operator=op, right=sql_lit)
+            # str → derived_expr_map 查找 TimeTransformExpr
+            if left in derived_expr_map:
+                op = self._COMPARE_OP_MAP.get(node.op)
+                if op is None:
+                    raise ValueError(f"不支持的比较操作符: {node.op}")
+                sql_lit = self._literal_from_label(node.right)
+                return Predicate(left=derived_expr_map[left], operator=op, right=sql_lit)
             return self._predicate_from_compare(node, table_alias)
         elif isinstance(node, LabelIsNull):
             return self._predicate_from_is_null(node, table_alias)

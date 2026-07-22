@@ -367,9 +367,14 @@ class RequirementPlanner:
             logger.warning("解析 metrics 失败：%s", e)
             metrics = []
 
-        try:
-            case_when_rules = []
-            for rule in raw.get("case_when_rules", []):
+        # 初始化 uncertainties——CASE WHEN 逐规则解析可能追加解析失败的 UncertaintyEntry
+        uncertainties: list[UncertaintyEntry] = []
+
+        # CASE WHEN 逐规则解析——单条失败不静默清空整个列表，
+        # 而是生成 UncertaintyEntry 记录解析错误，由 Validator 转为阻断级 OpenQuestion。
+        case_when_rules = []
+        for i, rule in enumerate(raw.get("case_when_rules", [])):
+            try:
                 branches = [
                     CaseWhenBranch(**b)
                     for b in rule.get("branches", [])
@@ -379,18 +384,26 @@ class RequirementPlanner:
                     branches=branches,
                     else_value=rule.get("else_value", ""),
                 ))
-        except Exception as e:
-            logger.warning("解析 case_when_rules 失败：%s", e)
-            case_when_rules = []
+            except Exception as e:
+                logger.warning(
+                    "解析 case_when_rules[%d] 失败：%s", i, e,
+                )
+                # 生成 UncertaintyEntry 标记解析失败——
+                # 下游 ProposalValidator 将其转为阻断 OpenQuestion
+                output_col = rule.get("output_column", "<unknown>")
+                uncertainties.append(UncertaintyEntry(
+                    field_ref=f"case_when_rules.parse_error.{output_col}",
+                    description=f"CASE WHEN 规则 '{output_col}' 解析失败：{e}",
+                ))
 
+        # LLM 返回的 uncertainties 追加到已有列表（已有列表可能含 CASE WHEN 解析错误）
         try:
-            uncertainties = [
+            uncertainties.extend([
                 UncertaintyEntry(**u)
                 for u in raw.get("uncertainties", [])
-            ]
+            ])
         except Exception as e:
             logger.warning("解析 uncertainties 失败：%s", e)
-            uncertainties = []
 
         return RequirementPlannerOutput(
             dimensions=dimensions,

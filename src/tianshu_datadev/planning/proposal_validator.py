@@ -1,6 +1,6 @@
 """ProposalValidator——确定性的 Proposal 正确性校验，不调 LLM。
 
-V1-V13 检查项全覆盖：
+V1-V11 检查项全覆盖：
 - 列存在性（V1-V2）
 - 时间函数白名单（V3）
 - 指标别名/维度名称唯一性（V4-V6）
@@ -8,8 +8,9 @@ V1-V13 检查项全覆盖：
 - 条件引用正确性（V9）
 - LabelNot 拒绝（V10b）
 - 冲突检测（V11）
-- 指标完整性（V12）
-- 输出列映射覆盖（V13）
+
+注意：输出列完整性（原 V12/V13）不在 Validator 职责范围——
+由 Pipeline._find_unresolved_derived_columns() 在 Planner + SpecEnricher 均完成后统一阻断。
 """
 
 from tianshu_datadev.developer_spec.models import (
@@ -238,43 +239,6 @@ class ProposalValidator:
                     blocking=True,
                 ))
                 valid = False
-
-        # ════════════════════════════════════════════
-        # V12: 至少有一个 metric 定义
-        # ════════════════════════════════════════════
-        if not proposal.metrics:
-            questions.append(OpenQuestion(
-                question_id="V12",
-                source="proposal_validator",
-                field_ref="metrics",
-                description="Proposal 中未定义任何指标",
-                blocking=True,
-            ))
-            valid = False
-
-        # ════════════════════════════════════════════
-        # V13: 所有输出列有映射
-        # ════════════════════════════════════════════
-        output_col_names = {col.name for col in spec.output_spec.columns}
-        mapped_names: set[str] = set()
-        for d in proposal.dimensions:
-            mapped_names.add(d.dimension_name)
-        for dd in proposal.derived_dimensions:
-            mapped_names.add(dd.dimension_name)
-        for m in proposal.metrics:
-            mapped_names.add(m.alias)
-        for rule in proposal.case_when_rules:
-            mapped_names.add(rule.output_column)
-        unmapped = output_col_names - mapped_names
-        if unmapped:
-            questions.append(OpenQuestion(
-                question_id="V13",
-                source="proposal_validator",
-                field_ref="output_spec.columns",
-                description=f"输出列无映射：{', '.join(sorted(unmapped))}",
-                blocking=True,
-            ))
-            valid = False
 
         return valid, questions
 

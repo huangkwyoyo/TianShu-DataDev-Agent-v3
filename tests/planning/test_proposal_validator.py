@@ -1,4 +1,4 @@
-"""ProposalValidator 全检查项测试（V1-V13）。"""
+"""ProposalValidator 全检查项测试（V1-V11）。"""
 
 
 from tianshu_datadev.developer_spec.models import (
@@ -447,83 +447,6 @@ class TestProposalValidator:
         assert any(q.question_id == "V11" for q in questions)
 
     # ════════════════════════════════════════
-    # V12: 至少有一个 metric
-    # ════════════════════════════════════════
-    def test_v12_no_metrics(self):
-        """V12: proposal 无指标则阻断。"""
-        validator = ProposalValidator()
-        proposal = self._make_proposal(metrics=[])
-        valid, questions = validator.validate(
-            proposal, self._make_spec(), self._make_manifest()
-        )
-        assert not valid
-        assert any(q.question_id == "V12" for q in questions)
-
-    # ════════════════════════════════════════
-    # V13: 所有输出列有映射
-    # ════════════════════════════════════════
-    def test_v13_unmapped_output_column(self):
-        """V13: 输出列在 proposal 中无映射则阻断。"""
-        validator = ProposalValidator()
-        spec = self._make_spec()
-        # 在 spec 输出列中加一个未被 proposal 覆盖的列
-        spec.output_spec.columns.append(OutputColumnDecl(name="extra_col"))
-        proposal = self._make_proposal()
-        valid, questions = validator.validate(
-            proposal, spec, self._make_manifest()
-        )
-        assert not valid
-        assert any(q.question_id == "V13" for q in questions)
-
-    # ════════════════════════════════════════
-    # V13: case_when_rules 的 output_column 也算映射
-    # ════════════════════════════════════════
-    def test_v13_case_when_maps_to_output(self):
-        """V13: CASE WHEN output_column 应算作有效映射。"""
-        validator = ProposalValidator()
-        spec = self._make_spec()
-        # 移除 pickup_hour 输出列，保证有效映射
-        spec.output_spec.columns = [
-            OutputColumnDecl(name="borough"),
-            OutputColumnDecl(name="trip_count"),
-            OutputColumnDecl(name="peak_type"),
-        ]
-        proposal = self._make_proposal(
-            dimensions=[DimensionDecl(
-                dimension_name="borough",
-                column_ref="borough",
-                source_table="ft",
-            )],
-            derived_dimensions=[],
-            case_when_rules=[
-                CaseWhenRule(
-                    output_column="peak_type",
-                    branches=[
-                        CaseWhenBranch(
-                            condition={
-                                "node_type": "COMPARE",
-                                "left": "borough",
-                                "op": "EQ",
-                                "right": {
-                                    "node_type": "LITERAL",
-                                    "value": "Brooklyn",
-                                    "data_type": "string",
-                                },
-                            },
-                            then_value="特殊",
-                        ),
-                    ],
-                    else_value="其他",
-                ),
-            ],
-        )
-        valid, questions = validator.validate(
-            proposal, spec, self._make_manifest()
-        )
-        assert valid
-        assert not any(q.question_id == "V13" for q in questions)
-
-    # ════════════════════════════════════════
     # 正常通过
     # ════════════════════════════════════════
     def test_valid_proposal_passes(self):
@@ -573,11 +496,10 @@ class TestProposalValidator:
             proposal, self._make_spec(), self._make_manifest()
         )
         assert not valid
-        # 应至少报告 V1, V2, V3, V7, V8, V12 六个问题
+        # 应至少报告 V1, V2, V3, V7, V8 五个问题
         question_ids = {q.question_id for q in questions}
         assert "V1" in question_ids
         assert "V2" in question_ids
         assert "V3" in question_ids
         assert "V7" in question_ids
         assert "V8" in question_ids
-        assert "V12" in question_ids

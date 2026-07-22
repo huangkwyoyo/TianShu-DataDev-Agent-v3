@@ -133,7 +133,7 @@ class TestExtractAggregateWithDerivedGroupKey:
                 ),
             ],
         )
-        aggs, groups, biz_keys, time_transforms = (
+        aggs, groups, biz_keys, time_transforms, derived_columns = (
             DataTransformContractExtractor._extract_aggregate(agg)
         )
         assert "pickup_hour" in groups
@@ -160,13 +160,12 @@ class TestRenderOperandWithTimeTransform:
 # Task 7: Spark 链路测试
 # ════════════════════════════════════════════
 
-from tianshu_datadev.spark.mapper import _map_aggregations
-from tianshu_datadev.spark.compiler import SparkCompiler
-from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
 from tianshu_datadev.artifacts.models import (
     ContractAggregation,
-    ContractTimeTransform,
 )
+from tianshu_datadev.spark.compiler import SparkCompiler
+from tianshu_datadev.spark.contract_adapter import adapt_lite_to_v1
+from tianshu_datadev.spark.mapper import _map_aggregations
 
 
 class TestMapAggregationsWithTimeTransforms:

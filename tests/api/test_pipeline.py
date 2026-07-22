@@ -72,3 +72,139 @@ class TestFindUnresolvedDerivedColumns:
         ))
         unresolved = _find_unresolved_derived_columns(spec)
         assert "distance_category" not in unresolved
+
+
+# ════════════════════════════════════════════
+# Planner / SpecEnricher 分工 + unresolved 阻断
+# ════════════════════════════════════════════
+
+
+class TestPlannerSpecEnricherDivision:
+    """验证 Planner 只覆盖部分输出列，其余留给 SpecEnricher，
+    最终 unresolved 检查能阻断真实遗漏。"""
+
+    def _make_spec_with_mixed_outputs(self):
+        """构造 Spec——输出列混合了 Planner 覆盖项和 SpecEnricher 覆盖项。"""
+        return ParsedDeveloperSpec(
+            spec_id="test_division",
+            spec_hash="hash_division",
+            title="高峰时段与异常出行分析",
+            description="按小时和区域统计出行次数，区分高峰/平峰，标记异常出行，窗口排名",
+            dataset_type=DatasetType.AGGREGATE_TABLE,
+            input_tables=[InputTableDecl(
+                table_alias="ft",
+                source_table="fact_table",
+                columns=[
+                    ColumnDecl(column_name="pickup_at", normalized_name="pickup_at",
+                              data_type="timestamp"),
+                    ColumnDecl(column_name="borough", normalized_name="borough",
+                              data_type="varchar"),
+                    ColumnDecl(column_name="trip_count", normalized_name="trip_count",
+                              data_type="bigint"),
+                    ColumnDecl(column_name="trip_duration", normalized_name="trip_duration",
+                              data_type="integer"),
+                ],
+                key_columns=[],
+                business_columns=[],
+            )],
+            metrics=[],
+            dimensions=[],
+            output_spec=OutputSpecDecl(
+                columns=[
+                    # Planner 产出
+                    OutputColumnDecl(name="pickup_hour"),
+                    OutputColumnDecl(name="borough"),
+                    OutputColumnDecl(name="trip_count"),
+                    OutputColumnDecl(name="peak_type"),
+                    # SpecEnricher 产出
+                    OutputColumnDecl(name="anomaly_trip_count"),
+                    OutputColumnDecl(name="rank_by_trip_count"),
+                ],
+                grain=["pickup_hour", "borough"],
+            ),
+            time_range=None,
+        )
+
+    def test_planner_resolves_peak_type_and_pickup_hour(self):
+        """Planner 产出 peak_type(CASE WHEN) + pickup_hour(derived_dimension)
+        → _find_unresolved_derived_columns 不再报告它们。"""
+        from tianshu_datadev.developer_spec.models import (
+            AggregationType,
+            CaseWhenBranch,
+            CaseWhenRule,
+            DerivedDimensionDecl,
+            DimensionDecl,
+            MetricDecl,
+            RequirementProposal,
+        )
+        from tianshu_datadev.planning.proposal_promotion import ProposalPromotion
+
+        spec = self._make_spec_with_mixed_outputs()
+
+        # 模拟 Planner 产出：只覆盖 peak_type / pickup_hour / borough / trip_count
+        proposal = RequirementProposal(
+            proposal_id="test_001",
+            spec_hash=spec.spec_hash,
+            dimensions=[DimensionDecl(
+                dimension_name="borough",
+                column_ref="borough",
+                source_table="ft",
+            )],
+            derived_dimensions=[DerivedDimensionDecl(
+                dimension_name="pickup_hour",
+                source_column="pickup_at",
+                source_table="ft",
+                time_function="HOUR",
+            )],
+            metrics=[MetricDecl(
+                metric_name="行程数",
+                aggregation=AggregationType.COUNT,
+                alias="trip_count",
+            )],
+            case_when_rules=[CaseWhenRule(
+                output_column="peak_type",
+                branches=[CaseWhenBranch(
+                    condition={
+                        "node_type": "COMPARE",
+                        "left": "pickup_hour",
+                        "op": "IN",
+                        "right": {
+                            "node_type": "LITERAL",
+                            "value": [7, 8, 9, 10, 17, 18, 19, 20],
+                            "data_type": "number",
+                        },
+                    },
+                    then_value="高峰",
+                )],
+                else_value="平峰",
+            )],
+            uncertainties=[],
+            llm_model="test",
+            inference_time_ms=0,
+            total_inferred=4,
+        )
+
+        # Promotion 写入 spec
+        promotion = ProposalPromotion()
+        spec = promotion.promote(proposal, spec)
+
+        unresolved = _find_unresolved_derived_columns(spec)
+        # Planner 覆盖的列不应在 unresolved 中
+        assert "pickup_hour" not in unresolved
+        assert "borough" not in unresolved
+        assert "trip_count" not in unresolved
+        assert "peak_type" not in unresolved
+        # SpecEnricher 覆盖的列应仍在 unresolved 中
+        assert "anomaly_trip_count" in unresolved
+        assert "rank_by_trip_count" in unresolved
+
+    def test_real_omission_still_blocked_by_unresolved(self):
+        """真实遗漏（所有输出列都未解析）→ unresolved 非空，管线硬阻断。"""
+        spec = self._make_spec_with_mixed_outputs()
+        # 无 Planner 产出，无 SpecEnricher —— 所有列应为 unresolved
+        unresolved = _find_unresolved_derived_columns(spec)
+        # borough 和 trip_count 在 input_tables 中已是物理列，不会被标记为 unresolved
+        assert len(unresolved) == 4  # pickup_hour / peak_type / anomaly_trip_count / rank_by_trip_count
+        assert "peak_type" in unresolved
+        assert "anomaly_trip_count" in unresolved
+        assert "rank_by_trip_count" in unresolved
