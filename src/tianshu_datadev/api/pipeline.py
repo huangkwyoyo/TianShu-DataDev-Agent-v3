@@ -644,16 +644,14 @@ class Pipeline:
         extra_questions: list[OpenQuestion] = []
 
         # ── 1. RequirementPlanner：有 Adapter 时先执行（v3.1 反转）──
-        if (self._requirement_planner is not None
-                and spec.dataset_type != DatasetType.LABEL_TABLE):
+        if self._requirement_planner is not None:
             unresolved_before = _find_unresolved_derived_columns(spec)
             if unresolved_before:
                 spec, planner_questions = self._run_requirement_planner(spec, manifest)
                 extra_questions.extend(planner_questions)
 
         # ── 2. SpecEnricher：完整 scope，后执行 ──
-        if spec.dataset_type != DatasetType.LABEL_TABLE:
-            spec = self._spec_enricher.apply_enrichment(spec, manifest)
+        spec = self._spec_enricher.apply_enrichment(spec, manifest)
 
         # ── 3. 统一 unresolved 检查（跳过有 compute_steps 的 spec——build 阶段自行解析）──
         unresolved_after = _find_unresolved_derived_columns(spec)
