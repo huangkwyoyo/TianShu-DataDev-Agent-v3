@@ -24,11 +24,11 @@
 from __future__ import annotations
 
 from tianshu_datadev.developer_spec.models import OpenQuestion, SourceManifest
+from tianshu_datadev.planning.models import ColumnRef, RatioExpr
 from tianshu_datadev.planning.relationship_hypothesis import (
     JoinEvidenceLevel,
     RelationshipHypothesis,
 )
-from tianshu_datadev.planning.models import ColumnRef
 from tianshu_datadev.planning.sql_build_plan import (
     AggregateStep,
     CaseWhenStep,
@@ -847,6 +847,31 @@ class SqlBuildPlanValidator:
 
             for column in step.columns:
                 expression = column.expression
+                if isinstance(expression, RatioExpr):
+                    missing = [
+                        dependency
+                        for dependency in (
+                            expression.numerator_alias,
+                            expression.denominator_alias,
+                        )
+                        if dependency not in available
+                    ]
+                    if missing:
+                        questions.append(OpenQuestion(
+                            question_id=(
+                                f"Q-VAL-RATIO-{step.step_id}-{column.alias}"
+                            ),
+                            source="validator",
+                            field_ref=f"{step.step_id}.columns.{column.alias}",
+                            description=(
+                                f"比率输出 '{column.alias}' 引用了未定义的聚合后别名 "
+                                f"{missing}"
+                            ),
+                            blocking=True,
+                        ))
+                    else:
+                        available.add(column.alias)
+                    continue
                 column_name = getattr(expression, "column_name", None)
                 normalized_name = getattr(expression, "normalized_name", None)
                 if column_name is None:

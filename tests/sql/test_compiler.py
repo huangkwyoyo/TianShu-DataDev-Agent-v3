@@ -331,6 +331,72 @@ class TestMetricVariantExpansion:
         assert specs[0].distinct is True
         assert specs[1].distinct is True
 
+    def test_strips_table_qualifier_from_input_column(self):
+        """input_column 含表别名前缀（如 cp.collision_id）→ 自动剥离为裸列名。
+
+        回归测试：Planner 有时在 input_column 前加表别名，
+        但 AggregateSpec.input_column 为 SafeIdentifier（不允许点号）。
+        """
+        builder = SqlBuildPlanBuilder()
+        m = MetricDecl(
+            metric_name="crash_count",
+            aggregation=AggregationType.COUNT,
+            input_column="cp.collision_id",  # 表别名前缀——应被剥离
+            alias="crash_count",
+        )
+        specs = builder._expand_metric_to_agg_specs(m)
+        assert len(specs) == 1
+        assert specs[0].input_column == "collision_id"  # 裸列名
+        assert specs[0].alias == "crash_count"
+
+    def test_strips_table_qualifier_from_variants_input_column(self):
+        """Variants 的 input_column 含表别名前缀 → 同样剥离。"""
+        builder = SqlBuildPlanBuilder()
+        m = MetricDecl(
+            metric_name="total_killed",
+            aggregation=AggregationType.SUM,
+            input_column="cp.number_of_persons_killed",  # 表别名前缀
+            alias="total_killed",
+            variants=[
+                MetricVariant(
+                    variant_name="pedestrian_killed",
+                    filter=MetricFilterDecl(column="pedestrian", operator="eq", value="true"),
+                    alias="pedestrian_killed",
+                ),
+            ],
+        )
+        specs = builder._expand_metric_to_agg_specs(m)
+        assert len(specs) == 2
+        # 基础和 variant 都应剥离前缀
+        assert specs[0].input_column == "number_of_persons_killed"
+        assert specs[1].input_column == "number_of_persons_killed"
+
+    def test_input_column_without_qualifier_unchanged(self):
+        """input_column 不含表别名前缀 → 保持不变。"""
+        builder = SqlBuildPlanBuilder()
+        m = MetricDecl(
+            metric_name="trip_count",
+            aggregation=AggregationType.COUNT,
+            input_column="collision_id",  # 已经是裸列名
+            alias="trip_count",
+        )
+        specs = builder._expand_metric_to_agg_specs(m)
+        assert len(specs) == 1
+        assert specs[0].input_column == "collision_id"
+
+    def test_input_column_none_unchanged(self):
+        """input_column=None（COUNT(*)）→ 保持 None。"""
+        builder = SqlBuildPlanBuilder()
+        m = MetricDecl(
+            metric_name="row_count",
+            aggregation=AggregationType.COUNT,
+            input_column=None,  # COUNT(*)
+            alias="row_count",
+        )
+        specs = builder._expand_metric_to_agg_specs(m)
+        assert len(specs) == 1
+        assert specs[0].input_column is None
+
 
 class TestMetricVariantsInCompiler:
     """Variants → Compiler 生成正确的 FILTER 子句。"""
@@ -2765,3 +2831,230 @@ class TestDerivedGroupKeyCompile:
 
         # 编译正常完成——不抛异常
         assert compiled.sql != ""
+
+
+# ════════════════════════════════════════════
+# 回归：链步骤 CASE WHEN + ignore_source_table
+# ════════════════════════════════════════════
+
+class TestChainStepCaseWhen:
+    """_build_chain_step 最终步骤应包含 CASE WHEN 标签规则。
+
+    v3.1 RequirementPlanner 生成的 label_rules / case_when_rules
+    在单表路径和 _build_multi_table 中均正常渲染，但 _build_chain_step
+    遗漏了 CASE WHEN 步骤，导致多跳链中标签列丢失并触发 Binder Error。
+    """
+
+    def test_chain_final_step_has_case_when_post_aggregate(self):
+        """链最终步骤——post_aggregate CASE WHEN 应出现在 Plan 中。"""
+        import hashlib
+
+        from tianshu_datadev.developer_spec.models import (
+            CaseWhenBranch,
+            CaseWhenRule,
+            DatasetType,
+            DimensionDecl,
+            InputTableDecl,
+            MetricDecl,
+            OutputColumnDecl,
+            OutputSpecDecl,
+            ParsedDeveloperSpec,
+        )
+        from tianshu_datadev.planning.relationship_hypothesis import (
+            JoinCandidate,
+            RelationshipHypothesis,
+        )
+
+        # 构造 label_table spec——含 2 表 + case_when_rules
+        tables = [
+            InputTableDecl(
+                source_table="dwd.fact_a",
+                table_alias="fa",
+                time_field="",
+                columns=[],
+                filters=[],
+            ),
+            InputTableDecl(
+                source_table="dwd.dim_b",
+                table_alias="db",
+                time_field="",
+                columns=[],
+                filters=[],
+            ),
+        ]
+        spec_hash = hashlib.sha256(b"test_chain_cw").hexdigest()
+        spec = ParsedDeveloperSpec(
+            spec_id="spec_test_chain_cw",
+            spec_hash=spec_hash,
+            dataset_type=DatasetType.LABEL_TABLE,
+            title="链步骤 CASE WHEN 回归",
+            description="测试",
+            input_tables=tables,
+            output_spec=OutputSpecDecl(
+                columns=[
+                    OutputColumnDecl(name="id", description=""),
+                    OutputColumnDecl(name="cnt", description=""),
+                    OutputColumnDecl(name="risk_level", description=""),
+                ],
+                grain=["id"],
+            ),
+            dimensions=[DimensionDecl(
+                dimension_name="id", column_ref="id", source_table="dwd.fact_a",
+            )],
+            metrics=[MetricDecl(
+                metric_name="cnt", aggregation="COUNT", input_column="id",
+                alias="cnt",
+            )],
+            # 使用 case_when_rules（dict 条件格式，LLM JSON Schema 兼容）
+            case_when_rules=[CaseWhenRule(
+                output_column="risk_level",
+                branches=[
+                    CaseWhenBranch(
+                        condition={
+                            "node_type": "COMPARE",
+                            "left": "cnt",
+                            "op": ">",
+                            "right": {
+                                "node_type": "LITERAL",
+                                "value": 10,
+                                "data_type": "number",
+                            },
+                        },
+                        then_value="高",
+                    ),
+                ],
+                else_value="低",
+            )],
+        )
+
+        builder = SqlBuildPlanBuilder()
+
+        # 2 表 Join → build_multi 以 2 表候选触发链路径
+        hypothesis = RelationshipHypothesis(
+            hypothesis_id="test_chain_cw",
+            spec_hash=spec_hash,
+            source_manifest_hash="fake_manifest",
+            candidates=[
+                JoinCandidate(
+                    candidate_id="jc_001",
+                    left_table="fa",
+                    right_table="db",
+                    left_key="id",
+                    right_key="id",
+                    left_key_normalized="id",
+                    right_key_normalized="id",
+                    join_type="INNER",
+                ),
+            ],
+            multi_table=True,
+        )
+
+        plans = builder.build_multi(spec, hypothesis)
+
+        assert len(plans) >= 1
+
+        # 最终 plan 必须包含 CaseWhenStep
+        final_plan = plans[-1]
+        case_when_steps = [
+            s for s in final_plan.steps if s.step_type == "case_when"
+        ]
+        assert len(case_when_steps) >= 1, (
+            f"链最终 Step 应至少包含 1 个 CaseWhenStep，"
+            f"实际 step_types: {[s.step_type for s in final_plan.steps]}"
+        )
+        assert str(case_when_steps[0].alias) == "risk_level", (
+            f"CaseWhenStep alias 应为 risk_level，"
+            f"实际: {case_when_steps[0].alias}"
+        )
+
+
+class TestIgnoreSourceTableInAggregate:
+    """_build_aggregate_step 的 ignore_source_table 参数。
+
+    多跳链 FINAL 步骤中数据来自 temp 表 Join 后，
+    dimension.source_table 指向的原始表别名已不在 FROM 子句中。
+    ignore_source_table=True 时所有 GROUP BY 列应使用 primary_table。
+    """
+
+    def test_ignore_source_table_uses_primary_table(self):
+        """source_table 设置时，ignore_source_table=True 跳过覆盖。"""
+        import hashlib
+
+        from tianshu_datadev.developer_spec.models import (
+            DatasetType,
+            DimensionDecl,
+            InputTableDecl,
+            MetricDecl,
+            OutputColumnDecl,
+            OutputSpecDecl,
+            ParsedDeveloperSpec,
+        )
+
+        tables = [
+            InputTableDecl(
+                source_table="dwd.fact_a",
+                table_alias="fa",
+                time_field="",
+                columns=[],
+                filters=[],
+            ),
+        ]
+        spec_hash = hashlib.sha256(b"test_ignore_st").hexdigest()
+        spec = ParsedDeveloperSpec(
+            spec_id="spec_test_ist",
+            spec_hash=spec_hash,
+            dataset_type=DatasetType.LABEL_TABLE,
+            title="ignore_source_table 回归",
+            description="测试",
+            input_tables=tables,
+            output_spec=OutputSpecDecl(
+                columns=[
+                    OutputColumnDecl(name="borough", description=""),
+                    OutputColumnDecl(name="cnt", description=""),
+                ],
+                grain=["borough"],
+            ),
+            # source_table="dwd.fact_a" → _resolve_derived_source_table → "fa"
+            dimensions=[DimensionDecl(
+                dimension_name="borough",
+                column_ref="borough",
+                source_table="dwd.fact_a",
+            )],
+            metrics=[MetricDecl(
+                metric_name="cnt", aggregation="COUNT", input_column="borough",
+                alias="cnt",
+            )],
+        )
+
+        builder = SqlBuildPlanBuilder()
+
+        # ignore_source_table=False（默认）——使用 resolved source_table "fa"
+        agg_default = builder._build_aggregate_step(
+            spec, primary_table="_temp_deadbeef_0",
+            ignore_source_table=False,
+        )
+        # ignore_source_table=True——使用 primary_table（temp 表名）
+        agg_ignored = builder._build_aggregate_step(
+            spec, primary_table="_temp_deadbeef_0",
+            ignore_source_table=True,
+        )
+
+        # 提取 GROUP BY 中 borough 列的 table_ref
+        def _find_borough_table_ref(agg) -> str:
+            for gk in agg.group_keys:
+                if hasattr(gk, "column_name") and gk.column_name == "borough":
+                    return gk.table_ref if hasattr(gk, "table_ref") else ""
+            return "<未找到>"
+
+        default_ref = _find_borough_table_ref(agg_default)
+        ignored_ref = _find_borough_table_ref(agg_ignored)
+
+        # 默认行为：source_table 解析为 "fa"
+        assert default_ref == "fa", (
+            f"默认应解析 source_table → 'fa'，实际: {default_ref!r}"
+        )
+        # ignore 行为：使用 primary_table（temp 表）
+        assert ignored_ref == "_temp_deadbeef_0", (
+            f"ignore_source_table=True 应使用 primary_table，"
+            f"实际: {ignored_ref!r}"
+        )

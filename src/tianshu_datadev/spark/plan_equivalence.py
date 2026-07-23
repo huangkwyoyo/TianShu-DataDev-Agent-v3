@@ -488,21 +488,31 @@ def compare_project_steps(
         )
 
     # 收集所有输出列（可能有多个 ProjectStep）
-    sql_cols: set[tuple[str, str]] = set()
+    def _project_signature(col: dict[str, Any]) -> tuple:
+        ratio = col.get("ratio_expr")
+        ratio_signature = None
+        if isinstance(ratio, dict):
+            ratio_signature = (
+                normalize_field_name(ratio.get("numerator_alias", "")),
+                normalize_field_name(ratio.get("denominator_alias", "")),
+                str(ratio.get("zero_division", "NULL")).upper(),
+                int(ratio.get("multiplier", 1)),
+            )
+        return (
+            normalize_field_name(col.get("column_name", "")),
+            normalize_field_name(col.get("alias", "")),
+            ratio_signature,
+        )
+
+    sql_cols: set[tuple] = set()
     for p in sql_projects:
         for col in p.get("columns", []) or []:
-            sql_cols.add((
-                normalize_field_name(col.get("column_name", "")),
-                normalize_field_name(col.get("alias", "")),
-            ))
+            sql_cols.add(_project_signature(col))
 
-    spark_cols: set[tuple[str, str]] = set()
+    spark_cols: set[tuple] = set()
     for p in spark_projects:
         for col in p.get("columns", []) or []:
-            spark_cols.add((
-                normalize_field_name(col.get("column_name", "")),
-                normalize_field_name(col.get("alias", "")),
-            ))
+            spark_cols.add(_project_signature(col))
 
     if sql_cols != spark_cols:
         return StepEquivalenceResult(
@@ -677,6 +687,20 @@ def compare_window_steps(
             detail=f"窗口步骤数量不一致：SQL 侧 {sql_count} 个，Spark 侧 {spark_count} 个",
         )
 
+    def normalized_frame(
+        function: str,
+        order_by: tuple[str, ...],
+        frame: str,
+    ) -> str:
+        """将无排序聚合窗口的隐式全分区帧归一为显式表示。"""
+        if (
+            not frame
+            and not order_by
+            and function in {"SUM_OVER", "AVG_OVER", "COUNT_OVER"}
+        ):
+            return "rows:unbounded_preceding:unbounded_following"
+        return frame
+
     # 收集所有窗口表达式（跨多个 WindowStep 聚合）
     sql_exprs: set[tuple[str, ...]] = set()
     for w in sql_windows:
@@ -689,7 +713,11 @@ def compare_window_steps(
             order = tuple([
                 normalize_field_name(o) for o in (expr.get("order_by", []) or [])
             ])
-            frame = normalize_field_name(expr.get("frame", ""))
+            frame = normalized_frame(
+                func,
+                order,
+                normalize_field_name(expr.get("frame", "")),
+            )
             input_val = normalize_field_name(str(expr.get("input_column", "") or ""))
             sql_exprs.add((func, alias, partition, order, frame, input_val))
 
@@ -704,7 +732,11 @@ def compare_window_steps(
             order = tuple([
                 normalize_field_name(o) for o in (expr.get("order_by", []) or [])
             ])
-            frame = normalize_field_name(expr.get("frame", ""))
+            frame = normalized_frame(
+                func,
+                order,
+                normalize_field_name(expr.get("frame", "")),
+            )
             input_val = normalize_field_name(str(expr.get("input_column", "") or ""))
             spark_exprs.add((func, alias, partition, order, frame, input_val))
 

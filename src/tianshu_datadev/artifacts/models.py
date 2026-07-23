@@ -107,6 +107,15 @@ class ContractTimeTransform(StrictModel):
     alias: str           # 输出别名——与 grouping_keys 中的逻辑名对应
 
 
+class ContractRatioExpr(StrictModel):
+    """Contract 中的窄范围比率表达式。"""
+
+    numerator_alias: str
+    denominator_alias: str
+    zero_division: Literal["NULL"] = "NULL"
+    multiplier: Literal[1, 100] = 1
+
+
 class ContractOutputColumn(StrictModel):
     """Contract 中的输出列——精简自 ProjectStep。"""
 
@@ -161,6 +170,7 @@ class DataTransformContractLite(StrictModel):
     case_when_labels: list = []  # CaseWhenLabelSpec 列表——避免 lite→v1 适配时丢失 CASE WHEN
     window_specs: list = []  # WindowSpecSummary 列表——避免 lite→v1 适配时丢失窗口函数
     time_transforms: list[ContractTimeTransform] = []
+    ratio_specs: dict[str, ContractRatioExpr] = Field(default_factory=dict)
 
     @staticmethod
     def generate_contract_id(plan_hash: str) -> str:
@@ -286,6 +296,7 @@ class DataTransformContractV1(StrictModel):
     case_when_labels: list[CaseWhenLabelSpec] = []
     window_specs: list[WindowSpecSummary] = []
     time_transforms: list[ContractTimeTransform] = []
+    ratio_specs: dict[str, ContractRatioExpr] = Field(default_factory=dict)
     write_spec: dict | None = None  # FinalWritePlan 序列化 dict
 
     @staticmethod

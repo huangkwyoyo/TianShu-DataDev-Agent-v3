@@ -6,7 +6,13 @@
 
 from __future__ import annotations
 
-from tianshu_datadev.planning.models import ColumnRef, DatePartExpression, DerivedGroupKey, TimeTransformExpr
+from tianshu_datadev.planning.models import (
+    ColumnRef,
+    DatePartExpression,
+    DerivedGroupKey,
+    RatioExpr,
+    TimeTransformExpr,
+)
 from tianshu_datadev.planning.relationship_hypothesis import RelationshipEvidence
 from tianshu_datadev.planning.sql_build_plan import (
     AggregateStep,
@@ -35,6 +41,7 @@ from .models import (
     ContractLimit,
     ContractOutputColumn,
     ContractPredicate,
+    ContractRatioExpr,
     ContractSort,
     ContractTimeTransform,
     DataTransformContractLite,
@@ -103,6 +110,7 @@ class DataTransformContractExtractor:
         limit_spec: ContractLimit | None = None
         business_keys: list[str] = []
         time_transforms: list[ContractTimeTransform] = []
+        ratio_specs: dict[str, ContractRatioExpr] = {}
         # ── Phase 3B 字段——lite 路径也需要提取以通过 adapt_lite_to_v1 传递 ──
         case_when_labels: list[CaseWhenLabelSpec] = []
         window_specs: list[WindowSpecSummary] = []
@@ -148,6 +156,7 @@ class DataTransformContractExtractor:
 
             elif isinstance(step, ProjectStep):
                 output_columns = self._extract_project(step)
+                ratio_specs.update(self._extract_ratio_specs(step))
 
             elif isinstance(step, SortStep):
                 sort_spec = self._extract_sort(step)
@@ -173,9 +182,12 @@ class DataTransformContractExtractor:
         # ProjectStep 仅包含基础 SELECT 列，不包含 CaseWhenStep/WindowStep
         # 生成的派生列。SQL 编译器会合并它们（compiler.py:639），
         # 但 Contract 提取器必须显式追加，否则 PySpark select() 缺列。
-        output_columns = self._merge_derived_output_columns(
-            output_columns, case_when_labels, window_specs,
-        )
+        # 含 RatioExpr 时，最后一个 ProjectStep 已是精确的最终输出边界。
+        # 窗口别名可能只是比率分母，不得被自动追加为对外输出列。
+        if not ratio_specs:
+            output_columns = self._merge_derived_output_columns(
+                output_columns, case_when_labels, window_specs,
+            )
         if aggregations:
             output_columns = self._clear_post_aggregate_qualifiers(output_columns)
 
@@ -202,6 +214,7 @@ class DataTransformContractExtractor:
             limit_spec=limit_spec,
             business_keys=business_keys,
             time_transforms=time_transforms,
+            ratio_specs=ratio_specs,
             semantic_policy_ref="",
             case_when_labels=case_when_labels,
             window_specs=window_specs,
@@ -473,6 +486,9 @@ class DataTransformContractExtractor:
                 )
                 col_name = expression.column_name
                 source_table_ref = expression.table_ref
+            elif isinstance(expression, RatioExpr):
+                col_name = ae.alias
+                source_table_ref = ""
             else:
                 col_name = str(expression)
                 source_table_ref = ""
@@ -485,6 +501,22 @@ class DataTransformContractExtractor:
                 )
             )
         return cols
+
+    @staticmethod
+    def _extract_ratio_specs(
+        step: ProjectStep,
+    ) -> dict[str, ContractRatioExpr]:
+        """从 ProjectStep 按输出别名提取类型化比率。"""
+        return {
+            str(alias_expr.alias): ContractRatioExpr(
+                numerator_alias=alias_expr.expression.numerator_alias,
+                denominator_alias=alias_expr.expression.denominator_alias,
+                zero_division=alias_expr.expression.zero_division,
+                multiplier=alias_expr.expression.multiplier,
+            )
+            for alias_expr in step.columns
+            if isinstance(alias_expr.expression, RatioExpr)
+        }
 
     @staticmethod
     def _resolve_column_lineage(
@@ -628,6 +660,7 @@ class DataTransformContractExtractor:
         limit_spec: ContractLimit | None = None
         business_keys: list[str] = []
         time_transforms: list[ContractTimeTransform] = []
+        ratio_specs: dict[str, ContractRatioExpr] = {}
 
         seen_tables: set[str] = set()
         seen_columns: set[tuple[str, str]] = set()
@@ -699,6 +732,7 @@ class DataTransformContractExtractor:
                         step,
                         temp_column_lineage,
                     )
+                    ratio_specs.update(self._extract_ratio_specs(step))
                 elif isinstance(step, SortStep):
                     sort_spec = self._extract_sort(step)
                 elif isinstance(step, LimitStep):
@@ -723,9 +757,12 @@ class DataTransformContractExtractor:
         # ── 将 CASE WHEN / Window 派生列合并到 output_columns ──
         # 与 lite 路径相同：ProjectStep 不含 CaseWhenStep/WindowStep 生成的派生列，
         # SQL 编译器合并它们，Contract 提取器也必须显式追加。
-        output_columns = self._merge_derived_output_columns(
-            output_columns, case_when_labels, window_specs,
-        )
+        # 比率计划的最终 ProjectStep 已显式列出对外字段；
+        # 中间窗口别名仅作为依赖保留在 window_specs。
+        if not ratio_specs:
+            output_columns = self._merge_derived_output_columns(
+                output_columns, case_when_labels, window_specs,
+            )
         if aggregations:
             output_columns = self._clear_post_aggregate_qualifiers(output_columns)
 
@@ -757,6 +794,7 @@ class DataTransformContractExtractor:
             limit_spec=limit_spec,
             business_keys=business_keys,
             time_transforms=time_transforms,
+            ratio_specs=ratio_specs,
             semantic_policy_ref="",
             step_dag=step_dag,
             temp_tables=temp_tables,

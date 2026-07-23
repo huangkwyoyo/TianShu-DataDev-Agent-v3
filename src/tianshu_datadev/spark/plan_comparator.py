@@ -893,12 +893,33 @@ class PlanComparator:
             if not column_name and "expression" in col:
                 expr = col["expression"]
                 if isinstance(expr, dict):
-                    column_name = expr.get("column_name", "")
+                    column_name = (
+                        expr.get("column_name", "")
+                        or (
+                            col.get("alias", "")
+                            if "numerator_alias" in expr
+                            and "denominator_alias" in expr
+                            else ""
+                        )
+                    )
             alias = col.get("alias", "")
-            flattened_columns.append({
+            flattened = {
                 "column_name": column_name,
                 "alias": alias,
-            })
+            }
+            expr = col.get("expression") or col.get("ratio_expr")
+            if (
+                isinstance(expr, dict)
+                and "numerator_alias" in expr
+                and "denominator_alias" in expr
+            ):
+                flattened["ratio_expr"] = {
+                    "numerator_alias": expr["numerator_alias"],
+                    "denominator_alias": expr["denominator_alias"],
+                    "zero_division": expr.get("zero_division", "NULL"),
+                    "multiplier": expr.get("multiplier", 1),
+                }
+            flattened_columns.append(flattened)
 
         result = dict(step_dict)
         result["columns"] = flattened_columns

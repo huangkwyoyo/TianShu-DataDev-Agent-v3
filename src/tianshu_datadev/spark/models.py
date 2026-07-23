@@ -182,12 +182,22 @@ class SparkProjectStep(StrictModel):
     columns: list[SparkProjectColumn] = []  # 投影列
 
 
+class SparkRatioExpr(StrictModel):
+    """Spark 侧窄范围比率表达式。"""
+
+    numerator_alias: str
+    denominator_alias: str
+    zero_division: Literal["NULL"] = "NULL"
+    multiplier: Literal[1, 100] = 1
+
+
 class SparkProjectColumn(StrictModel):
     """单个投影列——映射 ContractOutputColumn。"""
 
     column_name: str  # 源列名
     alias: str  # 输出别名
     source_alias: str = ""  # Join 后同名列的来源 DataFrame 别名
+    ratio_expr: SparkRatioExpr | None = None
 
 
 class SparkCaseWhenStep(StrictModel):

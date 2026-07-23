@@ -24,6 +24,7 @@ from tianshu_datadev.planning.models import (
     DerivedGroupKey,
     Predicate,
     PredicateOperator,
+    RatioExpr,
     SqlLiteral,
     SqlRawExpression,
     TimeTransformExpr,
@@ -307,6 +308,11 @@ class DuckDbSqlCompiler:
         Phase 3B 新增：CaseWhenStep 和 WindowStep 渲染到 SELECT 子句。
         Phase 5 新增：窗口过滤子查询包裹——支持全部 8 种窗口函数。
         """
+        # 比率必须引用已经产出的聚合/窗口别名，因此固定使用一层派生表。
+        # 该路径保持 RatioExpr 为封闭 AST，不读取或拼接自由表达式。
+        if self._has_ratio_expr(plan):
+            return self._render_ratio_wrapped_sql(plan)
+
         # ── 收集窗口函数别名 ──
         window_aliases: set[str] = self._collect_window_aliases(plan)
 
@@ -325,6 +331,175 @@ class DuckDbSqlCompiler:
             return self._render_window_wrapped_sql(plan, window_aliases)
         else:
             return self._render_flat_sql(plan)
+
+    @staticmethod
+    def _has_ratio_expr(plan: SqlBuildPlan) -> bool:
+        """检查最终投影是否包含类型化比率。"""
+        return any(
+            isinstance(column.expression, RatioExpr)
+            for step in plan.steps
+            if isinstance(step, ProjectStep)
+            for column in step.columns
+        )
+
+    def _render_ratio_wrapped_sql(self, plan: SqlBuildPlan) -> str:
+        """先计算聚合/窗口别名，再在外层按最终列顺序计算比率。"""
+        project_indexes = [
+            index for index, step in enumerate(plan.steps)
+            if isinstance(step, ProjectStep)
+            and any(
+                isinstance(column.expression, RatioExpr)
+                for column in step.columns
+            )
+        ]
+        if not project_indexes:
+            return self._render_flat_sql(plan)
+
+        project_index = project_indexes[-1]
+        project = plan.steps[project_index]
+        assert isinstance(project, ProjectStep)
+
+        outer_sort: list[SortStep] = []
+        outer_limit: list[LimitStep] = []
+        inner_steps = []
+        aggregate_aliases = {
+            str(metric.alias)
+            for step in plan.steps
+            if isinstance(step, AggregateStep)
+            for metric in step.metrics
+        }
+        post_aggregate_windows: list[WindowExpr] = []
+        for index, step in enumerate(plan.steps):
+            if index == project_index:
+                continue
+            if index > project_index and isinstance(step, SortStep):
+                outer_sort.append(step)
+                continue
+            if index > project_index and isinstance(step, LimitStep):
+                outer_limit.append(step)
+                continue
+            if isinstance(step, WindowStep):
+                remaining_windows: list[WindowExpr] = []
+                for window_expr in step.window_exprs:
+                    window_input = window_expr.input
+                    if (
+                        isinstance(window_input, ColumnRef)
+                        and str(window_input.column_name) in aggregate_aliases
+                    ):
+                        post_aggregate_windows.append(window_expr)
+                    else:
+                        remaining_windows.append(window_expr)
+                if remaining_windows:
+                    inner_steps.append(
+                        step.model_copy(update={
+                            "window_exprs": remaining_windows,
+                        })
+                    )
+                continue
+            inner_steps.append(step)
+
+        inner_plan = plan.model_copy(update={"steps": inner_steps})
+        inner_sql = self._render_sql(inner_plan)
+        if post_aggregate_windows:
+            inner_sql = self._render_ratio_window_layer(
+                inner_sql,
+                post_aggregate_windows,
+            )
+
+        select_columns = [
+            self._render_ratio_outer_alias(column)
+            for column in project.columns
+        ]
+        parts = [
+            f"SELECT\n  {', '.join(select_columns)}",
+            f"FROM (\n{inner_sql}\n) AS _ratio_base",
+        ]
+
+        order_by = [
+            f"_ratio_base.{sort.column} "
+            f"{sort.direction.value if hasattr(sort.direction, 'value') else sort.direction}"
+            for step in outer_sort
+            for sort in step.order_by
+        ]
+        if order_by:
+            parts.append(f"ORDER BY\n  {', '.join(order_by)}")
+
+        if outer_limit:
+            limit = outer_limit[-1]
+            suffix = (
+                f" OFFSET {limit.offset}"
+                if limit.offset is not None
+                else ""
+            )
+            parts.append(f"LIMIT {limit.limit}{suffix}")
+
+        return "\n".join(parts)
+
+    def _render_ratio_window_layer(
+        self,
+        aggregate_sql: str,
+        window_exprs: list[WindowExpr],
+    ) -> str:
+        """在已聚合派生表上计算比率所依赖的类型化窗口别名。"""
+        rendered_windows: list[str] = []
+        for window_expr in window_exprs:
+            window_input = window_expr.input
+            prefixed_input = (
+                window_input.model_copy(update={"table_ref": "_ratio_aggregate"})
+                if isinstance(window_input, ColumnRef)
+                else window_input
+            )
+            prefixed_partitions = [
+                column.model_copy(update={"table_ref": "_ratio_aggregate"})
+                for column in window_expr.partition_by
+            ]
+            prefixed_window = window_expr.model_copy(update={
+                "input": prefixed_input,
+                "partition_by": prefixed_partitions,
+            })
+            rendered_windows.append(self._render_window_expr(prefixed_window))
+
+        return "\n".join([
+            f"SELECT\n  _ratio_aggregate.*, {', '.join(rendered_windows)}",
+            f"FROM (\n{aggregate_sql}\n) AS _ratio_aggregate",
+        ])
+
+    def _render_ratio_outer_alias(self, alias_expr) -> str:
+        """渲染比率外层的单个类型化投影。"""
+        expression = alias_expr.expression
+        alias = alias_expr.alias
+        if isinstance(expression, RatioExpr):
+            numerator = f"_ratio_base.{expression.numerator_alias}"
+            denominator = f"_ratio_base.{expression.denominator_alias}"
+            value = (
+                f"CAST({numerator} AS DOUBLE) / "
+                f"CAST({denominator} AS DOUBLE)"
+            )
+            if expression.multiplier == 100:
+                value = f"({value}) * 100"
+            return (
+                f"CASE WHEN {denominator} IS NULL OR {denominator} = 0 "
+                f"THEN NULL ELSE {value} END AS {alias}"
+            )
+
+        if isinstance(expression, ColumnRef):
+            source_name = expression.column_name
+            rendered = f"_ratio_base.{source_name}"
+            return (
+                f"{rendered} AS {alias}"
+                if alias != source_name
+                else rendered
+            )
+
+        if isinstance(expression, DatePartExpression):
+            return f"_ratio_base.{alias}"
+
+        if isinstance(expression, WindowExpr):
+            return f"_ratio_base.{alias}"
+
+        raise ValueError(
+            f"RatioExpr 外层投影不支持表达式类型：{type(expression).__name__}"
+        )
 
     def _collect_window_aliases(self, plan: SqlBuildPlan) -> set[str]:
         """收集计划中所有 WindowStep 产出的别名。"""

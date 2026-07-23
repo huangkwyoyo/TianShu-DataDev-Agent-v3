@@ -49,6 +49,7 @@ from .models import (
     SparkPlanMappingResult,
     SparkProjectColumn,
     SparkProjectStep,
+    SparkRatioExpr,
     SparkReadStep,
     SparkSortDirection,
     SparkSortSpec,
@@ -166,7 +167,11 @@ def map_contract_to_spark_plan(
         agg_steps = agg_result
 
     # ── Step 5：输出列 → ProjectStep ──
-    project_result = _map_output_columns(contract.output_columns, gaps)
+    project_result = _map_output_columns(
+        contract.output_columns,
+        contract.ratio_specs,
+        gaps,
+    )
     if isinstance(project_result, ContractGap):
         gaps.append(project_result)
         project_steps = []
@@ -514,6 +519,7 @@ def _map_aggregations(
 
 def _map_output_columns(
     output_columns: list[ContractOutputColumn],
+    ratio_specs: dict,
     gaps: list[ContractGap],
 ) -> list[SparkProjectStep] | ContractGap:
     """将 Contract 的 output_columns 映射为 ProjectStep。
@@ -546,6 +552,16 @@ def _map_output_columns(
             column_name=oc.column_name,
             alias=oc.alias,
             source_alias=oc.source_table_ref,
+            ratio_expr=(
+                SparkRatioExpr(
+                    numerator_alias=ratio_specs[oc.alias].numerator_alias,
+                    denominator_alias=ratio_specs[oc.alias].denominator_alias,
+                    zero_division=ratio_specs[oc.alias].zero_division,
+                    multiplier=ratio_specs[oc.alias].multiplier,
+                )
+                if oc.alias in ratio_specs
+                else None
+            ),
         )
         for oc in output_columns
     ]
@@ -637,16 +653,29 @@ def _map_windows(
     # statement_id 是 Contract 层的标识符，不是数据流别名
     input_alias = ""
 
-    expressions = [
-        SparkWindowExpr(
-            function=_WINDOW_FUNCTION_MAP[ws.function.upper()],
-            alias=ws.alias,
-            input_column=ws.input_column,
-            partition_by=ws.partition_by,
-            order_by=ws.order_by,
+    expressions: list[SparkWindowExpr] = []
+    for ws in window_specs:
+        function_name = ws.function.upper()
+        is_full_partition_aggregate = (
+            function_name in {"SUM_OVER", "AVG_OVER", "COUNT_OVER"}
+            and not ws.order_by
         )
-        for ws in window_specs
-    ]
+        expressions.append(
+            SparkWindowExpr(
+                function=_WINDOW_FUNCTION_MAP[function_name],
+                alias=ws.alias,
+                input_column=ws.input_column,
+                partition_by=ws.partition_by,
+                order_by=ws.order_by,
+                # SQL 的无排序聚合窗口覆盖整个分区；Spark 默认只到当前行，
+                # 因此必须显式收口到 unbounded_following。
+                frame_end=(
+                    "unbounded_following"
+                    if is_full_partition_aggregate
+                    else "current_row"
+                ),
+            )
+        )
 
     return [
         SparkWindowStep(
