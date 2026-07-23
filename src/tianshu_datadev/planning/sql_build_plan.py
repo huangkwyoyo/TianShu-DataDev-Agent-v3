@@ -3233,6 +3233,13 @@ class SqlBuildPlanBuilder:
                 dim_table_ref = self._resolve_column_source_table(
                     d.column_ref, spec,
                 )
+            # _temp_ 表引用回退——链路径中 primary_table 可能为 _temp_ 表名
+            # （如 _temp_c41c54589_0），该表非真实源表，列需追溯到原始
+            # input_tables 获取正确别名（如 fc.borough 而非 _temp_xxx.borough）
+            if dim_table_ref and dim_table_ref.startswith("_temp_"):
+                resolved = self._resolve_column_source_table(d.column_ref, spec)
+                if resolved:
+                    dim_table_ref = resolved
             source = ColumnRef(
                 table_ref=dim_table_ref,
                 column_name=d.column_ref,
@@ -3345,6 +3352,14 @@ class SqlBuildPlanBuilder:
                     grain_table_ref = self._resolve_column_source_table(
                         grain_col, spec,
                     )
+                # _temp_ 表引用回退——同维度路径逻辑：
+                # 链路径中 primary_table 可能为 _temp_ 表名（truthy），
+                # 导致上述 elif not grain_table_ref 被跳过。
+                # 此回退确保 _temp_ 引用被替换为真实源表别名。
+                if grain_table_ref and grain_table_ref.startswith("_temp_"):
+                    resolved = self._resolve_column_source_table(grain_col, spec)
+                    if resolved:
+                        grain_table_ref = resolved
                 group_cols.append(
                     ColumnRef(
                         table_ref=grain_table_ref,
