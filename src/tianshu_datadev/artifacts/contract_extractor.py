@@ -417,9 +417,14 @@ class DataTransformContractExtractor:
         for m in step.metrics:
             # 多表场景下表别名消歧——source_table 非空时使用 cp.collision_id 格式，
             # 避免 Spark 在 JOIN 后的 agg 中报 AMBIGUOUS_REFERENCE
+            # _temp_* 表是链 DAG 内部管道——Contract 不暴露 _temp_ 表，
+            # 使用非限定列名，避免 Spark 物理验证中报 UNRESOLVED_COLUMN
+            src_table = m.source_table
+            if src_table and str(src_table).startswith("_temp_"):
+                src_table = None
             input_col = (
-                f"{m.source_table}.{m.input_column}"
-                if m.source_table and m.input_column
+                f"{src_table}.{m.input_column}"
+                if src_table and m.input_column
                 else m.input_column
             )
             aggs.append(
@@ -470,7 +475,12 @@ class DataTransformContractExtractor:
                     ))
             elif isinstance(gk, ColumnRef):
                 # 多表场景下表别名消歧——table_ref 非空时使用 cp.collision_id 格式
-                key = f"{gk.table_ref}.{gk.column_name}" if gk.table_ref else gk.normalized_name
+                # _temp_* 表是链 DAG 内部管道——Contract 不暴露 _temp_ 表，
+                # 使用非限定列名，避免 Spark 物理验证中报 UNRESOLVED_COLUMN
+                if gk.table_ref and not str(gk.table_ref).startswith("_temp_"):
+                    key = f"{gk.table_ref}.{gk.column_name}"
+                else:
+                    key = gk.normalized_name
                 if gk.normalized_name not in seen_groups:
                     groups.append(key)
                     seen_groups.add(gk.normalized_name)
