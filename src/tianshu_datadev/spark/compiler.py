@@ -64,6 +64,8 @@ class _CompileState:
     comment_lines: list[str] = field(default_factory=list)
     step_ids: list[str] = field(default_factory=list)
     step_counter: int = 0
+    join_result_vars: set[str] = field(default_factory=set)
+    """来自 JOIN 步骤的 DataFrame 变量名——其列名含 source_alias 前缀，需限定列引用。"""
 
     def next_step_id(self, step_type: str) -> str:
         """生成下一个 step_id。"""
@@ -144,6 +146,12 @@ class SparkCompiler:
                 if hasattr(a, "step_id") and a.step_id:
                     ann_map[a.step_id] = a
 
+        # ── 预扫描 JOIN 步骤——收集其输出变量，用于后续 JOIN 条件中的列名消歧 ──
+        join_result_vars: set[str] = set()
+        for resolved in resolved_plan.steps:
+            if isinstance(resolved.step, SparkJoinStep):
+                join_result_vars.add(resolved.output_var)
+
         for i, resolved in enumerate(resolved_plan.steps):
             step = resolved.step
             step_type = type(step).__name__
@@ -161,7 +169,10 @@ class SparkCompiler:
             elif isinstance(step, SparkLimitStep):
                 raw, comment = self._compile_limit(resolved, step_id, i, len(resolved_plan.steps))
             elif isinstance(step, SparkJoinStep):
-                raw, comment = self._compile_join(resolved, step_id, i, len(resolved_plan.steps))
+                raw, comment = self._compile_join(
+                    resolved, step_id, i, len(resolved_plan.steps),
+                    join_result_vars=join_result_vars,
+                )
             elif isinstance(step, SparkAggregateStep):
                 raw, comment = self._compile_aggregate(resolved, step_id, i, len(resolved_plan.steps))
             elif isinstance(step, SparkCaseWhenStep):
@@ -314,6 +325,33 @@ class SparkCompiler:
 
         col_strs: list[str] = []
         for col in step.columns:
+            if col.ratio_expr is not None:
+                ratio = col.ratio_expr
+                numerator = self.renderer.validate_identifier(
+                    ratio.numerator_alias,
+                    "ProjectStep.ratio_expr.numerator_alias",
+                )
+                denominator = self.renderer.validate_identifier(
+                    ratio.denominator_alias,
+                    "ProjectStep.ratio_expr.denominator_alias",
+                )
+                alias = self.renderer.validate_identifier(
+                    col.alias, "ProjectStep.alias",
+                )
+                denominator_ref = f'F.col("{denominator}")'
+                value = (
+                    f'(F.col("{numerator}").cast("double") / '
+                    f'{denominator_ref}.cast("double"))'
+                )
+                if ratio.multiplier == 100:
+                    value = f"({value} * F.lit(100))"
+                col_strs.append(
+                    "F.when("
+                    f"{denominator_ref}.isNull() | ({denominator_ref} == F.lit(0)), "
+                    'F.lit(None).cast("double")'
+                    f').otherwise({value}).alias("{alias}")'
+                )
+                continue
             col_name = self.renderer.validate_identifier(
                 col.column_name, "ProjectStep.column_name"
             )
@@ -396,6 +434,7 @@ class SparkCompiler:
 
     def _compile_join(
         self, resolved: ResolvedStep, step_id: str, index: int, total: int,
+        join_result_vars: set[str] | None = None,
     ) -> tuple[str, str]:
         """编译 JoinStep → fN = {left}.join({right}, on=..., how=...)。"""
         step = resolved.step
@@ -403,8 +442,24 @@ class SparkCompiler:
         right = resolved.input_vars[1]
         out_alias = resolved.output_var
 
-        left_key_ref = self.renderer.render_join_key(left, step.left_key)
-        right_key_ref = self.renderer.render_join_key(right, step.right_key)
+        # 使用 table.column 限定名消除 JOIN 结果中的同名列歧义。
+        # 当左/右 DataFrame 来自前序 JOIN 时，其列名按 PySpark 规则以
+        # source_alias.column_name 形式存在，直接使用原始字段名会导致
+        # AmbiguousReference（如 cp.crash_date_key vs fc.crash_date_key）。
+        # 对单源 DataFrame 仍使用原始列名。
+        _join_vars = join_result_vars or set()
+        left_col = (
+            f"{step.left_alias}.{step.left_key}"
+            if left in _join_vars
+            else step.left_key
+        )
+        right_col = (
+            f"{step.right_alias}.{step.right_key}"
+            if right in _join_vars
+            else step.right_key
+        )
+        left_key_ref = self.renderer.render_join_key(left, left_col)
+        right_key_ref = self.renderer.render_join_key(right, right_col)
         condition = f"{left_key_ref} == {right_key_ref}"
 
         how = self.renderer.render_join_type(step.join_type)
