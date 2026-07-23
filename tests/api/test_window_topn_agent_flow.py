@@ -110,7 +110,8 @@ def test_contract_preserves_post_window_filter_for_spark():
     assert 'F.col("trip_count").desc()' in code
     assert 'F.col("location_id").asc()' in code
     assert 'filter(F.col("rank_in_borough") <= 10)' in code
-    assert 'F.col("tz.zone_name")' not in code
+    # 多表场景下 GROUP BY 键使用 table.column 格式消除 Spark AMBIGUOUS_REFERENCE
+    assert 'F.col("tz.zone_name")' in code
 
 
 def test_non_count_aggregate_without_input_is_rejected_before_compile():

@@ -415,10 +415,17 @@ class DataTransformContractExtractor:
 
         # 聚合指标
         for m in step.metrics:
+            # 多表场景下表别名消歧——source_table 非空时使用 cp.collision_id 格式，
+            # 避免 Spark 在 JOIN 后的 agg 中报 AMBIGUOUS_REFERENCE
+            input_col = (
+                f"{m.source_table}.{m.input_column}"
+                if m.source_table and m.input_column
+                else m.input_column
+            )
             aggs.append(
                 ContractAggregation(
                     function=m.aggregation if isinstance(m.aggregation, str) else m.aggregation,
-                    input_column=m.input_column,
+                    input_column=input_col,
                     alias=m.alias,
                     filter=m.filter,  # 透传条件聚合 FILTER
                 )
