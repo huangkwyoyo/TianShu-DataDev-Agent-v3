@@ -462,11 +462,12 @@ class DataTransformContractExtractor:
                         date_part=gk.part,
                     ))
             elif isinstance(gk, ColumnRef):
-                key = gk.normalized_name
-                if key not in seen_groups:
+                # 多表场景下表别名消歧——table_ref 非空时使用 cp.collision_id 格式
+                key = f"{gk.table_ref}.{gk.column_name}" if gk.table_ref else gk.normalized_name
+                if gk.normalized_name not in seen_groups:
                     groups.append(key)
-                    seen_groups.add(key)
-                biz_keys.append(key)
+                    seen_groups.add(gk.normalized_name)
+                biz_keys.append(gk.normalized_name)
 
         return aggs, groups, biz_keys, time_transforms, derived
 
