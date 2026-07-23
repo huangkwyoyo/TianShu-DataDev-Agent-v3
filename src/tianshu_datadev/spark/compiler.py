@@ -458,12 +458,22 @@ class SparkCompiler:
             if right in _join_vars
             else step.right_key
         )
-        left_key_ref = self.renderer.render_join_key(left, left_col)
-        right_key_ref = self.renderer.render_join_key(right, right_col)
-        condition = f"{left_key_ref} == {right_key_ref}"
-
         how = self.renderer.render_join_type(step.join_type)
-        raw = f"{out_alias} = {left}.join({right}, on={condition}, how={how})"
+        if step.left_key == step.right_key:
+            # using-column Join 会把同名联结键合并为一个输出列，避免后续
+            # 聚合或投影以裸列名引用时触发 Spark AMBIGUOUS_REFERENCE。
+            join_key = self.renderer.validate_identifier(
+                step.left_key, "JoinStep.join_key",
+            )
+            raw = (
+                f'{out_alias} = {left}.join('
+                f'{right}, on="{join_key}", how={how})'
+            )
+        else:
+            left_key_ref = self.renderer.render_join_key(left, left_col)
+            right_key_ref = self.renderer.render_join_key(right, right_col)
+            condition = f"{left_key_ref} == {right_key_ref}"
+            raw = f"{out_alias} = {left}.join({right}, on={condition}, how={how})"
 
         comment = self._build_comment_block(
             step_id=step_id, index=index, total=total,

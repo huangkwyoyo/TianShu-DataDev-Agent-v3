@@ -878,9 +878,38 @@ class TestCompileJoin:
         result = compiler.compile(plan)
 
         assert ".join(" in result.raw_pyspark
-        assert 't1["user_id"]' in result.raw_pyspark
-        assert 't2["user_id"]' in result.raw_pyspark
+        assert 'on="user_id"' in result.raw_pyspark
         assert 'how="inner"' in result.raw_pyspark
+
+    def test_same_name_join_key_is_unambiguous_for_aggregate(self):
+        """同名联结键合并后，后续聚合可以安全使用裸列名。"""
+        plan = _make_plan(
+            SparkReadStep(alias="fc", source_name="fact_crashes", input_key="fc"),
+            SparkReadStep(alias="cp", source_name="crash_persons", input_key="cp"),
+            SparkJoinStep(
+                left_alias="fc",
+                right_alias="cp",
+                left_key="collision_id",
+                right_key="collision_id",
+                join_type=SparkJoinType.INNER,
+            ),
+            SparkAggregateStep(
+                input_alias="fc",
+                group_keys=["borough"],
+                metrics=[
+                    SparkAggregateSpec(
+                        function=SparkAggFunction.COUNT,
+                        input_column="collision_id",
+                        alias="crash_count",
+                    ),
+                ],
+            ),
+        )
+
+        result = SparkCompiler().compile(plan)
+
+        assert 'on="collision_id"' in result.raw_pyspark
+        assert 'F.count(F.col("collision_id")).alias("crash_count")' in result.raw_pyspark
 
     def test_left_join(self):
         """LEFT JOIN 编译。"""
