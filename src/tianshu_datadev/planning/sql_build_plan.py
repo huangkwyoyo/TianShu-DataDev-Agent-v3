@@ -2006,6 +2006,31 @@ class SqlBuildPlanBuilder:
                 return t.table_alias
         return dd_source_table  # 兜底：直接返回（单表别名即表名场景）
 
+    @staticmethod
+    def _resolve_column_source_table(
+        column_name: str, spec: ParsedDeveloperSpec,
+    ) -> str:
+        """从 input_tables 中查找列所属的表别名——多表消歧兜底。
+
+        当 dimension 未声明 source_table 时，通过遍历所有源表的
+        key_columns + business_columns 查找列的归属表。
+        多表命中时返回第一个匹配的表别名（歧义由上层 ColumnRef 的 AMBIGUOUS_REFERENCE
+        机制处理——此处仅提供候选），无匹配时返回空字符串。
+
+        Args:
+            column_name: 列名（原始名称）
+            spec: 已解析的 DeveloperSpec
+
+        Returns:
+            表别名或空字符串
+        """
+        for t in spec.input_tables:
+            all_cols = t.key_columns + t.business_columns
+            for c in all_cols:
+                if c.column_name == column_name:
+                    return t.table_alias
+        return ""  # 未找到——由上层兜底
+
     def _build_case_when_steps(self, spec: ParsedDeveloperSpec) -> list:
         """从 spec.label_rules 和 spec.case_when_rules 生成 CaseWhenStep 列表。
 
@@ -3196,9 +3221,18 @@ class SqlBuildPlanBuilder:
             # 需映射为表别名（如 dtz）才能通过 SafeIdentifier 校验。
             # 多跳链 FINAL 步骤中 ignore_source_table=True——
             # 数据已从多表 Join 到 temp 表，不再使用原始表别名。
+            # 多表场景下表别名消歧优先级：
+            # 1) LLM 标注的 source_table（解析为别名）
+            # 2) 从 input_tables 列声明中扫描（兜底）
+            # 3) primary_table（单表场景或以上均未命中）
             dim_table_ref = primary_table
             if not ignore_source_table and d.source_table:
                 dim_table_ref = self._resolve_derived_source_table(d.source_table, spec)
+            elif not dim_table_ref:
+                # 多表路径下 primary_table 可能为空——扫描源表列声明兜底
+                dim_table_ref = self._resolve_column_source_table(
+                    d.column_ref, spec,
+                )
             source = ColumnRef(
                 table_ref=dim_table_ref,
                 column_name=d.column_ref,
@@ -3297,9 +3331,23 @@ class SqlBuildPlanBuilder:
                         )
                     )
                     continue
+                # 多表场景下表别名消歧——grain 列通过以下优先级获知表别名：
+                # 1) 匹配 dimension 的 source_table（LLM 已标注）
+                # 2) 从 input_tables 的列声明中查找（兜底扫描）
+                # 3) primary_table（单表场景或以上均未命中）
+                grain_table_ref = primary_table
+                if derived and derived.source_table:
+                    grain_table_ref = self._resolve_derived_source_table(
+                        derived.source_table, spec
+                    )
+                elif not grain_table_ref:
+                    # 多表路径下 primary_table 可能为空——扫描源表列声明兜底
+                    grain_table_ref = self._resolve_column_source_table(
+                        grain_col, spec,
+                    )
                 group_cols.append(
                     ColumnRef(
-                        table_ref=primary_table,
+                        table_ref=grain_table_ref,
                         column_name=grain_col,
                         normalized_name=normalized,
                     )
