@@ -27,6 +27,7 @@ def _find_unresolved_derived_columns(
     6. 已有 label_rules 输出名
     7. 派生维度输出名（derived_dimensions）
     8. case_when_rules 输出名
+    9. 已提升的 ratio_metrics 输出名
 
     Args:
         spec: 已解析的 DeveloperSpec
@@ -81,7 +82,11 @@ def _find_unresolved_derived_columns(
     for rule in spec.case_when_rules:
         known.add(rule.output_column)
 
-    # 9. Manifest schema（如果有）
+    # 9. 已提升的聚合后比率输出名
+    for ratio in spec.ratio_metrics:
+        known.add(ratio.output_alias)
+
+    # 10. Manifest schema（如果有）
     if manifest is not None:
         for schema_col in manifest.schema or []:
             known.add(schema_col.get("name", ""))

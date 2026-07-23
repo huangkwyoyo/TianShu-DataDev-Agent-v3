@@ -360,12 +360,11 @@ def test_i6_label_kind_triggers_extractor():
 
 # ═══ I7: UNKNOWN 兜底调用 Extractor ═══
 
-def test_i7_unknown_kind_no_extractor():
-    """output_kind=UNKNOWN 但无已有规则 → 兜底逻辑调用 Extractor（向后兼容）。
+def test_i7_unknown_kind_no_extractor_revised():
+    """output_kind=UNKNOWN + 无已有规则 → Extractor 不调用 → HUMAN_REVIEW。
 
-    兜底逻辑：当 Planner 未标记任何 LABEL 列、且 label_rules/case_when_rules
-    均为空时，对所有 unresolved 列调用 LabelExtractor。
-    Extractor 返回空 proposals → 门禁检查失败 → LabelTableConfigError。
+    撤销兜底后：只有 output_kind=LABEL 才调用 Extractor。
+    UNKNOWN 列在最终 unresolved 检查处进入 HUMAN_REVIEW blocking OpenQuestion。
     """
     spec = _make_label_spec(
         input_tables=[{"name": "t", "key_columns": ["id"], "columns": [("id", "int"), ("val", "double")]}],
@@ -395,12 +394,17 @@ def test_i7_unknown_kind_no_extractor():
         adapter=adapter,
         label_extractor=CountingFakeExtractor(proposals=[]),
     )
-    # 兜底逻辑触发 Extractor 调用，但空 proposals 导致门禁失败
     result = pipeline.run_parse_and_enrich(spec)
-    # Extractor 被兜底逻辑调用了一次
-    assert call_count[0] == 1
-    # 门禁失败——空规则 + 仍有 unresolved 列
-    assert result["validation_passed"] is False
+    # 撤销兜底后——Extractor 不调用（UNKNOWN ≠ LABEL）
+    assert call_count[0] == 0, f"Extractor 不应被调用，但调用了 {call_count[0]} 次"
+    # 验证生成了 HUMAN_REVIEW blocking OpenQuestion
+    open_questions = result.get("open_questions", [])
+    human_review_qs = [
+        q for q in open_questions
+        if q.get("question_id", "").startswith("HUMAN_REVIEW-")
+    ]
+    assert len(human_review_qs) > 0, "应生成 HUMAN_REVIEW blocking OpenQuestion"
+    assert any(q.get("blocking") for q in human_review_qs), "HUMAN_REVIEW 应为 blocking"
 
 
 # ═══ I8: 非 label_table 的 Planner CASE WHEN 正常 ═══
@@ -499,3 +503,64 @@ def test_i10_sql_spark_same_contract():
     pipeline = Pipeline(adapter=adapter)
     result = pipeline.run_parse_and_enrich(spec)
     assert result is not None
+
+
+# ═══ I11: Planner 未标记 LABEL → Extractor 不调用 ═══
+
+def test_i11_non_label_not_sent_to_extractor():
+    """Planner 标记 output_kind=METRIC 的列不传给 LabelExtractor。"""
+    spec = _make_label_spec(
+        input_tables=[{"name": "t", "key_columns": ["id"], "columns": [("id", "int"), ("score", "double")]}],
+        output_columns=["score", "label_col"],
+        description="按 score 定义 label_col",
+    )
+    # Planner 只标记 METRIC 但未生成规则——LabelExtractor 不应调用
+    adapter = FakeAdapter(response={
+        "dimensions": [],
+        "derived_dimensions": [],
+        "metrics": [],
+        "case_when_rules": [],
+        "uncertainties": [{
+            "field_ref": "score_ref",
+            "output_column": "score",
+            "output_kind": "METRIC",
+            "description": "聚合函数 MODE 不在白名单",
+        }],
+    })
+    call_count = [0]
+
+    class CountingFakeExtractor(FakeLabelExtractor):
+        def extract(self, spec, unresolved_columns):
+            call_count[0] += 1
+            return super().extract(spec, unresolved_columns)
+
+    pipeline = Pipeline(
+        adapter=adapter,
+        label_extractor=CountingFakeExtractor(proposals=[]),
+    )
+    result = pipeline.run_parse_and_enrich(spec)
+    # METRIC ≠ LABEL → Extractor 不调用
+    assert call_count[0] == 0, f"Extractor 不应被调用，但调用了 {call_count[0]} 次"
+
+
+# ═══ I12: Planner 抛 RequirementPlanningError → enrich 阶段失败 ═══
+
+def test_i12_planner_error_aborts_pipeline():
+    """Planner 抛 RequirementPlanningError → enrich 阶段失败。
+
+    使用无注册的 FakeLLMAdapter → adapter.invoke() 失败。
+    验证管道在 enrich 阶段终止，不会静默继续。
+    """
+    from tianshu_datadev.llm.adapters.fake_adapter import FakeLLMAdapter
+
+    spec = _make_label_spec(
+        input_tables=[{"name": "t", "key_columns": ["id"], "columns": [("id", "int"), ("val", "double")]}],
+        output_columns=["val", "label_col"],
+        description="测试 Planner 失败场景",
+    )
+    fake = FakeLLMAdapter()
+    pipeline = Pipeline(adapter=fake)
+
+    result = pipeline.run_parse_and_enrich(spec)
+    # enrich 阶段失败 → result == {} 或 validation_passed=False
+    assert result == {} or result.get("validation_passed") is False

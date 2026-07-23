@@ -281,6 +281,164 @@ def test_pipeline_builds_half_open_snapshot_filter_from_spec():
     assert snapshot_filter.end_operator == "LT"
 
 
+def test_pipeline_snapshot_time_filter_empty_column_returns_none():
+    """time_range.column_ref 为空且无表配置 time_field 时返回 None 而非抛错。
+
+    回归测试：多表 label_table spec 中 Planner 可能不填充 column_ref，
+    快照时间过滤是性能优化而非正确性要求——应允许跳过。
+    """
+    from tianshu_datadev.developer_spec.models import (
+        ColumnDecl,
+        DatasetType,
+        InputTableDecl,
+        OutputColumnDecl,
+        OutputSpecDecl,
+        ParsedDeveloperSpec,
+        TimeRangeDecl,
+    )
+
+    def _col(name: str, dtype: str = "varchar") -> ColumnDecl:
+        return ColumnDecl(column_name=name, normalized_name=name, data_type=dtype)
+
+    spec = ParsedDeveloperSpec(
+        spec_id="test_multi_table_label",
+        spec_hash="test_hash_001",
+        title="多表标签测试",
+        description="多表标签 spec——Planner 未填充 column_ref",
+        dataset_type=DatasetType.LABEL_TABLE,
+        input_tables=[
+            InputTableDecl(
+                table_alias="cp",
+                source_table="crashes",
+                columns=[
+                    _col("collision_id"),
+                    _col("crash_date", "date"),
+                ],
+            ),
+            InputTableDecl(
+                table_alias="ve",
+                source_table="vehicles",
+                columns=[
+                    _col("collision_id"),
+                    _col("vehicle_type"),
+                ],
+            ),
+        ],
+        metrics=[],
+        dimensions=[],
+        output_spec=OutputSpecDecl(
+            columns=[
+                OutputColumnDecl(name="collision_id"),
+                OutputColumnDecl(name="risk_level"),
+            ],
+            grain=["collision_id"],
+        ),
+        time_range=TimeRangeDecl(
+            column_ref="",  # Planner 未填充——空字符串
+            start="2024-01-01",
+            end="2024-12-31",
+        ),
+    )
+
+    result = Pipeline._build_snapshot_time_filter(spec)
+    # 应返回 None（跳过时间过滤），而非抛 SnapshotMaterializationError
+    assert result is None
+
+
+def test_pipeline_snapshot_time_filter_no_time_range_returns_none():
+    """spec.time_range=None → 返回 None（无时间范围即跳过快照过滤）。"""
+    from tianshu_datadev.developer_spec.models import (
+        ColumnDecl,
+        DatasetType,
+        InputTableDecl,
+        OutputColumnDecl,
+        OutputSpecDecl,
+        ParsedDeveloperSpec,
+    )
+
+    def _col(name: str, dtype: str = "varchar") -> ColumnDecl:
+        return ColumnDecl(column_name=name, normalized_name=name, data_type=dtype)
+
+    spec = ParsedDeveloperSpec(
+        spec_id="test_no_time_range",
+        spec_hash="test_hash_002",
+        title="无时间范围 spec",
+        description="未配置时间范围",
+        dataset_type=DatasetType.AGGREGATE_TABLE,
+        input_tables=[
+            InputTableDecl(
+                table_alias="ft",
+                source_table="fact_table",
+                columns=[_col("id")],
+            ),
+        ],
+        metrics=[],
+        dimensions=[],
+        output_spec=OutputSpecDecl(
+            columns=[OutputColumnDecl(name="id")],
+            grain=["id"],
+        ),
+        time_range=None,  # 无时间范围
+    )
+
+    result = Pipeline._build_snapshot_time_filter(spec)
+    assert result is None
+
+
+def test_pipeline_snapshot_time_filter_with_time_field_works():
+    """表显式配置 time_field → 即使 column_ref 为空也能确定时间列。"""
+    from tianshu_datadev.developer_spec.models import (
+        ColumnDecl,
+        DatasetType,
+        InputTableDecl,
+        OutputColumnDecl,
+        OutputSpecDecl,
+        ParsedDeveloperSpec,
+        TimeRangeDecl,
+    )
+
+    def _col(name: str, dtype: str = "varchar") -> ColumnDecl:
+        return ColumnDecl(column_name=name, normalized_name=name, data_type=dtype)
+
+    spec = ParsedDeveloperSpec(
+        spec_id="test_time_field",
+        spec_hash="test_hash_003",
+        title="含 time_field 的 spec",
+        description="表显式声明了 time_field",
+        dataset_type=DatasetType.AGGREGATE_TABLE,
+        input_tables=[
+            InputTableDecl(
+                table_alias="ft",
+                source_table="fact_table",
+                time_field="pickup_at",  # 显式声明时间字段
+                columns=[
+                    _col("pickup_at", "timestamp"),
+                    _col("trip_count", "integer"),
+                ],
+            ),
+        ],
+        metrics=[],
+        dimensions=[],
+        output_spec=OutputSpecDecl(
+            columns=[OutputColumnDecl(name="trip_count")],
+            grain=["pickup_at"],
+        ),
+        time_range=TimeRangeDecl(
+            column_ref="",  # 空——由 time_field 兜底
+            start="2024-01-01",
+            end="2024-01-31",
+        ),
+    )
+
+    result = Pipeline._build_snapshot_time_filter(spec)
+    assert result is not None
+    assert result.column == "pickup_at"
+    assert result.table_alias == "ft"
+    assert result.start == "2024-01-01"
+    assert result.end == "2024-02-01"  # 半开区间 +1 天
+    assert result.end_operator == "LT"
+
+
 def _make_local_fixture_builder(tmpdir: str):
     """在 tmpdir 下创建 fact_trips_sample.csv 和对应 provider，返回 (provider, builder)。
 

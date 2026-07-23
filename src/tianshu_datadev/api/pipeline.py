@@ -587,7 +587,27 @@ class Pipeline:
         unresolved_after = _find_unresolved_derived_columns(spec)
         has_compute_steps = bool(spec.compute_steps)
         if unresolved_after and not has_compute_steps:
-            if self._adapter is None:
+            if spec.dataset_type == DatasetType.LABEL_TABLE:
+                # label_table：不支持能力进入 HUMAN_REVIEW（blocking OpenQuestion）
+                # Pipeline 不崩溃——保留已解析部分，供用户审查后补写配置
+                for col in unresolved_after:
+                    # 查找 Planner 对该列的说明
+                    reason = ""
+                    for u in spec.uncertainties:
+                        if u.output_column == col:
+                            reason = f"：{u.description}"
+                            break
+                    extra_questions.append(OpenQuestion(
+                        question_id=f"HUMAN_REVIEW-{col}",
+                        source="requirement_planner",
+                        field_ref=col,
+                        description=(
+                            f"输出列 '{col}' 无法自动解析{reason}——"
+                            f"需人工审核或手动补写结构化配置"
+                        ),
+                        blocking=True,
+                    ))
+            elif self._adapter is None:
                 raise ConfigError(
                     f"以下输出列无法解析且无 LLM Adapter 可用：{unresolved_after}"
                 )
@@ -595,6 +615,24 @@ class Pipeline:
                 raise ConfigError(
                     f"RequirementPlanner + SpecEnricher 后仍存在未解析列: {unresolved_after}"
                 )
+
+        # ── 3.5. label_table 门禁——至少一个合法标签列
+        # 已从 _prepare_labels() 移至此位置，确保在所有处理完成后检查。
+        # 使用 blocking OpenQuestion 而非异常——让 HUMAN_REVIEW 问题一并返回给用户。
+        if spec.dataset_type == DatasetType.LABEL_TABLE:
+            has_labels = bool(spec.label_rules) or bool(spec.case_when_rules)
+            if not has_labels and unresolved_after:
+                extra_questions.append(OpenQuestion(
+                    question_id="LABEL_TABLE_NO_RULES",
+                    source="label_table_gate",
+                    field_ref=None,
+                    description=(
+                        "label_table 至少需要一个合法标签列——"
+                        "label_rules 和 case_when_rules 均为空，"
+                        f"且以下输出列仍未解析：{unresolved_after}"
+                    ),
+                    blocking=True,
+                ))
 
         # ── 4. RelationshipPlanner ──
         hypothesis = None
@@ -626,6 +664,20 @@ class Pipeline:
 
         planner_output = self._requirement_planner.plan(spec, manifest)
         elapsed_ms = int((time.monotonic() - t0) * 1000)
+        # ── 诊断：追踪 Planner 对 CASE WHEN 的输出 ──
+        _diag_cw = []
+        for r in planner_output.case_when_rules:
+            _diag_refs = []
+            for b in r.branches:
+                _cond = b.condition if isinstance(b.condition, dict) else {}
+                _diag_refs.append(_cond.get("left", "?"))
+            _diag_cw.append({"col": r.output_column, "refs": _diag_refs})
+        logger.info(
+            "DIAG Planner: metrics=%s, cw_rules=%s, uncertainties=%s",
+            [m.alias for m in planner_output.metrics],
+            _diag_cw,
+            [(u.output_column, u.output_kind) for u in planner_output.uncertainties],
+        )
 
         proposal = RequirementProposal(
             proposal_id=_gen_uuid(),
@@ -651,6 +703,10 @@ class Pipeline:
 
         valid, questions = self._proposal_validator.validate(proposal, spec, manifest)
         if not valid:
+            logger.warning(
+                "DIAG ProposalValidator 失败: %s",
+                [(q.question_id, q.description[:120]) for q in questions if q.blocking],
+            )
             spec = _apply_uncertainties_to_spec(spec, proposal.uncertainties)
             return spec, questions
 
@@ -691,11 +747,9 @@ class Pipeline:
                     and col not in planner_covered_cols
                 ]
 
-                # ── 兜底：Planner 未标记任何 LABEL 列，但仍需标签规则时，
-                #     对所有 unresolved 列调用 LabelExtractor（向后兼容）
-                has_rules = bool(spec.label_rules) or bool(spec.case_when_rules)
-                if not label_candidates and not has_rules:
-                    label_candidates = list(unresolved)
+                # LabelExtractor 仅处理 Planner 明确确认的 LABEL 列（output_kind=LABEL）。
+                # Planner 未标记任何 LABEL 列时不调用 Extractor——
+                # unresolved 列将在最终门禁处进入 HUMAN_REVIEW。
 
                 if label_candidates:
                     if self._label_extractor is None:
@@ -733,19 +787,8 @@ class Pipeline:
                 "open_questions": spec.open_questions + conflict_questions,
             })
 
-        # ── label_table 门禁：至少一个合法标签列
-        # 仅当存在 unresolved 列（即有待提取/生成的列）时才要求有标签规则；
-        # 所有输出列均为源表透传时（如原始数据采样），视为纯透传 label_table，
-        # 不需要标签规则或 CASE WHEN 规则。
-        if spec.dataset_type == DatasetType.LABEL_TABLE:
-            has_labels = bool(spec.label_rules) or bool(spec.case_when_rules)
-            if not has_labels:
-                unresolved = _find_unresolved_derived_columns(spec)
-                if unresolved:
-                    raise LabelTableConfigError(
-                        "label_table 至少需要一个合法标签列——"
-                        "label_rules 和 case_when_rules 均为空"
-                    )
+        # label_table 门禁已移至 _enrich_and_plan() 步骤 3.5——
+        # 在最终 unresolved 检查之后执行。
 
         return spec
 
@@ -798,6 +841,17 @@ class Pipeline:
             }
         except LabelTableConfigError as e:
             # label_table 配置错误——阻断
+            return {
+                "spec": spec,
+                "hypothesis": None,
+                "open_questions": _summarize_open_questions(spec.open_questions),
+                "validation_passed": False,
+                "error": str(e),
+                "table_mapping": table_mapping or {},
+            }
+        except Exception as e:
+            # Planner/Enricher 阶段异常——记录错误并标记失败
+            logger.error("run_parse_and_enrich 失败: %s", e, exc_info=True)
             return {
                 "spec": spec,
                 "hypothesis": None,
@@ -1096,6 +1150,11 @@ class Pipeline:
             ]
             if len(time_field_tables) == 1:
                 column = time_field_tables[0].time_field or ""
+        # 无时间列引用且无法从 time_field 推断 → 跳过时间过滤
+        # 快照时间过滤是性能优化而非正确性要求，多表 label_table
+        # 场景下 Planner 可能无法自动确定时间列归属。
+        if not column:
+            return None
         candidates = []
         for table in spec.input_tables:
             declared_columns = {

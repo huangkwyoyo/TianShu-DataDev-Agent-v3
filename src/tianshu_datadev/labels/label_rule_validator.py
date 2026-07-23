@@ -118,15 +118,31 @@ class LabelRuleValidator:
         warnings: list[str] = []
 
         # 收集所有已知列名 + 列类型映射
+        # 遍历三种列声明：columns（通用列）、key_columns（主键列）、business_columns（业务列）
+        # 修复：此前仅收集 columns，key_columns/business_columns 被忽略，
+        #       当 spec 将所有列声明为后两类时 known_columns 为空，FIELD_EXISTS 全部失败。
         known_columns: set[str] = set()
         column_types: dict[str, str] = {}  # column_name → data_type
         for t in spec.input_tables:
-            for c in t.columns:
-                known_columns.add(c.normalized_name)
-                known_columns.add(c.column_name)
-                if c.data_type:
-                    column_types[c.normalized_name] = c.data_type
-                    column_types[c.column_name] = c.data_type
+            for col_list in (t.columns, t.key_columns, t.business_columns):
+                for c in col_list:
+                    known_columns.add(c.normalized_name)
+                    known_columns.add(c.column_name)
+                    if c.data_type:
+                        column_types[c.normalized_name] = c.data_type
+                        column_types[c.column_name] = c.data_type
+
+        # Fix B：CASE WHEN post_aggregate 条件引用聚合输出列（如 crash_count）是
+        # 正确语义——这些名称不在源表列中，而在 output_spec / metrics / dimensions 中。
+        # ProposalValidator.available_names 已包含这些范围，LabelRuleValidator 对齐。
+        for col in spec.output_spec.columns:
+            known_columns.add(col.name)
+        for m in spec.metrics:
+            known_columns.add(m.alias)
+        for d in spec.dimensions:
+            known_columns.add(d.dimension_name)
+        for dd in spec.derived_dimensions:
+            known_columns.add(dd.dimension_name)
 
         # 1. FIELD_EXISTS
         self._check_field_exists(proposal, known_columns, checks, blocking)

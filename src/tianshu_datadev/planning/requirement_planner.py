@@ -38,9 +38,16 @@ _REQUIREMENT_PLANNER_SYSTEM_PROMPT = """\
 硬约束
 ════════════════════════════════════════
 
-H1. 列名只能从 [Table Schemas] 中选择，禁止编造。
+H1. 列名只能从以下来源中选择，禁止编造：
+    - [Table Schemas] 的 columns.column_name：源表物理列
+    - [output_columns]：输出列名列表
+    - [existing_declarations] 的 metrics.alias：已声明的指标别名
+    CASE WHEN post_aggregate 条件引用聚合结果列（如 crash_count）是正确语义——
+    聚合结果列名在 output_columns 或 existing_declarations.metrics 中。
 
 H2. 聚合函数只能是：COUNT | SUM | AVG | MIN | MAX | COUNT_DISTINCT
+    input_column 必须是裸列名（如 collision_id），不要带表别名前缀（如 cp.collision_id）。
+    列名从 [Table Schemas] 的 columns.column_name 中选择。
 
 H3. 时间函数只能是：HOUR
     不要使用 DAY、MONTH、YEAR、DAY_OF_WEEK、DATE_TRUNC、EXTRACT 等。
@@ -50,6 +57,17 @@ H4. CASE WHEN 条件必须使用类型化 Predicate 树。
     条件只能使用 COMPARE / IS_NULL / IS_NOT_NULL / AND / OR。
     不要使用 NOT 节点——用反向比较操作符（!=、IS_NULL vs IS_NOT_NULL）代替。
     THEN 值为纯字符串字面量。
+
+H4 补充——有序 CASE WHEN 通过分支优先级避免 NOT 节点：
+
+正确示例——风险等级标注（分支由高到低排列，无需 NOT）：
+  CASE WHEN crash_count >= 30 OR total_killed >= 2 THEN "高"
+       WHEN crash_count >= 10 THEN "中"
+       WHEN crash_count >= 1 THEN "低"
+       ELSE "无数据"
+
+  关键：第一个分支拦截了所有"高风险"记录，
+  后续分支自动排除了已满足的条件——不需要 NOT。
 
 H5. 不确定时写入 uncertainties。每条包含：
     - field_ref: 诊断标识（自由文本，仅用于日志）
@@ -72,8 +90,11 @@ H8. 窗口函数、比率指标、跨粒度依赖不在你的处理范围——
 
 H9. 遇到白名单外聚合函数（如 MODE、MEDIAN、STDDEV 等）时：
     不要尝试构造 MetricDecl——Schema 会拒绝。
-    输出一条 uncertainty：output_kind=METRIC，output_column=目标列名，
-    description 说明"聚合函数 MODE 不在白名单 COUNT|SUM|AVG|MIN|MAX|COUNT_DISTINCT 中"。"""
+    输出一条 uncertainty：
+      - output_kind=METRIC
+      - output_column=目标列名
+      - description 说明"聚合函数 MODE 不在白名单 COUNT|SUM|AVG|MIN|MAX|COUNT_DISTINCT 中"
+    MODE 由最终 unresolved 检查确定性路由到人工审核——此处仅记录原因。"""
 
 # ════════════════════════════════════════════
 # JSON Schema（v3.1——predicate_root 不含 NOT）
@@ -259,6 +280,26 @@ _REQUIREMENT_PLANNER_JSON_SCHEMA = {
 }
 
 
+class RequirementPlanningError(Exception):
+    """RequirementPlanner 调用失败——禁止静默回退。
+
+    仅当 Adapter 技术失败时抛出：
+      - error_type="llm_call_failed": adapter.invoke() 抛异常
+
+    合法空输出（LLM 成功返回但所有列表为空）不抛异常——
+    继续传递给 SpecEnricher 处理。
+    """
+
+    def __init__(
+        self,
+        error_type: str,
+        message: str,
+    ):
+        super().__init__(f"[{error_type}] {message}")
+        self.error_type = error_type
+        self.message = message
+
+
 class RequirementPlanner:
     """从自然语言业务描述生成结构化声明。
 
@@ -269,7 +310,8 @@ class RequirementPlanner:
     - case_when_rules: 类型化 CASE WHEN 规则
     - uncertainties: 不确定项
 
-    LLM 调用失败时返回全空 RequirementPlannerOutput——不阻断管线。
+    adapter.invoke() 失败时抛出 RequirementPlanningError——
+    不再静默返回空 Output，由管线层处理阶段失败。
     """
 
     def __init__(self, adapter: ProviderAdapter | None = None):
@@ -309,9 +351,13 @@ class RequirementPlanner:
                 temperature=0.1,
             )
         except Exception as e:
-            logger.warning("RequirementPlanner LLM 调用失败：%s", e)
-            return RequirementPlannerOutput()
+            logger.error("RequirementPlanner LLM 调用失败：%s", e)
+            raise RequirementPlanningError(
+                error_type="llm_call_failed",
+                message=f"LLM 调用异常：{e}",
+            ) from e
 
+        # 合法空输出正常返回——交给 SpecEnricher
         return self._parse_response(raw)
 
     def _build_context(

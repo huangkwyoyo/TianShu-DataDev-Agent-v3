@@ -1046,3 +1046,97 @@ class TestSpecEnricherParseLLM:
         assert q.field_ref == "peak_type"
         assert "CASE WHEN" in q.description
         assert not q.blocking
+
+
+class TestResolveEvaluationPhase:
+    """验证 _resolve_evaluation_phase 确定性回退判定逻辑。"""
+
+    def test_pre_aggregate_when_condition_cols_are_physical(self):
+        """条件列全是源表物理列 → pre_aggregate（派生维度场景）。"""
+        from tianshu_datadev.developer_spec.models import (
+            CaseWhenDecl,
+            LabelIsNotNull,
+            LabelPredicateBranch,
+        )
+
+        spec = _build_minimal_spec()
+        cw = CaseWhenDecl(
+            output_column="peak_type",
+            typed_branches=[
+                LabelPredicateBranch(
+                    condition=LabelIsNotNull(column="amount"),
+                    then_label="高峰",
+                ),
+            ],
+            else_value="平峰",
+        )
+        result = SpecEnricher._resolve_evaluation_phase(cw, spec)
+        assert result == "pre_aggregate"
+
+    def test_post_aggregate_when_condition_refs_metric(self):
+        """条件引用聚合指标别名 → post_aggregate。"""
+        from tianshu_datadev.developer_spec.models import (
+            CaseWhenDecl,
+            LabelIsNotNull,
+            LabelPredicateBranch,
+        )
+
+        spec = _build_minimal_spec()
+        cw = CaseWhenDecl(
+            output_column="amount_level",
+            typed_branches=[
+                LabelPredicateBranch(
+                    condition=LabelIsNotNull(column="total_amount"),
+                    then_label="高",
+                ),
+            ],
+            else_value="低",
+        )
+        result = SpecEnricher._resolve_evaluation_phase(cw, spec)
+        assert result == "post_aggregate"
+
+    def test_pre_aggregate_when_output_in_grain(self):
+        """输出列在 grain 中 → pre_aggregate（规则 1 优先）。"""
+        from tianshu_datadev.developer_spec.models import CaseWhenDecl
+
+        spec = _build_minimal_spec()
+        cw = CaseWhenDecl(
+            output_column="stat_date",
+            else_value="unknown",
+        )
+        result = SpecEnricher._resolve_evaluation_phase(cw, spec)
+        assert result == "pre_aggregate"
+
+    def test_pre_aggregate_when_output_in_dimensions(self):
+        """输出列在 dimensions 中 → pre_aggregate（规则 1）。"""
+        from tianshu_datadev.developer_spec.models import CaseWhenDecl
+
+        spec = _build_minimal_spec()
+        # stat_date 已在 dimensions 中（见 _build_minimal_spec）
+        cw = CaseWhenDecl(
+            output_column="stat_date",
+        )
+        result = SpecEnricher._resolve_evaluation_phase(cw, spec)
+        assert result == "pre_aggregate"
+
+    def test_none_when_cannot_determine(self):
+        """条件列既不是物理列也不是聚合指标 → None（HUMAN_REVIEW）。"""
+        from tianshu_datadev.developer_spec.models import (
+            CaseWhenDecl,
+            LabelIsNotNull,
+            LabelPredicateBranch,
+        )
+
+        spec = _build_minimal_spec()
+        cw = CaseWhenDecl(
+            output_column="custom_label",
+            typed_branches=[
+                LabelPredicateBranch(
+                    condition=LabelIsNotNull(column="unknown_col"),
+                    then_label="是",
+                ),
+            ],
+            else_value="否",
+        )
+        result = SpecEnricher._resolve_evaluation_phase(cw, spec)
+        assert result is None

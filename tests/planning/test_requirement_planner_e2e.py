@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 from tianshu_datadev.developer_spec.models import (
+    CaseWhenBranch,
+    CaseWhenRule,
     ColumnDecl,
     DatasetType,
     InputTableDecl,
@@ -198,20 +200,23 @@ class TestRequirementPlanner:
         assert len(output.uncertainties) == 0
 
     def test_planner_empty_on_adapter_error(self):
-        """LLM 调用失败时 plan() 应返回全空输出，不阻断管线。"""
+        """LLM 调用失败时 plan() 应抛出 RequirementPlanningError，不再静默返回空。"""
+        import pytest
+
+        from tianshu_datadev.planning.requirement_planner import RequirementPlanningError
+
         fake = FakeLLMAdapter()
         # 不注册任何 fixture——FakeLLMAdapter 会抛出 AdapterError
 
         planner = RequirementPlanner(adapter=fake)
         spec = self._make_spec()
         manifest = self._make_manifest()
-        output = planner.plan(spec, manifest)
 
-        assert len(output.dimensions) == 0
-        assert len(output.derived_dimensions) == 0
-        assert len(output.metrics) == 0
-        assert len(output.case_when_rules) == 0
-        assert len(output.uncertainties) == 0
+        with pytest.raises(RequirementPlanningError) as exc_info:
+            planner.plan(spec, manifest)
+
+        assert exc_info.value.error_type == "llm_call_failed"
+        assert "LLM 调用异常" in exc_info.value.message
 
     def test_golden_chain_planner_to_builder(self):
         """Golden chain: FakeAdapter→Planner→Validator→Promotion→Builder 全链路。"""
@@ -367,3 +372,61 @@ class TestRequirementPlanner:
             if u.field_ref.startswith("case_when_rules.parse_error.")
         ]
         assert len(parse_errors) == 2
+
+    def test_v9_allows_case_when_refs_to_output_columns(self):
+        """V9 应允许 CASE WHEN 条件引用输出列名（即使 Planner 未生成匹配 MetricDecl）。
+
+        回归测试：半结构化 YAML spec 中指标以自然语言定义，
+        Planner 可能生成 case_when_rules 引用聚合输出列名
+        （如 killed_person_count），但未同时生成 MetricDecl。
+        此时输出列名应在 available_names 中，V9 不应阻断。
+        """
+        import uuid
+
+        from tianshu_datadev.developer_spec.models import RequirementProposal
+        from tianshu_datadev.planning.proposal_validator import ProposalValidator
+
+        spec = self._make_spec()
+        manifest = self._make_manifest()
+
+        # 构造 proposal：有 case_when 条件引用输出列名，但没有 metrics
+        # 模拟 Planner 只生成 case_when_rules 不生成 MetricDecl 的场景
+        proposal = RequirementProposal(
+            proposal_id=uuid.uuid4().hex[:12],
+            spec_hash=spec.spec_hash,
+            dimensions=[],
+            derived_dimensions=[],
+            metrics=[],  # 空——Planner 未生成 MetricDecl
+            case_when_rules=[
+                CaseWhenRule(
+                    output_column="peak_type",
+                    branches=[
+                        CaseWhenBranch(
+                            condition={
+                                "node_type": "COMPARE",
+                                "left": "trip_count",  # 引用输出列名（不在 metrics 中）
+                                "op": ">=",
+                                "right": {
+                                    "node_type": "LITERAL",
+                                    "value": 100,
+                                    "data_type": "number",
+                                },
+                            },
+                            then_value="高峰",
+                        ),
+                    ],
+                    else_value="平峰",
+                ),
+            ],
+            uncertainties=[],
+            llm_model="fake",
+            inference_time_ms=0,
+            total_inferred=1,
+        )
+
+        validator = ProposalValidator()
+        valid, questions = validator.validate(proposal, spec, manifest)
+
+        # trip_count 是 output_columns 中的名称（在 _make_spec 中定义），
+        # 即使不在 proposal.metrics 中，V9 也应通过
+        assert valid, f"V9 应允许引用输出列名，但被阻断：{questions}"

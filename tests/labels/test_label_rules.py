@@ -145,6 +145,7 @@ from tianshu_datadev.developer_spec.models import (
     OutputColumnDecl,
     OutputSpecDecl,
     ParsedDeveloperSpec,
+    UncertaintyEntry,
 )
 from tianshu_datadev.labels.label_rule_validator import LabelRuleValidator
 
@@ -629,6 +630,7 @@ class TestPrepareSpecFinalType:
         pipeline = Pipeline(label_extractor=fake_extractor)
 
         # ── 构造 LABEL_TABLE 类型的 Spec ──
+        # 需添加 LABEL uncertainty——确保 label_candidates 非空，触发 LabelExtractor
         spec = ParsedDeveloperSpec(
             spec_id="test", spec_hash="h", title="距离分类",
             description="距离 <= 2 英里归类为短途——锚定项目书。",
@@ -652,6 +654,12 @@ class TestPrepareSpecFinalType:
                 grain=[],
             ),
             time_range=None,
+            uncertainties=[UncertaintyEntry(
+                field_ref="distance_category_ref",
+                output_column="distance_category",
+                output_kind="LABEL",
+                description="需要 CASE WHEN 定义",
+            )],
         )
 
         # ── 执行预处理 ──
@@ -682,7 +690,7 @@ class TestPrepareSpecFinalType:
         # ── 创建无 label_extractor 的 Pipeline ──
         pipeline = Pipeline()
 
-        # ── 构造 LABEL_TABLE Spec ──
+        # ── 构造 LABEL_TABLE Spec —— 需添加 LABEL uncertainty 触发 Extractor ──
         spec = ParsedDeveloperSpec(
             spec_id="test", spec_hash="h", title="测试", description="",
             dataset_type=DatasetType.LABEL_TABLE,
@@ -705,9 +713,15 @@ class TestPrepareSpecFinalType:
                 grain=[],
             ),
             time_range=None,
+            uncertainties=[UncertaintyEntry(
+                field_ref="label_col_ref",
+                output_column="label_col",
+                output_kind="LABEL",
+                description="需要 CASE WHEN 定义",
+            )],
         )
 
-        # ── 应抛出 LabelTableConfigError ──
+        # ── 应抛出 LabelTableConfigError（Extractor 未配置）──
         from tianshu_datadev.developer_spec.source_manifest import (
             build_manifest_from_spec,
         )

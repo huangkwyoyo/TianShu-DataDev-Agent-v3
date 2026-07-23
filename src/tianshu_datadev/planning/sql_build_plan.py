@@ -43,6 +43,7 @@ from .models import (
     JoinType,
     Predicate,
     PredicateOperator,
+    RatioExpr,
     SafeIdentifier,
     SortDirection,
     SortSpec,
@@ -758,7 +759,11 @@ class SqlBuildPlanBuilder:
                     proj_table_ref = make_temp_name(chain_id, cs.source[0])
                 project = self._build_project_step(spec, default_table_ref=proj_table_ref)
                 # 排除 CaseWhenStep 已产出的列——避免 SELECT 中重复
-                if cs.case_when and cs.case_when.output_column:
+                if (
+                    cs.case_when
+                    and cs.case_when.output_column
+                    and not spec.ratio_metrics
+                ):
                     cw_output = cs.case_when.output_column
                     filtered_cols = [
                         c for c in project.columns
@@ -769,7 +774,7 @@ class SqlBuildPlanBuilder:
                         columns=filtered_cols,
                     )
                 # 排除 WindowStep 已产出的列——避免 SELECT 中重复
-                if window:
+                if window and not spec.ratio_metrics:
                     win_aliases = {str(w.alias) for w in window.window_exprs if w.alias}
                     filtered_cols = [
                         c for c in project.columns
@@ -973,10 +978,17 @@ class SqlBuildPlanBuilder:
         specs: list[AggregateSpec] = []
         st = source_table if source_table else None  # 空字符串 → None
 
+        # 规范化 input_column——去除表别名前缀（如 cp.collision_id → collision_id）
+        # Planner 有时会在 input_column 前加表别名，但 AggregateSpec.input_column
+        # 为 SafeIdentifier（不允许点号），表上下文应由 source_table 字段承载。
+        input_col = m.input_column
+        if input_col and "." in input_col:
+            input_col = input_col.split(".")[-1]
+
         # 基础指标
         specs.append(AggregateSpec(
             aggregation=m.aggregation,
-            input_column=m.input_column,
+            input_column=input_col,
             alias=m.alias,
             filter=m.filter,
             input_expression=m.input_expression,
@@ -989,7 +1001,7 @@ class SqlBuildPlanBuilder:
             for v in m.variants:
                 specs.append(AggregateSpec(
                     aggregation=m.aggregation,
-                    input_column=m.input_column,
+                    input_column=input_col,
                     alias=v.alias,
                     filter=v.filter,
                     input_expression=m.input_expression,
@@ -1529,6 +1541,7 @@ class SqlBuildPlanBuilder:
     def _predicate_from_label_node(
         self, node, table_alias: str,
         derived_expr_map: dict[str, TimeTransformExpr] | None = None,
+        output_names: set[str] | None = None,
     ) -> Predicate:
         """将 LabelPredicateCondition AST 节点转换为 SQL Predicate。
 
@@ -1540,6 +1553,8 @@ class SqlBuildPlanBuilder:
             table_alias: 源表别名——用于 ColumnRef.table_ref
             derived_expr_map: 派生维度名→TimeTransformExpr 映射——节点中的派名列名
                               被解析为 TimeTransformExpr 而非 ColumnRef
+            output_names: 聚合输出列名/指标别名集合——条件中引用这些名称时
+                          不加表前缀（它们是 SELECT 中的计算列，非源表物理列）
 
         Returns:
             Predicate——可放入 WhenBranch.condition 或嵌套 Predicate
@@ -1548,10 +1563,13 @@ class SqlBuildPlanBuilder:
             ValueError: 遇到不支持的节点类型
         """
         derived_expr_map = derived_expr_map or {}
+        output_names = output_names or set()
 
         # case_when_rules 使用 dict 条件（LLM JSON Schema 兼容格式）
         if isinstance(node, dict):
-            return self._predicate_from_dict(node, table_alias, derived_expr_map)
+            return self._predicate_from_dict(
+                node, table_alias, derived_expr_map, output_names=output_names,
+            )
 
         if isinstance(node, LabelCompare):
             left = node.left
@@ -1578,20 +1596,28 @@ class SqlBuildPlanBuilder:
                     raise ValueError(f"不支持的比较操作符: {node.op}")
                 sql_lit = self._literal_from_label(node.right)
                 return Predicate(left=derived_expr_map[left], operator=op, right=sql_lit)
-            return self._predicate_from_compare(node, table_alias)
+            return self._predicate_from_compare(
+                node, table_alias, output_names=output_names,
+            )
         elif isinstance(node, LabelIsNull):
-            return self._predicate_from_is_null(node, table_alias)
+            return self._predicate_from_is_null(
+                node, table_alias, output_names=output_names,
+            )
         elif isinstance(node, LabelIsNotNull):
-            return self._predicate_from_is_not_null(node, table_alias)
+            return self._predicate_from_is_not_null(
+                node, table_alias, output_names=output_names,
+            )
         elif isinstance(node, LabelAnd):
             return self._predicate_from_logical(
                 node.children, PredicateOperator.AND, table_alias,
                 derived_expr_map=derived_expr_map,
+                output_names=output_names,
             )
         elif isinstance(node, LabelOr):
             return self._predicate_from_logical(
                 node.children, PredicateOperator.OR, table_alias,
                 derived_expr_map=derived_expr_map,
+                output_names=output_names,
             )
         elif isinstance(node, LabelNot):
             raise ValueError(
@@ -1604,16 +1630,28 @@ class SqlBuildPlanBuilder:
 
     def _predicate_from_compare(
         self, node: LabelCompare, table_alias: str,
+        output_names: set[str] | None = None,
     ) -> Predicate:
-        """将 LabelCompare 转换为 Predicate。"""
+        """将 LabelCompare 转换为 Predicate。
+
+        聚合输出列名（output_names 中的名称）不加表前缀——
+        这些是 SELECT 中的计算列，非源表物理列。
+        """
+        output_names = output_names or set()
         source_column = (
             node.left.column_name
             if isinstance(node.left, LabelDatePartRef)
             else node.left
         )
         normalized = self._normalizer.normalize(source_column)
+        # 聚合输出别名不加表前缀——它们在 SELECT 中独立存在
+        effective_table_ref = (
+            SafeIdentifier(table_alias)
+            if source_column not in output_names and normalized not in output_names
+            else ""
+        )
         col_ref = ColumnRef(
-            table_ref=SafeIdentifier(table_alias),
+            table_ref=effective_table_ref,
             column_name=SafeIdentifier(source_column),
             normalized_name=SafeIdentifier(normalized),
         )
@@ -1631,11 +1669,18 @@ class SqlBuildPlanBuilder:
 
     def _predicate_from_is_null(
         self, node: LabelIsNull, table_alias: str,
+        output_names: set[str] | None = None,
     ) -> Predicate:
         """将 LabelIsNull 转换为 Predicate(IS_NULL)。"""
+        output_names = output_names or set()
         normalized = self._normalizer.normalize(node.column)
+        effective_table_ref = (
+            SafeIdentifier(table_alias)
+            if node.column not in output_names and normalized not in output_names
+            else ""
+        )
         col_ref = ColumnRef(
-            table_ref=SafeIdentifier(table_alias),
+            table_ref=effective_table_ref,
             column_name=SafeIdentifier(node.column),
             normalized_name=SafeIdentifier(normalized),
         )
@@ -1643,11 +1688,18 @@ class SqlBuildPlanBuilder:
 
     def _predicate_from_is_not_null(
         self, node: LabelIsNotNull, table_alias: str,
+        output_names: set[str] | None = None,
     ) -> Predicate:
         """将 LabelIsNotNull 转换为 Predicate(IS_NOT_NULL)。"""
+        output_names = output_names or set()
         normalized = self._normalizer.normalize(node.column)
+        effective_table_ref = (
+            SafeIdentifier(table_alias)
+            if node.column not in output_names and normalized not in output_names
+            else ""
+        )
         col_ref = ColumnRef(
-            table_ref=SafeIdentifier(table_alias),
+            table_ref=effective_table_ref,
             column_name=SafeIdentifier(node.column),
             normalized_name=SafeIdentifier(normalized),
         )
@@ -1659,6 +1711,7 @@ class SqlBuildPlanBuilder:
         operator: PredicateOperator,
         table_alias: str,
         derived_expr_map: dict[str, TimeTransformExpr] | None = None,
+        output_names: set[str] | None = None,
     ) -> Predicate:
         """将 AND/OR 子节点列表递归折叠为嵌套 Predicate。
 
@@ -1667,13 +1720,16 @@ class SqlBuildPlanBuilder:
 
         Args:
             derived_expr_map: 传递给子递归的派生维度映射
+            output_names: 聚合输出名称集合——传递给子递归
         """
         if len(children) < 2:
             raise ValueError(
                 f"{operator.value} 至少需要 2 个子节点，实际 {len(children)}"
             )
         preds = [
-            self._predicate_from_label_node(c, table_alias, derived_expr_map)
+            self._predicate_from_label_node(
+                c, table_alias, derived_expr_map, output_names=output_names,
+            )
             for c in children
         ]
         # 左结合折叠
@@ -1773,25 +1829,30 @@ class SqlBuildPlanBuilder:
         condition: dict,
         table_alias: str,
         derived_expr_map: dict[str, TimeTransformExpr],
+        output_names: set[str] | None = None,
     ) -> Predicate:
         """将 dict 类型条件转换为 Predicate——用于 case_when_rules。
 
         dict 格式与 LabelPredicateCondition 结构一致但使用字符串操作符，
         支持 "IN" 等 CompareOp 枚举范围外的操作符。
         """
+        output_names = output_names or set()
         node_type = condition.get("node_type", "")
 
         if node_type == "COMPARE":
             return self._predicate_from_dict_compare(
                 condition, table_alias, derived_expr_map,
+                output_names=output_names,
             )
         elif node_type == "IS_NULL":
             return self._predicate_from_dict_null(
                 condition, table_alias, derived_expr_map, is_null=True,
+                output_names=output_names,
             )
         elif node_type == "IS_NOT_NULL":
             return self._predicate_from_dict_null(
                 condition, table_alias, derived_expr_map, is_null=False,
+                output_names=output_names,
             )
         elif node_type in ("AND", "OR"):
             op = PredicateOperator.AND if node_type == "AND" else PredicateOperator.OR
@@ -1801,7 +1862,9 @@ class SqlBuildPlanBuilder:
                     f"{node_type} 至少需要 2 个子节点，实际 {len(children)}"
                 )
             preds = [
-                self._predicate_from_dict(c, table_alias, derived_expr_map)
+                self._predicate_from_dict(
+                    c, table_alias, derived_expr_map, output_names=output_names,
+                )
                 for c in children
             ]
             result = preds[0]
@@ -1818,8 +1881,10 @@ class SqlBuildPlanBuilder:
         condition: dict,
         table_alias: str,
         derived_expr_map: dict[str, TimeTransformExpr],
+        output_names: set[str] | None = None,
     ) -> Predicate:
         """将 COMPARE 类型的 dict 条件转换为 Predicate。"""
+        output_names = output_names or set()
         left_name = condition.get("left", "")
 
         # 左操作数——派生维度别名解析为 TimeTransformExpr
@@ -1827,8 +1892,14 @@ class SqlBuildPlanBuilder:
             left = derived_expr_map[left_name]
         else:
             normalized = self._normalizer.normalize(left_name)
+            # 聚合输出别名不加表前缀
+            effective_table_ref = (
+                SafeIdentifier(table_alias)
+                if left_name not in output_names and normalized not in output_names
+                else ""
+            )
             left = ColumnRef(
-                table_ref=SafeIdentifier(table_alias),
+                table_ref=effective_table_ref,
                 column_name=SafeIdentifier(left_name),
                 normalized_name=SafeIdentifier(normalized),
             )
@@ -1851,16 +1922,23 @@ class SqlBuildPlanBuilder:
         table_alias: str,
         derived_expr_map: dict[str, TimeTransformExpr],
         is_null: bool,
+        output_names: set[str] | None = None,
     ) -> Predicate:
         """将 IS_NULL / IS_NOT_NULL 类型的 dict 条件转换为 Predicate。"""
+        output_names = output_names or set()
         col_name = condition.get("column", "")
 
         if col_name in derived_expr_map:
             left = derived_expr_map[col_name]
         else:
             normalized = self._normalizer.normalize(col_name)
+            effective_table_ref = (
+                SafeIdentifier(table_alias)
+                if col_name not in output_names and normalized not in output_names
+                else ""
+            )
             left = ColumnRef(
-                table_ref=SafeIdentifier(table_alias),
+                table_ref=effective_table_ref,
                 column_name=SafeIdentifier(col_name),
                 normalized_name=SafeIdentifier(normalized),
             )
@@ -1951,6 +2029,15 @@ class SqlBuildPlanBuilder:
         steps: list = []
         table_alias = spec.input_tables[0].table_alias
 
+        # ── 构建"输出名称"集合——CASE WHEN 条件引用这些名称时不应加表前缀 ──
+        # 聚合输出别名（如 crash_count、total_killed）在 SELECT 中作为计算列存在，
+        # 不是源表物理列——加表前缀会导致 DuckDB Binder Error。
+        output_names: set[str] = set()
+        for col in spec.output_spec.columns:
+            output_names.add(col.name)
+        for m in spec.metrics:
+            output_names.add(m.alias)
+
         # ── 构建派生维度别名→TimeTransformExpr 映射（供 Predicate 引用）──
         derived_expr_map: dict[str, TimeTransformExpr] = {
             dd.dimension_name: TimeTransformExpr(
@@ -1979,6 +2066,7 @@ class SqlBuildPlanBuilder:
             for tb in rule.typed_branches:
                 predicate = self._predicate_from_label_node(
                     tb.condition, table_alias, derived_expr_map,
+                    output_names=output_names,
                 )
                 result = SqlLiteral(value=tb.then_label)
                 cases.append(WhenBranch(condition=predicate, result=result))
@@ -2009,6 +2097,7 @@ class SqlBuildPlanBuilder:
             for branch in rule.branches:
                 predicate = self._predicate_from_label_node(
                     branch.condition, table_alias, derived_expr_map,
+                    output_names=output_names,
                 )
                 result = SqlLiteral(value=branch.then_value)
                 cases.append(WhenBranch(condition=predicate, result=result))
@@ -2225,7 +2314,7 @@ class SqlBuildPlanBuilder:
         excluded_aliases.update(
             rule.output_column for rule in spec.case_when_rules
         )
-        if excluded_aliases:
+        if excluded_aliases and not spec.ratio_metrics:
             filtered_cols = [
                 c for c in project.columns
                 if c.alias not in excluded_aliases
@@ -2464,7 +2553,7 @@ class SqlBuildPlanBuilder:
         # 排除所有 CASE WHEN 输出列——这些列由 CaseWhenStep 产生，不在源表中
         label_output_columns = {rule.output_column for rule in spec.label_rules}
         excluded_aliases.update(label_output_columns)
-        if excluded_aliases:
+        if excluded_aliases and not spec.ratio_metrics:
             filtered_cols = [
                 c for c in project.columns
                 if c.alias not in excluded_aliases
@@ -2633,14 +2722,40 @@ class SqlBuildPlanBuilder:
         )
         steps.append(join_step)
 
-        # ── 5. 聚合 + 窗口 + 投影 / 透传投影 ──
+        # ── 5. 聚合 + CASE WHEN + 窗口 + 投影 / 透传投影 ──
         if is_final:
+            # ── CASE WHEN 步骤（pre/post aggregate 分流）──
+            #     链路径也必须支持 label_table 的 CASE WHEN 标签规则，
+            #     与 _build_single_table / _build_multi_table 保持一致。
+            all_case_when_steps = self._build_case_when_steps(spec)
+            pre_agg_cw = [s for s in all_case_when_steps
+                           if s.evaluation_phase == "pre_aggregate"]
+            post_agg_cw = [s for s in all_case_when_steps
+                            if s.evaluation_phase != "pre_aggregate"]
+            steps.extend(pre_agg_cw)
+
+            # pre-aggregate CASE WHEN 输出列 → 自动加入 group_by
+            pre_agg_cw_aliases: set[str] = {
+                str(s.alias) for s in pre_agg_cw if s.alias
+            }
+
             if spec.metrics:
-                agg = self._build_aggregate_step(spec, left_source)
+                # 链步骤中数据来自 temp 表 + 右表 Join 后，列无歧义时不应带表前缀。
+                # ignore_source_table=True 阻止 dimension.source_table 覆盖为
+                # 原始表别名（该别名已不在 FROM 子句中）。
+                agg = self._build_aggregate_step(
+                    spec, left_source,
+                    extra_group_keys=pre_agg_cw_aliases,
+                    ignore_source_table=True,
+                )
                 steps.append(agg)
+
+            # post-aggregate CASE WHEN——标签列在聚合后计算（条件可引用聚合指标）
+            steps.extend(post_agg_cw)
+
             # 窗口函数（聚合后、投影前）
             window = self._build_window_step(spec, left_source)
-            if window:
+            if window and not spec.ratio_metrics:
                 steps.append(window)
                 steps.extend(self._build_post_window_filter_steps(spec))
             # 构建 per-column table_ref 覆盖——
@@ -3055,6 +3170,7 @@ class SqlBuildPlanBuilder:
     def _build_aggregate_step(
         self, spec: ParsedDeveloperSpec, primary_table: str,
         extra_group_keys: set[str] | None = None,
+        ignore_source_table: bool = False,
     ) -> AggregateStep:
         """从 spec 构建 AggregateStep——支持派生维度 DerivedGroupKey 和 DatePartExpression。
 
@@ -3064,6 +3180,10 @@ class SqlBuildPlanBuilder:
             extra_group_keys: pre-aggregate CASE WHEN 派生列名——
                 这些列不是源表物理列，由 CaseWhenStep 在聚合前产生，
                 需要作为 GROUP BY 键（不带 table_ref）。
+            ignore_source_table: 忽略 dimension 的 source_table，
+                所有列使用 primary_table 作为 table_ref——
+                多跳链 FINAL 步骤中数据来自 temp 表 Join 后，
+                source_table 指向的原始表别名已不在 FROM 子句中。
         """
         # group_keys 从 dimensions 构建
         group_cols: list[ColumnRef | DatePartExpression | DerivedGroupKey] = []
@@ -3074,8 +3194,10 @@ class SqlBuildPlanBuilder:
             normalized = self._normalizer.normalize(d.column_ref)
             # LLM 输出的 source_table 可能是物理表名（如 gold.dim_taxi_zone），
             # 需映射为表别名（如 dtz）才能通过 SafeIdentifier 校验。
+            # 多跳链 FINAL 步骤中 ignore_source_table=True——
+            # 数据已从多表 Join 到 temp 表，不再使用原始表别名。
             dim_table_ref = primary_table
-            if d.source_table:
+            if not ignore_source_table and d.source_table:
                 dim_table_ref = self._resolve_derived_source_table(d.source_table, spec)
             source = ColumnRef(
                 table_ref=dim_table_ref,
@@ -3121,13 +3243,17 @@ class SqlBuildPlanBuilder:
                 dgk._shadow = True
                 group_cols.append(dgk)
                 continue
+            # 链步骤中 ignore_source_table=True：
+            #   派生维度渲染时使用 primary_table 而非原始表别名。
+            _dd_table = (
+                primary_table if ignore_source_table
+                else self._resolve_derived_source_table(dd.source_table, spec)
+            )
             group_cols.append(DerivedGroupKey(
                 alias=dd.dimension_name,
                 expr=TimeTransformExpr(
                     source_column=SafeIdentifier(dd.source_column),
-                    source_table=SafeIdentifier(
-                        self._resolve_derived_source_table(dd.source_table, spec)
-                    ),
+                    source_table=SafeIdentifier(_dd_table),
                     time_function=dd.time_function,
                 ),
             ))
@@ -3252,10 +3378,28 @@ class SqlBuildPlanBuilder:
 
         overrides = column_table_overrides or {}
         label_output_names = {rule.output_column for rule in spec.label_rules}
+        label_output_names.update(
+            rule.output_column for rule in spec.case_when_rules
+        )
+        ratio_map = {
+            ratio.output_alias: ratio for ratio in spec.ratio_metrics
+        }
 
         proj_cols: list[AliasExpr] = []
         for col in spec.output_spec.columns:
             col_name = col.name
+            ratio = ratio_map.get(col_name)
+            if ratio is not None:
+                proj_cols.append(AliasExpr(
+                    expression=RatioExpr(
+                        numerator_alias=ratio.numerator_alias,
+                        denominator_alias=ratio.denominator_alias,
+                        zero_division=ratio.zero_division,
+                        multiplier=ratio.multiplier,
+                    ),
+                    alias=col_name,
+                ))
+                continue
             # 解析源列名和表别名
             if col_name in label_output_names:
                 source_col = col_name
