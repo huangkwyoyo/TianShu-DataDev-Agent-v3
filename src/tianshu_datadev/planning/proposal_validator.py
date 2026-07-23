@@ -14,8 +14,10 @@ V1-V11 检查项全覆盖：
 """
 
 from tianshu_datadev.developer_spec.models import (
+    AggregationType,
     OpenQuestion,
     ParsedDeveloperSpec,
+    RatioProposal,
     RequirementProposal,
     SourceManifest,
 )
@@ -60,6 +62,11 @@ class ProposalValidator:
         # proposal 中所有已声明的名称（可用于条件引用验证）
         available_names: set[str] = set()
         available_names.update(spec_columns)
+        # 输出列名也纳入合法引用范围——CASE WHEN post_aggregate 条件
+        # 引用聚合输出列（如 killed_person_count）是正确语义，不依赖 Planner
+        # 是否生成匹配的 MetricDecl。真正的字段级校验由 SqlBuildPlanValidator 负责。
+        for col in spec.output_spec.columns:
+            available_names.add(col.name)
         for d in spec.dimensions:
             available_names.add(d.dimension_name)
         for dd in spec.derived_dimensions:
@@ -300,3 +307,145 @@ class ProposalValidator:
                 elif isinstance(child, dict):
                     refs.extend(ProposalValidator._extract_column_refs(child))
         return refs
+
+
+class RatioProposalValidator:
+    """比率候选的确定性校验器——只验证封闭字段与已知依赖。"""
+
+    _NUMERIC_TYPES = {
+        "tinyint", "smallint", "int", "integer", "bigint",
+        "float", "double", "real", "decimal", "numeric",
+        "long", "short",
+    }
+    _NUMERIC_WINDOWS = {
+        "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE",
+        "SUM", "SUM_OVER", "AVG", "AVG_OVER", "COUNT", "COUNT_OVER",
+    }
+
+    def validate(
+        self,
+        proposal: RatioProposal,
+        spec: ParsedDeveloperSpec,
+        manifest: SourceManifest,
+    ) -> tuple[bool, list[OpenQuestion]]:
+        """验证依赖、计算阶段、分母类型和输出冲突。"""
+        questions: list[OpenQuestion] = []
+        output_names = {column.name for column in spec.output_spec.columns}
+        metric_map = {metric.alias: metric for metric in spec.metrics}
+        window_map = {
+            metric.alias: metric for metric in spec.inferred_window_metrics
+        }
+        ratio_aliases = {ratio.output_alias for ratio in spec.ratio_metrics}
+        post_aggregate_names = set(metric_map) | set(window_map) | ratio_aliases
+
+        def reject(code: str, field: str, description: str) -> None:
+            questions.append(OpenQuestion(
+                question_id=f"RATIO-{code}-{proposal.output_alias}",
+                source="ratio_proposal_validator",
+                field_ref=field,
+                description=description,
+                blocking=True,
+            ))
+
+        if proposal.output_alias not in output_names:
+            reject(
+                "OUTPUT",
+                f"ratio_metrics.{proposal.output_alias}",
+                f"比率输出 '{proposal.output_alias}' 不在 output_spec.columns 中",
+            )
+
+        occupied = (
+            set(metric_map)
+            | set(window_map)
+            | ratio_aliases
+            | {dimension.dimension_name for dimension in spec.dimensions}
+            | {dimension.dimension_name for dimension in spec.derived_dimensions}
+        )
+        if proposal.output_alias in occupied:
+            reject(
+                "CONFLICT",
+                f"ratio_metrics.{proposal.output_alias}",
+                f"比率输出别名 '{proposal.output_alias}' 与已有声明冲突",
+            )
+
+        for role, dependency in (
+            ("numerator_alias", proposal.numerator_alias),
+            ("denominator_alias", proposal.denominator_alias),
+        ):
+            if dependency not in post_aggregate_names:
+                reject(
+                    "DEPENDENCY",
+                    f"ratio_metrics.{proposal.output_alias}.{role}",
+                    (
+                        f"比率依赖 '{dependency}' 不存在，或不是聚合/窗口后的数值输出；"
+                        "RatioExpr 只能在 post_aggregate 阶段引用已定义别名"
+                    ),
+                )
+
+        if (
+            proposal.denominator_alias in post_aggregate_names
+            and not self._is_numeric_output(
+                proposal.denominator_alias, metric_map, window_map, ratio_aliases, manifest
+            )
+        ):
+            reject(
+                "DENOMINATOR_TYPE",
+                f"ratio_metrics.{proposal.output_alias}.denominator_alias",
+                (
+                    f"分母 '{proposal.denominator_alias}' 的类型不能确定为数值型，"
+                    "禁止生成除法"
+                ),
+            )
+
+        if proposal.confidence == "low":
+            reject(
+                "CONFIDENCE",
+                f"ratio_metrics.{proposal.output_alias}",
+                f"比率 '{proposal.output_alias}' 置信度为 low，需人工确认",
+            )
+
+        return not questions, questions
+
+    def _is_numeric_output(
+        self,
+        alias: str,
+        metric_map: dict,
+        window_map: dict,
+        ratio_aliases: set[str],
+        manifest: SourceManifest,
+    ) -> bool:
+        """根据聚合/窗口声明和 Manifest 确定输出是否可作为分母。"""
+        if alias in ratio_aliases:
+            return True
+
+        metric = metric_map.get(alias)
+        if metric is not None:
+            if metric.aggregation in {
+                AggregationType.COUNT,
+                AggregationType.COUNT_DISTINCT,
+            }:
+                return True
+            return self._column_is_numeric(metric.input_column, manifest)
+
+        window = window_map.get(alias)
+        if window is None:
+            return False
+        if str(window.window_function).upper() in self._NUMERIC_WINDOWS:
+            return True
+        return self._column_is_numeric(window.input_column, manifest)
+
+    def _column_is_numeric(
+        self,
+        column_name: str | None,
+        manifest: SourceManifest,
+    ) -> bool:
+        """仅依据 SourceManifest 的显式类型判断数值列。"""
+        if not column_name:
+            return False
+        for table in manifest.tables:
+            for column in table.columns:
+                if column.column_name != column_name:
+                    continue
+                data_type = column.data_type.lower().split("(", 1)[0].strip()
+                return data_type in self._NUMERIC_TYPES
+        return False

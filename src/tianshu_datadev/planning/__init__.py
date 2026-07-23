@@ -21,6 +21,7 @@ from .models import (
     NullOrder,
     Predicate,
     PredicateOperator,
+    RatioExpr,
     SafeIdentifier,
     SortSpec,
     SqlLiteral,
@@ -42,7 +43,8 @@ from .program_factory import (
 from .proposal_promotion import ProposalPromotion
 
 # ── ProposalValidator（Phase 4 Planner 核心三件套之二）──
-from .proposal_validator import ProposalValidator
+from .proposal_validator import ProposalValidator, RatioProposalValidator
+from .ratio_promotion import RatioPromotion
 
 # ── Join 推测模型 ──
 from .relationship_hypothesis import (
@@ -111,6 +113,7 @@ __all__ = [
     "NullOrder",
     "Predicate",
     "PredicateOperator",
+    "RatioExpr",
     "SafeIdentifier",
     "SortSpec",
     "WhenBranch",
@@ -161,8 +164,10 @@ __all__ = [
     "RequirementPlanner",
     # ProposalValidator（Phase 4 Planner 核心三件套之二）
     "ProposalValidator",
+    "RatioProposalValidator",
     # ProposalPromotion（Phase 4 Planner 核心三件套之三）
     "ProposalPromotion",
+    "RatioPromotion",
     # 交叉验证（Phase 4E 指标↔Join 一致性）
     "cross_validate",
     # SqlProgram 工厂

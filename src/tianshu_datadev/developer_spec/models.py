@@ -545,6 +545,28 @@ class InferredComputedMetric(StrictModel):
     confidence: str = "medium"  # high | medium | low
 
 
+class RatioProposal(StrictModel):
+    """SpecEnricher 从业务描述提出的窄范围比率候选。"""
+
+    output_alias: str
+    numerator_alias: str
+    denominator_alias: str
+    zero_division: Literal["NULL"] = "NULL"
+    multiplier: Literal[1, 100] = 1
+    confidence: Literal["high", "medium", "low"] = "medium"
+    reasoning: str = ""
+
+
+class RatioDecl(StrictModel):
+    """通过确定性校验后写入正式 Spec 的比率声明。"""
+
+    output_alias: str
+    numerator_alias: str
+    denominator_alias: str
+    zero_division: Literal["NULL"] = "NULL"
+    multiplier: Literal[1, 100] = 1
+
+
 class EnrichedSpec(StrictModel):
     """SpecEnricher 产出——原始 spec + 推断补充。
 
@@ -563,6 +585,8 @@ class EnrichedSpec(StrictModel):
     inferred_post_window_filters: list[PostWindowFilterDecl] = []
     # 推断的计算指标（聚合后表达式计算）
     inferred_computed_metrics: list[InferredComputedMetric] = []
+    # 窄范围比率候选——禁止携带自由表达式
+    ratio_proposals: list[RatioProposal] = Field(default_factory=list)
     # 推断的维度映射——输出列名 → 源列名 + 源表（多表/多跳链消歧义用）
     inferred_dimensions: list[DimensionDecl] = []
     # 丰富化元数据
@@ -1054,6 +1078,7 @@ class ParsedDeveloperSpec(StrictModel):
     compute_steps: list[ComputeStep] | None = None  # 分步计算声明——None 时走原路径
     inferred_window_metrics: list[InferredWindowMetric] = []  # SpecEnricher 推断的窗口指标
     inferred_post_window_filters: list[PostWindowFilterDecl] = []  # 窗口输出上的封闭过滤
+    ratio_metrics: list[RatioDecl] = Field(default_factory=list)  # 已提升的聚合后比率
     # ── v4-light 最终版: 标签表支持 ──
     dataset_type: DatasetType = DatasetType.UNSPECIFIED  # 数据产品类型——Label Extractor 推断
     # 已提升的 CASE WHEN 标签规则——仅 LABEL_TABLE 时非空；Proposal 仅保存在 Artifact

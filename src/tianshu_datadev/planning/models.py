@@ -333,6 +333,15 @@ class SqlRawExpression(StrictModel):
     sql_fragment: str  # 如 "total_crashes * 1000000.0 / NULLIF(total_trip_count, 0)"
 
 
+class RatioExpr(StrictModel):
+    """聚合后比率表达式——仅允许两个已命名依赖做安全除法。"""
+
+    numerator_alias: SafeIdentifier
+    denominator_alias: SafeIdentifier
+    zero_division: Literal["NULL"] = "NULL"
+    multiplier: Literal[1, 100] = 1
+
+
 class AliasExpr(StrictModel):
     """别名表达式——列引用、窗口表达式或安全原始 SQL 片段 + 输出别名。
 
@@ -341,7 +350,13 @@ class AliasExpr(StrictModel):
     Phase 7A 扩展支持 SqlRawExpression（派生表达式——安全原始 SQL 片段）。
     """
 
-    expression: ColumnRef | DatePartExpression | WindowExpr | SqlRawExpression
+    expression: (
+        ColumnRef
+        | DatePartExpression
+        | WindowExpr
+        | RatioExpr
+        | SqlRawExpression
+    )
     alias: SafeIdentifier  # 输出列别名——SafeIdentifier 防止 AS 子句注入
 
 
