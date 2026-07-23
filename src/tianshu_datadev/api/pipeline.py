@@ -747,9 +747,11 @@ class Pipeline:
                     and col not in planner_covered_cols
                 ]
 
-                # LabelExtractor 仅处理 Planner 明确确认的 LABEL 列（output_kind=LABEL）。
-                # Planner 未标记任何 LABEL 列时不调用 Extractor——
-                # unresolved 列将在最终门禁处进入 HUMAN_REVIEW。
+                # ── 兜底：Planner 未标记任何 LABEL 列，但仍需标签规则时，
+                #     对所有 unresolved 列调用 LabelExtractor（向后兼容）
+                has_rules = bool(spec.label_rules) or bool(spec.case_when_rules)
+                if not label_candidates and not has_rules:
+                    label_candidates = list(unresolved)
 
                 if label_candidates:
                     if self._label_extractor is None:

@@ -361,10 +361,11 @@ def test_i6_label_kind_triggers_extractor():
 # ═══ I7: UNKNOWN 兜底调用 Extractor ═══
 
 def test_i7_unknown_kind_no_extractor_revised():
-    """output_kind=UNKNOWN + 无已有规则 → Extractor 不调用 → HUMAN_REVIEW。
+    """output_kind=UNKNOWN + 无已有规则→ 兜底触发 Extractor（调用一次）→ 空 proposals → HUMAN_REVIEW。
 
-    撤销兜底后：只有 output_kind=LABEL 才调用 Extractor。
-    UNKNOWN 列在最终 unresolved 检查处进入 HUMAN_REVIEW blocking OpenQuestion。
+    恢复兜底后：Planner 未标记任何 LABEL 列且无已有规则时，
+    对所有 unresolved 列调用 LabelExtractor。Extractor 返回空 proposals 后，
+    列仍 unresolved，进入 HUMAN_REVIEW blocking OpenQuestion。
     """
     spec = _make_label_spec(
         input_tables=[{"name": "t", "key_columns": ["id"], "columns": [("id", "int"), ("val", "double")]}],
@@ -395,8 +396,8 @@ def test_i7_unknown_kind_no_extractor_revised():
         label_extractor=CountingFakeExtractor(proposals=[]),
     )
     result = pipeline.run_parse_and_enrich(spec)
-    # 撤销兜底后——Extractor 不调用（UNKNOWN ≠ LABEL）
-    assert call_count[0] == 0, f"Extractor 不应被调用，但调用了 {call_count[0]} 次"
+    # 兜底触发——Extractor 被调用一次（UNKNOWN 列进入兜底）
+    assert call_count[0] == 1, f"Extractor 应被调用 1 次（兜底），实际 {call_count[0]} 次"
     # 验证生成了 HUMAN_REVIEW blocking OpenQuestion
     open_questions = result.get("open_questions", [])
     human_review_qs = [
@@ -508,13 +509,17 @@ def test_i10_sql_spark_same_contract():
 # ═══ I11: Planner 未标记 LABEL → Extractor 不调用 ═══
 
 def test_i11_non_label_not_sent_to_extractor():
-    """Planner 标记 output_kind=METRIC 的列不传给 LabelExtractor。"""
+    """无 LABEL 列且无已有规则 → 兜底触发 Extractor（未解析列全部传入）。
+
+    恢复兜底后：Planner 未标记任何 LABEL 列且无已有规则时，
+    对所有 unresolved 列调用 LabelExtractor。空 proposals → HUMAN_REVIEW。
+    """
     spec = _make_label_spec(
         input_tables=[{"name": "t", "key_columns": ["id"], "columns": [("id", "int"), ("score", "double")]}],
         output_columns=["score", "label_col"],
         description="按 score 定义 label_col",
     )
-    # Planner 只标记 METRIC 但未生成规则——LabelExtractor 不应调用
+    # Planner 只标记 METRIC（未标记 LABEL）+ 无已有规则→ 兜底触发 Extractor
     adapter = FakeAdapter(response={
         "dimensions": [],
         "derived_dimensions": [],
@@ -539,8 +544,8 @@ def test_i11_non_label_not_sent_to_extractor():
         label_extractor=CountingFakeExtractor(proposals=[]),
     )
     result = pipeline.run_parse_and_enrich(spec)
-    # METRIC ≠ LABEL → Extractor 不调用
-    assert call_count[0] == 0, f"Extractor 不应被调用，但调用了 {call_count[0]} 次"
+    # 兜底触发——未解析列 label_col 传入 Extractor（label_col output_kind=UNKNOWN）
+    assert call_count[0] == 1, f"Extractor 应被兜底调用 1 次，实际 {call_count[0]} 次"
 
 
 # ═══ I12: Planner 抛 RequirementPlanningError → enrich 阶段失败 ═══
