@@ -2765,13 +2765,15 @@ class SqlBuildPlanBuilder:
             }
 
             if spec.metrics:
-                # 链步骤中数据来自 temp 表 + 右表 Join 后，列无歧义时不应带表前缀。
-                # ignore_source_table=True 阻止 dimension.source_table 覆盖为
-                # 原始表别名（该别名已不在 FROM 子句中）。
+                # 链步骤中数据来自 temp 表（left_source）+ 右表 Join 后。
+                # 仅右表别名在 FROM 子句中有效——原始表别名已被 temp 表替代。
+                # valid_table_aliases={right_alias}：
+                #   列解析到 right_alias → 使用（该表在 FROM 中）
+                #   列解析到其他别名 → 回退至 primary_table（即 left_source/temp 表）
                 agg = self._build_aggregate_step(
                     spec, left_source,
                     extra_group_keys=pre_agg_cw_aliases,
-                    ignore_source_table=True,
+                    valid_table_aliases={right_alias},
                 )
                 steps.append(agg)
 
@@ -3195,20 +3197,20 @@ class SqlBuildPlanBuilder:
     def _build_aggregate_step(
         self, spec: ParsedDeveloperSpec, primary_table: str,
         extra_group_keys: set[str] | None = None,
-        ignore_source_table: bool = False,
+        valid_table_aliases: set[str] | None = None,
     ) -> AggregateStep:
         """从 spec 构建 AggregateStep——支持派生维度 DerivedGroupKey 和 DatePartExpression。
 
         Args:
             spec: 已解析的 DeveloperSpec
-            primary_table: 主表别名
+            primary_table: 主表别名（默认 table_ref，当消歧失败时回退到此值）
             extra_group_keys: pre-aggregate CASE WHEN 派生列名——
                 这些列不是源表物理列，由 CaseWhenStep 在聚合前产生，
                 需要作为 GROUP BY 键（不带 table_ref）。
-            ignore_source_table: 忽略 dimension 的 source_table，
-                所有列使用 primary_table 作为 table_ref——
-                多跳链 FINAL 步骤中数据来自 temp 表 Join 后，
-                source_table 指向的原始表别名已不在 FROM 子句中。
+            valid_table_aliases: 当前 FROM 子句中有效的表别名集合——
+                None 表示所有别名均有效（向后兼容）；
+                空集表示仅 primary_table 有效（等效于旧 ignore_source_table=True）；
+                非空集时仅接受匹配的解析结果，不匹配则回退至 primary_table。
         """
         # group_keys 从 dimensions 构建
         group_cols: list[ColumnRef | DatePartExpression | DerivedGroupKey] = []
@@ -3217,28 +3219,22 @@ class SqlBuildPlanBuilder:
                 # CASE 输出是上游派生列；同名维度不能重新解释为源表物理列。
                 continue
             normalized = self._normalizer.normalize(d.column_ref)
-            # LLM 输出的 source_table 可能是物理表名（如 gold.dim_taxi_zone），
-            # 需映射为表别名（如 dtz）才能通过 SafeIdentifier 校验。
-            # 多跳链 FINAL 步骤中 ignore_source_table=True——
-            # 数据已从多表 Join 到 temp 表，不再使用原始表别名。
             # 多表场景下表别名消歧优先级：
             # 1) LLM 标注的 source_table（解析为别名）
             # 2) 从 input_tables 列声明中扫描（兜底）
-            # 3) primary_table（单表场景或以上均未命中）
+            # 3) primary_table（以上均未命中或解析结果不在有效别名集合中）
+            # valid_table_aliases 机制替代旧的 ignore_source_table 布尔开关——
+            # None=全部有效，空集=仅 primary_table 有效，非空集=仅指定别名有效
             dim_table_ref = primary_table
-            if not ignore_source_table and d.source_table:
-                dim_table_ref = self._resolve_derived_source_table(d.source_table, spec)
-            elif not dim_table_ref:
-                # 多表路径下 primary_table 可能为空——扫描源表列声明兜底
-                dim_table_ref = self._resolve_column_source_table(
-                    d.column_ref, spec,
-                )
-            # _temp_ 表引用回退——链路径中 primary_table 可能为 _temp_ 表名
-            # （如 _temp_c41c54589_0），该表非真实源表，列需追溯到原始
-            # input_tables 获取正确别名（如 fc.borough 而非 _temp_xxx.borough）
-            if dim_table_ref and dim_table_ref.startswith("_temp_"):
+            if d.source_table:
+                resolved = self._resolve_derived_source_table(d.source_table, spec)
+                if valid_table_aliases is None or resolved in valid_table_aliases:
+                    dim_table_ref = resolved
+            if dim_table_ref == primary_table:
+                # source_table 未设置或解析结果不在有效别名集合中——
+                # 尝试列扫描兜底（多表路径下 primary_table 可能为空或 _temp_ 表）
                 resolved = self._resolve_column_source_table(d.column_ref, spec)
-                if resolved:
+                if resolved and (valid_table_aliases is None or resolved in valid_table_aliases):
                     dim_table_ref = resolved
             source = ColumnRef(
                 table_ref=dim_table_ref,
@@ -3284,12 +3280,13 @@ class SqlBuildPlanBuilder:
                 dgk._shadow = True
                 group_cols.append(dgk)
                 continue
-            # 链步骤中 ignore_source_table=True：
-            #   派生维度渲染时使用 primary_table 而非原始表别名。
-            _dd_table = (
-                primary_table if ignore_source_table
-                else self._resolve_derived_source_table(dd.source_table, spec)
-            )
+            # 派生维度渲染时解析 source_table——若 valid_table_aliases 约束有效别名集合，
+            # 解析结果不在有效集合中时回退至 primary_table。
+            _dd_resolved = self._resolve_derived_source_table(dd.source_table, spec)
+            if valid_table_aliases is not None and _dd_resolved not in valid_table_aliases:
+                _dd_table = primary_table
+            else:
+                _dd_table = _dd_resolved
             group_cols.append(DerivedGroupKey(
                 alias=dd.dimension_name,
                 expr=TimeTransformExpr(
@@ -3341,24 +3338,20 @@ class SqlBuildPlanBuilder:
                 # 多表场景下表别名消歧——grain 列通过以下优先级获知表别名：
                 # 1) 匹配 dimension 的 source_table（LLM 已标注）
                 # 2) 从 input_tables 的列声明中查找（兜底扫描）
-                # 3) primary_table（单表场景或以上均未命中）
+                # 3) primary_table（以上均未命中或解析结果不在有效别名集合中）
                 grain_table_ref = primary_table
                 if derived and derived.source_table:
-                    grain_table_ref = self._resolve_derived_source_table(
+                    resolved = self._resolve_derived_source_table(
                         derived.source_table, spec
                     )
-                elif not grain_table_ref:
-                    # 多表路径下 primary_table 可能为空——扫描源表列声明兜底
-                    grain_table_ref = self._resolve_column_source_table(
+                    if valid_table_aliases is None or resolved in valid_table_aliases:
+                        grain_table_ref = resolved
+                if grain_table_ref == primary_table:
+                    # 上述未命中——扫描源表列声明兜底
+                    resolved = self._resolve_column_source_table(
                         grain_col, spec,
                     )
-                # _temp_ 表引用回退——同维度路径逻辑：
-                # 链路径中 primary_table 可能为 _temp_ 表名（truthy），
-                # 导致上述 elif not grain_table_ref 被跳过。
-                # 此回退确保 _temp_ 引用被替换为真实源表别名。
-                if grain_table_ref and grain_table_ref.startswith("_temp_"):
-                    resolved = self._resolve_column_source_table(grain_col, spec)
-                    if resolved:
+                    if resolved and (valid_table_aliases is None or resolved in valid_table_aliases):
                         grain_table_ref = resolved
                 group_cols.append(
                     ColumnRef(
