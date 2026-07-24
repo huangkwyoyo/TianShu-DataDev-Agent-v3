@@ -481,19 +481,24 @@ class Pipeline:
         )
         self._llm_traces[request_id][node_name] = trace
 
-    def _get_llm_traces(self, request_id: str) -> dict[str, LlmTraceNode] | None:
+    def _get_llm_traces(self, request_id: str) -> dict[str, dict] | None:
         """获取指定 request_id 的 LLM 调用追踪数据。
 
         Args:
             request_id: Pipeline 请求 ID
 
         Returns:
-            {node_name: LlmTraceNode} 字典，无数据时返回 None
+            可直接进入 JSON 响应的 {node_name: trace_dict}，无数据时返回 None
         """
         traces = self._llm_traces.get(request_id)
         if not traces:
             return None
-        return dict(traces)
+        # LlmTraceNode 是运行时强类型模型；API/SSE 边界只允许 JSON 数据。
+        # 在唯一读取出口转换，避免每个响应拼装点重复处理或遗漏。
+        return {
+            node_name: trace.model_dump(mode="json")
+            for node_name, trace in traces.items()
+        }
 
     def get_label_artifacts(self, request_id: str) -> dict | None:
         """获取指定 request_id 的标签提取和提升 Artifact。
@@ -569,16 +574,40 @@ class Pipeline:
             table_mapping = _auto_table_mapping(spec)
 
         extra_questions: list[OpenQuestion] = []
+        request_id = self._gen_request_id(spec)
 
         # ── 1. RequirementPlanner：有 Adapter 时先执行（v3.1 反转）──
         if self._requirement_planner is not None:
             unresolved_before = _find_unresolved_derived_columns(spec)
             if unresolved_before:
+                _t0 = time.time()
                 spec, planner_questions = self._run_requirement_planner(spec, manifest)
                 extra_questions.extend(planner_questions)
+                self._record_trace(
+                    request_id, "requirement_planner",
+                    model=self._adapter.provider_name() if self._adapter else "deterministic",
+                    latency_ms=int((time.time() - _t0) * 1000),
+                    status="valid" if not planner_questions else "skipped",
+                )
+            else:
+                self._record_trace(
+                    request_id, "requirement_planner",
+                    model="deterministic",
+                    latency_ms=1,
+                    status="skipped",
+                )
 
         # ── 2. SpecEnricher：完整 scope，后执行 ──
+        _t0 = time.time()
         spec = self._spec_enricher.apply_enrichment(spec, manifest)
+        # Pipeline 与 SpecEnricher 共享同一 adapter
+        _has_llm = self._adapter is not None
+        self._record_trace(
+            request_id, "spec_enricher",
+            model=self._adapter.provider_name() if self._adapter else "deterministic",
+            latency_ms=int((time.time() - _t0) * 1000),
+            status="valid" if _has_llm else "skipped",
+        )
 
         # ── 2.5. 标签规则处理——合并候选 + Extractor + Validator + Promotion
         spec = self._prepare_labels(spec, manifest)
@@ -637,12 +666,26 @@ class Pipeline:
         # ── 4. RelationshipPlanner ──
         hypothesis = None
         if len(spec.input_tables) > 1:
+            _t0 = time.time()
             hypothesis, rel_questions = self._relationship_planner.plan(spec, manifest)
             extra_questions.extend(rel_questions)
+            self._record_trace(
+                request_id, "relationship_planner",
+                model=self._adapter.provider_name() if self._adapter else "deterministic",
+                latency_ms=int((time.time() - _t0) * 1000),
+                status="valid",
+            )
             # 交叉验证——指标推断 vs Join 推断一致性检查
             if hypothesis:
                 xv_questions = cross_validate(spec, hypothesis, manifest)
                 extra_questions.extend(xv_questions)
+        else:
+            self._record_trace(
+                request_id, "relationship_planner",
+                model="deterministic",
+                latency_ms=1,
+                status="skipped",
+            )
 
         return spec, hypothesis, extra_questions, table_mapping or {}
 
@@ -759,8 +802,16 @@ class Pipeline:
                             "label_table 需要 LlmLabelExtractor，但未配置——"
                             "请设置 DEEPSEEK_API_KEY 环境变量"
                         )
+                    _t0 = time.time()
                     proposals, extraction_artifact = self._label_extractor.extract(
                         spec, label_candidates,
+                    )
+                    _le_request_id = self._gen_request_id(spec)
+                    self._record_trace(
+                        _le_request_id, "label_extractor",
+                        model="deepseek",
+                        latency_ms=int((time.time() - _t0) * 1000),
+                        status="valid" if proposals else "skipped",
                     )
                     if proposals:
                         from tianshu_datadev.labels.label_rule_validator import (
@@ -1392,6 +1443,7 @@ class Pipeline:
                 "column_ref": spec.time_range.column_ref,
                 "start": spec.time_range.start,
                 "end": spec.time_range.end,
+                "inclusive": spec.time_range.inclusive,
             }
         base["tables"] = tables
         base["metrics"] = [
@@ -1406,7 +1458,7 @@ class Pipeline:
         base["joins"] = joins
         base["time_range"] = time_range
         base["output_spec"] = {
-            "columns": [c.model_dump() for c in spec.output_spec.columns],
+            "columns": [c.name for c in spec.output_spec.columns],
             "grain": spec.output_spec.grain,
             "sort_columns": [s.column for s in (spec.output_spec.sort or [])],
             "limit": spec.output_spec.limit,
@@ -2502,6 +2554,62 @@ class Pipeline:
             result["join_evidence"] = self._extract_join_evidence(plan)
             # 文件树（来自 PackageRichResponse）
             result["file_tree"] = self._build_file_tree(package_manifest.artifacts)
+            # SpecRichResponse 格式的解析摘要（供 run_all_full 透传给前端）
+            _spec_tables = []
+            for t in spec.input_tables:
+                _spec_tables.append({
+                    "table_alias": t.table_alias,
+                    "source_table": str(t.source_table),
+                    "row_count": t.row_count,
+                    "role": t.role,
+                    "column_count": len(t.columns) + len(t.key_columns) + len(t.business_columns),
+                    "has_time_field": t.time_field is not None,
+                    "has_partition": t.partition_field is not None,
+                })
+            _spec_joins = []
+            for j in (spec.joins or []):
+                _spec_joins.append({
+                    "left_table": j.left_table,
+                    "right_table": j.right_table,
+                    "left_key": j.left_key,
+                    "right_key": j.right_key,
+                    "join_type": _safe_enum_value(j, "join_type"),
+                })
+            _spec_tr = None
+            if spec.time_range:
+                _spec_tr = {
+                    "column_ref": spec.time_range.column_ref,
+                    "start": spec.time_range.start,
+                    "end": spec.time_range.end,
+                    "inclusive": spec.time_range.inclusive,
+                }
+            result["spec_result"] = {
+                "request_id": request_id,
+                "spec_id": spec.spec_id,
+                "spec_hash": spec.spec_hash,
+                "title": spec.title,
+                "description": spec.description if hasattr(spec, "description") else "",
+                "tables": _spec_tables,
+                "metrics": [
+                    {"metric_name": m.metric_name, "aggregation": m.aggregation.value,
+                     "input_column": m.input_column, "alias": m.alias}
+                    for m in spec.metrics
+                ],
+                "dimensions": [
+                    {"dimension_name": d.dimension_name, "column_ref": d.column_ref}
+                    for d in spec.dimensions
+                ],
+                "joins": _spec_joins,
+                "time_range": _spec_tr,
+                "output_spec": {
+                    "columns": [c.name for c in spec.output_spec.columns],
+                    "grain": spec.output_spec.grain,
+                    "sort_columns": [s.column for s in (spec.output_spec.sort or [])],
+                    "limit": spec.output_spec.limit,
+                },
+                "open_questions": [],
+                "parse_warnings": [],
+            }
         return result
 
     def run_all_full(
@@ -2663,6 +2771,10 @@ class Pipeline:
             "spec_id": sql_result.get("spec_id"),
             "plan_id": sql_result.get("plan_id"),
             "package_id": sql_result.get("package_id"),
+            # 解析摘要 + Plan 步骤（透传自 run_all rich 结果——供前端 ParsePreview/PlanStepsPanel）
+            "spec_result": sql_result.get("spec_result"),
+            "steps": sql_result.get("steps", []),
+            "join_evidence": sql_result.get("join_evidence", []),
             # Spark 管线摘要
             "spark_ok": spark_ok,
             "spark_stages": spark_stages,
@@ -3000,17 +3112,28 @@ class Pipeline:
                     "spec_id": sql_result.get("spec_id"),
                     "plan_id": sql_result.get("plan_id"),
                     "package_id": sql_result.get("package_id"),
+                    # 解析摘要 + Plan 步骤（透传自 run_all rich 结果）
+                    "spec_result": sql_result.get("spec_result"),
+                    "steps": sql_result.get("steps", []),
+                    "join_evidence": sql_result.get("join_evidence", []),
                     "spark_ok": spark_ok,
                     "spark_stages": spark_stages,
                     "pyspark_code": pyspark_code,
                     "standalone_pyspark": standalone_pyspark,
                     "llm_traces": all_llm_traces,
                     # COMPARATOR 细粒度状态与审核标记
-                "comparator_status": comparator_status,
-                "requires_human_review": not review_ready,
-                "review_ready": review_ready,
+                    "comparator_status": comparator_status,
+                    "requires_human_review": not review_ready,
+                    "review_ready": review_ready,
                 }
 
+                logger.info(
+                    "run_all_full_stream done event: request_id=%s sql_ok=%s spark_ok=%s "
+                    "spec_result=%s steps=%d",
+                    request_id, sql_ok, spark_ok,
+                    "yes" if sql_result.get("spec_result") else "no",
+                    len(sql_result.get("steps", [])),
+                )
                 event_queue.put({"event": "done", "result": full_result})
 
             except Exception as exc:
@@ -3033,12 +3156,22 @@ class Pipeline:
         while not stop_event.is_set() or not event_queue.empty():
             try:
                 event = event_queue.get(timeout=0.5)
-                yield json.dumps(event, ensure_ascii=False) + "\n"
+                line = json.dumps(event, ensure_ascii=False) + "\n"
+                yield line
                 if event.get("event") in ("done", "fatal"):
                     return
             except _queue_mod.Empty:
                 # 心跳保持连接
                 yield '{"event":"heartbeat"}\n'
+            except Exception as _serr:
+                # json.dumps 序列化失败时记录日志，向客户端发送 fatal 事件后终止
+                logger.error("流式事件 JSON 序列化失败: %s", _serr)
+                yield json.dumps({
+                    "event": "fatal",
+                    "error_code": "SERIALIZATION_ERROR",
+                    "message": f"事件序列化失败: {_serr}",
+                }) + "\n"
+                return
 
     def run_all_rich(
         self, markdown_text: str,
@@ -3811,7 +3944,7 @@ class Pipeline:
     def _get_or_create_spark_context(self, request_id: str) -> SparkStageContext:
         """获取或创建 request_id 的 Spark 阶段上下文。"""
         if request_id not in self._spark_contexts:
-            self._spark_contexts[request_id] = SparkStageContext()
+            self._spark_contexts[request_id] = SparkStageContext(request_id=request_id)
         return self._spark_contexts[request_id]
 
     def _check_stage_dependencies(
@@ -4238,10 +4371,18 @@ class Pipeline:
                 context.errors.append(err_msg)
             return
 
+        _dev_t0 = time.time()
         try:
             annotated = self._spark_developer_service.annotate(context.spark_plan)
             context.annotation_result = annotated
             context.stage_results["DEVELOPER"] = "SUCCESS"
+            # 记录 LLM 追踪
+            self._record_trace(
+                context.request_id, "spark_developer",
+                model="deepseek",
+                latency_ms=int((time.time() - _dev_t0) * 1000),
+                status="valid",
+            )
         except Exception as e:
             context.stage_results["DEVELOPER"] = "FAILURE"
             new_error = f"[DEVELOPER] 标注异常：{e}"
@@ -5021,6 +5162,7 @@ class SparkStageContext:
     由 Pipeline._get_or_create_spark_context() 创建和管理，
     独立于 SparkOrchestrator 的内部缓存。
     """
+    request_id: str = ""  # 关联的 Pipeline 请求 ID，由 _get_or_create_spark_context 设置
     spark_plan: "SparkPlan | None" = None
     compile_result: "SparkCompileResult | None" = None
     standalone_pyspark: str | None = None  # 独立可执行 PySpark 脚本（含 SparkSession 引导，仅人审 artifact）
