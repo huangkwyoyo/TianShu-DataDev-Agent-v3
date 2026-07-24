@@ -1,4 +1,4 @@
-/* LLM 调用追踪面板——终端风格 */
+/* LLM 调用追踪面板——指示灯横向布局 */
 
 .llm-trace-panel {
   border: 1px solid var(--border);
@@ -62,6 +62,7 @@
   color: var(--text-dim);
   background: var(--bg);
   border-bottom: 1px solid var(--border);
+  margin-bottom: var(--space-md);
 }
 
 .llm-trace-summary-item {
@@ -78,42 +79,66 @@
   font-weight: 600;
 }
 
-/* 调用节点表 */
-.llm-trace-table {
-  width: 100%;
-  border-collapse: collapse;
+/* ═══ 指示灯横向布局 ═══ */
+
+.llm-trace-lights {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+/* 每一行（灯行 / 详情行） */
+.llm-trace-lights-row {
+  display: flex;
+  gap: var(--space-lg);
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+/* 每个节点列 */
+.llm-trace-light-cell {
+  flex: 0 0 auto;
+  min-width: 100px;
+}
+
+/* 指示灯 + 标签容器 */
+.llm-trace-light-wrapper {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+}
+
+/* 指示灯圆点 */
+.llm-trace-light-dot {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  box-shadow: 0 0 4px rgba(0, 0, 0, 0.3);
+}
+
+/* 节点标签 */
+.llm-trace-light-label {
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
-}
-
-.llm-trace-table th {
-  text-align: left;
-  padding: var(--space-xs) var(--space-sm);
-  color: var(--text-faint);
-  font-weight: 600;
-  border-bottom: 1px solid var(--border);
-}
-
-.llm-trace-table td {
-  padding: var(--space-xs) var(--space-sm);
   color: var(--text-dim);
-  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
 }
 
-.llm-trace-table tr:last-child td {
-  border-bottom: none;
+/* LLM 调用详情 */
+.llm-trace-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-left: calc(12px + var(--space-xs));  /* 与指示灯标签左对齐 */
 }
 
-.llm-trace-table tr.status-valid td:first-child {
-  color: var(--success);
-}
-
-.llm-trace-table tr.status-error td:first-child {
-  color: var(--error);
-}
-
-.llm-trace-table tr.status-skipped td:first-child {
+.llm-trace-detail-item {
+  font-family: var(--font-mono);
+  font-size: 11px;
   color: var(--text-faint);
+  white-space: nowrap;
 }
 
 /* 空状态 */
