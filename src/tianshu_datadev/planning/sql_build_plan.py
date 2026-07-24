@@ -608,6 +608,51 @@ class SqlBuildPlanBuilder:
                     required_columns=scan_cols,
                 )
                 plan_steps.append(scan)
+                # ── 混合源：上游 _temp_ + 物理表 Join ──
+                if cs.joins:
+                    # 防御性断言——Validator 应已校验
+                    assert len(cs.joins) == 1, (
+                        f"混合源步骤 '{cs.step_name}' joins 长度 != 1——Validator 应已阻断"
+                    )
+                    jd = cs.joins[0]
+                    table_map = {t.table_alias: t for t in spec.input_tables}
+                    right_table = table_map.get(jd.right_table)
+                    if not right_table:
+                        raise ValueError(f"右表 '{jd.right_table}' 不在 source_tables 中")
+
+                    right_cols = self._build_columns_for_input_step_table(
+                        cs, right_table, extra_cols=[jd.right_key],
+                    )
+                    right_scan = ScanStep(
+                        step_id=SqlBuildPlan.generate_step_id(
+                            "scan_r", {"step": cs.step_name, "table": right_table.source_table},
+                        ),
+                        table_ref=right_table.table_alias,
+                        required_columns=right_cols,
+                        estimated_row_count=right_table.row_count,
+                    )
+                    plan_steps.append(right_scan)
+                    for f in right_table.filters:
+                        plan_steps.append(self._build_filter_step(f, right_table.table_alias))
+
+                    left_norm = self._normalizer.normalize(jd.left_key)
+                    right_norm = self._normalizer.normalize(jd.right_key)
+                    plan_steps.append(JoinStep(
+                        step_id=SqlBuildPlan.generate_step_id("join", {
+                            "step": cs.step_name,
+                            "left": temp_ref, "right": jd.right_table,
+                            "left_key": jd.left_key, "right_key": jd.right_key,
+                        }),
+                        right_table_ref=right_table.table_alias,
+                        join_type=JoinType(jd.join_type.value.upper()),
+                        join_keys=[(
+                            ColumnRef(table_ref=temp_ref, column_name=SafeIdentifier(jd.left_key),
+                                      normalized_name=left_norm),
+                            ColumnRef(table_ref=right_table.table_alias, column_name=SafeIdentifier(jd.right_key),
+                                      normalized_name=right_norm),
+                        )],
+                        relationship_ref=f"compute_steps:{chain_id}:{cs.step_name}:{jd.right_table}",
+                    ))
 
             else:
                 # ── 合流步骤：从多个上游 _temp 表扫描 + Join ──
@@ -705,8 +750,8 @@ class SqlBuildPlanBuilder:
                 plan_steps.append(case_step)
 
             # ── AggregateStep ──
-            # 合流步骤有 case_when 时跳过聚合——CASE WHEN 已替代聚合逻辑
-            if cs.metrics and not cs.case_when:
+            # case_when + metrics 共存——Validator 已校验 evaluation_phase
+            if cs.metrics:
                 # 合流步骤（source 为列表）：GROUP BY 各列可能来自不同上游源，
                 # 需要按列消歧——仅对重叠列（多个源都有）加表前缀
                 if isinstance(cs.source, list) and len(cs.source) > 0:
@@ -930,34 +975,20 @@ class SqlBuildPlanBuilder:
         right_src: str,
         step_outputs: dict,
     ) -> tuple[str, str]:
-        """查找两个源步骤之间的 Join 键。
+        """查找两个源步骤之间的 Join 键——仅从显式 JoinDecl 查找。
 
-        优先级：
-        1. spec.joins 中显式声明的 JoinDecl（left_table/right_table 匹配 step_name）
-           - JoinDecl 的 key 为空字符串时 → 返回 ("", "") 表示 CROSS JOIN
-        2. 两个上游步骤的共同 group_by 列（兜底自动推断）
-        3. 无共同列 → 返回 ("", "") 表示 CROSS JOIN（跨粒度场景）
-
-        Returns:
-            (left_key, right_key) 列名对——均为 "" 时表示 CROSS JOIN
+        共同列猜键和隐式 CROSS JOIN 回退已删除。
+        ComputeStepValidator 应已阻断无显式 JoinDecl 的合流步骤。
         """
-        # 1. 从 JoinDecl 查找
         key = (left_src, right_src)
         if key in join_key_map:
             jk = join_key_map[key]
-            # JoinDecl 显式声明空键 → CROSS JOIN
-            return jk
-
-        # 2. 兜底：共同 group_by 列自动推断
-        left_cols = {c.normalized_name for c in step_outputs.get(left_src, [])}
-        right_cols = {c.normalized_name for c in step_outputs.get(right_src, [])}
-        common = left_cols & right_cols
-        if common:
-            col = sorted(common)[0]
-            return col, col
-
-        # 3. 无共同列 → CROSS JOIN（跨粒度场景：一侧有 GROUP BY，一侧无）
-        return "", ""
+            if jk[0] and jk[1]:
+                return jk
+        raise ValueError(
+            f"合流步骤的源对 ({left_src}, {right_src}) 无显式 JoinDecl——"
+            f"ComputeStepValidator 应已阻断"
+        )
 
     def _expand_metric_to_agg_specs(
         self, m, source_table: str = "",  # MetricDecl
