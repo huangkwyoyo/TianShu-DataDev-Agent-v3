@@ -478,6 +478,10 @@ export interface FullRunResponse {
   spec_id: string | null;
   plan_id: string | null;
   package_id: string | null;
+  // 解析摘要 + Plan 步骤（透传自 run_all rich 结果——供 ParsePreview/PlanStepsPanel 展示）
+  spec_result: SpecRichResponse | null;
+  steps: PlanStepSummary[];
+  join_evidence: JoinEvidenceItem[];
   spark_ok: boolean;
   spark_stages: { stage: string; status: string; errors: string[]; comparator_status?: string }[];
   pyspark_code: string | null;
@@ -595,8 +599,8 @@ export function runAllFullStream(
             try {
               const event = JSON.parse(trimmed) as FullRunEvent;
               onEvent?.(event);
-            } catch {
-              // 忽略解析失败的行（畸形 JSON）
+            } catch (parseErr) {
+              console.error('[Stream] JSON 解析失败或 onEvent 异常:', parseErr, '行预览:', trimmed.slice(0, 200));
             }
           }
         }

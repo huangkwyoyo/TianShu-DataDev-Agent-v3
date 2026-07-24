@@ -170,6 +170,9 @@
 /* 面板状态边框 */
 .run-progress-panel.progress-done {
   border-color: var(--success);
+  /* 完成后收起——限制高度，可滚动查看 */
+  max-height: 180px;
+  overflow-y: auto;
 }
 
 .run-progress-panel.progress-fatal {

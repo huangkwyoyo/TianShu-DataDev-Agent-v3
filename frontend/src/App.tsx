@@ -293,78 +293,92 @@ export default function App() {
           }
 
           if (event.event === 'done') {
-            const fr = event.result;
-            // 诊断日志——排查代码框不显示原因
-            console.log('[RunAll done]', {
-              sql_ok: fr.sql_ok,
-              request_id: fr.request_id,
-              generated_sql_len: fr.generated_sql?.length || 0,
-              pyspark_code_len: fr.pyspark_code?.length || 0,
-              standalone_pyspark_len: fr.standalone_pyspark?.length || 0,
-              spark_ok: fr.spark_ok,
-              spark_stages_count: fr.spark_stages?.length || 0,
-            });
-            // 构建 SQL 管线阶段指示灯
-            const sqlStages: StageInfo[] = fr.sql_pipeline_stages
-              ? fr.sql_pipeline_stages.map((s) => ({
-                  stage: s.stage,
-                  status: s.status === 'ok' ? 'ok' : s.status === 'failed' ? 'failed' : 'skipped',
-                }))
-              : [];
-            // 构建 Spark 管线阶段指示灯
-            const sparkStages: StageInfo[] = fr.spark_stages.map((s) => ({
-              stage: s.stage,
-              status: s.status === 'ok' ? 'ok' : s.status === 'failed' ? 'failed' : 'skipped',
-            }));
-            // 构建 executeResult（含 SQL 代码）
-            const executeResult: ExecuteRichResponse | null = fr.sql_ok && fr.request_id
-              ? {
-                  request_id: fr.request_id,
-                  spec_id: fr.spec_id || '',
-                  plan_id: fr.plan_id || '',
-                  generated_sql: fr.generated_sql || '',
-                  sql_sha256: '',
-                  compiler_version: '',
-                  execution_trace: { trace_id: '', status: '', row_count: 0, execution_time_ms: 0, error_message: null },
-                  result_summary: { summary_id: '', columns: [], column_types: [], row_count: 0, null_counts: {}, numeric_sums: {} },
-                  open_questions: [],
-                }
-              : null;
-            // 持久化 PySpark 代码（standalone 优先——完整可运行脚本）
-            const compilerCode = fr.pyspark_code || fr.standalone_pyspark
-              ? { pyspark: fr.pyspark_code || '', standalone: fr.standalone_pyspark || '' }
-              : prev.compilerCode;
-
-            // 异步验证 artifacts 是否就绪
-            if (fr.request_id) {
-              checkArtifactsStatus(fr.request_id).then((status) => {
-                setState((prev2) => ({ ...prev2, artifactsReady: status.artifacts_ready }));
-              }).catch(() => {});
-            }
-
-            return {
-              ...prev,
-              isLoading: false,
-              isStreaming: false,
-              runProgressEvents: newEvents,
-              requestId: fr.request_id,
-              executeResult,
-              compilerCode,
-              // SQL 成功就展示代码（即使 Spark 失败也保留，标注由 Spark 阶段状态体现）
-              showCodeDownload: fr.sql_ok,
-              sparkStages,
-              pipelineStages: sqlStages,
-              llmTraces: fr.llm_traces,
-              activePanel: 'sql' as Panel,
-              // SQL 失败时的错误
-              error: fr.sql_pipeline_error
+            try {
+              const fr = event.result;
+              // 诊断日志——排查面板不显示原因
+              console.log('[RunAll done] keys:', Object.keys(fr));
+              console.log('[RunAll done] spec_result?', !!fr.spec_result, 'steps?', !!fr.steps);
+              // 构建 SQL 管线阶段指示灯
+              const sqlStages: StageInfo[] = fr.sql_pipeline_stages
+                ? fr.sql_pipeline_stages.map((s) => ({
+                    stage: s.stage,
+                    status: s.status === 'ok' ? 'ok' : s.status === 'failed' ? 'failed' : 'skipped',
+                  }))
+                : [];
+              // 构建 Spark 管线阶段指示灯
+              const sparkStages: StageInfo[] = fr.spark_stages.map((s) => ({
+                stage: s.stage,
+                status: s.status === 'ok' ? 'ok' : s.status === 'failed' ? 'failed' : 'skipped',
+              }));
+              // 构建 executeResult（含 SQL 代码）
+              const executeResult: ExecuteRichResponse | null = fr.sql_ok && fr.request_id
                 ? {
-                    error_code: `PIPELINE_${fr.sql_pipeline_error.stage.toUpperCase()}_FAILED`,
-                    message: fr.sql_pipeline_error.error_message,
-                    field_ref: fr.sql_pipeline_error.stage,
+                    request_id: fr.request_id,
+                    spec_id: fr.spec_id || '',
+                    plan_id: fr.plan_id || '',
+                    generated_sql: fr.generated_sql || '',
+                    sql_sha256: '',
+                    compiler_version: '',
+                    execution_trace: { trace_id: '', status: '', row_count: 0, execution_time_ms: 0, error_message: null },
+                    result_summary: { summary_id: '', columns: [], column_types: [], row_count: 0, null_counts: {}, numeric_sums: {} },
+                    open_questions: [],
                   }
-                : null,
-            };
+                : null;
+              // 持久化 PySpark 代码（standalone 优先——完整可运行脚本）
+              const compilerCode = fr.pyspark_code || fr.standalone_pyspark
+                ? { pyspark: fr.pyspark_code || '', standalone: fr.standalone_pyspark || '' }
+                : prev.compilerCode;
+
+              // 异步验证 artifacts 是否就绪
+              if (fr.request_id) {
+                checkArtifactsStatus(fr.request_id).then((status) => {
+                  setState((prev2) => ({ ...prev2, artifactsReady: status.artifacts_ready }));
+                }).catch(() => {});
+              }
+
+              return {
+                ...prev,
+                isLoading: false,
+                isStreaming: false,
+                runProgressEvents: newEvents,
+                requestId: fr.request_id,
+                specResult: fr.spec_result || prev.specResult,
+                planResult: fr.steps?.length
+                  ? {
+                      request_id: fr.request_id || '',
+                      spec_id: fr.spec_id || '',
+                      plan_id: fr.plan_id || '',
+                      step_count: fr.steps.length,
+                      step_types: fr.steps.map(s => s.step_type),
+                      steps: fr.steps,
+                      multi_table: (fr.join_evidence?.length || 0) > 0,
+                      validation_passed: fr.sql_ok,
+                      open_questions: [],
+                      join_evidence: fr.join_evidence || [],
+                    }
+                  : prev.planResult,
+                executeResult,
+                compilerCode,
+                // SQL 成功就展示代码（即使 Spark 失败也保留，标注由 Spark 阶段状态体现）
+                showCodeDownload: fr.sql_ok,
+                sparkStages,
+                pipelineStages: sqlStages,
+                llmTraces: fr.llm_traces,
+                activePanel: 'sql' as Panel,
+                // SQL 失败时的错误
+                error: fr.sql_pipeline_error
+                  ? {
+                      error_code: `PIPELINE_${fr.sql_pipeline_error.stage.toUpperCase()}_FAILED`,
+                      message: fr.sql_pipeline_error.error_message,
+                      field_ref: fr.sql_pipeline_error.stage,
+                    }
+                  : null,
+              };
+            } catch (doneErr) {
+              console.error('[RunAll done] 处理器异常:', doneErr);
+              // 即使 done 处理失败，也结束加载态
+              return { ...prev, isLoading: false, isStreaming: false, runProgressEvents: newEvents };
+            }
           }
 
           if (event.event === 'fatal') {
@@ -393,9 +407,9 @@ export default function App() {
           streamError: err.message,
         });
       },
-      // onDone
+      // onDone——安全兜底：无论 done 事件是否成功处理，都结束加载态
       () => {
-        setState((prev) => ({ ...prev, isStreaming: false }));
+        setState((prev) => ({ ...prev, isLoading: false, isStreaming: false }));
       },
     );
 
@@ -618,7 +632,7 @@ export default function App() {
             />
 
             {state.specResult && (
-              <ParsePreview spec={state.specResult} visible={state.activePanel === 'parse'} />
+              <ParsePreview spec={state.specResult} visible={true} />
             )}
 
             {state.specResult && state.specResult.open_questions?.length > 0 && (
@@ -641,7 +655,7 @@ export default function App() {
               <PlanStepsPanel
                 steps={state.planResult.steps}
                 validationPassed={state.planResult.validation_passed}
-                visible={state.activePanel === 'plan'}
+                visible={true}
               />
             )}
 
@@ -657,7 +671,7 @@ export default function App() {
 
             {/* 代码下载区 */}
             {state.showCodeDownload && (
-              <div className="panel">
+              <div className="panel code-download-panel" data-testid="code-download-panel">
                 <div className="panel-header">
                   <h3>Code</h3>
                 </div>
@@ -758,13 +772,10 @@ export default function App() {
               />
             )}
 
-            {/* LLM 调用追踪——编译执行后或 Spark 阶段后 */}
+            {/* LLM 调用追踪——有执行结果即展示 */}
             <LlmTracePanel
               traces={state.llmTraces}
-              visible={
-                (state.activePanel === 'sql' || state.activePanel === 'package') &&
-                state.executeResult !== null
-              }
+              visible={state.executeResult !== null}
             />
 
             {state.packageResult && (
