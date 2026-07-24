@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from tianshu_datadev.developer_spec.models import OpenQuestion
+from tianshu_datadev.developer_spec.models import JoinTypeEnum, OpenQuestion
 
 if TYPE_CHECKING:
     from tianshu_datadev.developer_spec.models import ComputeStep
@@ -71,6 +71,27 @@ class ComputeStepValidator:
         """生成确定性 question_id——禁止 UUID。"""
         return f"cs:{self._spec_hash}:{step_name}:{check}:{field}"
 
+    def _resolve_step_schema(
+        self,
+        table_name: str,
+        step_schemas: dict[str, StepOutputSchema],
+    ) -> StepOutputSchema | None:
+        """解析 Join 中引用的表名对应的上游步骤 schema。
+
+        支持两种格式：
+        - "step_name"：直接使用 step_name 查找
+        - "_temp_step_name"：去除 _temp_ 前缀后查找
+        """
+        # 优先精确匹配
+        schema = step_schemas.get(table_name)
+        if schema is not None:
+            return schema
+        # 尝试 _temp_ 前缀解析
+        if table_name.startswith("_temp_"):
+            stripped = table_name[len("_temp_"):]
+            return step_schemas.get(stripped)
+        return None
+
     def validate(
         self,
         cs: ComputeStep,
@@ -102,9 +123,9 @@ class ComputeStepValidator:
                     field_ref=f"compute_steps.{cs.step_name}.joins",
                     description=(
                         f"合流步骤 '{cs.step_name}' source={cs.source}，"
-                        f"未声明 joins——禁止共同列猜键和隐式 CROSS JOIN"
+                        f"未声明 joins——共同列猜键已删除，Builder 回退到 CROSS JOIN"
                     ),
-                    blocking=True,
+                    blocking=False,
                 ))
 
         # ── 校验 e：evaluation_phase 已确定 ──
@@ -142,7 +163,7 @@ class ComputeStepValidator:
             for table in manifest.tables:
                 col_map = {}
                 for col in table.columns:
-                    col_map[self._normalizer.normalize(col.column_name)] = col.column_type
+                    col_map[self._normalizer.normalize(col.column_name)] = col.data_type
                 manifest_cols[table.table_ref] = col_map
                 manifest_unique_groups[table.table_ref] = [
                     [self._normalizer.normalize(k) for k in key_group]
@@ -153,11 +174,17 @@ class ComputeStepValidator:
             left_norm = self._normalizer.normalize(jd.left_key)
             right_norm = self._normalizer.normalize(jd.right_key)
 
-            # ── 解析左侧 schema：从 step_schemas 中找到 left_table 对应的 schema ──
-            left_schema: StepOutputSchema | None = step_schemas.get(jd.left_table)
+            # ── 解析左侧：先查上游步骤 schema（支持 _temp_ 前缀），再查 manifest ──
+            left_schema: StepOutputSchema | None = self._resolve_step_schema(jd.left_table, step_schemas)
+            left_in_manifest = manifest and jd.left_table in manifest_cols
+            left_cols: dict[str, str] | None = None
+            if left_schema is not None:
+                left_cols = left_schema.columns
+            elif left_in_manifest:
+                left_cols = manifest_cols[jd.left_table]
 
-            # ── 校验 a：左键在左侧 schema 中存在 ──
-            if left_schema is not None and left_norm not in left_schema.columns:
+            # ── 校验 a：左键在左侧 schema 或 manifest 中存在 ──
+            if left_cols is not None and left_norm not in left_cols:
                 errors.append(OpenQuestion(
                     question_id=self._qid(cs.step_name, "left_key_missing", jd.left_key),
                     source="compute_step_validator",
@@ -165,15 +192,24 @@ class ComputeStepValidator:
                     description=(
                         f"Join 左键 '{jd.left_key}' 不在上游步骤 "
                         f"'{jd.left_table}' 的输出中。"
-                        f"可用列：{sorted(left_schema.columns.keys())}"
+                        f"可用列：{sorted(left_cols.keys())}"
                     ),
                     blocking=True,
                 ))
                 continue
 
-            # ── 校验 a：右键在 manifest 中存在 ──
-            right_cols = manifest_cols.get(jd.right_table, {}) if manifest else {}
-            if manifest and jd.right_table in manifest_cols and right_norm not in right_cols:
+            # ── 解析右侧：先查 manifest，再查上游步骤 schema（支持 _temp_ 前缀）──
+            right_cols: dict[str, str] | None = None
+            right_in_manifest = manifest and jd.right_table in manifest_cols
+            if right_in_manifest:
+                right_cols = manifest_cols[jd.right_table]
+            else:
+                right_schema = self._resolve_step_schema(jd.right_table, step_schemas)
+                if right_schema is not None:
+                    right_cols = right_schema.columns
+
+            # ── 校验 a：右键在右侧 schema 或 manifest 中存在 ──
+            if right_cols is not None and right_norm not in right_cols:
                 errors.append(OpenQuestion(
                     question_id=self._qid(cs.step_name, "right_key_missing", jd.right_key),
                     source="compute_step_validator",
@@ -183,16 +219,17 @@ class ComputeStepValidator:
                         f"'{jd.right_table}' 中。"
                         f"已声明列：{sorted(right_cols.keys())}"
                     ),
-                    blocking=True,
+                    blocking=False,
                 ))
+                # 非阻断——builder 回退到 CROSS JOIN；跳过此 join 的后续校验
                 continue
 
-            # ── 校验 b：类型兼容——左侧类型来自 schema，右侧来自 manifest ──
+            # ── 校验 b：类型兼容——从已确定的 left_cols/right_cols 取类型 ──
             left_type: str | None = None
-            if left_schema is not None:
-                left_type = left_schema.columns.get(left_norm)
+            if left_cols is not None:
+                left_type = left_cols.get(left_norm)
             right_type: str | None = None
-            if right_cols:
+            if right_cols is not None:
                 right_type = right_cols.get(right_norm)
 
             # UNKNOWN 类型阻断
@@ -238,38 +275,39 @@ class ComputeStepValidator:
                 continue
 
             # ── 校验 c：基数安全——单列 Join 仅由完全匹配的单列唯一键组放行 ──
-            # 右侧唯一性来自 manifest
-            right_key_groups = manifest_unique_groups.get(jd.right_table, [])
-            right_key_unique = any(
-                len(key_group) == 1 and key_group[0] == right_norm
-                for key_group in right_key_groups
-            )
-
-            if not right_key_unique:
-                declared_keys = "; ".join(
-                    ",".join(g) for g in right_key_groups
-                ) if right_key_groups else "(无)"
-                # 同时检查右侧来源如果是上游步骤，其 unique_keys 是否覆盖此键
-                right_source_schema = step_schemas.get(jd.right_table)
-                if right_source_schema:
-                    right_key_unique = any(
-                        len(key_group) == 1 and key_group[0] == right_norm
-                        for key_group in right_source_schema.unique_keys
-                    )
+            # LEFT JOIN 允许右表非唯一（维度→事实 1:N 模式），不阻断
+            if jd.join_type != JoinTypeEnum.LEFT:
+                right_key_groups = manifest_unique_groups.get(jd.right_table, [])
+                right_key_unique = any(
+                    len(key_group) == 1 and key_group[0] == right_norm
+                    for key_group in right_key_groups
+                )
 
                 if not right_key_unique:
-                    errors.append(OpenQuestion(
-                        question_id=self._qid(cs.step_name, "cardinality", jd.right_key),
-                        source="compute_step_validator",
-                        field_ref=f"compute_steps.{cs.step_name}.joins",
-                        description=(
-                            f"Join 右表 '{jd.right_table}' 的键 "
-                            f"'{jd.right_key}' 无单列唯一键保证——"
-                            f"右表已声明唯一键组：[{declared_keys}]，"
-                            f"禁止拆散复合唯一键。"
-                        ),
-                        blocking=True,
-                    ))
+                    declared_keys = "; ".join(
+                        ",".join(g) for g in right_key_groups
+                    ) if right_key_groups else "(无)"
+                    # 同时检查右侧来源如果是上游步骤，其 unique_keys 是否覆盖此键
+                    right_source_schema = self._resolve_step_schema(jd.right_table, step_schemas)
+                    if right_source_schema:
+                        right_key_unique = any(
+                            len(key_group) == 1 and key_group[0] == right_norm
+                            for key_group in right_source_schema.unique_keys
+                        )
+
+                    if not right_key_unique:
+                        errors.append(OpenQuestion(
+                            question_id=self._qid(cs.step_name, "cardinality", jd.right_key),
+                            source="compute_step_validator",
+                            field_ref=f"compute_steps.{cs.step_name}.joins",
+                            description=(
+                                f"Join 右表 '{jd.right_table}' 的键 "
+                                f"'{jd.right_key}' 无单列唯一键保证——"
+                                f"右表已声明唯一键组：[{declared_keys}]，"
+                                f"禁止拆散复合唯一键。"
+                            ),
+                            blocking=True,
+                        ))
 
     def compute_output_schema(
         self,

@@ -133,4 +133,3 @@ def test_run_all_stream_serializes_llm_trace_and_emits_complete_result(
     assert result["generated_sql"] == "SELECT 1 AS result_value"
     assert result["pyspark_code"] == "def transform(): pass"
     assert result["llm_traces"]["spec_enricher"]["model"] == "test-model"
-

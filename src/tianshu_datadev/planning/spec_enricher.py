@@ -1848,6 +1848,21 @@ class SpecEnricher:
         condition_cols: set[str] = set()
         for tb in cw.typed_branches:
             SpecEnricher._collect_condition_columns(tb.condition, condition_cols)
+        # 同时处理字符串型分支（compute_step 中的 case_when 使用 when/then 字符串）
+        for bb in cw.branches:
+            if bb.when:
+                # 从布尔表达式字符串中提取标识符（列名）
+                # 分割 SQL 操作符和关键字，保留字母数字下划线标识符
+                tokens = set()
+                for part in re.split(
+                    r'\s+(?:AND|OR|NOT|IN|BETWEEN|IS|NULL|LIKE|AS)\s+'
+                    r'|[=!<>]=?|>=|<=|!=|\(|\)|,|\s+',
+                    bb.when,
+                ):
+                    part = part.strip()
+                    if part and re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', part):
+                        tokens.add(part.lower())
+                condition_cols.update(tokens)
 
         # 规则 3：条件引用了聚合指标别名 → post_aggregate
         metric_aliases = {m.alias for m in spec.metrics}
@@ -1868,6 +1883,15 @@ class SpecEnricher:
             c.lower() in manifest_cols for c in condition_cols
         ):
             return "pre_aggregate"
+
+        # 规则 5：条件列引用 compute_step 中的表达式列名 → post_aggregate
+        if spec.compute_steps:
+            expr_names: set[str] = set()
+            for step in spec.compute_steps:
+                for expr in step.expressions:
+                    expr_names.add(expr.name.lower())
+            if condition_cols & expr_names:
+                return "post_aggregate"
 
         # 无法判定 → None（转为 OpenQuestion）
         return None
@@ -2033,6 +2057,16 @@ class SpecEnricher:
                 resolved = self._resolve_evaluation_phase(cw, spec)
                 if resolved is not None:
                     cw.evaluation_phase = resolved
+
+        # ── 回填 ComputeStep 内 defined case_when 的 evaluation_phase ──
+        # ComputeStep 的 case_when 不经过 Planner/LLM 路径，
+        # 需要在此处补调 evaluation_phase 判定逻辑。
+        if spec.compute_steps:
+            for step in spec.compute_steps:
+                if step.case_when and step.case_when.evaluation_phase is None:
+                    resolved = self._resolve_evaluation_phase(step.case_when, spec)
+                    if resolved is not None:
+                        step.case_when.evaluation_phase = resolved
 
         # ── 未解析的 CASE WHEN 列 → OpenQuestion ──
         new_open_questions: list[OpenQuestion] = []

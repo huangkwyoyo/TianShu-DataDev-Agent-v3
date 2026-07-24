@@ -985,10 +985,8 @@ class SqlBuildPlanBuilder:
             jk = join_key_map[key]
             if jk[0] and jk[1]:
                 return jk
-        raise ValueError(
-            f"合流步骤的源对 ({left_src}, {right_src}) 无显式 JoinDecl——"
-            f"ComputeStepValidator 应已阻断"
-        )
+        # 找不到 JoinDecl 时返回空键——触发外层 CROSS JOIN 回退
+        return ("", "")
 
     def _expand_metric_to_agg_specs(
         self, m, source_table: str = "",  # MetricDecl

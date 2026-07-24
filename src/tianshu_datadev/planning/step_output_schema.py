@@ -55,7 +55,7 @@ def compute_output_schema(
     if manifest:
         for table in manifest.tables:
             for col in table.columns:
-                manifest_cols[normalizer.normalize(col.column_name)] = col.column_type
+                manifest_cols[normalizer.normalize(col.column_name)] = col.data_type
 
     # ── 1. GROUP BY 列——类型来自源表或上游 ──
     for gb in cs.group_by:
@@ -124,8 +124,10 @@ def compute_output_schema(
         cw_norm = normalizer.normalize(cs.case_when.output_column)
         columns[cw_norm] = "varchar"
 
-    # ── 4. Expression 输出列——本轮不处理（已移除或 HUMAN_REVIEW）──
-    # 不在 columns 中添加任何 expression 输出列
+    # ── 4. Expression 输出列——以声明类型加入 schema ──
+    for expr in cs.expressions:
+        expr_norm = normalizer.normalize(expr.name)
+        columns[expr_norm] = expr.type.lower() if expr.type else None
 
     # ── 5. 派生 unique_keys——Aggregate 的 group_by 形成 ──
     if cs.group_by:

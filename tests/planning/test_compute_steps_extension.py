@@ -24,7 +24,7 @@ from tianshu_datadev.developer_spec import FieldNormalizer
 
 def _make_col(name: str, col_type: str) -> SimpleNamespace:
     """构建可被 Validator/StepOutputSchema 读取的伪列对象。"""
-    return SimpleNamespace(column_name=name, normalized_name=name, column_type=col_type)
+    return SimpleNamespace(column_name=name, normalized_name=name, data_type=col_type)
 
 
 def _make_table(
