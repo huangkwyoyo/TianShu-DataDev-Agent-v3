@@ -723,14 +723,7 @@ class DataTransformContractExtractor:
                         phase="post_window" if window_seen else "pre_transform",
                     ))
                 elif isinstance(step, JoinStep):
-                    # 两个临时关系之间的 Join 属于 DAG 内部编排；临时结果与外部表
-                    # 的 Join 仍是业务语义，必须还原结构化列血缘后进入 Contract。
-                    if step.join_keys and any(
-                        k[0].table_ref.startswith("_temp_")
-                        and k[1].table_ref.startswith("_temp_")
-                        for k in step.join_keys
-                    ):
-                        continue
+                    # 保留所有显式 Join——不使用下划线命名判断内部 Join
                     join_rel = self._extract_join(
                         step,
                         evidence_map,
