@@ -132,8 +132,8 @@ class LlmTraceNode(StrictModel):
     """
     node_name: str
     # 合法值：
-    #   "parse_developer_spec" | "relationship_planner" |
-    #   "sql_build_planner" | "sql_program_planner" | "spark_developer"
+    #   "requirement_planner" | "spec_enricher" | "relationship_planner" |
+    #   "label_extractor" | "spark_developer"
     model: str              # 实际模型标识（Fake 时为 "fake"）
     token_usage: dict[str, int] = {}
     # {"prompt_tokens": N, "completion_tokens": N, "total_tokens": N}

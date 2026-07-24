@@ -504,6 +504,16 @@ pre, code, textarea, .code-block {
 .app-main.layout-executed .output-area {
   order: 3;
 }
+
+/* 输出区保持文档审查顺序；代码下载始终位于结果面板之后。 */
+.output-area {
+  display: flex;
+  flex-direction: column;
+}
+
+.output-area .code-download-panel {
+  order: 10;
+}
 .app-main.layout-executed .error-display {
   order: 4;
 }
