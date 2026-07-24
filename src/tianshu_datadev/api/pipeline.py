@@ -49,6 +49,7 @@ from tianshu_datadev.planning.requirement_planner import RequirementPlanner
 from tianshu_datadev.planning.spec_enricher import SpecEnricher
 from tianshu_datadev.planning.sql_build_plan import SqlBuildPlan, SqlBuildPlanBuilder
 from tianshu_datadev.planning.sql_program import SqlProgram
+from tianshu_datadev.planning.step_output_schema import StepOutputSchema
 from tianshu_datadev.sql.compiler import DuckDbSqlCompiler
 from tianshu_datadev.sql.executor import DuckDBExecutor
 from tianshu_datadev.sql.models import (
@@ -1500,7 +1501,46 @@ class Pipeline:
             builder = SqlBuildPlanBuilder()
 
             if spec.compute_steps and len(spec.compute_steps) > 0:
-                # ── ComputeSteps 路径：每步独立聚合 Plan，_temp 串联 ──
+                # ── ComputeSteps 路径：Validator（前置门禁）→ Builder ──
+                from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer
+                from tianshu_datadev.planning.compute_step_validator import ComputeStepValidator
+
+                _cs_validator = ComputeStepValidator(
+                    normalizer=FieldNormalizer(),
+                    spec_hash=getattr(spec, 'normalized_spec_hash', '') or getattr(spec, 'spec_hash', '') or '',
+                )
+
+                # 按拓扑顺序逐步骤校验——逐步构建 step_schemas
+                step_schemas: dict[str, StepOutputSchema] = {}
+                cs_blocking: list = []
+
+                # 拓扑排序 compute_steps（简化：按源码顺序）
+                sorted_steps = list(spec.compute_steps)
+
+                for cs in sorted_steps:
+                    qs = _cs_validator.validate(cs, step_schemas, manifest)
+                    blocking_qs = [q for q in qs if q.blocking]
+                    if blocking_qs:
+                        cs_blocking.extend(blocking_qs)
+                        continue  # 此步骤不计算 schema——阻断
+                    # 计算此步骤的输出 schema 供下游使用
+                    schema = _cs_validator.compute_output_schema(cs, step_schemas, manifest)
+                    step_schemas[cs.step_name] = schema
+
+                if cs_blocking:
+                    # ── Validator 阻断——不调用 Builder ──
+                    return {
+                        "request_id": request_id,
+                        "spec_id": spec.spec_id,
+                        "plan_id": "",
+                        "step_count": 0,
+                        "step_types": [],
+                        "multi_table": False,
+                        "validation_passed": False,
+                        "open_questions": _summarize_open_questions(cs_blocking),
+                    }
+
+                # ── 全部通过——Builder 签名不变 ──
                 with collector.stage("sql_builder", request_id) as ctx:
                     plans = builder.build_from_steps(spec, hypothesis)
                     plan_snap = plans[-1]
@@ -1625,7 +1665,47 @@ class Pipeline:
             builder = SqlBuildPlanBuilder()
 
             if spec.compute_steps and len(spec.compute_steps) > 0:
-                # ── ComputeSteps 路径 ──
+                # ── ComputeSteps 路径：Validator（前置门禁）→ Builder ──
+                from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer
+                from tianshu_datadev.planning.compute_step_validator import ComputeStepValidator
+
+                _cs_validator = ComputeStepValidator(
+                    normalizer=FieldNormalizer(),
+                    spec_hash=getattr(spec, 'normalized_spec_hash', '') or getattr(spec, 'spec_hash', '') or '',
+                )
+
+                # 按拓扑顺序逐步骤校验——逐步构建 step_schemas
+                step_schemas: dict[str, StepOutputSchema] = {}
+                cs_blocking: list = []
+
+                # 拓扑排序 compute_steps（简化：按源码顺序）
+                sorted_steps = list(spec.compute_steps)
+
+                for cs in sorted_steps:
+                    qs = _cs_validator.validate(cs, step_schemas, manifest)
+                    blocking_qs = [q for q in qs if q.blocking]
+                    if blocking_qs:
+                        cs_blocking.extend(blocking_qs)
+                        continue  # 此步骤不计算 schema——阻断
+                    # 计算此步骤的输出 schema 供下游使用
+                    schema = _cs_validator.compute_output_schema(cs, step_schemas, manifest)
+                    step_schemas[cs.step_name] = schema
+
+                if cs_blocking:
+                    # ── Validator 阻断——不调用 Builder ──
+                    blocked = self._build_validation_blocked_response(
+                        spec, manifest, None, list(cs_blocking),
+                        table_mapping=table_mapping,
+                    )
+                    blocked.update({
+                        "sql_sha256": "",
+                        "compiler_version": "",
+                        "execution_trace": None,
+                        "result_summary": None,
+                    })
+                    return blocked
+
+                # ── 全部通过——Builder 签名不变 ──
                 with collector.stage("sql_builder", request_id) as ctx:
                     plans = builder.build_from_steps(spec, hypothesis)
                     plan_snap = plans[-1]
@@ -2012,7 +2092,46 @@ class Pipeline:
             builder = SqlBuildPlanBuilder()
 
             if spec.compute_steps and len(spec.compute_steps) > 0:
-                # ── ComputeSteps 路径 ──
+                # ── ComputeSteps 路径：Validator（前置门禁）→ Builder ──
+                from tianshu_datadev.developer_spec.field_normalizer import FieldNormalizer
+                from tianshu_datadev.planning.compute_step_validator import ComputeStepValidator
+
+                _cs_validator = ComputeStepValidator(
+                    normalizer=FieldNormalizer(),
+                    spec_hash=getattr(spec, 'normalized_spec_hash', '') or getattr(spec, 'spec_hash', '') or '',
+                )
+
+                # 按拓扑顺序逐步骤校验——逐步构建 step_schemas
+                step_schemas: dict[str, StepOutputSchema] = {}
+                cs_blocking: list = []
+
+                # 拓扑排序 compute_steps（简化：按源码顺序）
+                sorted_steps = list(spec.compute_steps)
+
+                for cs in sorted_steps:
+                    qs = _cs_validator.validate(cs, step_schemas, manifest)
+                    blocking_qs = [q for q in qs if q.blocking]
+                    if blocking_qs:
+                        cs_blocking.extend(blocking_qs)
+                        continue  # 此步骤不计算 schema——阻断
+                    # 计算此步骤的输出 schema 供下游使用
+                    schema = _cs_validator.compute_output_schema(cs, step_schemas, manifest)
+                    step_schemas[cs.step_name] = schema
+
+                if cs_blocking:
+                    # ── Validator 阻断——不调用 Builder ──
+                    blocked = self._build_validation_blocked_response(
+                        spec, manifest, None, list(cs_blocking),
+                        table_mapping=table_mapping, all_stages=_run_all_stages,
+                    )
+                    blocked.update({
+                        "execution_status": "not_executed",
+                        "row_count": 0,
+                        "elapsed_ms": 0,
+                    })
+                    return blocked
+
+                # ── 全部通过——Builder 签名不变 ──
                 with collector.stage("sql_builder", request_id) as ctx:
                     plans = builder.build_from_steps(spec, hypothesis)
                     plan_snap = plans[-1]
