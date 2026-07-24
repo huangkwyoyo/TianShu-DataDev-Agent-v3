@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 from tianshu_datadev.developer_spec.models import MetricFilterDecl
 from tianshu_datadev.spark._alias_resolver import (
+    AliasResolutionError,
     ResolvedStep,
     resolve_codegen_aliases,
 )
@@ -125,8 +126,7 @@ class SparkCompiler:
             SparkCompileResult——含 raw + annotated 两个版本
         """
         # ── 单一入口：解析所有代码生成变量名 ──
-        resolved_plan = resolve_codegen_aliases(plan)
-
+        # 注意：主步骤的解析已移至分支编译之后，以便感知分支输出变量
         state = _CompileState()
 
         # 渲染导入和函数签名
@@ -145,6 +145,102 @@ class SparkCompiler:
             for a in annotations:
                 if hasattr(a, "step_id") and a.step_id:
                     ann_map[a.step_id] = a
+
+        # ── 新增：编译所有分支（branches）──
+        # 每个分支产生独立 DataFrame 变量——最终变量名 = 分支名
+        # 先编译分支，再编译主 steps，主步骤可通过 JoinStep.alias 引用分支输出
+        branch_outputs: dict[str, str] = {}
+        if plan.branches:
+            branch_var_counter = 0
+            for branch_name, branch_steps in plan.branches.items():
+                if not branch_steps:
+                    continue
+
+                # 分支头部注释——仅 annotated 输出包含，raw 输出不包含
+                state.annotated_lines.append(f"# ── 分支: {branch_name} ──")
+
+                # 追踪该分支内的别名→变量名映射
+                _branch_latest: dict[str, str] = {}
+                _branch_prev_output: str | None = None
+
+                for j, step in enumerate(branch_steps):
+                    step_type = type(step).__name__
+                    step_id = state.next_step_id(step_type)
+                    is_last = (j == len(branch_steps) - 1)
+
+                    if isinstance(step, SparkReadStep):
+                        branch_var_counter += 1
+                        out_var = branch_name if is_last else f"_br_{branch_name}_{branch_var_counter}"
+                        _branch_latest[step.alias] = out_var
+                        _branch_prev_output = out_var
+                        _resolved = ResolvedStep(step=step, input_vars=(), output_var=out_var)
+                        raw, comment = self._compile_read(_resolved, step_id, j, len(branch_steps))
+
+                    elif isinstance(step, SparkJoinStep):
+                        left_var = _branch_latest.get(step.left_alias)
+                        if left_var is None:
+                            raise AliasResolutionError(
+                                f"分支 {branch_name!r} Join 步骤左表别名 {step.left_alias!r} 未解析"
+                            )
+                        right_var = _branch_latest.get(step.right_alias)
+                        if right_var is None:
+                            raise AliasResolutionError(
+                                f"分支 {branch_name!r} Join 步骤右表别名 {step.right_alias!r} 未解析"
+                            )
+                        branch_var_counter += 1
+                        out_var = branch_name if is_last else f"_br_{branch_name}_{branch_var_counter}"
+                        _branch_latest[step.left_alias] = out_var
+                        _branch_prev_output = out_var
+                        _resolved = ResolvedStep(step=step, input_vars=(left_var, right_var), output_var=out_var)
+                        raw, comment = self._compile_join(
+                            _resolved, step_id, j, len(branch_steps),
+                            join_result_vars=None,
+                        )
+
+                    else:
+                        # 单输入步骤——Filter/Project/Sort/Limit/Aggregate/CaseWhen/Window
+                        input_key = getattr(step, "input_alias", "") or ""
+                        input_var: str | None = None
+                        if input_key:
+                            input_var = _branch_latest.get(input_key)
+                        elif _branch_prev_output is not None:
+                            input_var = _branch_prev_output
+                        if input_var is None:
+                            raise AliasResolutionError(
+                                f"分支 {branch_name!r} 步骤 {j} {step_type} 的 input_alias={input_key!r} 未解析"
+                            )
+                        branch_var_counter += 1
+                        out_var = branch_name if is_last else f"_br_{branch_name}_{branch_var_counter}"
+                        if input_key:
+                            _branch_latest[input_key] = out_var
+                        _branch_prev_output = out_var
+                        _resolved = ResolvedStep(step=step, input_vars=(input_var,), output_var=out_var)
+
+                        if isinstance(step, SparkFilterStep):
+                            raw, comment = self._compile_filter(_resolved, step_id, j, len(branch_steps))
+                        elif isinstance(step, SparkProjectStep):
+                            raw, comment = self._compile_project(_resolved, step_id, j, len(branch_steps))
+                        elif isinstance(step, SparkSortStep):
+                            raw, comment = self._compile_sort(_resolved, step_id, j, len(branch_steps))
+                        elif isinstance(step, SparkLimitStep):
+                            raw, comment = self._compile_limit(_resolved, step_id, j, len(branch_steps))
+                        elif isinstance(step, SparkAggregateStep):
+                            raw, comment = self._compile_aggregate(_resolved, step_id, j, len(branch_steps))
+                        elif isinstance(step, SparkCaseWhenStep):
+                            raw, comment = self._compile_case_when(_resolved, step_id, j, len(branch_steps))
+                        elif isinstance(step, SparkWindowStep):
+                            raw, comment = self._compile_window(_resolved, step_id, j, len(branch_steps))
+                        else:
+                            raw, comment = self._compile_unsupported(step, step_id, "unknown")
+
+                    # 使用 add_step 统一管理（与主步骤一致：comment 进 comment_lines，raw 进两列表）
+                    state.add_step(step_id, raw, comment)
+
+                # 注册分支输出——分支名 → 分支输出变量名
+                branch_outputs[branch_name] = branch_name
+
+        # ── 解析主步骤所有代码生成变量名（感知分支输出）──
+        resolved_plan = resolve_codegen_aliases(plan, branch_outputs)
 
         # ── 预扫描 JOIN 步骤——收集其输出变量，用于后续 JOIN 条件中的列名消歧 ──
         join_result_vars: set[str] = set()

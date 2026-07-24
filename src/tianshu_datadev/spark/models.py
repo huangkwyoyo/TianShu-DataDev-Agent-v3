@@ -331,6 +331,12 @@ class SparkPlan(StrictModel):
     source_contract_hash: str  # 来源 DataTransformContractV1 的 hash
     source_contract_version: str = "v1"  # 来源 Contract 的版本
     steps: list[SparkStep] = Field(default_factory=list)
+    # ── 新增：多分支 DAG 支持 ──
+    branches: dict[str, list[SparkStep]] = Field(default_factory=dict)
+    # branches key = 分支名（如 compute_step step_name）
+    # branches value = 该分支的步骤列表（Read→...→Aggregate）
+    # 编译时：先编译所有 branches → 产生独立 DataFrame 变量
+    #         再编译主 steps → 可通过 JoinStep.alias 引用分支输出
     # ── 写入占位（Phase 6 开放）──
     write_mode: str | None = None  # "overwrite_partition" / None（Phase 5 不实现写入）
 

@@ -99,13 +99,17 @@ def assign_source_aliases(steps: list[SparkStep]) -> dict[str, str]:
     return {alias: f"t{i + 1}" for i, (alias, _) in enumerate(read_entries)}
 
 
-def resolve_codegen_aliases(plan) -> ResolvedPlan:
+def resolve_codegen_aliases(
+    plan,
+    branch_outputs: dict[str, str] | None = None,
+) -> ResolvedPlan:
     """解析 SparkPlan 的所有代码生成变量名——单一入口。
 
     规则：
     - Read 按 input_key 字典序 → t1、t2...
     - 非 Read 按执行顺序 → f1、f2...
     - 通过 latest 映射追踪每个 alias 的最新输出变量（仅此一份逻辑）
+    - Join 的左右别名可引用分支输出（branch_outputs）
 
     严格校验：
     - 非 Read 步骤的依赖必须在 latest 中已注册
@@ -114,6 +118,7 @@ def resolve_codegen_aliases(plan) -> ResolvedPlan:
 
     Args:
         plan: SparkPlan 实例（含 steps 列表）
+        branch_outputs: 已编译分支的输出变量映射 {分支名: 输出变量名}
 
     Returns:
         ResolvedPlan——含所有步骤的已解析变量名
@@ -122,6 +127,8 @@ def resolve_codegen_aliases(plan) -> ResolvedPlan:
         AliasResolutionError: 依赖缺失、空 Plan、重复 key
     """
     from tianshu_datadev.spark.models import SparkPlan
+
+    branch_outputs = branch_outputs or {}
 
     if isinstance(plan, SparkPlan):
         steps = list(plan.steps)
@@ -151,20 +158,26 @@ def resolve_codegen_aliases(plan) -> ResolvedPlan:
             ))
 
         elif isinstance(step, SparkJoinStep):
-            # 双输入——左右别名必须已在 latest 中注册
+            # 双输入——优先检查分支输出，再查 latest 映射
             left_var = latest.get(step.left_alias)
+            if left_var is None:
+                left_var = branch_outputs.get(step.left_alias)
             if left_var is None:
                 raise AliasResolutionError(
                     f"步骤 {i} Join 的左表别名 {step.left_alias!r} 未解析——"
-                    f"请确认该别名对应的 Read 或上游步骤已执行。"
+                    f"请确认该别名对应的 Read、上游步骤或分支已执行。"
                     f"当前已解析别名: {list(latest.keys())}"
+                    + (f"，可用分支: {list(branch_outputs.keys())}" if branch_outputs else "")
                 )
             right_var = latest.get(step.right_alias)
             if right_var is None:
+                right_var = branch_outputs.get(step.right_alias)
+            if right_var is None:
                 raise AliasResolutionError(
                     f"步骤 {i} Join 的右表别名 {step.right_alias!r} 未解析——"
-                    f"请确认该别名对应的 Read 或上游步骤已执行。"
+                    f"请确认该别名对应的 Read、上游步骤或分支已执行。"
                     f"当前已解析别名: {list(latest.keys())}"
+                    + (f"，可用分支: {list(branch_outputs.keys())}" if branch_outputs else "")
                 )
             f_counter += 1
             out_var = f"f{f_counter}"

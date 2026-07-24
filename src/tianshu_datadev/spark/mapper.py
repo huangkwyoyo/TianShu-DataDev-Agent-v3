@@ -255,6 +255,24 @@ def map_contract_to_spark_plan(
             warnings=warnings,
         )
 
+    # ── 新增：识别分支 DAG（骨架，待填充）──
+    # 当 step_dag 有多条语句时，未被其他语句依赖的叶语句可独立为分支
+    # branches 具体步骤的填充需要更深入的 Contract 分析——此轮仅添加骨架
+    _branches: dict[str, list] = {}
+    if (hasattr(contract, 'step_dag')
+        and contract.step_dag
+        and len(contract.step_dag) > 1):
+        # 找出所有被依赖的语句 ID
+        referenced: set[str] = set()
+        for deps in contract.step_dag.values():
+            for d in deps:
+                referenced.add(d)
+        # 未被其他语句依赖的 = 叶分支
+        leaf_stmts = [sid for sid in contract.step_dag if sid not in referenced]
+        if leaf_stmts:
+            # 叶语句存在时标记为潜在分支（当前暂不填充具体步骤）
+            _branches = {}
+
     spark_plan = SparkPlan(
         plan_id=plan_id,
         version="v1",
