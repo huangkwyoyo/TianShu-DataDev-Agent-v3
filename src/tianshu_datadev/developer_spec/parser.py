@@ -30,6 +30,7 @@ from .models import (
     AggregationType,
     CaseWhenBranchDecl,
     CaseWhenDecl,
+    LabelPredicateBranch,
     ColumnDecl,
     ComputeStep,
     ComputeStepExpression,
@@ -1176,7 +1177,7 @@ class DeveloperSpecParser:
     def _parse_case_when_raw(
         self, step_name: str, raw_step: dict
     ) -> CaseWhenDecl | None:
-        """从原始 YAML 字典解析 CaseWhenDecl——支持字符串模式和类型化模式。"""
+        """从原始 YAML 字典解析 CaseWhenDecl——支持字符串模式、类型化模式、typed_branches。"""
         raw_cw = raw_step.get("case_when")
         if raw_cw is None:
             return None
@@ -1186,43 +1187,76 @@ class DeveloperSpecParser:
                 f"compute_step '{step_name}' 的 case_when 必须是字典",
             )
 
+        # ── 分支 A：branches（字符串模式 × 类型化模式）──
         raw_branches = raw_cw.get("branches", [])
-        if not isinstance(raw_branches, list) or len(raw_branches) == 0:
-            raise ParseError(
-                ParseErrorCode.E002_MISSING_REQUIRED_FIELD,
-                f"compute_step '{step_name}' 的 case_when.branches 必须是非空列表",
-            )
-
-        branches: list[CaseWhenBranchDecl] = []
-        for bi, rb in enumerate(raw_branches):
-            if isinstance(rb, dict):
-                # 字符串模式：when/then 字段
-                if "when" in rb and "then" in rb:
-                    branches.append(CaseWhenBranchDecl(when=rb["when"], then=rb["then"]))
-                # 类型化模式：condition_column/condition_operator/condition_value/result_column
-                elif "condition_column" in rb:
-                    branches.append(CaseWhenBranchDecl(
-                        condition_column=rb.get("condition_column", ""),
-                        condition_operator=rb.get("condition_operator", "="),
-                        condition_value=str(rb.get("condition_value", "")),
-                        result_column=rb.get("result_column", ""),
-                    ))
+        if isinstance(raw_branches, list) and len(raw_branches) > 0:
+            branches: list[CaseWhenBranchDecl] = []
+            for bi, rb in enumerate(raw_branches):
+                if isinstance(rb, dict):
+                    # 字符串模式：when/then 字段
+                    if "when" in rb and "then" in rb:
+                        branches.append(
+                            CaseWhenBranchDecl(when=rb["when"], then=rb["then"])
+                        )
+                    # 类型化模式：condition_column/condition_operator/condition_value/result_column
+                    elif "condition_column" in rb:
+                        branches.append(CaseWhenBranchDecl(
+                            condition_column=rb.get("condition_column", ""),
+                            condition_operator=rb.get("condition_operator", "="),
+                            condition_value=str(rb.get("condition_value", "")),
+                            result_column=rb.get("result_column", ""),
+                        ))
+                    else:
+                        raise ParseError(
+                            ParseErrorCode.E002_MISSING_REQUIRED_FIELD,
+                            f"compute_step '{step_name}' 的 case_when 分支[{bi}] "
+                            f"需提供 when/then（字符串模式）或 condition_column/...（类型化模式）",
+                        )
                 else:
                     raise ParseError(
-                        ParseErrorCode.E002_MISSING_REQUIRED_FIELD,
-                        f"compute_step '{step_name}' 的 case_when 分支[{bi}] "
-                        f"需提供 when/then（字符串模式）或 condition_column/...  （类型化模式）",
+                        ParseErrorCode.E001_YAML_PARSE_FAILED,
+                        f"compute_step '{step_name}' 的 case_when 分支[{bi}] 必须是字典",
                     )
-            else:
-                raise ParseError(
-                    ParseErrorCode.E001_YAML_PARSE_FAILED,
-                    f"compute_step '{step_name}' 的 case_when 分支[{bi}] 必须是字典",
-                )
+            return CaseWhenDecl(
+                branches=branches,
+                else_value=raw_cw.get("else_value") or raw_cw.get("else_label"),
+                output_column=raw_cw.get("output_column", ""),
+                evaluation_phase=raw_cw.get("evaluation_phase"),
+            )
 
-        return CaseWhenDecl(
-            branches=branches,
-            else_value=raw_cw.get("else_value") or raw_cw.get("else_label"),
-            output_column=raw_cw.get("output_column", ""),
+        # ── 分支 B：typed_branches（类型化 LabelPredicateBranch 分支）──
+        raw_typed = raw_cw.get("typed_branches", [])
+        if isinstance(raw_typed, list) and len(raw_typed) > 0:
+            typed_branches: list[LabelPredicateBranch] = []
+            for bi, rt in enumerate(raw_typed):
+                if not isinstance(rt, dict):
+                    raise ParseError(
+                        ParseErrorCode.E001_YAML_PARSE_FAILED,
+                        f"compute_step '{step_name}' 的 case_when.typed_branches[{bi}] 必须是字典",
+                    )
+                try:
+                    typed_branches.append(
+                        LabelPredicateBranch.model_validate(rt)
+                    )
+                except Exception as exc:
+                    raise ParseError(
+                        ParseErrorCode.E001_YAML_PARSE_FAILED,
+                        f"compute_step '{step_name}' 的 case_when.typed_branches[{bi}] "
+                        f"不符合 LabelPredicateBranch 格式: {exc}",
+                    )
+            return CaseWhenDecl(
+                branches=[],
+                typed_branches=typed_branches,
+                else_value=raw_cw.get("else_value") or raw_cw.get("else_label"),
+                output_column=raw_cw.get("output_column", ""),
+                evaluation_phase=raw_cw.get("evaluation_phase"),
+            )
+
+        # ── 既无 branches 也无 typed_branches → 报错 ──
+        raise ParseError(
+            ParseErrorCode.E002_MISSING_REQUIRED_FIELD,
+            f"compute_step '{step_name}' 的 case_when "
+            f"必须提供 branches（非空列表）或 typed_branches（非空列表）",
         )
 
     def _parse_expressions_raw(
