@@ -1072,7 +1072,11 @@ class DeveloperSpecParser:
                     or (isinstance(source_raw, list) and "input" in source_raw)
                 )
                 if _has_input_source and input_col is not None:
-                    normalized_input = self._normalizer.normalize(input_col)
+                    # 剥离表前缀（如 cd.crash_id → crash_id）再归一化——
+                    # normalize() 会移除 "." 导致 cd.crash_id → cdcrash_id，
+                    # 无法匹配 declared_cols 中的纯列名 crash_id
+                    col_name_only = input_col.split(".", 1)[-1] if "." in input_col else input_col
+                    normalized_input = self._normalizer.normalize(col_name_only)
                     if normalized_input not in declared_cols:
                         raise ParseError(
                             ParseErrorCode.E004_UNDECLARED_FIELD_REF,
@@ -1193,10 +1197,11 @@ class DeveloperSpecParser:
             branches: list[CaseWhenBranchDecl] = []
             for bi, rb in enumerate(raw_branches):
                 if isinstance(rb, dict):
-                    # 字符串模式：when/then 字段
-                    if "when" in rb and "then" in rb:
+                    # 字符串模式：when/then 或 condition/then（condition 为 when 的别名）
+                    condition_expr = rb.get("when") or rb.get("condition")
+                    if condition_expr and "then" in rb:
                         branches.append(
-                            CaseWhenBranchDecl(when=rb["when"], then=rb["then"])
+                            CaseWhenBranchDecl(when=condition_expr, then=rb["then"])
                         )
                     # 类型化模式：condition_column/condition_operator/condition_value/result_column
                     elif "condition_column" in rb:
@@ -1210,7 +1215,7 @@ class DeveloperSpecParser:
                         raise ParseError(
                             ParseErrorCode.E002_MISSING_REQUIRED_FIELD,
                             f"compute_step '{step_name}' 的 case_when 分支[{bi}] "
-                            f"需提供 when/then（字符串模式）或 condition_column/...（类型化模式）",
+                            f"需提供 when/then、condition/then（字符串模式）或 condition_column/...（类型化模式）",
                         )
                 else:
                     raise ParseError(

@@ -577,18 +577,20 @@ class SqlBuildPlanBuilder:
                 up_col_map = {c.normalized_name for c in upstream_cols}
                 scan_cols: list[ColumnRef] = []
                 for gb in cs.group_by:
-                    gb_norm = self._normalizer.normalize(gb)
+                    col_name = gb.split(".", 1)[-1] if "." in gb else gb
+                    gb_norm = self._normalizer.normalize(col_name)
                     if gb_norm in up_col_map:
                         scan_cols.append(ColumnRef(
-                            table_ref=temp_ref, column_name=gb,
+                            table_ref=temp_ref, column_name=col_name,
                             normalized_name=gb_norm,
                         ))
                 for m in cs.metrics:
                     if m.input_column:
-                        m_norm = self._normalizer.normalize(m.input_column)
+                        col_name = m.input_column.split(".", 1)[-1] if "." in m.input_column else m.input_column
+                        m_norm = self._normalizer.normalize(col_name)
                         if m_norm in up_col_map:
                             scan_cols.append(ColumnRef(
-                                table_ref=temp_ref, column_name=m.input_column,
+                                table_ref=temp_ref, column_name=col_name,
                                 normalized_name=m_norm,
                             ))
                 if not scan_cols:
@@ -1096,7 +1098,9 @@ class SqlBuildPlanBuilder:
         seen: set[str] = set()
         cols: list[ColumnRef] = []
 
-        def _add(col_name: str) -> None:
+        def _add(col_ref: str) -> None:
+            # 剥离表前缀："cd.crash_id" → "crash_id"（normalize 会移除 "." 产生错误匹配）
+            col_name = col_ref.split(".", 1)[-1] if "." in col_ref else col_ref
             normalized = self._normalizer.normalize(col_name)
             if normalized not in seen:
                 seen.add(normalized)
@@ -1150,7 +1154,9 @@ class SqlBuildPlanBuilder:
         # 只保留该表拥有的列——用 sorted 保证确定性
         cols: list[ColumnRef] = []
         seen: set[str] = set()
-        for col_name in sorted(needed):
+        for col_ref in sorted(needed):
+            # 剥离表前缀再归一化——normalize 会移除 "." 导致 "cd.crash_id"→"cdcrash_id"
+            col_name = col_ref.split(".", 1)[-1] if "." in col_ref else col_ref
             normalized = self._normalizer.normalize(col_name)
             if normalized in declared and normalized not in seen:
                 seen.add(normalized)
@@ -1175,10 +1181,12 @@ class SqlBuildPlanBuilder:
                 source_table = cs.source
         group_cols: list[ColumnRef] = []
         for gb in cs.group_by:
-            normalized = self._normalizer.normalize(gb)
+            # 剥离表前缀："cd.borough" → "borough"（ColumnRef.column_name 不接受 "."）
+            col_name = gb.split(".", 1)[-1] if "." in gb else gb
+            normalized = self._normalizer.normalize(col_name)
             group_cols.append(ColumnRef(
                 table_ref=source_table,
-                column_name=gb,
+                column_name=col_name,
                 normalized_name=normalized,
             ))
 
@@ -1298,16 +1306,18 @@ class SqlBuildPlanBuilder:
 
         # GROUP BY 键
         for gb in cs.group_by:
-            gb_norm = self._normalizer.normalize(gb)
+            # 剥离表前缀："cd.borough" → "borough"（ColumnRef.column_name 不接受 "."）
+            col_name = gb.split(".", 1)[-1] if "." in gb else gb
+            gb_norm = self._normalizer.normalize(col_name)
             if gb_norm not in seen:
                 seen.add(gb_norm)
                 proj_cols.append(AliasExpr(
                     expression=ColumnRef(
                         table_ref=default_table_ref,
-                        column_name=gb,
+                        column_name=col_name,
                         normalized_name=gb_norm,
                     ),
-                    alias=gb,
+                    alias=col_name,
                 ))
 
         # 指标
@@ -3140,7 +3150,10 @@ class SqlBuildPlanBuilder:
         seen: set[str] = set()
         cols: list[ColumnRef] = []
 
-        def _add(col_name: str) -> None:
+        def _add(col_ref: str) -> None:
+            # 剥离表前缀："cd.crash_id" → "crash_id"（ColumnRef.column_name 不接受 "."）
+            # normalize() 会移除 "." 导致 "cd.crash_id"→"cdcrash_id" 无法匹配 declared_cols
+            col_name = col_ref.split(".", 1)[-1] if "." in col_ref else col_ref
             normalized = self._normalizer.normalize(col_name)
             if normalized in declared and normalized not in seen:
                 seen.add(normalized)
