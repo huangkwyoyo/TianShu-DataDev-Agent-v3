@@ -9,6 +9,7 @@
 
 import os
 from functools import lru_cache
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,7 +24,7 @@ from tianshu_datadev.planning.sql_program import (
     topological_sort,
     validate_program_dag,
 )
-from tianshu_datadev.planning.temp_table import TempTableSpec
+from tianshu_datadev.planning.temp_table import TempTableSpec, make_temp_name
 
 # ── 辅助函数 ──
 
@@ -121,6 +122,82 @@ def _make_statement_with_temp_refs(
         depends_on=depends_on or [],
         produces=produces,
     )
+
+
+def test_bridge_temp_identity_matches_consumer_reference():
+    """桥接 Producer、Consumer 与 TempTableSpec 必须共享同一 temp_id。"""
+    chain_id = "c9bba4f6"
+    bridge_name = "__bridge_td_tz_zone_risk_assessment"
+    bridge_plan_id = (
+        "plan_ca3d3e653497_c9bba4f6_bridge_"
+        "td_tz_zone_risk_assessment"
+    )
+    first_plan = _cached_base_plan().model_copy(
+        deep=True,
+        update={"plan_id": "plan_ca3d3e653497_c9bba4f6_0"},
+    )
+    bridge_plan = _cached_base_plan().model_copy(
+        deep=True,
+        update={"plan_id": bridge_plan_id},
+    )
+    expected_temp = make_temp_name(chain_id, bridge_name)
+    final_plan = _cached_base_plan().model_copy(
+        deep=True,
+        update={
+            "plan_id": "plan_ca3d3e653497_c9bba4f6_1",
+            "steps": [
+                ScanStep(
+                    step_id="scan_bridge",
+                    table_ref=expected_temp,
+                    required_columns=[
+                        ColumnRef(
+                            table_ref=expected_temp,
+                            column_name="borough",
+                            normalized_name="borough",
+                        )
+                    ],
+                ),
+            ],
+        },
+    )
+    spec = SimpleNamespace(
+        compute_steps=[
+            SimpleNamespace(
+                step_name="zone_crash_stats",
+                source="input",
+            ),
+            SimpleNamespace(
+                step_name="zone_risk_assessment",
+                source=["zone_crash_stats", bridge_name],
+            ),
+        ],
+        output_spec=None,
+        spec_hash="ca3d3e653497",
+    )
+
+    program = SqlProgramBuilder().build_from_compute_steps(
+        [first_plan, bridge_plan, final_plan],
+        spec,
+        chain_id,
+    )
+
+    bridge_statement = next(
+        s for s in program.statements if s.statement_id == bridge_plan_id
+    )
+    bridge_temp = next(
+        t for t in program.temp_tables if t.produced_by == bridge_plan_id
+    )
+    final_statement = next(
+        s for s in program.statements
+        if s.statement_id == "plan_ca3d3e653497_c9bba4f6_1"
+    )
+
+    assert bridge_statement.produces == expected_temp
+    assert bridge_temp.temp_id == expected_temp
+    assert bridge_temp.consumed_by == [final_statement.statement_id]
+    assert bridge_plan_id in final_statement.depends_on
+    questions = validate_program_dag(program)
+    assert not [q for q in questions if q.blocking]
 
 
 # ════════════════════════════════════════════

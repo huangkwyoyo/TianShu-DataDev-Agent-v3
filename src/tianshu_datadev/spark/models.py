@@ -191,6 +191,17 @@ class SparkRatioExpr(StrictModel):
     multiplier: Literal[1, 100] = 1
 
 
+class SparkArithmeticExpression(StrictModel):
+    """Spark 侧封闭算术表达式。"""
+
+    kind: Literal["column", "literal", "binary", "null_if_zero"]
+    column_name: str | None = None
+    value: int | float | None = None
+    operator: Literal["ADD", "SUBTRACT", "MULTIPLY", "DIVIDE"] | None = None
+    left: "SparkArithmeticExpression | None" = None
+    right: "SparkArithmeticExpression | None" = None
+
+
 class SparkProjectColumn(StrictModel):
     """单个投影列——映射 ContractOutputColumn。"""
 
@@ -198,6 +209,7 @@ class SparkProjectColumn(StrictModel):
     alias: str  # 输出别名
     source_alias: str = ""  # Join 后同名列的来源 DataFrame 别名
     ratio_expr: SparkRatioExpr | None = None
+    arithmetic_expression: SparkArithmeticExpression | None = None
 
 
 class SparkCaseWhenStep(StrictModel):

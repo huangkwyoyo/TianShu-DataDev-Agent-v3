@@ -116,6 +116,17 @@ class ContractRatioExpr(StrictModel):
     multiplier: Literal[1, 100] = 1
 
 
+class ContractArithmeticExpression(StrictModel):
+    """封闭算术表达式，仅允许列、数值字面量和四则运算。"""
+
+    kind: Literal["column", "literal", "binary", "null_if_zero"]
+    column_name: str | None = None
+    value: int | float | None = None
+    operator: Literal["ADD", "SUBTRACT", "MULTIPLY", "DIVIDE"] | None = None
+    left: "ContractArithmeticExpression | None" = None
+    right: "ContractArithmeticExpression | None" = None
+
+
 class ContractOutputColumn(StrictModel):
     """Contract 中的输出列——精简自 ProjectStep。"""
 
@@ -123,6 +134,7 @@ class ContractOutputColumn(StrictModel):
     alias: str  # 输出别名
     data_type: str | None = None  # 推断的数据类型
     source_table_ref: str = ""  # 原始来源表别名；用于 Join 后同名列消歧
+    arithmetic_expression: ContractArithmeticExpression | None = None
 
 
 class ContractSort(StrictModel):
@@ -257,6 +269,28 @@ class WindowSpecSummary(StrictModel):
     order_by: list[str] = []  # 排序键及方向，如 "trip_count DESC"
 
 
+class StatementTransformContract(StrictModel):
+    """SqlProgram 单条语句的结构化转换契约。"""
+
+    statement_id: str
+    depends_on: list[str] = Field(default_factory=list)
+    produces: str | None = None
+    input_tables: list[ContractInputTable] = Field(default_factory=list)
+    input_temp_tables: list[str] = Field(default_factory=list)
+    filters: list[ContractPredicate] = Field(default_factory=list)
+    join_relationships: list[ContractJoin] = Field(default_factory=list)
+    aggregations: list[ContractAggregation] = Field(default_factory=list)
+    derived_columns: list[ContractDerivedColumn] = Field(default_factory=list)
+    grouping_keys: list[str] = Field(default_factory=list)
+    output_columns: list[ContractOutputColumn] = Field(default_factory=list)
+    sort_spec: list[ContractSort] | None = None
+    limit_spec: ContractLimit | None = None
+    case_when_labels: list[CaseWhenLabelSpec] = Field(default_factory=list)
+    window_specs: list[WindowSpecSummary] = Field(default_factory=list)
+    time_transforms: list[ContractTimeTransform] = Field(default_factory=list)
+    ratio_specs: dict[str, ContractRatioExpr] = Field(default_factory=dict)
+
+
 class DataTransformContractV1(StrictModel):
     """DataTransformContract v1——从 SqlProgram 确定性抽取的完整业务规格。
 
@@ -297,6 +331,9 @@ class DataTransformContractV1(StrictModel):
     window_specs: list[WindowSpecSummary] = []
     time_transforms: list[ContractTimeTransform] = []
     ratio_specs: dict[str, ContractRatioExpr] = Field(default_factory=dict)
+    statement_contracts: list[StatementTransformContract] = Field(
+        default_factory=list
+    )
     write_spec: dict | None = None  # FinalWritePlan 序列化 dict
 
     @staticmethod

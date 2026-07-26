@@ -1284,9 +1284,12 @@ class DeveloperSpecParser:
                     ParseErrorCode.E001_YAML_PARSE_FAILED,
                     f"compute_step '{step_name}' 的 expressions[{ei}] 必须是字典",
                 )
+            # formula 为 expression 的业务别名——程序员自然使用 "formula" 表示计算公式
+            expr_text = raw_expr.get("expression") or raw_expr.get("formula", "")
+            expr_name = raw_expr.get("name") or raw_expr.get("alias", "")
             exprs.append(ComputeStepExpression(
-                name=raw_expr.get("name", ""),
-                expression=raw_expr.get("expression", ""),
+                name=expr_name,
+                expression=expr_text,
                 type=raw_expr.get("type", "double"),
             ))
         return exprs

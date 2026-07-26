@@ -12,6 +12,7 @@ import pytest
 from tianshu_datadev.planning.models import ColumnRef
 from tianshu_datadev.planning.temp_table import (
     TempTableSpec,
+    make_temp_name,
     validate_consumer_is_declared,
     validate_temp_table_naming,
     validate_temp_table_refs,
@@ -69,6 +70,42 @@ class TestTempTableNaming:
         validate_temp_table_naming("_temp_my_table_123")
         validate_temp_table_naming("_temp_Abc_456_def")
         validate_temp_table_naming("_temp_X")
+
+    def test_make_temp_name_keeps_short_name_readable(self):
+        """短名称保持既有格式，避免无意义的 artifact hash 变化。"""
+        assert make_temp_name("c9bba4f6", "aggregate") == (
+            "_temp_cc9bba4f6_aggregate"
+        )
+
+    def test_make_temp_name_compacts_long_internal_identifier(self):
+        """桥接计划的长内部标识应稳定压缩到安全长度。"""
+        step_identifier = (
+            "bp_ca3d3e653497_c9bba4f6_bridge_td_tz_zone_risk_assessment"
+        )
+
+        first = make_temp_name("c9bba4f6", step_identifier)
+        second = make_temp_name("c9bba4f6", step_identifier)
+
+        assert first == second
+        assert len(first) <= 64
+        assert first.startswith("_temp_cc9bba4f6_bp_ca3d3e653497")
+        validate_temp_table_naming(first)
+
+    def test_make_temp_name_hash_distinguishes_long_identifiers(self):
+        """共享长前缀的不同步骤不能压缩为同一个临时表名。"""
+        shared = "bridge_" + "a" * 80
+
+        left = make_temp_name("deadbeef", f"{shared}_left")
+        right = make_temp_name("deadbeef", f"{shared}_right")
+
+        assert left != right
+
+    def test_make_temp_name_rejects_illegal_suffix_beyond_limit(self):
+        """截断前校验完整输入，禁止隐藏尾部非法字符。"""
+        malicious = "a" * 80 + ";drop"
+
+        with pytest.raises(ValueError, match="包含非法字符"):
+            make_temp_name("deadbeef", malicious)
 
     def test_pydantic_field_rejects_injection_at_model_level(self):
         """Pydantic Field 约束在模型构造时即拒绝注入标识符。"""

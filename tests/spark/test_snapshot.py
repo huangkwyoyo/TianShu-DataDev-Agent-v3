@@ -176,6 +176,91 @@ class TestWarehouseSnapshotMaterialization:
                 sampling=SamplingSpec(mode="head", limit=2),
             )
 
+    def test_partial_join_graph_snaps_disconnected_components(self, tmp_path):
+        """Join 图部分连通时——连通分支正常级联，孤立表独立快照。
+
+        模拟 Case04 场景：3 张表，只有 td→tz 有 Join，cd 孤立。
+        不应因 Join 图不连通而抛异常，各分支独立快照。
+        """
+        import duckdb
+        import pyarrow.parquet as pq
+
+        db_path = tmp_path / "partial.duckdb"
+        con = duckdb.connect(str(db_path))
+        try:
+            con.execute("CREATE SCHEMA silver")
+            # cd 分支（孤立——无 Join）
+            con.execute(
+                "CREATE TABLE silver.crash_detail AS "
+                "SELECT * FROM (VALUES "
+                "(1, 'Manhattan', 2), "
+                "(2, 'Brooklyn', 0), "
+                "(3, 'Queens', 1), "
+                "(4, 'Bronx', 3)"
+                ") AS t(crash_id, borough, persons_injured)"
+            )
+            # td 分支（与 tz 连通）
+            con.execute(
+                "CREATE TABLE silver.trip_detail AS "
+                "SELECT * FROM (VALUES "
+                "(1, 10, 15.0), "
+                "(2, 20, 25.0), "
+                "(3, 10, 30.0), "
+                "(4, 30, 12.0)"
+                ") AS t(trip_id, pickup_location_id, fare_amount)"
+            )
+            con.execute(
+                "CREATE TABLE silver.taxi_zone AS "
+                "SELECT * FROM (VALUES "
+                "(10, 'Manhattan'), "
+                "(20, 'Brooklyn'), "
+                "(30, 'Queens')"
+                ") AS t(location_id, borough)"
+            )
+        finally:
+            con.close()
+
+        builder = SnapshotBuilder(str(tmp_path / "snapshots"))
+        manifest = builder.materialize_warehouse_tables(
+            contract_hash="f" * 64,
+            source_tables=[
+                "silver.crash_detail",
+                "silver.trip_detail",
+                "silver.taxi_zone",
+            ],
+            duckdb_path=str(db_path),
+            joins=[{
+                "left_table": "td",
+                "right_table": "tz",
+                "left_key": "pickup_location_id",
+                "right_key": "location_id",
+                "join_type": "INNER",
+            }],
+            table_aliases={
+                "silver.crash_detail": "cd",
+                "silver.trip_detail": "td",
+                "silver.taxi_zone": "tz",
+            },
+            sampling=SamplingSpec(mode="head", limit=10),
+            memory_limit="128MB",
+            max_temp_directory_size="128MB",
+        )
+
+        # 三张表都应被快照
+        files = {item.source_name: item for item in manifest.files}
+        assert len(files) == 3
+
+        # cd 独立快照——所有 4 行都保留
+        cd_rows = pq.read_table(files["cd"].file_path)
+        assert cd_rows.num_rows == 4
+
+        # td → tz 级联——tz 只保留 td 中命中的 location_id（10, 20, 30）
+        td_rows = pq.read_table(files["td"].file_path)
+        assert td_rows.num_rows == 4
+        tz_rows = pq.read_table(files["tz"].file_path)
+        tz_ids = tz_rows.column("location_id").to_pylist()
+        assert set(tz_ids) == {10, 20, 30}
+
     def test_anchor_time_filter_precedes_limit_and_cascades_join_keys(self, tmp_path):
         """时间过滤必须先于 LIMIT，维表仍按过滤后的锚点键级联。"""
         import duckdb
@@ -1267,6 +1352,60 @@ class TestSnapshotBuilderAliases:
                 "tz_do": "silver.taxi_zone.parquet",
                 "tz_pu": "silver.taxi_zone.parquet",
             }
+
+    def test_snapshot_join_graph_excludes_derived_result_joins(self):
+        """快照只消费物理输入 Join，派生合流 Join 留给 Spark。"""
+        from tianshu_datadev.artifacts.models import (
+            ContractInputTable,
+            ContractJoin,
+            DataTransformContractLite,
+        )
+
+        contract = DataTransformContractLite(
+            contract_id="contract_derived_join",
+            source_sqlbuildplan_hash="plan_hash",
+            input_tables=[
+                ContractInputTable(table_ref="cd", source_table="crash_detail"),
+                ContractInputTable(table_ref="td", source_table="trip_detail"),
+                ContractInputTable(table_ref="tz", source_table="taxi_zone"),
+            ],
+            join_relationships=[
+                ContractJoin(
+                    join_id="join_cd_tz",
+                    left_table="cd",
+                    right_table="tz",
+                    left_key="borough",
+                    right_key="borough",
+                    join_type="INNER",
+                    level="MEDIUM",
+                ),
+                ContractJoin(
+                    join_id="join_td_tz",
+                    left_table="td",
+                    right_table="tz",
+                    left_key="pickup_location_id",
+                    right_key="location_id",
+                    join_type="INNER",
+                    level="MEDIUM",
+                ),
+                ContractJoin(
+                    join_id="join_derived_results",
+                    left_table="",
+                    right_table="tz",
+                    left_key="borough",
+                    right_key="borough",
+                    join_type="INNER",
+                    level="MEDIUM",
+                ),
+            ],
+        )
+
+        joins = Pipeline._snapshot_source_joins(contract)
+
+        assert [join["join_id"] for join in joins] == [
+            "join_cd_tz",
+            "join_td_tz",
+        ]
 
     def test_build_without_aliases_keeps_physical_source_name(self):
         """未提供 table_aliases——source_name 回退物理名（向后兼容）。"""

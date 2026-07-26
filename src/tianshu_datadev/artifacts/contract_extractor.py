@@ -6,11 +6,15 @@
 
 from __future__ import annotations
 
+import ast
+import re
+
 from tianshu_datadev.planning.models import (
     ColumnRef,
     DatePartExpression,
     DerivedGroupKey,
     RatioExpr,
+    SqlRawExpression,
     TimeTransformExpr,
 )
 from tianshu_datadev.planning.relationship_hypothesis import RelationshipEvidence
@@ -26,7 +30,7 @@ from tianshu_datadev.planning.sql_build_plan import (
     SqlBuildPlan,
     WindowStep,
 )
-from tianshu_datadev.planning.sql_program import SqlProgram
+from tianshu_datadev.planning.sql_program import SqlProgram, SqlStatement
 from tianshu_datadev.sql.write_plan import FinalWritePlan
 
 from .models import (
@@ -34,6 +38,7 @@ from .models import (
     CaseWhenCondition,
     CaseWhenLabelSpec,
     ContractAggregation,
+    ContractArithmeticExpression,
     ContractColumn,
     ContractDerivedColumn,
     ContractInputTable,
@@ -46,6 +51,7 @@ from .models import (
     ContractTimeTransform,
     DataTransformContractLite,
     DataTransformContractV1,
+    StatementTransformContract,
     WindowSpecSummary,
 )
 
@@ -497,6 +503,7 @@ class DataTransformContractExtractor:
         cols: list[ContractOutputColumn] = []
         for ae in step.columns:
             expression = ae.expression
+            arithmetic_expression = None
             if isinstance(expression, ColumnRef):
                 expression = DataTransformContractExtractor._resolve_column_lineage(
                     expression,
@@ -507,6 +514,14 @@ class DataTransformContractExtractor:
             elif isinstance(expression, RatioExpr):
                 col_name = ae.alias
                 source_table_ref = ""
+            elif isinstance(expression, SqlRawExpression):
+                col_name = ae.alias
+                source_table_ref = ""
+                arithmetic_expression = (
+                    DataTransformContractExtractor._parse_arithmetic_expression(
+                        expression.sql_fragment
+                    )
+                )
             else:
                 col_name = str(expression)
                 source_table_ref = ""
@@ -516,9 +531,67 @@ class DataTransformContractExtractor:
                     alias=ae.alias,
                     data_type="unknown",
                     source_table_ref=source_table_ref,
+                    arithmetic_expression=arithmetic_expression,
                 )
             )
         return cols
+
+    @staticmethod
+    def _parse_arithmetic_expression(
+        expression: str,
+    ) -> ContractArithmeticExpression:
+        """将受控公式转换为封闭 AST，拒绝函数调用和任意语法。"""
+        operator_map = {
+            ast.Add: "ADD",
+            ast.Sub: "SUBTRACT",
+            ast.Mult: "MULTIPLY",
+            ast.Div: "DIVIDE",
+        }
+
+        def convert(node: ast.AST) -> ContractArithmeticExpression:
+            if isinstance(node, ast.Name):
+                return ContractArithmeticExpression(
+                    kind="column",
+                    column_name=node.id,
+                )
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, (int, float))
+                and not isinstance(node.value, bool)
+            ):
+                return ContractArithmeticExpression(
+                    kind="literal",
+                    value=node.value,
+                )
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id.upper() == "NULLIF"
+                and len(node.args) == 2
+                and not node.keywords
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == 0
+            ):
+                return ContractArithmeticExpression(
+                    kind="null_if_zero",
+                    left=convert(node.args[0]),
+                )
+            if isinstance(node, ast.BinOp) and type(node.op) in operator_map:
+                return ContractArithmeticExpression(
+                    kind="binary",
+                    operator=operator_map[type(node.op)],
+                    left=convert(node.left),
+                    right=convert(node.right),
+                )
+            raise ValueError(
+                "派生公式仅支持列、数字字面量、括号和 + - * / 四则运算"
+            )
+
+        try:
+            parsed = ast.parse(expression, mode="eval")
+        except SyntaxError as exc:
+            raise ValueError(f"派生公式语法无效: {expression!r}") from exc
+        return convert(parsed.body)
 
     @staticmethod
     def _extract_ratio_specs(
@@ -688,6 +761,7 @@ class DataTransformContractExtractor:
         step_dag: dict[str, list[str]] = {}
         case_when_labels: list[CaseWhenLabelSpec] = []
         window_specs: list[WindowSpecSummary] = []
+        statement_contracts: list[StatementTransformContract] = []
 
         # 遍历所有 statement，按优先级聚合：
         # - 最终 statement（FINAL/STANDALONE）的 sort/limit 优先
@@ -696,6 +770,9 @@ class DataTransformContractExtractor:
             plan = stmt.plan
             sid = stmt.statement_id
             window_seen = False
+            statement_contracts.append(
+                self._extract_statement_contract(stmt, evidence_map)
+            )
 
             # 从当前 plan 的 AggregateStep 构建 derived_expr_map
             derived_expr_map: dict[str, TimeTransformExpr] = {}
@@ -811,12 +888,74 @@ class DataTransformContractExtractor:
             temp_tables=temp_tables,
             case_when_labels=case_when_labels,
             window_specs=window_specs,
+            statement_contracts=statement_contracts,
             write_spec=write_plan.model_dump() if write_plan else None,
         )
 
         return contract
 
     # ── v1 专用 Step 抽取辅助 ──
+
+    def _extract_statement_contract(
+        self,
+        stmt: SqlStatement,
+        evidence_map: dict[str, RelationshipEvidence],
+    ) -> StatementTransformContract:
+        """逐语句保留转换边界，供 Spark 按 SqlProgram DAG 构建分支。"""
+        lite = self.extract(stmt.plan, evidence_map=evidence_map)
+        temp_inputs = [
+            step.table_ref
+            for step in stmt.plan.steps
+            if isinstance(step, ScanStep) and step.table_ref.startswith("_temp_")
+        ]
+        physical_inputs = [
+            table
+            for table in lite.input_tables
+            if not table.table_ref.startswith("_temp_")
+        ]
+        case_when_labels = [
+            spec.model_copy(update={"statement_id": stmt.statement_id})
+            for spec in lite.case_when_labels
+        ]
+        window_specs = [
+            spec.model_copy(update={"statement_id": stmt.statement_id})
+            for spec in lite.window_specs
+        ]
+        grouping_keys = list(lite.grouping_keys)
+        group_index = 0
+        for step in stmt.plan.steps:
+            if not isinstance(step, AggregateStep):
+                continue
+            for group_key in step.group_keys:
+                if (
+                    isinstance(group_key, ColumnRef)
+                    and group_key.table_ref.startswith("_temp_")
+                    and group_index < len(grouping_keys)
+                ):
+                    grouping_keys[group_index] = (
+                        f"{group_key.table_ref}.{group_key.column_name}"
+                    )
+                group_index += 1
+
+        return StatementTransformContract(
+            statement_id=stmt.statement_id,
+            depends_on=list(stmt.depends_on),
+            produces=stmt.produces,
+            input_tables=physical_inputs,
+            input_temp_tables=list(dict.fromkeys(temp_inputs)),
+            filters=list(lite.filters),
+            join_relationships=list(lite.join_relationships),
+            aggregations=list(lite.aggregations),
+            derived_columns=list(lite.derived_columns),
+            grouping_keys=grouping_keys,
+            output_columns=list(lite.output_columns),
+            sort_spec=lite.sort_spec,
+            limit_spec=lite.limit_spec,
+            case_when_labels=case_when_labels,
+            window_specs=window_specs,
+            time_transforms=list(lite.time_transforms),
+            ratio_specs=dict(lite.ratio_specs),
+        )
 
     @staticmethod
     def _extract_case_when_v1(
@@ -864,13 +1003,13 @@ class DataTransformContractExtractor:
                 # Spark compiler 遇到 COMPLEX_RAW 时会抛出 RenderError 阻断——
                 # 这是预期行为：复杂表达式当前不走结构化 contract 路径。
                 raw_text = (
-                    branch.raw_condition.sql_fragment[:200]
+                    branch.raw_condition.sql_fragment
                     if branch.raw_condition is not None and hasattr(branch.raw_condition, "sql_fragment")
                     else ""
                 )
-                cond = CaseWhenCondition(
-                    operator="COMPLEX_RAW",
-                    normalized_name=raw_text,
+                cond = (
+                    DataTransformContractExtractor
+                    ._parse_case_when_boolean_expression(raw_text)
                 )
             label = str(branch.result.value) if hasattr(branch.result, "value") else ""
             branches_spec.append(CaseWhenBranchSpec(label=label, condition=cond))
@@ -888,6 +1027,65 @@ class DataTransformContractExtractor:
         ]
 
     # ── Predicate → CaseWhenCondition 转换辅助 ──
+
+    @staticmethod
+    def _parse_case_when_boolean_expression(
+        expression: str,
+    ) -> CaseWhenCondition:
+        """解析受控布尔公式，仅接受列与字面量比较及 AND/OR。"""
+        normalized = re.sub(r"\bAND\b", "and", expression, flags=re.IGNORECASE)
+        normalized = re.sub(r"\bOR\b", "or", normalized, flags=re.IGNORECASE)
+        normalized = normalized.replace("<>", "!=")
+        normalized = re.sub(r"(?<![<>=!])=(?!=)", "==", normalized)
+        compare_operators = {
+            ast.Eq: "EQ",
+            ast.NotEq: "NEQ",
+            ast.Gt: "GT",
+            ast.GtE: "GTE",
+            ast.Lt: "LT",
+            ast.LtE: "LTE",
+        }
+
+        def convert(node: ast.AST) -> CaseWhenCondition:
+            if isinstance(node, ast.BoolOp) and isinstance(
+                node.op, (ast.And, ast.Or)
+            ):
+                operator = "AND" if isinstance(node.op, ast.And) else "OR"
+                children = [convert(value) for value in node.values]
+                result = children[0]
+                for child in children[1:]:
+                    result = CaseWhenCondition(
+                        operator=operator,
+                        left=result,
+                        right=child,
+                    )
+                return result
+            if (
+                isinstance(node, ast.Compare)
+                and len(node.ops) == 1
+                and len(node.comparators) == 1
+                and isinstance(node.left, ast.Name)
+                and type(node.ops[0]) in compare_operators
+                and isinstance(node.comparators[0], ast.Constant)
+                and isinstance(
+                    node.comparators[0].value,
+                    (str, int, float, bool),
+                )
+            ):
+                return CaseWhenCondition(
+                    operator=compare_operators[type(node.ops[0])],
+                    normalized_name=node.left.id,
+                    value=node.comparators[0].value,
+                )
+            raise ValueError(
+                "标签条件仅支持列与字面量比较，以及 AND/OR 组合"
+            )
+
+        try:
+            parsed = ast.parse(normalized, mode="eval")
+        except SyntaxError as exc:
+            raise ValueError(f"标签条件语法无效: {expression!r}") from exc
+        return convert(parsed.body)
 
     @staticmethod
     def _extract_column_ref(col) -> tuple[str, str]:

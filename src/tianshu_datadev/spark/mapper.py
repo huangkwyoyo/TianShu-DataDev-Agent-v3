@@ -30,6 +30,7 @@ from tianshu_datadev.artifacts.models import (
     ContractSort,
     ContractTimeTransform,
     DataTransformContractV1,
+    StatementTransformContract,
     WindowSpecSummary,
 )
 
@@ -38,6 +39,7 @@ from .models import (
     SparkAggFunction,
     SparkAggregateSpec,
     SparkAggregateStep,
+    SparkArithmeticExpression,
     SparkCaseWhenBranch,
     SparkCaseWhenStep,
     SparkDerivedGroupKey,
@@ -123,6 +125,14 @@ def map_contract_to_spark_plan(
 
     # 计算 contract hash（用于 plan_id 派生）
     contract_hash = DataTransformContractV1.compute_contract_hash(contract)
+    if len(contract.statement_contracts) > 1:
+        return _map_statement_contracts(
+            contract,
+            contract_hash,
+            unsupported,
+            gaps,
+            warnings,
+        )
 
     # ── Step 1：输入表 → ReadStep ──
     if not contract.input_tables:
@@ -304,6 +314,218 @@ def map_contract_to_spark_plan(
 # ════════════════════════════════════════════
 # 各字段映射辅助函数
 # ════════════════════════════════════════════
+
+
+def _map_statement_contracts(
+    contract: DataTransformContractV1,
+    contract_hash: str,
+    unsupported: list[UnsupportedPattern],
+    gaps: list[ContractGap],
+    warnings: list[str],
+) -> SparkPlanMappingResult:
+    """按逐语句 Contract 映射分支，避免跨语句业务步骤被扁平化。"""
+    statements = contract.statement_contracts
+    final_statements = [stmt for stmt in statements if stmt.produces is None]
+    if len(final_statements) != 1:
+        gaps.append(
+            ContractGap(
+                gap_id="gap_program_final_statement",
+                contract_field="statement_contracts",
+                missing_info=(
+                    "多语句 Contract 必须且只能包含一个最终语句，"
+                    f"当前数量={len(final_statements)}"
+                ),
+                severity="BLOCKING",
+            )
+        )
+        return SparkPlanMappingResult(
+            success=False,
+            spark_plan=None,
+            unsupported=unsupported,
+            gaps=gaps,
+            warnings=warnings,
+        )
+
+    known_temp_aliases = {
+        stmt.produces for stmt in statements if stmt.produces is not None
+    }
+    branches: dict[str, list] = {}
+    main_steps: list = []
+    seen_statement_ids: set[str] = set()
+
+    for stmt in statements:
+        missing_dependencies = [
+            dep for dep in stmt.depends_on if dep not in seen_statement_ids
+        ]
+        if missing_dependencies:
+            gaps.append(
+                ContractGap(
+                    gap_id=f"gap_statement_order_{stmt.statement_id}",
+                    contract_field=f"statement_contracts.{stmt.statement_id}.depends_on",
+                    missing_info=(
+                        "逐语句 Contract 不是拓扑顺序，缺少前置语句: "
+                        f"{missing_dependencies}"
+                    ),
+                    severity="BLOCKING",
+                )
+            )
+            continue
+
+        steps = _map_statement_steps(stmt, unsupported, gaps)
+        _chain_input_aliases(steps)
+        if (
+            len(stmt.input_temp_tables) == 1
+            and steps
+            and not isinstance(steps[0], (SparkReadStep, SparkJoinStep))
+            and getattr(steps[0], "input_alias", "") == ""
+        ):
+            steps[0].input_alias = stmt.input_temp_tables[0]
+            _chain_input_aliases(steps)
+
+        valid_aliases = {
+            step.alias for step in steps if isinstance(step, SparkReadStep)
+        }
+        valid_aliases.update(known_temp_aliases)
+        alias_errors = _validate_step_aliases(steps, valid_aliases)
+        if alias_errors:
+            gaps.append(
+                ContractGap(
+                    gap_id=f"gap_statement_alias_{stmt.statement_id}",
+                    contract_field=f"statement_contracts.{stmt.statement_id}",
+                    missing_info="；".join(alias_errors),
+                    severity="BLOCKING",
+                )
+            )
+
+        if stmt.produces is None:
+            main_steps = steps
+        else:
+            branches[stmt.produces] = steps
+        seen_statement_ids.add(stmt.statement_id)
+
+    blocking_gaps = [gap for gap in gaps if gap.severity == "BLOCKING"]
+    if unsupported or blocking_gaps or not main_steps:
+        if not main_steps and not blocking_gaps:
+            gaps.append(
+                ContractGap(
+                    gap_id="gap_program_main_steps",
+                    contract_field="statement_contracts",
+                    missing_info="最终语句未产生可执行 Spark 步骤",
+                    severity="BLOCKING",
+                )
+            )
+        return SparkPlanMappingResult(
+            success=False,
+            spark_plan=None,
+            unsupported=unsupported,
+            gaps=gaps,
+            warnings=warnings,
+        )
+
+    plan = SparkPlan(
+        plan_id=SparkPlan.generate_plan_id(contract_hash),
+        version="v1",
+        source_phase="phase-5",
+        source_contract_hash=contract_hash,
+        source_contract_version="v1",
+        steps=main_steps,
+        branches=branches,
+        write_mode=(
+            "overwrite_partition"
+            if contract.write_spec
+            and contract.write_spec.get("type") == "partition_overwrite"
+            else None
+        ),
+    )
+    warn_gaps = [gap for gap in gaps if gap.severity == "WARN"]
+    warnings.extend(
+        f"WARN: {gap.contract_field} - {gap.missing_info}"
+        for gap in warn_gaps
+    )
+    return SparkPlanMappingResult(
+        success=True,
+        spark_plan=plan,
+        unsupported=[],
+        gaps=warn_gaps,
+        warnings=warnings,
+    )
+
+
+def _map_statement_steps(
+    statement: StatementTransformContract,
+    unsupported: list[UnsupportedPattern],
+    gaps: list[ContractGap],
+) -> list:
+    """映射单条语句，不跨越 statement 边界补链。"""
+    read_steps = _map_input_tables(statement.input_tables)
+    pre_filters = _map_filters(
+        [item for item in statement.filters if item.phase != "post_window"],
+        unsupported,
+    )
+    post_window_filters = _map_filters(
+        [item for item in statement.filters if item.phase == "post_window"],
+        unsupported,
+    )
+    join_steps = _map_joins(statement.join_relationships, unsupported)
+    aggregate_result = _map_aggregations(
+        statement.aggregations,
+        statement.grouping_keys,
+        time_transforms=statement.time_transforms,
+        derived_columns=statement.derived_columns,
+        unsupported=unsupported,
+        gaps=gaps,
+    )
+    if isinstance(aggregate_result, ContractGap):
+        gaps.append(aggregate_result)
+        aggregate_steps = []
+    elif isinstance(aggregate_result, UnsupportedPattern):
+        unsupported.append(aggregate_result)
+        aggregate_steps = []
+    else:
+        aggregate_steps = aggregate_result
+
+    project_result = _map_output_columns(
+        statement.output_columns,
+        statement.ratio_specs,
+        gaps,
+    )
+    if isinstance(project_result, ContractGap):
+        gaps.append(project_result)
+        project_steps = []
+    else:
+        project_steps = project_result
+
+    case_when_steps = _map_case_when(statement.case_when_labels)
+    pre_aggregate_case = [
+        step
+        for step in case_when_steps
+        if step.evaluation_phase == "pre_aggregate"
+    ]
+    post_aggregate_case = [
+        step
+        for step in case_when_steps
+        if step.evaluation_phase != "pre_aggregate"
+    ]
+    window_result = _map_windows(statement.window_specs, unsupported)
+    if isinstance(window_result, UnsupportedPattern):
+        unsupported.append(window_result)
+        window_steps = []
+    else:
+        window_steps = window_result
+
+    return [
+        *read_steps,
+        *pre_filters,
+        *join_steps,
+        *pre_aggregate_case,
+        *aggregate_steps,
+        *window_steps,
+        *post_aggregate_case,
+        *post_window_filters,
+        *project_steps,
+        *_map_sort(statement.sort_spec),
+        *_map_limit(statement.limit_spec),
+    ]
 
 
 def _map_input_tables(
@@ -580,6 +802,11 @@ def _map_output_columns(
                 if oc.alias in ratio_specs
                 else None
             ),
+            arithmetic_expression=(
+                _map_arithmetic_expression(oc.arithmetic_expression)
+                if oc.arithmetic_expression is not None
+                else None
+            ),
         )
         for oc in output_columns
     ]
@@ -590,6 +817,26 @@ def _map_output_columns(
             columns=columns,
         )
     ]
+
+
+def _map_arithmetic_expression(expression) -> SparkArithmeticExpression:
+    """将 Contract 算术 AST 逐节点复制到 Spark IR。"""
+    return SparkArithmeticExpression(
+        kind=expression.kind,
+        column_name=expression.column_name,
+        value=expression.value,
+        operator=expression.operator,
+        left=(
+            _map_arithmetic_expression(expression.left)
+            if expression.left is not None
+            else None
+        ),
+        right=(
+            _map_arithmetic_expression(expression.right)
+            if expression.right is not None
+            else None
+        ),
+    )
 
 
 def _map_case_when(

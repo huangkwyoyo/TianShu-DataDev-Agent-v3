@@ -683,8 +683,57 @@ class SqlProgramBuilder:
         if not steps:
             raise ValueError("compute_steps 为空")
 
+        # ── 分离桥接计划和步骤计划 ──
+        # 桥接计划的 plan_id 包含 "__bridge_" 或 "_bridge_" 标记
+        bridge_plans_list: list[SqlBuildPlan] = []
+        step_plans_list: list[SqlBuildPlan] = []
+        for plan in plans:
+            if "_bridge_" in plan.plan_id:
+                bridge_plans_list.append(plan)
+            else:
+                step_plans_list.append(plan)
+
+        # ── 构建桥接步骤名 → plan_id 映射 ──
+        # 桥接步骤名：__bridge_{needed}_{bridge}_{parent}
+        # 桥接 plan_id：plan_{spec_hash}_{chain_id}_bridge_{needed}_{bridge}_{parent}
+        bridge_name_to_plan_id: dict[str, str] = {}
+        bridge_name_by_plan_id: dict[str, str] = {}
+        for bp in bridge_plans_list:
+            # 从 plan_id 提取桥接标识部分
+            if "_bridge_" in bp.plan_id:
+                bridge_suffix = bp.plan_id.split("_bridge_", 1)[1]
+                bridge_name = f"__bridge_{bridge_suffix}"
+                bridge_name_to_plan_id[bridge_name] = bp.plan_id
+                bridge_name_by_plan_id[bp.plan_id] = bridge_name
+
         statements: list[SqlStatement] = []
         temp_tables: list[TempTableSpec] = []
+
+        # ── 桥接语句生成（PRODUCER——无上游依赖，直接从源表读取）──
+        for bridge_plan in bridge_plans_list:
+            # Consumer 在 SqlBuildPlan 中按桥接步骤名引用 _temp 表；
+            # Producer 必须使用同一逻辑身份生成名称，不能改用 plan_id。
+            bridge_name = bridge_name_by_plan_id[bridge_plan.plan_id]
+            temp_name = make_temp_name(chain_id, bridge_name)
+            stmt = SqlStatement(
+                statement_id=bridge_plan.plan_id,
+                plan=bridge_plan,
+                kind=StatementKind.PRODUCER,
+                depends_on=[],  # 桥接计划直接从源表读取
+                produces=temp_name,
+                intent="桥接 JOIN——预连接源表以提供共同列给下游步骤",
+            )
+            statements.append(stmt)
+
+            # TempTableSpec——桥接表被其父步骤消费
+            bridge_col_defs = _extract_output_columns(bridge_plan)
+            # 消费者将在后续循环中填充
+            temp_tables.append(TempTableSpec(
+                temp_id=temp_name,
+                produced_by=bridge_plan.plan_id,
+                consumed_by=[],  # 后续填充
+                column_defs=bridge_col_defs,
+            ))
 
         # ── DAG 消费者分析：不被任何下游步骤消费的 step 才是 FINAL ──
         consumed: set[str] = set()
@@ -694,7 +743,7 @@ class SqlProgramBuilder:
             for src in src_list:
                 if src != "input" and src in step_names:
                     consumed.add(src)
-        for idx, (cs, plan) in enumerate(zip(steps, plans)):
+        for idx, (cs, plan) in enumerate(zip(steps, step_plans_list)):
             is_final = cs.step_name not in consumed
 
             # ── 填写 intent ──
@@ -703,7 +752,7 @@ class SqlProgramBuilder:
             else:
                 # 查找此步骤的下游消费者
                 consumers: list[str] = []
-                for other_cs, _ in zip(steps, plans):
+                for other_cs, _ in zip(steps, step_plans_list):
                     other_src = (
                         other_cs.source
                         if isinstance(other_cs.source, list)
@@ -727,12 +776,25 @@ class SqlProgramBuilder:
             )
             for src in src_list:
                 if src != "input":
-                    # 找到 src 对应的 plan_id
-                    for other_cs, other_plan in zip(steps, plans):
+                    # 先查找常规步骤的 plan_id
+                    found = False
+                    for other_cs, other_plan in zip(steps, step_plans_list):
                         if other_cs.step_name == src:
                             if other_plan.plan_id not in depends_on:
                                 depends_on.append(other_plan.plan_id)
+                            found = True
                             break
+                    # 再查找桥接步骤的 plan_id
+                    if not found and src.startswith("__bridge_"):
+                        bp_id = bridge_name_to_plan_id.get(src)
+                        if bp_id and bp_id not in depends_on:
+                            depends_on.append(bp_id)
+                            found = True
+                    if not found:
+                        raise ValueError(
+                            f"步骤 '{cs.step_name}' 的源 '{src}' "
+                            f"未找到对应的 plan_id"
+                        )
 
             # ── 中间步骤产生 _temp 表 ──
             produces: str | None = None
@@ -753,12 +815,12 @@ class SqlProgramBuilder:
 
         # ── 构建 TempTableSpec 列表 ──
         # 只对被下游消费的中间步骤创建 _temp 表；不被消费的 FINAL 步骤不需要
-        for idx, (cs, plan) in enumerate(zip(steps, plans)):
+        for idx, (cs, plan) in enumerate(zip(steps, step_plans_list)):
             if cs.step_name in consumed:
                 temp_id = make_temp_name(chain_id, cs.step_name)
                 # 收集消费者
                 consumed_by: list[str] = []
-                for other_cs, other_plan in zip(steps, plans):
+                for other_cs, other_plan in zip(steps, step_plans_list):
                     other_src = (
                         other_cs.source
                         if isinstance(other_cs.source, list)
@@ -773,6 +835,24 @@ class SqlProgramBuilder:
                     consumed_by=consumed_by,
                     column_defs=col_defs,
                 ))
+
+        # ── 填充桥接 TempTableSpec 的消费者 ──
+        # 桥接表被引用它的步骤（source 中包含 __bridge_ 前缀）消费
+        for bridge_name, bridge_plan_id in bridge_name_to_plan_id.items():
+            # 查找哪个步骤引用此桥接
+            for cs, plan in zip(steps, step_plans_list):
+                src_list = (
+                    cs.source if isinstance(cs.source, list)
+                    else [cs.source]
+                )
+                if bridge_name in src_list:
+                    # 更新桥接 TempTableSpec 的 consumed_by
+                    for tts in temp_tables:
+                        if tts.produced_by == bridge_plan_id:
+                            if plan.plan_id not in tts.consumed_by:
+                                tts.consumed_by.append(plan.plan_id)
+                            break
+                    break
 
         # ── 从 spec.output_spec 派生 final_output_target ──
         final_output_target: str | None = None

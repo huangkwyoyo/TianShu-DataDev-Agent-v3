@@ -462,21 +462,94 @@ class SqlBuildPlanBuilder:
         step_plan_map: dict[str, SqlBuildPlan] = {}
         # step_name → plan_id（供外部查询依赖关系）
         self._step_plan_ids: dict[str, str] = {}
+        # 桥接计划追踪——step_name → (bridge_step_name, bridge_plan, bridge_output_cols)
+        bridge_plans: dict[str, tuple[str, SqlBuildPlan, list[ColumnRef]]] = {}
 
         for idx, cs in enumerate(sorted_steps):
             is_final = (idx == len(sorted_steps) - 1)
             plan_steps: list[StepNode] = []
+            temp_ref = ""  # 线性步骤的临时表引用——供 aggregate 块使用
+            auto_joined_aliases: set[str] = set()  # 自动 JOIN 的源表别名
 
-            # 归一化 source 为列表
+            # ── 0. 预扫描：检测当前步骤是否需要桥接 JOIN ──
+            # 桥接检测需在步骤构建之前运行（利用已累积的 step_outputs），
+            # 检测到两跳 JOIN 时生成桥接计划并修改 cs.source 为合流。
+            sources_raw = cs.source if isinstance(cs.source, list) else [cs.source]
+            if len(sources_raw) == 1 and sources_raw[0] != "input":
+                upstream_cols_pre = step_outputs.get(sources_raw[0], [])
+                up_col_map_pre = {c.normalized_name for c in upstream_cols_pre}
+                table_map_pre = {t.table_alias: t for t in spec.input_tables}
+
+                for m in cs.metrics:
+                    if not m.input_column or "." not in m.input_column:
+                        continue
+                    prefix, col_name = m.input_column.split(".", 1)
+                    m_norm = self._normalizer.normalize(col_name)
+                    if m_norm in up_col_map_pre:
+                        continue
+                    if prefix not in table_map_pre:
+                        continue
+
+                    needed_table = table_map_pre[prefix]
+                    join_path = self._find_auto_join_path(
+                        needed_table, upstream_cols_pre, table_map_pre, spec,
+                    )
+                    if join_path:
+                        continue  # 可直接 1-hop JOIN
+
+                    bridges = self._find_bridge_candidates(
+                        needed_table, upstream_cols_pre, table_map_pre,
+                    )
+                    if not bridges:
+                        continue  # 无桥接——主循环中抛异常
+
+                    # 收集源表需要的列
+                    needed_cols_set: set[str] = set()
+                    for m2 in cs.metrics:
+                        if (
+                            m2.input_column
+                            and m2.input_column.startswith(f"{prefix}.")
+                        ):
+                            needed_cols_set.add(
+                                m2.input_column.split(".", 1)[1]
+                            )
+                    needed_cols = sorted(needed_cols_set)
+
+                    bridge_name, bridge_plan_obj, bridge_cols = (
+                        self._build_bridge_join_plan(
+                            needed_table, bridges[0], needed_cols,
+                            upstream_cols_pre, spec, chain_id, cs.step_name,
+                        )
+                    )
+                    bridge_plans[cs.step_name] = (
+                        bridge_name, bridge_plan_obj, bridge_cols
+                    )
+                    step_outputs[bridge_name] = bridge_cols
+                    step_plan_map[bridge_name] = bridge_plan_obj
+                    self._step_plan_ids[bridge_name] = bridge_plan_obj.plan_id
+                    # 修改步骤源为合流
+                    cs.source = [sources_raw[0], bridge_name]
+                    break
+
+            # 归一化 source 为列表（预扫描可能已修改为合流）
             sources: list[str] = (
                 cs.source if isinstance(cs.source, list) else [cs.source]
             )
 
             if len(sources) == 1 and sources[0] == "input":
-                if cs.joins:
+                # cs.joins 优先；未声明时回退到 spec.joins（spec 级别的全局 Join 声明）
+                table_map = {t.table_alias: t for t in spec.input_tables}
+                # cs.joins 优先；仅当 spec.joins 的左右表都是源表别名时才回退
+                # （spec.joins 可能含 step-level joins，如合流步骤的步骤间 Join）
+                effective_joins = cs.joins
+                if not effective_joins and spec.joins:
+                    effective_joins = [
+                        j for j in spec.joins
+                        if j.left_table in table_map and j.right_table in table_map
+                    ]
+                if effective_joins:
                     # ── 多源 Join 场景：source="input" + joins → 需 Join 多张源表后再聚合 ──
-                    table_map = {t.table_alias: t for t in spec.input_tables}
-                    for j_idx, jd in enumerate(cs.joins):
+                    for j_idx, jd in enumerate(effective_joins):
                         left_table = table_map.get(jd.left_table)
                         right_table = table_map.get(jd.right_table)
                         if not left_table or not right_table:
@@ -572,9 +645,14 @@ class SqlBuildPlanBuilder:
             elif len(sources) == 1:
                 # ── 线性步骤：从单个上游 _temp 表扫描 ──
                 src = sources[0]
-                temp_ref = make_temp_name(chain_id, src)
+                temp_ref = make_temp_name(chain_id, src)  # 后续 aggregate 块复用此引用
                 upstream_cols = step_outputs.get(src, [])
                 up_col_map = {c.normalized_name for c in upstream_cols}
+                # 构建源表别名→表映射（用于检测指标引用的源表）
+                table_map = {t.table_alias: t for t in spec.input_tables}
+                # 收集需要自动 JOIN 的源表：table_alias → 需要的列名列表
+                auto_join_needed: dict[str, list[str]] = {}
+
                 scan_cols: list[ColumnRef] = []
                 for gb in cs.group_by:
                     col_name = gb.split(".", 1)[-1] if "." in gb else gb
@@ -586,14 +664,24 @@ class SqlBuildPlanBuilder:
                         ))
                 for m in cs.metrics:
                     if m.input_column:
-                        col_name = m.input_column.split(".", 1)[-1] if "." in m.input_column else m.input_column
+                        prefix = ""
+                        col_name = m.input_column
+                        if "." in m.input_column:
+                            prefix, col_name = m.input_column.split(".", 1)
                         m_norm = self._normalizer.normalize(col_name)
                         if m_norm in up_col_map:
+                            # 列在上游输出中——从上游临时表扫描
                             scan_cols.append(ColumnRef(
                                 table_ref=temp_ref, column_name=col_name,
                                 normalized_name=m_norm,
                             ))
-                if not scan_cols:
+                        elif prefix and prefix in table_map:
+                            # 列不在上游输出中，前缀匹配源表别名——需要自动 JOIN 该源表
+                            if prefix not in auto_join_needed:
+                                auto_join_needed[prefix] = []
+                            auto_join_needed[prefix].append(col_name)
+                # 仅当既没有从上游匹配到列、也没有待 JOIN 的源表时，才回退到全列扫描
+                if not scan_cols and not auto_join_needed:
                     scan_cols = [
                         ColumnRef(
                             table_ref=temp_ref,
@@ -610,14 +698,105 @@ class SqlBuildPlanBuilder:
                     required_columns=scan_cols,
                 )
                 plan_steps.append(scan)
-                # ── 混合源：上游 _temp_ + 物理表 Join ──
-                if cs.joins:
+
+                # ── 自动 JOIN 缺失的源表（1-hop 直接列名匹配）──
+                auto_joined_aliases = set()  # 重置——仅当前步骤的自动 JOIN 别名生效
+                if auto_join_needed and not cs.joins:
+                    for tbl_alias, needed_cols in auto_join_needed.items():
+                        needed_table = table_map[tbl_alias]
+                        join_path = self._find_auto_join_path(
+                            needed_table, upstream_cols, table_map, spec,
+                        )
+                        if join_path is None:
+                            # 桥接场景应在预扫描中处理——此处为未预料的失败
+                            raise ValueError(
+                                f"无法自动推导 '{tbl_alias}' "
+                                f"({needed_table.source_table}) "
+                                f"与上游临时表的 JOIN 键——无共同列名。"
+                            )
+
+                        if len(join_path) != 1:
+                            raise ValueError(
+                                f"自动 JOIN 路径需要 {len(join_path)} 跳，"
+                                f"但 V-009d 仅允许单 Plan 一个 JoinStep。"
+                            )
+
+                        path_step = join_path[0]
+                        join_table = path_step["table"]
+                        join_keys = path_step["join_keys"]
+
+                        # 收集 JOIN 表需要的扫描列：JOIN 键 + 指标列
+                        join_col_names: set[str] = set()
+                        for _left_col, right_col in join_keys:
+                            join_col_names.add(right_col)
+                        join_col_names.update(needed_cols)
+                        join_scan_cols = []
+                        for col_name in sorted(join_col_names):
+                            col_norm = self._normalizer.normalize(col_name)
+                            join_scan_cols.append(ColumnRef(
+                                table_ref=join_table.table_alias,
+                                column_name=col_name,
+                                normalized_name=col_norm,
+                            ))
+
+                        # 扫描源表
+                        right_scan = ScanStep(
+                            step_id=SqlBuildPlan.generate_step_id(
+                                "scan_r", {"step": cs.step_name,
+                                           "table": join_table.source_table}
+                            ),
+                            table_ref=join_table.table_alias,
+                            required_columns=join_scan_cols,
+                            estimated_row_count=join_table.row_count,
+                        )
+                        plan_steps.append(right_scan)
+                        for f in join_table.filters:
+                            plan_steps.append(self._build_filter_step(
+                                f, join_table.table_alias
+                            ))
+
+                        # JoinStep：上游临时表 ⋈ 源表
+                        join_key_pairs = []
+                        for left_col, right_col in join_keys:
+                            left_norm = self._normalizer.normalize(left_col)
+                            right_norm = self._normalizer.normalize(right_col)
+                            join_key_pairs.append((
+                                ColumnRef(
+                                    table_ref=temp_ref,
+                                    column_name=left_col,
+                                    normalized_name=left_norm,
+                                ),
+                                ColumnRef(
+                                    table_ref=join_table.table_alias,
+                                    column_name=right_col,
+                                    normalized_name=right_norm,
+                                ),
+                            ))
+
+                        plan_steps.append(JoinStep(
+                            step_id=SqlBuildPlan.generate_step_id("join", {
+                                "step": cs.step_name,
+                                "left": temp_ref,
+                                "right": join_table.table_alias,
+                                "auto_detected": True,
+                            }),
+                            right_table_ref=join_table.table_alias,
+                            join_type=JoinType.INNER,
+                            join_keys=join_key_pairs,
+                            relationship_ref=(
+                                f"compute_steps:{chain_id}:{cs.step_name}:"
+                                f"auto:{join_table.table_alias}"
+                            ),
+                        ))
+
+                        auto_joined_aliases.add(tbl_alias)
+                # ── 混合源：上游 _temp_ + 物理表 Join（显式 cs.joins）──
+                if cs.joins and not auto_joined_aliases:
                     # 防御性断言——Validator 应已校验
                     assert len(cs.joins) == 1, (
                         f"混合源步骤 '{cs.step_name}' joins 长度 != 1——Validator 应已阻断"
                     )
                     jd = cs.joins[0]
-                    table_map = {t.table_alias: t for t in spec.input_tables}
                     right_table = table_map.get(jd.right_table)
                     if not right_table:
                         raise ValueError(f"右表 '{jd.right_table}' 不在 source_tables 中")
@@ -650,8 +829,11 @@ class SqlBuildPlanBuilder:
                         join_keys=[(
                             ColumnRef(table_ref=temp_ref, column_name=SafeIdentifier(jd.left_key),
                                       normalized_name=left_norm),
-                            ColumnRef(table_ref=right_table.table_alias, column_name=SafeIdentifier(jd.right_key),
-                                      normalized_name=right_norm),
+                            ColumnRef(
+                                table_ref=right_table.table_alias,
+                                column_name=SafeIdentifier(jd.right_key),
+                                normalized_name=right_norm,
+                            ),
                         )],
                         relationship_ref=f"compute_steps:{chain_id}:{cs.step_name}:{jd.right_table}",
                     ))
@@ -693,6 +875,14 @@ class SqlBuildPlanBuilder:
                     left_key_raw, right_key_raw = self._find_join_keys(
                         join_key_map, sources, left_src, right_src, step_outputs
                     )
+
+                    # 桥接合流键检测——当显式 JoinDecl 无覆盖且至少一个源是桥接步骤时
+                    if not left_key_raw and not right_key_raw:
+                        bridge_key = self._find_bridge_confluence_keys(
+                            left_src, right_src, step_outputs,
+                        )
+                        if bridge_key:
+                            left_key_raw, right_key_raw = bridge_key
 
                     # 空键 → CROSS JOIN（跨粒度场景：一侧有 GROUP BY，一侧无）
                     if not left_key_raw and not right_key_raw:
@@ -783,11 +973,27 @@ class SqlBuildPlanBuilder:
                             normalized_name=gk.normalized_name,
                         )
                     agg.group_keys = [_rebuild_group_key(gk) for gk in agg.group_keys]
-                else:
-                    st = "" if isinstance(cs.source, list) else (
-                        cs.source if cs.source != "input" else ""
+                    self._bind_confluence_aggregate(
+                        agg,
+                        sources=sources,
+                        step_outputs=step_outputs,
+                        chain_id=chain_id,
+                        output_columns=[
+                            column.name for column in spec.output_spec.columns
+                        ],
                     )
-                    agg = self._build_aggregate_from_compute_step(cs, source_table=st)
+                else:
+                    # 线性步骤：使用 temp_ref（如 _temp_cc9bba4f6_zone_crash_stats）
+                    # source:input：无前缀（单表上下文或由 group_by 表前缀消歧）
+                    st = temp_ref if temp_ref else (
+                        "" if isinstance(cs.source, list) else (
+                            cs.source if cs.source != "input" else ""
+                        )
+                    )
+                    agg = self._build_aggregate_from_compute_step(
+                        cs, source_table=st,
+                        valid_table_aliases=auto_joined_aliases if auto_joined_aliases else None,
+                    )
                 plan_steps.append(agg)
 
             # ── WindowStep（仅最终步骤，聚合后、投影前）──
@@ -932,8 +1138,14 @@ class SqlBuildPlanBuilder:
             step_plan_map[cs.step_name] = plan
             self._step_plan_ids[cs.step_name] = plan_id
 
-        # 按原始声明顺序返回 plans——Pipeline 通过索引与 compute_steps 配对
-        return [step_plan_map[s.step_name] for s in steps]
+        # 按依赖顺序返回 plans——桥接计划插入在依赖它的步骤之前
+        ordered_plans: list[SqlBuildPlan] = []
+        for s in steps:
+            if s.step_name in bridge_plans:
+                bridge_name, bridge_plan_obj, _ = bridge_plans[s.step_name]
+                ordered_plans.append(bridge_plan_obj)  # 桥接计划先于依赖步骤
+            ordered_plans.append(step_plan_map[s.step_name])
+        return ordered_plans
 
     @staticmethod
     def _topo_sort_compute_steps(steps) -> list:
@@ -990,8 +1202,359 @@ class SqlBuildPlanBuilder:
         # 找不到 JoinDecl 时返回空键——触发外层 CROSS JOIN 回退
         return ("", "")
 
+    @staticmethod
+    def _find_bridge_confluence_keys(
+        left_src: str,
+        right_src: str,
+        step_outputs: dict,
+    ) -> tuple[str, str] | None:
+        """为桥接合流步骤查找共同列作为 JOIN 键。
+
+        当合流中至少有一个源是桥接步骤（以 __bridge_ 开头）时，
+        且显式 JoinDecl 未覆盖时，自动从 step_outputs 中检测共同列名。
+
+        Args:
+            left_src: 左侧源步骤名
+            right_src: 右侧源步骤名
+            step_outputs: 步骤名 → 输出列列表
+
+        Returns:
+            (left_key, right_key) 或 None（无共同列）
+        """
+        is_bridge = (
+            left_src.startswith("__bridge_")
+            or right_src.startswith("__bridge_")
+        )
+        if not is_bridge:
+            return None
+
+        left_cols = {c.column_name for c in step_outputs.get(left_src, [])}
+        right_cols = {c.column_name for c in step_outputs.get(right_src, [])}
+        common = left_cols & right_cols
+        if common:
+            col = sorted(common)[0]  # 取第一个共同列（确定性）
+            return (col, col)
+        return None
+
+    @staticmethod
+    def _detect_fk_candidates(source_table, target_table) -> list[tuple[str, str]]:
+        """检测 source_table → target_table 的潜在外键关系。
+
+        基于命名约定：如果 target 表有 key_column X，
+        且 source 表有列名以 _X 结尾的列，则视为潜在 FK。
+        返回 (source_fk_col, target_key_col) 列表。
+
+        Args:
+            source_table: 外键所在的源表（InputTableDecl）
+            target_table: 被引用的目标表（InputTableDecl）
+
+        Returns:
+            (source_fk_column, target_key_column) 列表
+        """
+        candidates = []
+        target_keys = {k.column_name for k in target_table.key_columns}
+        all_source_cols = list(source_table.key_columns) + list(source_table.business_columns)
+        for col in all_source_cols:
+            for key in target_keys:
+                if col.column_name != key and col.column_name.endswith(f"_{key}"):
+                    candidates.append((col.column_name, key))
+        return candidates
+
+    def _find_auto_join_path(
+        self, needed_table, upstream_cols: list, table_map: dict, spec,
+    ) -> list[dict] | None:
+        """查找从 needed_table 到上游临时表的自动 JOIN 路径（1-hop）。
+
+        仅返回直接列名匹配的单跳路径——符合 V-009d 单 Plan 一个 JoinStep 约束。
+        多跳路径（需桥接表）返回 None，由调用方负责给出明确错误。
+
+        Args:
+            needed_table: 需要 JOIN 的源表（InputTableDecl）
+            upstream_cols: 上游临时表的输出列列表（ColumnRef 列表）
+            table_map: 源表别名→InputTableDecl 映射
+            spec: 解析后的开发者 spec（预留，用于未来扩展 spec.joins 感知）
+
+        Returns:
+            单元素路径列表 [{"table": InputTableDecl, "join_keys": [(left_col, right_col)]}]
+            或 None（无法直接 JOIN）
+        """
+        up_col_names = {c.column_name for c in upstream_cols}
+
+        # 收集 needed_table 的所有列名
+        needed_col_names = {c.column_name for c in needed_table.key_columns}
+        needed_col_names.update(c.column_name for c in needed_table.business_columns)
+
+        # 策略 1：直接列名匹配——needed_table 与上游输出有共同列
+        direct_matches = needed_col_names & up_col_names
+        if direct_matches:
+            return [{
+                "table": needed_table,
+                "join_keys": [(col, col) for col in sorted(direct_matches)],
+            }]
+
+        # 策略 2：spec.joins 中有涉及 needed_table 的声明——
+        # 检查是否为 needed_table ↔ 上游输出列的桥接
+        if spec.joins:
+            for j in spec.joins:
+                # needed_table 作为左表或右表参与 Join
+                if j.left_table == needed_table.table_alias:
+                    other_key = j.right_key
+                    needed_key = j.left_key
+                elif j.right_table == needed_table.table_alias:
+                    other_key = j.left_key
+                    needed_key = j.right_key
+                else:
+                    continue
+
+                # 检查另一张表的 join key 是否在上游输出中
+                other_key_norm = self._normalizer.normalize(other_key)
+                if other_key_norm in {c.normalized_name for c in upstream_cols}:
+                    # 找到！needed_table 通过 spec.joins 的 join key 与上游连接
+                    # 但还需确认 other_alias 的 join key 列确实在上游存在
+                    return [{
+                        "table": needed_table,
+                        "join_keys": [(other_key, needed_key)],
+                    }]
+
+        return None
+
+    def _find_bridge_candidates(
+        self, needed_table, upstream_cols: list, table_map: dict,
+    ) -> list[dict]:
+        """查找可桥接 needed_table 与上游输出的中间源表（用于错误消息）。
+
+        检测两跳路径：needed_table → bridge_table → upstream。
+        受 V-009d 约束不能自动构建，但可为错误消息提供指引。
+
+        Returns:
+            桥接候选列表 [{"alias": str, "table": InputTableDecl, "fk": (src_fk, tgt_key)}]
+        """
+        up_col_names = {c.column_name for c in upstream_cols}
+        bridges = []
+
+        for bridge_alias, bridge_table in table_map.items():
+            if bridge_alias == needed_table.table_alias:
+                continue
+
+            # 桥接表需要与上游有共同列
+            bridge_col_names = {c.column_name for c in bridge_table.key_columns}
+            bridge_col_names.update(c.column_name for c in bridge_table.business_columns)
+            if not (bridge_col_names & up_col_names):
+                continue
+
+            # needed_table 需要对桥接表有 FK 关系
+            fk_candidates = self._detect_fk_candidates(needed_table, bridge_table)
+            if fk_candidates:
+                bridges.append({
+                    "alias": bridge_alias,
+                    "table": bridge_table,
+                    "fk": fk_candidates[0],
+                })
+
+        return bridges
+
+    def _build_bridge_join_plan(
+        self,
+        needed_table,       # InputTableDecl——需要 JOIN 的源表
+        bridge_info: dict,  # {"alias":, "table":, "fk": (src_fk, tgt_key)}
+        needed_cols: list[str],  # 指标需要的列名
+        upstream_cols: list,  # 上游临时表的输出列（ColumnRef 列表）
+        spec,                # ParsedDeveloperSpec
+        chain_id: str,
+        parent_step_name: str,
+    ) -> tuple[str, SqlBuildPlan, list[ColumnRef]]:
+        """为两跳 JOIN 场景构建桥接计划——预连接源表与桥接表。
+
+        生成一个简单的 SqlBuildPlan：
+        - Scan needed_table（源表——FK 源列 + 指标列）
+        - Scan bridge_table（桥接表——FK 目标列 + 与上游共同的列）
+        - Join on FK（如 pickup_location_id = location_id）
+        - Project: 桥接表与上游共同的列 + 源表的指标列
+
+        桥接计划自身只包含一个 JoinStep，符合 V-009d 约束。
+
+        Args:
+            needed_table: 需要 JOIN 的源表（InputTableDecl）
+            bridge_info: 桥接表信息（alias, table, fk）
+            needed_cols: 源表中指标需要的列名列表
+            upstream_cols: 上游临时表的输出列
+            spec: 已解析的 DeveloperSpec
+            chain_id: 执行链 ID
+            parent_step_name: 依赖此桥接的步骤名
+
+        Returns:
+            (bridge_step_name, bridge_plan, bridge_output_columns)
+        """
+        bridge_table = bridge_info["table"]
+        bridge_alias = bridge_info["alias"]
+        fk_src_col, fk_tgt_col = bridge_info["fk"]
+
+        # 桥接步骤命名——使用 __bridge_ 前缀避免与用户步骤名冲突
+        bridge_step_name = (
+            f"__bridge_{needed_table.table_alias}_{bridge_alias}_"
+            f"{parent_step_name}"
+        )
+
+        # 计算桥接表需要输出的列：
+        # 1) 与上游临时表有共同列名的列——这些将成为合流 JOIN 的键
+        # 2) 桥接表的 FK 目标列——虽然不一定在最终输出中，但 JOIN 需要
+        up_col_names = {c.column_name for c in upstream_cols}
+        bridge_all_cols = list(bridge_table.key_columns) + list(bridge_table.business_columns)
+        bridge_common_cols = [
+            c for c in bridge_all_cols
+            if c.column_name in up_col_names
+        ]
+        # 桥接表扫描列：FK 目标列 + 与上游共同的列
+        bridge_scan_col_names: set[str] = {fk_tgt_col}
+        bridge_scan_col_names.update(c.column_name for c in bridge_common_cols)
+
+        # 源表扫描列：FK 源列 + 指标需要的列
+        needed_scan_col_names: set[str] = {fk_src_col}
+        needed_scan_col_names.update(needed_cols)
+
+        plan_steps: list[StepNode] = []
+
+        # ── Scan needed_table（源表）──
+        needed_scan_cols = []
+        for col_name in sorted(needed_scan_col_names):
+            col_norm = self._normalizer.normalize(col_name)
+            needed_scan_cols.append(ColumnRef(
+                table_ref=needed_table.table_alias,
+                column_name=col_name,
+                normalized_name=col_norm,
+            ))
+        plan_steps.append(ScanStep(
+            step_id=SqlBuildPlan.generate_step_id(
+                "scan", {"step": bridge_step_name,
+                         "table": needed_table.source_table}
+            ),
+            table_ref=needed_table.table_alias,
+            required_columns=needed_scan_cols,
+            estimated_row_count=needed_table.row_count,
+        ))
+        # 源表预过滤
+        for f in needed_table.filters:
+            plan_steps.append(self._build_filter_step(
+                f, needed_table.table_alias
+            ))
+
+        # ── Scan bridge_table（桥接表）──
+        bridge_scan_cols = []
+        for col_name in sorted(bridge_scan_col_names):
+            col_norm = self._normalizer.normalize(col_name)
+            bridge_scan_cols.append(ColumnRef(
+                table_ref=bridge_table.table_alias,
+                column_name=col_name,
+                normalized_name=col_norm,
+            ))
+        plan_steps.append(ScanStep(
+            step_id=SqlBuildPlan.generate_step_id(
+                "scan_r", {"step": bridge_step_name,
+                           "table": bridge_table.source_table}
+            ),
+            table_ref=bridge_table.table_alias,
+            required_columns=bridge_scan_cols,
+            estimated_row_count=bridge_table.row_count,
+        ))
+        # 桥接表预过滤
+        for f in bridge_table.filters:
+            plan_steps.append(self._build_filter_step(
+                f, bridge_table.table_alias
+            ))
+
+        # ── JoinStep：源表 ⋈ 桥接表（FK 列）──
+        fk_src_norm = self._normalizer.normalize(fk_src_col)
+        fk_tgt_norm = self._normalizer.normalize(fk_tgt_col)
+        plan_steps.append(JoinStep(
+            step_id=SqlBuildPlan.generate_step_id("join", {
+                "step": bridge_step_name,
+                "left": needed_table.table_alias,
+                "right": bridge_table.table_alias,
+                "left_key": fk_src_col,
+                "right_key": fk_tgt_col,
+                "bridge": True,
+            }),
+            right_table_ref=bridge_table.table_alias,
+            join_type=JoinType.INNER,
+            join_keys=[(
+                ColumnRef(
+                    table_ref=needed_table.table_alias,
+                    column_name=fk_src_col,
+                    normalized_name=fk_src_norm,
+                ),
+                ColumnRef(
+                    table_ref=bridge_table.table_alias,
+                    column_name=fk_tgt_col,
+                    normalized_name=fk_tgt_norm,
+                ),
+            )],
+            relationship_ref=(
+                f"compute_steps:{chain_id}:bridge:"
+                f"{needed_table.table_alias}:{bridge_table.table_alias}"
+            ),
+        ))
+
+        # ── ProjectStep：输出桥接表共同列 + 源表指标列 ──
+        proj_cols: list[AliasExpr] = []
+        # 1) 桥接表中与上游共同的列——这些列将成为下游合流 JOIN 的键
+        for c in bridge_common_cols:
+            col_norm = self._normalizer.normalize(c.column_name)
+            proj_cols.append(AliasExpr(
+                expression=ColumnRef(
+                    table_ref=bridge_table.table_alias,
+                    column_name=c.column_name,
+                    normalized_name=col_norm,
+                ),
+                alias=c.column_name,
+            ))
+        # 2) 源表中指标需要的列
+        for col_name in sorted(needed_cols):
+            col_norm = self._normalizer.normalize(col_name)
+            proj_cols.append(AliasExpr(
+                expression=ColumnRef(
+                    table_ref=needed_table.table_alias,
+                    column_name=col_name,
+                    normalized_name=col_norm,
+                ),
+                alias=col_name,
+            ))
+
+        plan_steps.append(ProjectStep(
+            step_id=SqlBuildPlan.generate_step_id(
+                "project", {"step": bridge_step_name, "bridge": True}
+            ),
+            columns=proj_cols,
+        ))
+
+        # ── 桥接计划输出列（供下游步骤查找）──
+        bridge_output_cols = [
+            ColumnRef(
+                table_ref="",
+                column_name=pc.alias,
+                normalized_name=self._normalizer.normalize(pc.alias),
+            )
+            for pc in proj_cols
+        ]
+
+        # ── 组装桥接计划 ──
+        # plan_id 编码桥接步骤名信息——SqlProgramBuilder 据此匹配依赖关系
+        bridge_plan_id = (
+            f"plan_{spec.spec_hash[:12]}_{chain_id}_"
+            f"bridge_{needed_table.table_alias}_{bridge_alias}_"
+            f"{parent_step_name}"
+        )
+        bridge_plan = SqlBuildPlan(
+            plan_id=bridge_plan_id,
+            spec_hash=spec.spec_hash,
+            steps=plan_steps,
+            multi_table=False,
+        )
+
+        return bridge_step_name, bridge_plan, bridge_output_cols
+
     def _expand_metric_to_agg_specs(
         self, m, source_table: str = "",  # MetricDecl
+        valid_table_aliases: set[str] | None = None,
     ) -> list[AggregateSpec]:
         """将一个 MetricDecl（含可选 variants）展开为多个 AggregateSpec。
 
@@ -1002,6 +1565,9 @@ class SqlBuildPlanBuilder:
         Args:
             m: MetricDecl 实例
             source_table: 源表别名——自引用/多表场景消除列歧义
+            valid_table_aliases: 有效的源表别名集合——当前缀匹配时为该指标
+                                 使用前缀作为 source_table（处理线性步骤中
+                                 上游临时表 + 自动 JOIN 源表的场景）
 
         Returns:
             展开后的 AggregateSpec 列表——长度 ≥ 1
@@ -1009,12 +1575,20 @@ class SqlBuildPlanBuilder:
         specs: list[AggregateSpec] = []
         st = source_table if source_table else None  # 空字符串 → None
 
-        # 规范化 input_column——去除表别名前缀（如 cp.collision_id → collision_id）
+        # 规范化 input_column——提取表别名前缀承载到 source_table 字段
+        # 如 "cd.crash_id" → source_table="cd", input_column="crash_id"
         # Planner 有时会在 input_column 前加表别名，但 AggregateSpec.input_column
         # 为 SafeIdentifier（不允许点号），表上下文应由 source_table 字段承载。
         input_col = m.input_column
         if input_col and "." in input_col:
-            input_col = input_col.split(".")[-1]
+            prefix, input_col = input_col.split(".", 1)
+            # 若 source_table 未设置，使用用户显式指定的表前缀——消除多表 JOIN 后的列歧义
+            if not st:
+                st = prefix
+            # 即使 source_table 已设置（如线性步骤的 temp_ref），若前缀匹配
+            # 有效源表别名，优先使用前缀——处理上游临时表 + 自动 JOIN 源表的场景
+            elif valid_table_aliases and prefix in valid_table_aliases:
+                st = prefix
 
         # 基础指标
         specs.append(AggregateSpec(
@@ -1167,13 +1741,18 @@ class SqlBuildPlanBuilder:
                 ))
         return cols
 
-    def _build_aggregate_from_compute_step(self, cs, source_table: str = "") -> AggregateStep:  # ComputeStep
+    def _build_aggregate_from_compute_step(
+        self, cs, source_table: str = "",
+        valid_table_aliases: set[str] | None = None,
+    ) -> AggregateStep:  # ComputeStep
         """从 ComputeStep 构建 AggregateStep。
 
         Args:
             cs: ComputeStep 实例
             source_table: 源表引用——用于 group_keys 的 table_ref。
                           空字符串表示当前上下文（Join 后或源表扫描后）。
+            valid_table_aliases: 有效的源表别名集合——传递给 _expand_metric_to_agg_specs，
+                                 使前缀匹配的指标使用正确源表作为 source_table。
         """
         # 确定 source_table：标量非 input → 用 source 值，列表或 input → 空字符串
         if not source_table:
@@ -1181,11 +1760,15 @@ class SqlBuildPlanBuilder:
                 source_table = cs.source
         group_cols: list[ColumnRef] = []
         for gb in cs.group_by:
-            # 剥离表前缀："cd.borough" → "borough"（ColumnRef.column_name 不接受 "."）
-            col_name = gb.split(".", 1)[-1] if "." in gb else gb
+            if "." in gb:
+                # 用户显式指定了表前缀（如 "cd.borough"）——保留以消除多表 JOIN 后的列歧义
+                table_prefix, col_name = gb.split(".", 1)
+            else:
+                table_prefix = source_table
+                col_name = gb
             normalized = self._normalizer.normalize(col_name)
             group_cols.append(ColumnRef(
-                table_ref=source_table,
+                table_ref=table_prefix,
                 column_name=col_name,
                 normalized_name=normalized,
             ))
@@ -1194,6 +1777,7 @@ class SqlBuildPlanBuilder:
         for m in cs.metrics:
             agg_metrics.extend(self._expand_metric_to_agg_specs(
                 m, source_table=source_table,
+                valid_table_aliases=valid_table_aliases,
             ))
 
         step_id_content = {
@@ -1206,6 +1790,69 @@ class SqlBuildPlanBuilder:
             group_keys=group_cols,
             metrics=agg_metrics,
         )
+
+    def _bind_confluence_aggregate(
+        self,
+        aggregate: AggregateStep,
+        *,
+        sources: list[str],
+        step_outputs: dict[str, list[ColumnRef]],
+        chain_id: str,
+        output_columns: list[str],
+    ) -> None:
+        """将合流聚合引用绑定到实际临时输入，并保留上游聚合粒度。"""
+        column_sources: dict[str, list[str]] = {}
+        for source in sources:
+            for column in step_outputs.get(source, []):
+                normalized = self._normalizer.normalize(column.column_name)
+                column_sources.setdefault(normalized, []).append(source)
+
+        for metric in aggregate.metrics:
+            normalized = self._normalizer.normalize(str(metric.input_column))
+            candidates = list(dict.fromkeys(column_sources.get(normalized, [])))
+            if len(candidates) == 1:
+                metric.source_table = make_temp_name(chain_id, candidates[0])
+            elif len(candidates) > 1:
+                explicit = str(metric.source_table or "")
+                matched = [
+                    source
+                    for source in candidates
+                    if explicit in {source, make_temp_name(chain_id, source)}
+                ]
+                if len(matched) != 1:
+                    raise ValueError(
+                        f"合流聚合列 '{metric.input_column}' 同时来自 "
+                        f"{candidates}，无法确定指标输入"
+                    )
+                metric.source_table = make_temp_name(chain_id, matched[0])
+
+        grouped = {
+            self._normalizer.normalize(group.column_name)
+            for group in aggregate.group_keys
+            if isinstance(group, ColumnRef)
+        }
+        metric_aliases = {
+            self._normalizer.normalize(str(metric.alias))
+            for metric in aggregate.metrics
+        }
+        for output_column in output_columns:
+            normalized = self._normalizer.normalize(output_column)
+            if normalized in grouped or normalized in metric_aliases:
+                continue
+            candidates = list(dict.fromkeys(column_sources.get(normalized, [])))
+            if not candidates:
+                continue
+            if len(candidates) > 1:
+                raise ValueError(
+                    f"合流透传列 '{output_column}' 同时来自 "
+                    f"{candidates}，无法确定输出来源"
+                )
+            aggregate.group_keys.append(ColumnRef(
+                table_ref=make_temp_name(chain_id, candidates[0]),
+                column_name=output_column,
+                normalized_name=normalized,
+            ))
+            grouped.add(normalized)
 
     def _build_case_when_from_decl(
         self,

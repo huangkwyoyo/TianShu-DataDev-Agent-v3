@@ -288,6 +288,69 @@ def _make_sql_program_from_chain(
 class TestMultiHopChainGolden:
     """多跳 Join 链——合法场景全部通过。"""
 
+    def test_parallel_branches_may_reuse_same_dimension(self):
+        """独立分支复用同一维表不属于同一路径重复。"""
+        left_plan = _make_join_plan("plan_left", "fact_a", "dim_shared", "id")
+        right_plan = _make_join_plan(
+            "plan_right", "fact_b", "dim_shared", "id"
+        )
+        final_plan = _make_join_plan(
+            "plan_final", "_temp_left", "_temp_right", "id"
+        )
+
+        statements = [
+            SqlStatement(
+                statement_id="plan_left",
+                plan=left_plan,
+                kind=StatementKind.PRODUCER,
+                depends_on=[],
+                produces="_temp_left",
+            ),
+            SqlStatement(
+                statement_id="plan_right",
+                plan=right_plan,
+                kind=StatementKind.PRODUCER,
+                depends_on=[],
+                produces="_temp_right",
+            ),
+            SqlStatement(
+                statement_id="plan_final",
+                plan=final_plan,
+                kind=StatementKind.FINAL,
+                depends_on=["plan_left", "plan_right"],
+                produces=None,
+            ),
+        ]
+        program = SqlProgram(
+            program_id="program_parallel_shared_dimension",
+            spec_id="parallel_shared_dimension",
+            statements=statements,
+            temp_tables=[
+                TempTableSpec(
+                    temp_id="_temp_left",
+                    produced_by="plan_left",
+                    consumed_by=["plan_final"],
+                    column_defs=[_cr("_temp_left", "id")],
+                ),
+                TempTableSpec(
+                    temp_id="_temp_right",
+                    produced_by="plan_right",
+                    consumed_by=["plan_final"],
+                    column_defs=[_cr("_temp_right", "id")],
+                ),
+            ],
+            topological_order=["plan_left", "plan_right", "plan_final"],
+            final_output="plan_final",
+        )
+
+        passed, questions = (
+            SqlBuildPlanValidator().validate_multi_hop_chain(program)
+        )
+
+        assert passed, [
+            q.description for q in questions if q.blocking
+        ]
+
     def test_two_hop_chain_passes(self):
         """两跳链（u→o→p）通过 V-009b + V-009c 校验。
 

@@ -197,6 +197,8 @@ def resolve_codegen_aliases(
                 # 依赖必须在 latest 中已注册
                 input_var = latest.get(input_key)
                 if input_var is None:
+                    input_var = branch_outputs.get(input_key)
+                if input_var is None:
                     raise AliasResolutionError(
                         f"步骤 {i} {type(step).__name__} 的 input_alias={input_key!r} 未解析——"
                         f"请确认该别名对应的 Read 或上游步骤已执行。"

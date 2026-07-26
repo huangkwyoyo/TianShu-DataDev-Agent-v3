@@ -1307,7 +1307,7 @@ class Pipeline:
                 output_dir=output_dir,
                 contract_hash=contract_hash,
                 source_tables=physical_tables,
-                joins=[join.model_dump(mode="json") for join in contract.join_relationships],
+                joins=self._snapshot_source_joins(contract),
                 table_aliases=physical_to_alias,
                 table_role_aliases=physical_to_aliases,
                 sampling=SamplingSpec(
@@ -1366,6 +1366,21 @@ class Pipeline:
         return snapshot_manifest, resolved_paths
 
     # ── 公共方法 ──────────────────────────────────────────
+
+    @staticmethod
+    def _snapshot_source_joins(contract) -> list[dict]:
+        """仅向快照层传递物理输入表之间的 Join。
+
+        多步骤 Contract 还包含派生结果之间的业务 Join，供 Spark 重建数据流。
+        快照只物化输入表，因此其关系图不能包含派生结果端点。
+        """
+        input_aliases = {table.table_ref for table in contract.input_tables}
+        return [
+            join.model_dump(mode="json")
+            for join in contract.join_relationships
+            if join.left_table in input_aliases
+            and join.right_table in input_aliases
+        ]
 
     def parse_only(self, markdown_text: str, rich: bool = False) -> dict:
         """解析 DeveloperSpec——返回 SpecParseResponse / SpecRichResponse 的 dict。
@@ -1507,7 +1522,11 @@ class Pipeline:
 
                 _cs_validator = ComputeStepValidator(
                     normalizer=FieldNormalizer(),
-                    spec_hash=getattr(spec, 'normalized_spec_hash', '') or getattr(spec, 'spec_hash', '') or '',
+                    spec_hash=(
+                        getattr(spec, "normalized_spec_hash", "")
+                        or getattr(spec, "spec_hash", "")
+                        or ""
+                    ),
                 )
 
                 # 按拓扑顺序逐步骤校验——逐步构建 step_schemas
@@ -1671,7 +1690,11 @@ class Pipeline:
 
                 _cs_validator = ComputeStepValidator(
                     normalizer=FieldNormalizer(),
-                    spec_hash=getattr(spec, 'normalized_spec_hash', '') or getattr(spec, 'spec_hash', '') or '',
+                    spec_hash=(
+                        getattr(spec, "normalized_spec_hash", "")
+                        or getattr(spec, "spec_hash", "")
+                        or ""
+                    ),
                 )
 
                 # 按拓扑顺序逐步骤校验——逐步构建 step_schemas
@@ -2098,7 +2121,11 @@ class Pipeline:
 
                 _cs_validator = ComputeStepValidator(
                     normalizer=FieldNormalizer(),
-                    spec_hash=getattr(spec, 'normalized_spec_hash', '') or getattr(spec, 'spec_hash', '') or '',
+                    spec_hash=(
+                        getattr(spec, "normalized_spec_hash", "")
+                        or getattr(spec, "spec_hash", "")
+                        or ""
+                    ),
                 )
 
                 # 按拓扑顺序逐步骤校验——逐步构建 step_schemas

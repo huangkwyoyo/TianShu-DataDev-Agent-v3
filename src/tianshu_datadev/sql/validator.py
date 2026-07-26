@@ -178,10 +178,11 @@ class SqlBuildPlanValidator:
             ordered_stmts = [stmt_map[sid] for sid in topo_order if sid in stmt_map]
 
         join_chain: list[dict] = []  # [{step_id, right_table_ref, statement_id}, ...]
-        seen_right_tables: set[str] = set()
+        join_refs_by_statement: dict[str, list[str]] = {}
 
         for stmt in ordered_stmts:
             plan = stmt.plan
+            statement_refs: list[str] = []
             for step in plan.steps:
                 if isinstance(step, JoinStep):
                     join_chain.append({
@@ -189,6 +190,9 @@ class SqlBuildPlanValidator:
                         "right_table_ref": step.right_table_ref,
                         "statement_id": stmt.statement_id,
                     })
+                    if not step.right_table_ref.startswith("_temp_"):
+                        statement_refs.append(step.right_table_ref)
+            join_refs_by_statement[stmt.statement_id] = statement_refs
 
         # ── V-009c：深度上限 ≤ 5 ──
         total_hops = len(join_chain)
@@ -211,34 +215,56 @@ class SqlBuildPlanValidator:
                 )
             )
 
-        # ── V-009b：循环检测——右表引用链中不得出现重复 ──
-        for j in join_chain:
-            right_ref = j["right_table_ref"]
-            # 跳过 _temp 中间表引用（由 SqlProgram 串联产生，不算循环）
-            if right_ref.startswith("_temp_"):
-                continue
-            if right_ref in seen_right_tables:
-                chain_desc = " → ".join(
-                    jj["right_table_ref"] for jj in join_chain
-                )
-                questions.append(
-                    OpenQuestion(
-                        question_id=(
-                            f"Q-VAL-MULTIHOP-CYCLE-{program.program_id}"
-                        ),
-                        source="validator",
-                        field_ref=f"SqlProgram.statements.{j['statement_id']}",
-                        description=(
-                            f"V-009b AMBIGUOUS_MULTI_HOP——"
-                            f"右表 '{right_ref}' 在 Join 链中重复出现。"
-                            f"链: {chain_desc}。"
-                            f"多跳 Join 链必须为线性——每个右表只能被 JOIN 一次，"
-                            f"否则说明 Join 顺序存在歧义（菱形 Join）。"
-                        ),
-                        blocking=True,
-                    )
-                )
-            seen_right_tables.add(right_ref)
+        # ── V-009b：按依赖路径检测重复右表 ──
+        # 独立 PRODUCER 分支可以各自复用同一维表；只有同一条 depends_on
+        # 路径再次出现同一右表，才构成循环或含糊的重复 Join。
+        paths_by_statement: dict[str, list[tuple[str, ...]]] = {}
+        reported_cycles: set[tuple[str, str]] = set()
+
+        for stmt in ordered_stmts:
+            parent_paths: list[tuple[str, ...]] = []
+            for dependency in stmt.depends_on:
+                parent_paths.extend(paths_by_statement.get(dependency, [()]))
+            if not parent_paths:
+                parent_paths = [()]
+
+            current_refs = join_refs_by_statement.get(stmt.statement_id, [])
+            statement_paths: list[tuple[str, ...]] = []
+            for parent_path in parent_paths:
+                extended_path = list(parent_path)
+                seen_on_path = set(parent_path)
+                for right_ref in current_refs:
+                    if right_ref in seen_on_path:
+                        cycle_key = (stmt.statement_id, right_ref)
+                        if cycle_key not in reported_cycles:
+                            chain_desc = " → ".join(extended_path + [right_ref])
+                            questions.append(
+                                OpenQuestion(
+                                    question_id=(
+                                        f"Q-VAL-MULTIHOP-CYCLE-"
+                                        f"{program.program_id}-"
+                                        f"{stmt.statement_id}-{right_ref}"
+                                    ),
+                                    source="validator",
+                                    field_ref=(
+                                        f"SqlProgram.statements."
+                                        f"{stmt.statement_id}"
+                                    ),
+                                    description=(
+                                        f"V-009b AMBIGUOUS_MULTI_HOP——"
+                                        f"右表 '{right_ref}' 在同一依赖路径中"
+                                        f"重复出现。路径: {chain_desc}。"
+                                        f"同一路径内每个右表只能被 JOIN 一次，"
+                                        f"否则说明 Join 顺序存在歧义或循环。"
+                                    ),
+                                    blocking=True,
+                                )
+                            )
+                            reported_cycles.add(cycle_key)
+                    seen_on_path.add(right_ref)
+                    extended_path.append(right_ref)
+                statement_paths.append(tuple(extended_path))
+            paths_by_statement[stmt.statement_id] = statement_paths
 
         all_passed = not any(q.blocking for q in questions)
         return all_passed, questions

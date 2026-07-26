@@ -512,10 +512,33 @@ class SnapshotBuilder:
                             break
 
                         if not progress:
-                            raise SnapshotMaterializationError(
-                                "Contract Join 图无法覆盖全部输入表："
-                                f"{sorted(unresolved_tables)}"
+                            # Join 图不连通：锚表级联耗尽后仍有未解析表。
+                            # 从未解析表中选新的子锚表独立快照，然后继续级联其可达表。
+                            # 这处理了 Case04 场景——cd 分支与 td→tz 分支无共同 Join 键。
+                            sub_anchor_table = sorted(unresolved_tables)[0]
+                            sub_anchor_path = self._snapshot_file_path(
+                                snapshot_dir,
+                                sub_anchor_table,
                             )
+                            self._copy_query_to_parquet(
+                                con,
+                                f"SELECT * FROM {sub_anchor_table} "
+                                f"LIMIT {row_limit}",
+                                sub_anchor_path,
+                            )
+                            primary_alias = physical_to_aliases[
+                                sub_anchor_table
+                            ][0]
+                            sub_file = self._snapshot_file(
+                                primary_alias,
+                                sub_anchor_path,
+                            )
+                            for alias in physical_to_aliases[
+                                sub_anchor_table
+                            ]:
+                                selected_paths[alias] = sub_anchor_path
+                            files.append(sub_file)
+                            unresolved_tables.remove(sub_anchor_table)
                 finally:
                     con.close()
 

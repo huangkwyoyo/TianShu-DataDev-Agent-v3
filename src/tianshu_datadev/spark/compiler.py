@@ -20,6 +20,7 @@ from tianshu_datadev.spark._alias_resolver import (
 from tianshu_datadev.spark.annotations import StepAnnotation
 from tianshu_datadev.spark.models import (
     SparkAggregateStep,
+    SparkArithmeticExpression,
     SparkCaseWhenStep,
     SparkFilterStep,
     SparkJoinStep,
@@ -179,10 +180,14 @@ class SparkCompiler:
                     elif isinstance(step, SparkJoinStep):
                         left_var = _branch_latest.get(step.left_alias)
                         if left_var is None:
+                            left_var = branch_outputs.get(step.left_alias)
+                        if left_var is None:
                             raise AliasResolutionError(
                                 f"分支 {branch_name!r} Join 步骤左表别名 {step.left_alias!r} 未解析"
                             )
                         right_var = _branch_latest.get(step.right_alias)
+                        if right_var is None:
+                            right_var = branch_outputs.get(step.right_alias)
                         if right_var is None:
                             raise AliasResolutionError(
                                 f"分支 {branch_name!r} Join 步骤右表别名 {step.right_alias!r} 未解析"
@@ -191,7 +196,11 @@ class SparkCompiler:
                         out_var = branch_name if is_last else f"_br_{branch_name}_{branch_var_counter}"
                         _branch_latest[step.left_alias] = out_var
                         _branch_prev_output = out_var
-                        _resolved = ResolvedStep(step=step, input_vars=(left_var, right_var), output_var=out_var)
+                        _resolved = ResolvedStep(
+                            step=step,
+                            input_vars=(left_var, right_var),
+                            output_var=out_var,
+                        )
                         raw, comment = self._compile_join(
                             _resolved, step_id, j, len(branch_steps),
                             join_result_vars=None,
@@ -203,11 +212,14 @@ class SparkCompiler:
                         input_var: str | None = None
                         if input_key:
                             input_var = _branch_latest.get(input_key)
+                            if input_var is None:
+                                input_var = branch_outputs.get(input_key)
                         elif _branch_prev_output is not None:
                             input_var = _branch_prev_output
                         if input_var is None:
                             raise AliasResolutionError(
-                                f"分支 {branch_name!r} 步骤 {j} {step_type} 的 input_alias={input_key!r} 未解析"
+                                f"分支 {branch_name!r} 步骤 {j} "
+                                f"{step_type} 的 input_alias={input_key!r} 未解析"
                             )
                         branch_var_counter += 1
                         out_var = branch_name if is_last else f"_br_{branch_name}_{branch_var_counter}"
@@ -237,6 +249,16 @@ class SparkCompiler:
                     state.add_step(step_id, raw, comment)
 
                 # 注册分支输出——分支名 → 分支输出变量名
+                branch_alias = self.renderer.validate_identifier(
+                    branch_name,
+                    "SparkPlan.branches key",
+                )
+                alias_step_id = state.next_step_id("SparkBranchAlias")
+                state.add_step(
+                    alias_step_id,
+                    f'{branch_name} = {branch_name}.alias("{branch_alias}")',
+                    "",
+                )
                 branch_outputs[branch_name] = branch_name
 
         # ── 解析主步骤所有代码生成变量名（感知分支输出）──
@@ -421,6 +443,15 @@ class SparkCompiler:
 
         col_strs: list[str] = []
         for col in step.columns:
+            if col.arithmetic_expression is not None:
+                alias = self.renderer.validate_identifier(
+                    col.alias, "ProjectStep.alias",
+                )
+                expression = self._render_arithmetic_expression(
+                    col.arithmetic_expression
+                )
+                col_strs.append(f'({expression}).alias("{alias}")')
+                continue
             if col.ratio_expr is not None:
                 ratio = col.ratio_expr
                 numerator = self.renderer.validate_identifier(
@@ -477,6 +508,50 @@ class SparkCompiler:
             output=out_alias,
         )
         return raw, comment
+
+    def _render_arithmetic_expression(
+        self,
+        expression: SparkArithmeticExpression,
+    ) -> str:
+        """递归渲染封闭算术 AST，不接受原始 PySpark 表达式。"""
+        if expression.kind == "column":
+            column_name = self.renderer.validate_identifier(
+                expression.column_name or "",
+                "SparkArithmeticExpression.column_name",
+            )
+            return f'F.col("{column_name}")'
+        if expression.kind == "literal":
+            if expression.value is None:
+                raise RenderError("算术字面量不得为空")
+            return f"F.lit({expression.value!r})"
+        if expression.kind == "null_if_zero":
+            if expression.left is None:
+                raise RenderError("NULLIF 表达式缺少输入")
+            value = self._render_arithmetic_expression(expression.left)
+            return (
+                f"F.when(({value}).isNull() | ({value} == F.lit(0)), "
+                f"F.lit(None)).otherwise({value})"
+            )
+        if (
+            expression.kind != "binary"
+            or expression.left is None
+            or expression.right is None
+        ):
+            raise RenderError("二元算术表达式缺少左右操作数")
+        operators = {
+            "ADD": "+",
+            "SUBTRACT": "-",
+            "MULTIPLY": "*",
+            "DIVIDE": "/",
+        }
+        operator = operators.get(expression.operator or "")
+        if operator is None:
+            raise RenderError(
+                f"不支持的算术操作符: {expression.operator!r}"
+            )
+        left = self._render_arithmetic_expression(expression.left)
+        right = self._render_arithmetic_expression(expression.right)
+        return f"({left} {operator} {right})"
 
     def _compile_sort(
         self, resolved: ResolvedStep, step_id: str, index: int, total: int,

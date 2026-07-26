@@ -13,6 +13,7 @@ _temp 表是 SqlProgram 中语句间传递中间结果的临时表，生命周�
 
 from __future__ import annotations
 
+import hashlib
 import re
 
 from pydantic import Field
@@ -28,6 +29,9 @@ _TEMP_PREFIX = "_temp_"
 # DuckDB 未加引号的标识符必须以字母或 _ 开头，这里进一步限制为字母开头
 _TEMP_ID_PATTERN = re.compile(r"^_temp_[A-Za-z][A-Za-z0-9_]{0,58}$")
 #                                                      ^^^^^ 前缀5字符 + 最多59字符 = 总计 ≤ 64
+_TEMP_ID_UNBOUNDED_PATTERN = re.compile(r"^_temp_[A-Za-z][A-Za-z0-9_]*$")
+_TEMP_ID_MAX_LENGTH = 64
+_TEMP_HASH_LENGTH = 12
 
 # 当前支持的清理时机
 VALID_CLEANUP_AFTER = frozenset({"program_end"})
@@ -75,7 +79,22 @@ def make_temp_name(chain_id: str, step_identifier: str) -> str:
     Raises:
         ValueError: 生成的表名未通过白名单校验（理论上不会，但作为安全门禁保留）
     """
-    temp_id = f"_temp_c{chain_id}_{step_identifier}"
+    raw_temp_id = f"_temp_c{chain_id}_{step_identifier}"
+
+    # 先校验完整原始值，避免非法字符藏在被截断的尾部后绕过白名单。
+    if not _TEMP_ID_UNBOUNDED_PATTERN.fullmatch(raw_temp_id):
+        validate_temp_table_naming(raw_temp_id)
+
+    temp_id = raw_temp_id
+    if len(raw_temp_id) > _TEMP_ID_MAX_LENGTH:
+        digest = hashlib.sha256(raw_temp_id.encode("utf-8")).hexdigest()[
+            :_TEMP_HASH_LENGTH
+        ]
+        suffix = f"_{digest}"
+        readable_length = _TEMP_ID_MAX_LENGTH - len(suffix)
+        readable_prefix = raw_temp_id[:readable_length].rstrip("_")
+        temp_id = f"{readable_prefix}{suffix}"
+
     # 安全门禁——确保生成的表名符合白名单规范
     validate_temp_table_naming(temp_id)
     return temp_id
