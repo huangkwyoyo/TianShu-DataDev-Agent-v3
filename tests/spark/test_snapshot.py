@@ -98,6 +98,117 @@ class TestWarehouseSnapshotMaterialization:
         dim = pq.read_table(files["dc"].file_path)
         assert dim.column("customer_id").to_pylist() == [10, 20]
 
+    def test_relation_fanout_keeps_complete_dimension_groups(self, tmp_path):
+        """关系采样只选择完整维度组，不得按锚表的 10 行上限截断组内事实。"""
+        import duckdb
+        import pyarrow.parquet as pq
+
+        db_path = tmp_path / "fanout.duckdb"
+        con = duckdb.connect(str(db_path))
+        try:
+            con.execute("CREATE SCHEMA silver")
+            con.execute(
+                "CREATE TABLE silver.anchor AS "
+                "SELECT * FROM (VALUES (1, 'A'), (2, 'B')) "
+                "AS t(anchor_id, borough)"
+            )
+            con.execute(
+                "CREATE TABLE silver.crash_detail AS "
+                "SELECT range AS crash_id, "
+                "CASE WHEN range < 100 THEN 'A' ELSE 'B' END AS borough "
+                "FROM range(220)"
+            )
+        finally:
+            con.close()
+
+        builder = SnapshotBuilder(str(tmp_path / "snapshots"))
+
+        def materialize():
+            return builder.materialize_warehouse_tables(
+                contract_hash="f" * 64,
+                source_tables=[
+                    "silver.anchor",
+                    "silver.crash_detail",
+                ],
+                duckdb_path=str(db_path),
+                joins=[{
+                    "left_table": "a",
+                    "right_table": "cd",
+                    "left_key": "borough",
+                    "right_key": "borough",
+                    "join_type": "INNER",
+                }],
+                table_aliases={
+                    "silver.anchor": "a",
+                    "silver.crash_detail": "cd",
+                },
+                sampling=SamplingSpec(mode="head", limit=10),
+                memory_limit="128MB",
+                max_temp_directory_size="128MB",
+                relation_row_budget=110,
+            )
+
+        first = materialize()
+        first_file = next(item for item in first.files if item.source_name == "cd")
+        first_rows = pq.read_table(first_file.file_path)
+        first_ids = first_rows.column("crash_id").to_pylist()
+
+        second = materialize()
+        second_file = next(item for item in second.files if item.source_name == "cd")
+        second_rows = pq.read_table(second_file.file_path)
+
+        assert len(first_ids) == 100
+        assert set(first_rows.column("borough").to_pylist()) == {"A"}
+        assert second_rows.column("crash_id").to_pylist() == first_ids
+
+    def test_oversized_single_group_fails_without_partial_snapshot(self, tmp_path):
+        """单个完整组超过安全预算时阻断，禁止静默截断后继续验证。"""
+        import duckdb
+
+        db_path = tmp_path / "oversized_group.duckdb"
+        con = duckdb.connect(str(db_path))
+        try:
+            con.execute("CREATE SCHEMA silver")
+            con.execute(
+                "CREATE TABLE silver.anchor AS "
+                "SELECT 1 AS anchor_id, 'A' AS borough"
+            )
+            con.execute(
+                "CREATE TABLE silver.crash_detail AS "
+                "SELECT range AS crash_id, 'A' AS borough "
+                "FROM range(100)"
+            )
+        finally:
+            con.close()
+
+        with pytest.raises(
+            SnapshotMaterializationError,
+            match="最小完整关系分组含 100 行",
+        ):
+            SnapshotBuilder(
+                str(tmp_path / "snapshots")
+            ).materialize_warehouse_tables(
+                contract_hash="g" * 64,
+                source_tables=[
+                    "silver.anchor",
+                    "silver.crash_detail",
+                ],
+                duckdb_path=str(db_path),
+                joins=[{
+                    "left_table": "a",
+                    "right_table": "cd",
+                    "left_key": "borough",
+                    "right_key": "borough",
+                    "join_type": "INNER",
+                }],
+                table_aliases={
+                    "silver.anchor": "a",
+                    "silver.crash_detail": "cd",
+                },
+                sampling=SamplingSpec(mode="head", limit=10),
+                relation_row_budget=50,
+            )
+
     def test_role_aliases_share_one_relation_consistent_snapshot(self, tmp_path):
         """同一维表的多个角色应合并 Join 命中行，并共享一个 Parquet。"""
         import json
@@ -1309,6 +1420,8 @@ class TestSnapshotBuilderAliases:
         )
 
         def _fake_materialize(_self, **_kwargs):
+            assert _self._memory_limit == "512MB"
+            assert _self._process_memory_limit_mb == 1536
             SnapshotBuilder._write_inputs_index(
                 fake_manifest.snapshot_dir,
                 fake_manifest.files,

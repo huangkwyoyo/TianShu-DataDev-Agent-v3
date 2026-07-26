@@ -2,6 +2,10 @@ import { test, expect } from '@playwright/test';
 import type { Locator } from '@playwright/test';
 
 test('Run-All 完成后保留全部结果面板并按审查顺序展示', async ({ page }) => {
+  await page.context().grantPermissions(
+    ['clipboard-read', 'clipboard-write'],
+    { origin: 'http://127.0.0.1:5173' },
+  );
   const doneResult = {
     request_id: 'req-panel',
     pipeline_error: null,
@@ -59,17 +63,46 @@ test('Run-All 完成后保留全部结果面板并按审查顺序展示', async 
       errors: [],
     }],
     pyspark_code: 'def transform(inputs, params): return inputs["t"]',
-    standalone_pyspark: 'print("spark")',
+    standalone_pyspark: [
+      'from pyspark.sql import SparkSession',
+      'from transform import transform',
+      'if __name__ == "__main__":',
+      '    spark = SparkSession.builder.appName("tianshu_datadev").getOrCreate()',
+    ].join('\n'),
     llm_traces: {
+      requirement_planner: {
+        node_name: 'requirement_planner',
+        model: 'deterministic',
+        token_usage: {},
+        latency_ms: 1,
+        status: 'skipped',
+        error_type: null,
+      },
       spec_enricher: {
         node_name: 'spec_enricher',
-        model: 'test-model',
+        model: 'anthropic',
         token_usage: {
           prompt_tokens: 10,
           completion_tokens: 5,
           total_tokens: 15,
         },
-        latency_ms: 12,
+        latency_ms: 61219,
+        status: 'valid',
+        error_type: null,
+      },
+      relationship_planner: {
+        node_name: 'relationship_planner',
+        model: 'anthropic',
+        token_usage: {},
+        latency_ms: 17066,
+        status: 'valid',
+        error_type: null,
+      },
+      spark_developer: {
+        node_name: 'spark_developer',
+        model: 'deepseek',
+        token_usage: {},
+        latency_ms: 36125,
         status: 'valid',
         error_type: null,
       },
@@ -118,7 +151,7 @@ test('Run-All 完成后保留全部结果面板并按审查顺序展示', async 
   const parse = page.getByRole('heading', { name: /解析预览/ });
   const plan = page.getByRole('heading', { name: /SqlBuildPlan 步骤/ });
   const sql = page.getByRole('heading', { name: /生成的 SQL/ });
-  const llm = page.getByText('LLM 调用追踪', { exact: true });
+  const llm = page.locator('.llm-trace-panel');
   const code = page.locator('[data-testid="code-download-panel"]');
 
   await expect(progress).toBeVisible();
@@ -128,7 +161,46 @@ test('Run-All 完成后保留全部结果面板并按审查顺序展示', async 
   await expect(plan).toBeVisible();
   await expect(sql).toBeVisible();
   await expect(llm).toBeVisible();
+  await expect(llm).toContainText('3 次调用');
+  await llm.getByRole('button', { name: /LLM 调用追踪/ }).click();
+  await expect(llm.locator('[data-pipeline="sql"]')).toContainText('SQL 管线');
+  await expect(llm.locator('[data-pipeline="sql"]')).toContainText('需求规划');
+  await expect(llm.locator('[data-pipeline="sql"]')).toContainText('未调用');
+  await expect(llm.locator('[data-pipeline="sql"]')).toContainText('Spec 增强');
+  await expect(llm.locator('[data-pipeline="sql"]')).toContainText('61.2 s');
+  await expect(llm.locator('[data-pipeline="sql"]')).toContainText('标签提取');
+  await expect(llm.locator('[data-pipeline="sql"]')).toContainText('未触发');
+  await expect(llm.locator('[data-pipeline="spark"]')).toContainText('Spark 管线');
+  await expect(llm.locator('[data-pipeline="spark"]')).toContainText('语义标注');
+  await expect(llm.locator('[data-pipeline="spark"]')).toContainText('36.1 s');
+  await expect(llm).not.toContainText('SQL Plan 构建');
   await expect(code).toBeVisible();
+  await expect(code).toContainText('SELECT 1 AS trip_count');
+  await expect(code).toContainText('def transform(inputs, params)');
+  await expect(code).toContainText('Spark 本地运行入口 · spark_job.py');
+  await expect(code).toContainText('from transform import transform');
+  await expect(page.getByRole('button', { name: '复制 SQL' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '下载 SQL' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '复制 PySpark Transform' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '下载 PySpark Transform' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '复制 Spark 本地运行入口' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '下载 Spark 本地运行入口' })).toBeVisible();
+
+  const sqlCopy = page.getByRole('button', { name: '复制 SQL' });
+  await sqlCopy.click();
+  await expect(sqlCopy).toHaveText('✅');
+
+  const sqlDownloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: '下载 SQL' }).click();
+  expect((await sqlDownloadPromise).suggestedFilename()).toBe('query.sql');
+
+  const transformDownloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: '下载 PySpark Transform' }).click();
+  expect((await transformDownloadPromise).suggestedFilename()).toBe('transform.py');
+
+  const runnerDownloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: '下载 Spark 本地运行入口' }).click();
+  expect((await runnerDownloadPromise).suggestedFilename()).toBe('spark_job.py');
 
   const y = async (locator: Locator) => (await locator.boundingBox())!.y;
   expect(await y(progress)).toBeLessThan(await y(parse));

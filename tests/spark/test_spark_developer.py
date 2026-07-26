@@ -29,6 +29,7 @@ from tianshu_datadev.spark.models import (
     SparkWindowFunction,
     SparkWindowStep,
 )
+from tianshu_datadev.spark.step_ids import iter_plan_steps
 
 # ════════════════════════════════════════════
 # 测试辅助——构造最小 SparkPlan
@@ -111,17 +112,18 @@ def _mock_llm_annotate(spark_plan: SparkPlan) -> AnnotatedSparkPlan:
         "SparkWindowStep": StepIntent.RANK,
     }
 
-    for i, step in enumerate(spark_plan.steps):
+    for global_index, (step_id, _stage, _index, step) in enumerate(
+        iter_plan_steps(spark_plan)
+    ):
         step_type = type(step).__name__
-        step_id = f"{step_type}_{i}"
         intent = intent_map.get(step_type, StepIntent.SHAPE)
         annotations.append(
             StepAnnotation(
                 step_id=step_id,
-                step_index=i,
+                step_index=global_index,
                 step_type=step.step_type.value if hasattr(step.step_type, "value") else str(step.step_type),
                 intent=intent,
-                intent_detail=f"Mock 标注——{step_type} 第 {i} 步",
+                intent_detail=f"Mock 标注——{step_type} 第 {global_index} 步",
                 operation_summary=f"执行 {step_type} 操作",
             )
         )
@@ -374,6 +376,45 @@ class TestProviderAdapterIntegration:
         assert call_count[0] == 2
         assert isinstance(result, AnnotatedSparkPlan)
 
+    def test_adapter_retry_uses_exponential_backoff(self, monkeypatch):
+        """可恢复故障重试前按配置执行有界指数退避。"""
+        from tianshu_datadev.llm.adapters.base import AdapterError
+        from tianshu_datadev.prompts.manager import PromptManager
+
+        call_count = [0]
+        sleeps: list[float] = []
+
+        class RetryAdapter:
+            def invoke(
+                self, system_message: str, user_message: str,
+                json_schema: dict, model: str, temperature: float,
+            ) -> dict:
+                call_count[0] += 1
+                if call_count[0] < 3:
+                    raise AdapterError("模拟临时故障", provider="test")
+                plan = _make_simple_plan()
+                return _mock_llm_annotate(plan).model_dump(mode="json")
+
+            def provider_name(self) -> str:
+                return "retry"
+
+        monkeypatch.setattr(
+            "tianshu_datadev.spark.developer.time.sleep",
+            sleeps.append,
+        )
+        svc = SparkDeveloperService.from_provider_adapter(
+            RetryAdapter(),
+            PromptManager(),
+            max_llm_retries=2,
+            retry_backoff_sec=1.0,
+        )
+
+        result = svc.annotate(_make_simple_plan())
+
+        assert call_count[0] == 3
+        assert sleeps == [1.0, 2.0]
+        assert isinstance(result, AnnotatedSparkPlan)
+
     def test_adapter_exhausts_retries_raises(self):
         """重试耗尽后仍然失败——抛出异常。"""
         from tianshu_datadev.llm.adapters.base import AdapterError
@@ -428,6 +469,65 @@ class TestProviderAdapterIntegration:
 
         # 非 AdapterError 只调用 1 次——不浪费重试次数
         assert call_count[0] == 1
+
+    def test_adapter_normalizes_legacy_flags_field(self):
+        """旧 Prompt 的 flags 仅在 Adapter 边界归一化为 review_flags。"""
+        from tianshu_datadev.prompts.manager import PromptManager
+
+        plan = _make_simple_plan()
+
+        class LegacyFlagsAdapter:
+            def invoke(
+                self, system_message: str, user_message: str,
+                json_schema: dict, model: str, temperature: float,
+            ) -> dict:
+                data = _mock_llm_annotate(plan).model_dump(mode="json")
+                for annotation in data["annotations"]:
+                    annotation["flags"] = ["NEEDS_REVIEW"]
+                    annotation.pop("review_flags", None)
+                return data
+
+            def provider_name(self) -> str:
+                return "legacy_flags"
+
+        service = SparkDeveloperService.from_provider_adapter(
+            LegacyFlagsAdapter(),
+            PromptManager(),
+        )
+
+        result = service.annotate(plan)
+
+        assert all(
+            annotation.review_flags == ["NEEDS_REVIEW"]
+            for annotation in result.annotations
+        )
+
+    def test_adapter_rejects_conflicting_flag_fields(self):
+        """新旧字段同时存在且内容冲突时继续 fail-closed。"""
+        from tianshu_datadev.prompts.manager import PromptManager
+
+        plan = _make_simple_plan()
+
+        class ConflictingFlagsAdapter:
+            def invoke(
+                self, system_message: str, user_message: str,
+                json_schema: dict, model: str, temperature: float,
+            ) -> dict:
+                data = _mock_llm_annotate(plan).model_dump(mode="json")
+                data["annotations"][0]["flags"] = ["LEGACY"]
+                data["annotations"][0]["review_flags"] = ["CURRENT"]
+                return data
+
+            def provider_name(self) -> str:
+                return "conflicting_flags"
+
+        service = SparkDeveloperService.from_provider_adapter(
+            ConflictingFlagsAdapter(),
+            PromptManager(),
+        )
+
+        with pytest.raises(ValueError, match="冲突的 flags 和 review_flags"):
+            service.annotate(plan)
 
 
 # ════════════════════════════════════════════

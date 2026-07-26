@@ -106,7 +106,7 @@ class AnnotatedSparkPlan(StrictModel):
     """标注后的 SparkPlan——baseline SparkPlan + 标注层。
 
     约束：
-    1. annotations 数量 == baseline.steps 数量（一一对应）
+    1. annotations 数量 == baseline 中 branches + 主阶段的步骤总数（一一对应）
     2. 删除全部 annotations 后，Compiler 产出等价代码
     3. annotations 不参与 SparkPlan.compute_plan_hash()
     """

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchTemplates, fetchTemplate, TemplateSummary, TemplateFull } from '../api/client';
 
 interface Props {
@@ -10,12 +10,47 @@ export function TemplateSelector({ onSelect }: Props) {
   const [templates, setTemplates] = useState<TemplateSummary[]>([]);
   const [open, setOpen] = useState(false);
   const [loadErr, setLoadErr] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const requestSequence = useRef(0);
+
+  const loadTemplates = useCallback(async () => {
+    const requestId = requestSequence.current + 1;
+    requestSequence.current = requestId;
+    setLoading(true);
+    setLoadErr(null);
+    try {
+      const response = await fetchTemplates();
+      if (!Array.isArray(response.templates)) {
+        throw new Error('模板列表响应格式不正确');
+      }
+      if (requestId !== requestSequence.current) return;
+      setTemplates(response.templates);
+      setLoadErr(null);
+    } catch {
+      if (requestId !== requestSequence.current) return;
+      setLoadErr('模板加载失败');
+    } finally {
+      if (requestId === requestSequence.current) {
+        setLoading(false);
+      }
+    }
+  }, []);
 
   useEffect(() => {
-    fetchTemplates()
-      .then((res) => setTemplates(res.templates))
-      .catch(() => setLoadErr('模板加载失败'));
-  }, []);
+    void loadTemplates();
+  }, [loadTemplates]);
+
+  const handleToggle = () => {
+    const nextOpen = !open;
+    setOpen(nextOpen);
+    if (
+      nextOpen
+      && !loading
+      && (loadErr !== null || templates.length === 0)
+    ) {
+      void loadTemplates();
+    }
+  };
 
   const handleClick = async (tpl: TemplateSummary) => {
     try {
@@ -40,7 +75,7 @@ export function TemplateSelector({ onSelect }: Props) {
     <div className="header-template-select">
       <button
         className="header-template-btn"
-        onClick={() => setOpen(!open)}
+        onClick={handleToggle}
         title="加载模板"
       >
         Templates <span className="arrow">{open ? '▲' : '▼'}</span>
@@ -50,6 +85,11 @@ export function TemplateSelector({ onSelect }: Props) {
         <>
           <div className="template-overlay" onClick={() => setOpen(false)} />
           <div className="template-dropdown">
+            {loading && (
+              <div className="template-dropdown-item" style={{ cursor: 'default' }}>
+                正在加载模板…
+              </div>
+            )}
             {loadErr && (
               <div className="template-dropdown-item" style={{ color: 'var(--error)', cursor: 'default' }}>
                 {loadErr}

@@ -48,9 +48,9 @@ export function SparkStageResultPanel({ stage, result, status, visible }: Props)
   if (!visible) return null;
 
   const stageCn = STAGE_CN[stage] || stage;
-  // 编译阶段：切换「编译产物」/「独立运行脚本」
+  // 编译阶段：切换纯转换模块和确定性作业入口。
   const [compilerTab, setCompilerTab] = useState<'annotated' | 'standalone'>(
-    result.standalone_pyspark ? 'standalone' : 'annotated'
+    'annotated'
   );
   // 代码复制按钮状态
   const [codeCopied, setCodeCopied] = useState(false);
@@ -194,7 +194,7 @@ export function SparkStageResultPanel({ stage, result, status, visible }: Props)
       {/* COMPILER——PySpark 代码展示（带标签切换 + 复制按钮） */}
       {result.type === 'compiler' && status === 'ok' && (
         <>
-          <div className="section-title">🐍 PySpark DSL 代码（最终产物）</div>
+          <div className="section-title">🐍 PySpark 代码产物</div>
           <div className="spark-plan-summary">
             <span className="stat-label">步骤数</span>
             <span className="stat-value">{result.step_count}</span>
@@ -208,27 +208,29 @@ export function SparkStageResultPanel({ stage, result, status, visible }: Props)
             )}
           </div>
 
-          {/* 标签切换：编译产物 / 独立运行脚本 */}
+          {/* 标签切换：纯转换模块 / 确定性作业入口 */}
           {result.standalone_pyspark && (
             <div className="spark-code-tabs">
               <div
                 className={`spark-code-tab${compilerTab === 'annotated' ? ' active' : ''}`}
                 onClick={() => setCompilerTab('annotated')}
               >
-                编译产物
+                Transform 模块
               </div>
               <div
                 className={`spark-code-tab${compilerTab === 'standalone' ? ' active' : ''}`}
                 onClick={() => setCompilerTab('standalone')}
               >
-                独立运行脚本
+                本地运行入口
               </div>
             </div>
           )}
 
           <div className="code-block-wrapper">
             <div className="code-block-header">
-              <span className="code-block-title">PySpark</span>
+              <span className="code-block-title">
+                {compilerTab === 'standalone' ? 'spark_job.py' : 'transform.py'}
+              </span>
               <button
                 className={`btn-copy${codeCopied ? ' copied' : ''}`}
                 onClick={() => {

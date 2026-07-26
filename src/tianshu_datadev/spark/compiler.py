@@ -126,6 +126,9 @@ class SparkCompiler:
         Returns:
             SparkCompileResult——含 raw + annotated 两个版本
         """
+        if plan.branches:
+            return self._compile_multistage(plan, annotations)
+
         # ── 单一入口：解析所有代码生成变量名 ──
         # 注意：主步骤的解析已移至分支编译之后，以便感知分支输出变量
         state = _CompileState()
@@ -358,6 +361,362 @@ class SparkCompiler:
             SparkCompileResult——raw_pyspark 与 compile(plan, annotations).raw_pyspark 相同
         """
         return self.compile(plan, annotations=None)
+
+    def _compile_multistage(
+        self,
+        plan: SparkPlan,
+        annotations: list | None,
+    ) -> SparkCompileResult:
+        """把多语句 DAG 编译为多个私有转换函数和一个公开编排入口。"""
+        imports = self.renderer.render_imports()
+        ann_map = {
+            annotation.step_id: annotation
+            for annotation in (annotations or [])
+            if getattr(annotation, "step_id", "")
+        }
+        raw_blocks: list[str] = [imports]
+        annotated_blocks: list[str] = [imports]
+        step_ids: list[str] = []
+        stage_outputs: dict[str, str] = {}
+        stage_calls: list[tuple[str, str, list[str]]] = []
+
+        for stage_index, (branch_name, branch_steps) in enumerate(
+            plan.branches.items(),
+            start=1,
+        ):
+            if not branch_steps:
+                continue
+            stage_var = f"s{stage_index}"
+            function_name = f"_transform_{stage_var}"
+            dependencies = self._stage_dependencies(
+                branch_steps,
+                stage_outputs,
+            )
+            raw, annotated, branch_step_ids = self._compile_stage_function(
+                function_name=function_name,
+                stage_label=stage_var,
+                steps=branch_steps,
+                external_outputs=stage_outputs,
+                dependencies=dependencies,
+                output_alias=stage_var,
+                annotations=ann_map,
+                main_stage=False,
+            )
+            raw_blocks.append(raw)
+            annotated_blocks.append(annotated)
+            step_ids.extend(branch_step_ids)
+            stage_outputs[branch_name] = stage_var
+            stage_calls.append((stage_var, function_name, dependencies))
+
+        final_stage_index = len(stage_calls) + 1
+        final_stage_var = f"s{final_stage_index}"
+        final_function_name = f"_transform_{final_stage_var}"
+        final_dependencies = self._stage_dependencies(
+            plan.steps,
+            stage_outputs,
+        )
+        raw, annotated, final_step_ids = self._compile_stage_function(
+            function_name=final_function_name,
+            stage_label=final_stage_var,
+            steps=plan.steps,
+            external_outputs=stage_outputs,
+            dependencies=final_dependencies,
+            output_alias=None,
+            annotations=ann_map,
+            main_stage=True,
+        )
+        raw_blocks.append(raw)
+        annotated_blocks.append(annotated)
+        step_ids.extend(final_step_ids)
+        stage_calls.append(
+            (final_stage_var, final_function_name, final_dependencies)
+        )
+
+        signature = self.renderer.render_function_signature()
+        raw_orchestrator = [signature]
+        annotated_orchestrator = [
+            signature,
+            "    # 按 SqlProgram DAG 顺序执行业务阶段",
+        ]
+        for stage_var, function_name, dependencies in stage_calls:
+            args = ["inputs", *dependencies, "params=params"]
+            call = f"    {stage_var} = {function_name}({', '.join(args)})"
+            raw_orchestrator.append(call)
+            annotated_orchestrator.append(call)
+        raw_orchestrator.append(f"    return {final_stage_var}")
+        annotated_orchestrator.append(f"    return {final_stage_var}")
+        raw_blocks.append("\n".join(raw_orchestrator))
+        annotated_blocks.append("\n".join(annotated_orchestrator))
+
+        raw_pyspark = "\n\n\n".join(raw_blocks) + "\n"
+        annotated_pyspark = "\n\n\n".join(annotated_blocks) + "\n"
+        self._verify_no_comment_injection(raw_pyspark, annotated_pyspark)
+        return SparkCompileResult(
+            raw_pyspark=raw_pyspark,
+            annotated_pyspark=annotated_pyspark,
+            raw_hash=hashlib.sha256(raw_pyspark.encode()).hexdigest(),
+            step_ids=step_ids,
+        )
+
+    def _compile_stage_function(
+        self,
+        *,
+        function_name: str,
+        stage_label: str,
+        steps: list,
+        external_outputs: dict[str, str],
+        dependencies: list[str],
+        output_alias: str | None,
+        annotations: dict[str, StepAnnotation],
+        main_stage: bool,
+    ) -> tuple[str, str, list[str]]:
+        """编译一个业务阶段；阶段内部统一使用 tN/fN。"""
+        resolved_plan = resolve_codegen_aliases(steps, external_outputs)
+        params = ["inputs: Mapping[str, DataFrame]"]
+        params.extend(f"{name}: DataFrame" for name in dependencies)
+        params.append("params: dict | None = None")
+        signature = (
+            f"def {function_name}(\n"
+            + "".join(f"    {param},\n" for param in params)
+            + ") -> DataFrame:"
+        )
+        raw_lines = [signature]
+        annotated_lines = [
+            signature,
+            f"    # 业务阶段 {stage_label}",
+            f"    {self._stage_goal_comment(steps, main_stage=main_stage)}",
+        ]
+        join_result_vars = {
+            resolved.output_var
+            for resolved in resolved_plan.steps
+            if isinstance(resolved.step, SparkJoinStep)
+        }
+        step_ids: list[str] = []
+
+        for index, resolved in enumerate(resolved_plan.steps):
+            render_step = self._remap_external_aliases(
+                resolved.step,
+                external_outputs,
+            )
+            render_resolved = ResolvedStep(
+                step=render_step,
+                input_vars=resolved.input_vars,
+                output_var=resolved.output_var,
+            )
+            step = render_step
+            step_id = (
+                f"{type(step).__name__}_{index}"
+                if main_stage
+                else f"{type(step).__name__}_{stage_label}_{index}"
+            )
+            raw, _ = self._compile_resolved_step(
+                render_resolved,
+                step_id,
+                index,
+                len(resolved_plan.steps),
+                join_result_vars,
+            )
+            comment = (
+                f"{self._build_comment_block(step_id, index, len(resolved_plan.steps))}\n"
+                f"{self._readable_step_comment(render_resolved)}"
+            )
+            annotation = annotations.get(step_id)
+            if annotation is not None:
+                comment = self._enhance_comment_with_annotation(
+                    comment,
+                    annotation,
+                )
+            raw_lines.append(f"    {raw}")
+            annotated_lines.extend(
+                f"    {line}" for line in comment.splitlines()
+            )
+            annotated_lines.append(f"    {raw}")
+            step_ids.append(step_id)
+
+        return_expr = resolved_plan.output_var
+        if output_alias is not None:
+            safe_alias = self.renderer.validate_identifier(
+                output_alias,
+                "SparkPlan.branches key",
+            )
+            return_expr = f'{return_expr}.alias("{safe_alias}")'
+        raw_lines.append(f"    return {return_expr}")
+        annotated_lines.append(f"    return {return_expr}")
+        return "\n".join(raw_lines), "\n".join(annotated_lines), step_ids
+
+    def _stage_goal_comment(self, steps: list, *, main_stage: bool) -> str:
+        """根据封闭 SparkStep 结构生成一行阶段业务目标。"""
+        source_names = list(dict.fromkeys(
+            step.source_name
+            for step in steps
+            if isinstance(step, SparkReadStep)
+        ))
+        operation_names: list[str] = []
+        operation_map = (
+            (SparkFilterStep, "过滤"),
+            (SparkJoinStep, "关联"),
+            (SparkAggregateStep, "聚合"),
+            (SparkCaseWhenStep, "业务标签"),
+            (SparkWindowStep, "窗口计算"),
+            (SparkSortStep, "排序"),
+            (SparkLimitStep, "行数限制"),
+            (SparkProjectStep, "字段选择"),
+        )
+        for step in steps:
+            for step_type, operation_name in operation_map:
+                if isinstance(step, step_type):
+                    if operation_name not in operation_names:
+                        operation_names.append(operation_name)
+                    break
+
+        output_columns: list[str] = []
+        for step in reversed(steps):
+            if isinstance(step, SparkProjectStep):
+                output_columns = [
+                    column.alias or column.column_name
+                    for column in step.columns
+                ]
+                break
+
+        if source_names:
+            source_text = f"读取 {'、'.join(source_names)}"
+        else:
+            source_text = "合并上游阶段"
+        operation_text = (
+            f"，完成{'、'.join(operation_names)}"
+            if operation_names
+            else ""
+        )
+        output_text = (
+            f"，产出 {'、'.join(output_columns)}"
+            if output_columns
+            else ""
+        )
+        purpose = "作为最终结果" if main_stage else "供后续阶段使用"
+        detail = f"业务目标：{source_text}{operation_text}{output_text}，{purpose}。"
+        return self.renderer.render_comment_line(detail)
+
+    @staticmethod
+    def _stage_dependencies(
+        steps: list,
+        stage_outputs: dict[str, str],
+    ) -> list[str]:
+        """按 sN 顺序返回当前阶段实际引用的上游阶段。"""
+        used: set[str] = set()
+        for step in steps:
+            if isinstance(step, SparkJoinStep):
+                aliases = (step.left_alias, step.right_alias)
+            else:
+                aliases = (getattr(step, "input_alias", ""),)
+            for alias in aliases:
+                stage_var = stage_outputs.get(alias)
+                if stage_var is not None:
+                    used.add(stage_var)
+        return sorted(used, key=lambda name: int(name[1:]))
+
+    def _remap_external_aliases(
+        self,
+        step,
+        external_outputs: dict[str, str],
+    ):
+        """仅在代码生成视图中把内部临时表别名替换为 sN。"""
+        if not external_outputs:
+            return step
+
+        def remap(value):
+            if isinstance(value, str):
+                for source, target in external_outputs.items():
+                    if value == source:
+                        return target
+                    if value.startswith(f"{source}."):
+                        return f"{target}{value[len(source):]}"
+                return value
+            if isinstance(value, list):
+                return [remap(item) for item in value]
+            if isinstance(value, dict):
+                return {key: remap(item) for key, item in value.items()}
+            return value
+
+        payload = remap(step.model_dump(mode="python"))
+        return type(step).model_validate(payload)
+
+    def _compile_resolved_step(
+        self,
+        resolved: ResolvedStep,
+        step_id: str,
+        index: int,
+        total: int,
+        join_result_vars: set[str],
+    ) -> tuple[str, str]:
+        """统一分发已解析步骤，避免多阶段编译器维护第二套规则。"""
+        step = resolved.step
+        if isinstance(step, SparkReadStep):
+            return self._compile_read(resolved, step_id, index, total)
+        if isinstance(step, SparkFilterStep):
+            return self._compile_filter(resolved, step_id, index, total)
+        if isinstance(step, SparkProjectStep):
+            return self._compile_project(resolved, step_id, index, total)
+        if isinstance(step, SparkSortStep):
+            return self._compile_sort(resolved, step_id, index, total)
+        if isinstance(step, SparkLimitStep):
+            return self._compile_limit(resolved, step_id, index, total)
+        if isinstance(step, SparkJoinStep):
+            return self._compile_join(
+                resolved,
+                step_id,
+                index,
+                total,
+                join_result_vars=join_result_vars,
+            )
+        if isinstance(step, SparkAggregateStep):
+            return self._compile_aggregate(resolved, step_id, index, total)
+        if isinstance(step, SparkCaseWhenStep):
+            return self._compile_case_when(resolved, step_id, index, total)
+        if isinstance(step, SparkWindowStep):
+            return self._compile_window(resolved, step_id, index, total)
+        return self._compile_unsupported(step, step_id, "unknown")
+
+    def _readable_step_comment(self, resolved: ResolvedStep) -> str:
+        """生成贴近代码的确定性操作注释，不暴露内部 step_id。"""
+        step = resolved.step
+        output = resolved.output_var
+        if isinstance(step, SparkReadStep):
+            detail = f"读取输入 {step.source_name} -> {output}"
+        elif isinstance(step, SparkFilterStep):
+            detail = (
+                f"尽早过滤 {step.left} {step.operator} "
+                f"{step.right} -> {output}"
+            )
+        elif isinstance(step, SparkJoinStep):
+            detail = (
+                f"{step.join_type.value} JOIN: "
+                f"{step.left_key} = {step.right_key} -> {output}"
+            )
+        elif isinstance(step, SparkAggregateStep):
+            metrics = ", ".join(metric.alias for metric in step.metrics)
+            groups = ", ".join(step.group_keys) or "全局"
+            detail = f"按 {groups} 聚合 {metrics} -> {output}"
+        elif isinstance(step, SparkProjectStep):
+            columns = ", ".join(
+                column.alias or column.column_name
+                for column in step.columns
+            )
+            detail = f"选择业务列 {columns} -> {output}"
+        elif isinstance(step, SparkCaseWhenStep):
+            detail = f"生成业务标签 {step.output_alias} -> {output}"
+        elif isinstance(step, SparkWindowStep):
+            expressions = ", ".join(
+                expression.alias for expression in step.expressions
+            )
+            detail = f"计算窗口列 {expressions} -> {output}"
+        elif isinstance(step, SparkSortStep):
+            columns = ", ".join(spec.column for spec in step.order_by)
+            detail = f"按 {columns} 排序 -> {output}"
+        elif isinstance(step, SparkLimitStep):
+            detail = f"限制为前 {step.limit} 行 -> {output}"
+        else:
+            detail = f"执行 {type(step).__name__} -> {output}"
+        return f"# {self.renderer.render_comment_text(detail)}"
 
     # ── Step 编译方法 ──
 

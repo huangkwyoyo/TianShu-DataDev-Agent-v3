@@ -1,4 +1,4 @@
-/* LLM 调用追踪面板——指示灯横向布局 */
+/* LLM 调用追踪仅展示真实 LLM 节点，确定性阶段由流程面板负责。 */
 
 .llm-trace-panel {
   border: 1px solid var(--border);
@@ -12,16 +12,18 @@
   display: flex;
   align-items: center;
   gap: var(--space);
+  width: 100%;
+  height: 34px;
   padding: var(--space-sm) var(--space-md);
-  height: 30px;
-  background: var(--bg);
+  border: 0;
   border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-dim);
   cursor: pointer;
-  user-select: none;
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
   font-weight: 600;
-  color: var(--text-dim);
+  text-align: left;
 }
 
 .llm-trace-header:hover {
@@ -29,8 +31,8 @@
 }
 
 .llm-trace-chevron {
-  font-size: var(--font-size-xs);
   color: var(--text-faint);
+  font-size: var(--font-size-xs);
   transition: transform 0.15s;
 }
 
@@ -40,29 +42,29 @@
 
 .llm-trace-badge {
   margin-left: auto;
+  padding: 1px 6px;
+  border-radius: var(--radius);
   background: var(--accent);
   color: #0d1117;
   font-size: var(--font-size-xs);
   font-weight: 600;
-  padding: 0 6px;
-  border-radius: var(--radius);
 }
 
 .llm-trace-body {
   padding: var(--space-md);
 }
 
-/* 汇总行 */
 .llm-trace-summary {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-lg);
   padding: var(--space-sm) var(--space-md);
+  margin-bottom: var(--space-md);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
-  color: var(--text-dim);
-  background: var(--bg);
-  border-bottom: 1px solid var(--border);
-  margin-bottom: var(--space-md);
 }
 
 .llm-trace-summary-item {
@@ -79,73 +81,147 @@
   font-weight: 600;
 }
 
-/* ═══ 指示灯横向布局 ═══ */
-
-.llm-trace-lights {
-  display: flex;
-  flex-direction: column;
+.llm-trace-groups {
+  display: grid;
+  grid-template-columns: minmax(0, 4fr) minmax(180px, 1fr);
   gap: var(--space-md);
 }
 
-/* 每一行（灯行 / 详情行） */
-.llm-trace-lights-row {
+.llm-trace-group {
+  min-width: 0;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.llm-trace-group-header {
   display: flex;
-  gap: var(--space-lg);
-  flex-wrap: wrap;
-  align-items: flex-start;
-}
-
-/* 每个节点列 */
-.llm-trace-light-cell {
-  flex: 0 0 auto;
-  min-width: 100px;
-}
-
-/* 指示灯 + 标签容器 */
-.llm-trace-light-wrapper {
-  display: flex;
-  align-items: center;
-  gap: var(--space-xs);
-}
-
-/* 指示灯圆点 */
-.llm-trace-light-dot {
-  display: inline-block;
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  flex-shrink: 0;
-  box-shadow: 0 0 4px rgba(0, 0, 0, 0.3);
-}
-
-/* 节点标签 */
-.llm-trace-light-label {
+  justify-content: space-between;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
-  color: var(--text-dim);
-  white-space: nowrap;
+  font-weight: 600;
 }
 
-/* LLM 调用详情 */
-.llm-trace-detail {
+.llm-trace-group-header span:last-child {
+  color: var(--text-faint);
+  font-weight: 400;
+}
+
+.llm-trace-node-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.llm-trace-node {
+  min-width: 0;
+  padding: var(--space-sm) var(--space-md);
+  border-right: 1px solid var(--border);
+}
+
+.llm-trace-node:last-child {
+  border-right: 0;
+}
+
+.llm-trace-node-title {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
-  margin-left: calc(12px + var(--space-xs));  /* 与指示灯标签左对齐 */
+  align-items: center;
+  min-height: 22px;
+  gap: var(--space-xs);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
 }
 
-.llm-trace-detail-item {
-  font-family: var(--font-mono);
-  font-size: 11px;
+.llm-trace-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--text-faint);
+}
+
+.llm-trace-status-dot.success {
+  background: var(--success, #22c55e);
+}
+
+.llm-trace-status-dot.error {
+  background: var(--error, #ef4444);
+}
+
+.llm-trace-node-label {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.llm-trace-status {
+  margin-left: auto;
   color: var(--text-faint);
   white-space: nowrap;
 }
 
-/* 空状态 */
-.llm-trace-empty {
-  padding: var(--space-md);
-  text-align: center;
+.llm-trace-status.success {
+  color: var(--success, #22c55e);
+}
+
+.llm-trace-status.error {
+  color: var(--error, #ef4444);
+}
+
+.llm-trace-node-details {
+  display: grid;
+  gap: 3px;
+  margin: var(--space-xs) 0 0 12px;
   font-family: var(--font-mono);
-  font-size: var(--font-size-sm);
+  font-size: 11px;
+}
+
+.llm-trace-node-details div {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr);
+  gap: var(--space-xs);
+}
+
+.llm-trace-node-details dt {
+  color: var(--text-faint);
+}
+
+.llm-trace-node-details dd {
+  min-width: 0;
+  margin: 0;
   color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.llm-trace-error {
+  margin: var(--space-xs) 0 0 12px;
+  color: var(--error, #ef4444);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 900px) {
+  .llm-trace-groups {
+    grid-template-columns: 1fr;
+  }
+
+  .llm-trace-node-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .llm-trace-node {
+    border-bottom: 1px solid var(--border);
+  }
+}
+
+@media (max-width: 560px) {
+  .llm-trace-node-list {
+    grid-template-columns: 1fr;
+  }
+
+  .llm-trace-node {
+    border-right: 0;
+  }
 }

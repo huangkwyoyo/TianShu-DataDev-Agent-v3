@@ -1112,7 +1112,11 @@ class TestNYCCase06SqlPipeline:
     def test_run_all_produces_borough_results(self, nyc06_spec_md, nyc06_csv_paths):
         """Pipeline.run_all() 全链路执行——输出应包含 5 个 NYC 行政区结果。"""
         pipeline = Pipeline()
-        result = pipeline.run_all(nyc06_spec_md, table_paths=nyc06_csv_paths)
+        result = pipeline.run_all(
+            nyc06_spec_md,
+            table_paths=nyc06_csv_paths,
+            rich=True,
+        )
 
         assert result["validation_passed"] is True, (
             f"Case 06 验证应通过: {result.get('open_questions')}"
@@ -1135,6 +1139,13 @@ class TestNYCCase06SqlPipeline:
         assert bundle is not None
         assert bundle.compiled_program is not None
         assert len(bundle.compiled_program.statements) > 1
+        generated_sql = result.get("generated_sql", "")
+        assert generated_sql
+        assert generated_sql.count("-- Statement ") == len(
+            bundle.compiled_program.statements
+        )
+        for statement in bundle.compiled_program.statements:
+            assert statement.sql.strip().rstrip(";") in generated_sql
 
         # 验证输出包含 borough 列，且至少有 5 个不同的 borough
         summary = result["result_summary"]

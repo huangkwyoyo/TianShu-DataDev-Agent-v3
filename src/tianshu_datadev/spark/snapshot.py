@@ -131,8 +131,9 @@ class SnapshotManifest(StrictModel):
 # 快照目录内的 inputs 索引侧车文件名——executor prologue 据此按别名装载 inputs
 _INPUTS_INDEX_FILENAME = "_inputs_index.json"
 
-# 必须不高于 Executor 的完整结果上限，否则合法快照会在 execute 阶段必然阻断。
+# 锚表限制控制初始键集合；关联表按完整 Join 分组使用独立安全预算。
 SNAPSHOT_DEFAULT_ROW_LIMIT = 10_000
+SNAPSHOT_RELATION_ROW_BUDGET = 500_000
 
 
 # ════════════════════════════════════════════
@@ -315,6 +316,7 @@ class SnapshotBuilder:
         memory_limit: str = "1GB",
         threads: int = 1,
         max_temp_directory_size: str = "4GB",
+        relation_row_budget: int = SNAPSHOT_RELATION_ROW_BUDGET,
     ) -> SnapshotManifest:
         """从 DuckDB 仓库生成受控、关系一致的 Parquet 快照。
 
@@ -360,6 +362,8 @@ class SnapshotBuilder:
         row_limit = spec.limit
         if spec.mode != "head" or row_limit is None or row_limit <= 0:
             raise SnapshotMaterializationError("仓库快照只支持带正数上限的 head 采样")
+        if relation_row_budget <= 0:
+            raise SnapshotMaterializationError("关系完整分组预算必须大于 0")
 
         normalized_joins = self._validate_warehouse_join_graph(
             aliases=list(alias_to_physical),
@@ -455,6 +459,7 @@ class SnapshotBuilder:
                         progress = False
                         for target_table in sorted(unresolved_tables):
                             predicates: list[str] = []
+                            target_keys: list[str] = []
                             for join in normalized_joins:
                                 left_alias = join["left_table"]
                                 right_alias = join["right_table"]
@@ -474,6 +479,8 @@ class SnapshotBuilder:
                                     target_key = join["left_key"]
                                 else:
                                     continue
+                                if target_key not in target_keys:
+                                    target_keys.append(target_key)
 
                                 source_path = _render_sql_string_literal(
                                     selected_paths[source_alias]
@@ -502,18 +509,61 @@ class SnapshotBuilder:
                                 snapshot_dir,
                                 target_table,
                             )
+                            group_keys = ", ".join(target_keys)
+                            group_order = ", ".join(
+                                f"{key} ASC NULLS FIRST" for key in target_keys
+                            )
+                            join_condition = " AND ".join(
+                                f"_eligible.{key} IS NOT DISTINCT FROM "
+                                f"_selected.{key}"
+                                for key in target_keys
+                            )
                             query = (
-                                f"SELECT * FROM {target_table} "
+                                "WITH _group_counts AS ("
+                                f"SELECT {group_keys}, COUNT(*) AS _group_rows "
+                                f"FROM {target_table} "
                                 f"WHERE {' OR '.join(predicates)} "
-                                f"LIMIT {row_limit + 1}"
+                                f"GROUP BY {group_keys}"
+                                "), _ranked_groups AS ("
+                                f"SELECT {group_keys}, _group_rows, "
+                                "SUM(_group_rows) OVER ("
+                                "ORDER BY _group_rows ASC, "
+                                f"{group_order} "
+                                "ROWS BETWEEN UNBOUNDED PRECEDING "
+                                "AND CURRENT ROW"
+                                ") AS _cumulative_rows "
+                                "FROM _group_counts"
+                                "), _selected AS ("
+                                f"SELECT {group_keys} FROM _ranked_groups "
+                                f"WHERE _cumulative_rows <= {relation_row_budget}"
+                                ") SELECT _eligible.* FROM ("
+                                f"SELECT * FROM {target_table} "
+                                f"WHERE {' OR '.join(predicates)}"
+                                ") AS _eligible "
+                                f"JOIN _selected ON {join_condition}"
                             )
                             self._copy_query_to_parquet(con, query, target_path)
                             primary_alias = physical_to_aliases[target_table][0]
                             snapshot_file = self._snapshot_file(primary_alias, target_path)
-                            if snapshot_file.row_count > row_limit:
-                                raise SnapshotMaterializationError(
-                                    f"表 {target_table} 的关系样本超过 {row_limit} 行上限"
-                                )
+                            if snapshot_file.row_count == 0:
+                                min_group_rows = con.execute(
+                                    "WITH _eligible AS ("
+                                    f"SELECT * FROM {target_table} "
+                                    f"WHERE {' OR '.join(predicates)}"
+                                    ") SELECT MIN(_group_rows) FROM ("
+                                    "SELECT COUNT(*) AS _group_rows "
+                                    f"FROM _eligible GROUP BY {group_keys}"
+                                    ")"
+                                ).fetchone()[0]
+                                if (
+                                    min_group_rows is not None
+                                    and min_group_rows > relation_row_budget
+                                ):
+                                    raise SnapshotMaterializationError(
+                                        f"表 {target_table} 的最小完整关系分组含 "
+                                        f"{min_group_rows} 行，超过个人环境安全预算 "
+                                        f"{relation_row_budget}；未截断组内数据"
+                                    )
                             for alias in physical_to_aliases[target_table]:
                                 selected_paths[alias] = target_path
                             files.append(snapshot_file)

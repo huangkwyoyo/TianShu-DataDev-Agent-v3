@@ -1017,6 +1017,8 @@ class TestPipelineSparkDevelop:
         assert ctx.annotation_result is not None
         assert ctx.annotation_result.annotations[0].step_id == "SparkReadStep_0"
         mock_service.annotate.assert_called_once_with(ctx.spark_plan)
+        trace = pipeline._get_llm_traces(ctx.request_id)
+        assert trace["spark_developer"]["status"] == "valid"
 
     def test_do_spark_develop_service_failure(self):
         """service 抛异常时 DEVELOPER 标记 FAILURE。"""
@@ -1036,6 +1038,9 @@ class TestPipelineSparkDevelop:
 
         assert ctx.stage_results["DEVELOPER"] == "FAILURE"
         assert any("[DEVELOPER] 标注异常" in e for e in ctx.errors)
+        trace = pipeline._get_llm_traces(ctx.request_id)
+        assert trace["spark_developer"]["status"] == "error"
+        assert trace["spark_developer"]["error_type"] == "ValueError"
 
     def test_do_spark_develop_no_service_skips(self):
         """service=None 时 DEVELOPER 标记 SKIPPED。"""
@@ -1048,3 +1053,6 @@ class TestPipelineSparkDevelop:
 
         assert ctx.stage_results["DEVELOPER"] == "SKIPPED"
         assert any("未注入" in e for e in ctx.errors)
+        trace = pipeline._get_llm_traces(ctx.request_id)
+        assert trace["spark_developer"]["status"] == "skipped"
+        assert trace["spark_developer"]["model"] == "deterministic"

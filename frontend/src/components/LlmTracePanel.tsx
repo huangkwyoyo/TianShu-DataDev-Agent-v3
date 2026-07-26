@@ -1,191 +1,187 @@
-import { useState, useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { LlmTraceNode } from '../api/client';
 import './LlmTracePanel.css';
 
-/** 节点名 → 中文映射（完整 LLM 节点列表） */
-const LLM_NODES: { key: string; label: string }[] = [
-  { key: 'requirement_planner', label: '需求规划' },
-  { key: 'spec_enricher', label: 'Spec 增强' },
-  { key: 'relationship_planner', label: '关系规划' },
-  { key: 'label_extractor', label: '标签提取' },
-  { key: 'spark_developer', label: 'Spark 标注' },
-];
-
-/** 旧路径确定性节点——向后兼容 */
-const DETERMINISTIC_NODES: { key: string; label: string }[] = [
-  { key: 'parse_developer_spec', label: 'Spec 解析' },
-  { key: 'sql_build_planner', label: 'SQL Plan 构建' },
-  { key: 'sql_program_planner', label: 'SQL 程序生成' },
-];
-
-/** 按顺序合并所有节点，去重 */
-function getOrderedNodes(traces: Record<string, LlmTraceNode>): { key: string; label: string }[] {
-  const seen = new Set<string>();
-  const result: { key: string; label: string }[] = [];
-  // 先遍历 LLM 节点
-  for (const n of LLM_NODES) {
-    if (n.key in traces) {
-      result.push(n);
-      seen.add(n.key);
-    }
-  }
-  // 再遍历确定性节点
-  for (const n of DETERMINISTIC_NODES) {
-    if (n.key in traces && !seen.has(n.key)) {
-      result.push(n);
-      seen.add(n.key);
-    }
-  }
-  // 未识别的节点追加末尾
-  for (const key of Object.keys(traces)) {
-    if (!seen.has(key)) {
-      result.push({ key, label: key });
-      seen.add(key);
-    }
-  }
-  return result;
+interface TraceNodeDefinition {
+  key: string;
+  label: string;
 }
+
+interface TraceGroupDefinition {
+  key: 'sql' | 'spark';
+  label: string;
+  nodes: TraceNodeDefinition[];
+}
+
+const TRACE_GROUPS: TraceGroupDefinition[] = [
+  {
+    key: 'sql',
+    label: 'SQL 管线',
+    nodes: [
+      { key: 'requirement_planner', label: '需求规划' },
+      { key: 'spec_enricher', label: 'Spec 增强' },
+      { key: 'relationship_planner', label: '关系规划' },
+      { key: 'label_extractor', label: '标签提取' },
+    ],
+  },
+  {
+    key: 'spark',
+    label: 'Spark 管线',
+    nodes: [
+      { key: 'spark_developer', label: '语义标注' },
+    ],
+  },
+];
 
 interface Props {
   traces: Record<string, LlmTraceNode> | null | undefined;
   visible: boolean;
 }
 
+function isInvoked(trace: LlmTraceNode | undefined): boolean {
+  return Boolean(trace && trace.status !== 'skipped' && trace.model !== 'deterministic');
+}
+
+function formatDuration(latencyMs: number): string {
+  if (latencyMs <= 0) return '-';
+  if (latencyMs < 1000) return `${latencyMs} ms`;
+  return `${(latencyMs / 1000).toFixed(1)} s`;
+}
+
+function statusMeta(trace: LlmTraceNode | undefined): {
+  label: string;
+  className: string;
+} {
+  if (!trace) return { label: '未触发', className: 'idle' };
+  if (trace.model === 'deterministic') return { label: '未调用', className: 'idle' };
+  if (trace.status === 'valid') return { label: '成功', className: 'success' };
+  if (trace.status === 'invalid') return { label: '校验失败', className: 'error' };
+  if (trace.status === 'error') return { label: '调用失败', className: 'error' };
+  return { label: '未调用', className: 'idle' };
+}
+
 export function LlmTracePanel({ traces, visible }: Props) {
   const [expanded, setExpanded] = useState(false);
+  const traceMap = traces ?? {};
 
-  const orderedNodes = useMemo(() => {
-    if (!traces) return [];
-    return getOrderedNodes(traces);
-  }, [traces]);
+  const summary = useMemo(() => {
+    const actualTraces = TRACE_GROUPS
+      .flatMap((group) => group.nodes)
+      .map((node) => traceMap[node.key])
+      .filter((trace): trace is LlmTraceNode => isInvoked(trace));
 
-  // 不显示时返回 null
-  if (!visible) return null;
-
-  // 无数据时显示精简提示面板
-  if (orderedNodes.length === 0) {
-    return (
-      <div className="llm-trace-panel">
-        <div className="llm-trace-header" onClick={() => setExpanded(!expanded)}>
-          <span className={`llm-trace-chevron ${expanded ? 'expanded' : ''}`}>▶</span>
-          LLM 调用追踪
-          <span className="llm-trace-badge">无数据</span>
-        </div>
-        {expanded && (
-          <div className="llm-trace-empty">
-            暂无 LLM 调用数据——当前为确定性运行模式（Fake Adapter），未产生真实 LLM 调用。
-          </div>
-        )}
-      </div>
+    return actualTraces.reduce(
+      (result, trace) => {
+        result.calls += 1;
+        result.promptTokens += trace.token_usage?.prompt_tokens || 0;
+        result.completionTokens += trace.token_usage?.completion_tokens || 0;
+        result.totalTokens += trace.token_usage?.total_tokens || 0;
+        result.latencyMs += trace.latency_ms || 0;
+        return result;
+      },
+      {
+        calls: 0,
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        latencyMs: 0,
+      },
     );
-  }
+  }, [traceMap]);
 
-  // 计算汇总
-  let totalPrompt = 0;
-  let totalCompletion = 0;
-  let totalTokens = 0;
-  let totalLatency = 0;
-  for (const [name, trace] of Object.entries(traces!)) {
-    if (trace.token_usage) {
-      totalPrompt += trace.token_usage.prompt_tokens || 0;
-      totalCompletion += trace.token_usage.completion_tokens || 0;
-      totalTokens += trace.token_usage.total_tokens || 0;
-    }
-    totalLatency += trace.latency_ms || 0;
-  }
-
-  /** 指示灯颜色 */
-  function statusColor(status: string): string {
-    if (status === 'valid') return 'var(--success, #22c55e)';
-    if (status === 'invalid' || status === 'error') return 'var(--error, #ef4444)';
-    return 'var(--text-faint, #555)';
-  }
-
-  /** 状态提示文字 */
-  function statusHint(status: string): string {
-    if (status === 'valid') return '调用成功';
-    if (status === 'invalid') return '校验失败';
-    if (status === 'error') return '调用异常';
-    return '已跳过';
-  }
+  if (!visible) return null;
 
   return (
     <div className="llm-trace-panel">
-      <div className="llm-trace-header" onClick={() => setExpanded(!expanded)}>
+      <button
+        type="button"
+        className="llm-trace-header"
+        aria-expanded={expanded}
+        onClick={() => setExpanded(!expanded)}
+      >
         <span className={`llm-trace-chevron ${expanded ? 'expanded' : ''}`}>▶</span>
         LLM 调用追踪
-        <span className="llm-trace-badge">{orderedNodes.length} 节点</span>
-      </div>
+        <span className="llm-trace-badge">
+          {summary.calls > 0 ? `${summary.calls} 次调用` : '无实际调用'}
+        </span>
+      </button>
 
       {expanded && (
         <div className="llm-trace-body">
-          {/* 汇总行 */}
           <div className="llm-trace-summary">
             <span className="llm-trace-summary-item">
-              <span className="label">Prompt:</span>
-              <span className="value">{totalPrompt || '-'}</span>
+              <span className="label">Prompt</span>
+              <span className="value">{summary.promptTokens || '-'}</span>
             </span>
             <span className="llm-trace-summary-item">
-              <span className="label">Completion:</span>
-              <span className="value">{totalCompletion || '-'}</span>
+              <span className="label">Completion</span>
+              <span className="value">{summary.completionTokens || '-'}</span>
             </span>
             <span className="llm-trace-summary-item">
-              <span className="label">总 Token:</span>
-              <span className="value">{totalTokens || '-'}</span>
+              <span className="label">总 Token</span>
+              <span className="value">{summary.totalTokens || '-'}</span>
             </span>
             <span className="llm-trace-summary-item">
-              <span className="label">总耗时:</span>
-              <span className="value">{totalLatency > 0 ? `${totalLatency}ms` : '-'}</span>
+              <span className="label">LLM 总耗时</span>
+              <span className="value">{formatDuration(summary.latencyMs)}</span>
             </span>
           </div>
 
-          {/* 指示灯表格：两行——灯 + 详情 */}
-          <div className="llm-trace-lights">
-            {/* 行 1：指示灯 */}
-            <div className="llm-trace-lights-row">
-              {orderedNodes.map(({ key, label }) => {
-                const trace = traces![key];
-                return (
-                  <div
-                    key={key}
-                    className="llm-trace-light-cell"
-                    title={`${label} — ${statusHint(trace.status)}`}
-                  >
-                    <div className="llm-trace-light-wrapper">
-                      <span
-                        className="llm-trace-light-dot"
-                        style={{ background: statusColor(trace.status) }}
-                      />
-                      <span className="llm-trace-light-label">{label}</span>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
+          <div className="llm-trace-groups">
+            {TRACE_GROUPS.map((group) => {
+              const invokedCount = group.nodes.filter((node) => (
+                isInvoked(traceMap[node.key])
+              )).length;
 
-            {/* 行 2：LLM 调用详情 */}
-            <div className="llm-trace-lights-row">
-              {orderedNodes.map(({ key }) => {
-                const trace = traces![key];
-                return (
-                  <div key={key} className="llm-trace-light-cell">
-                    <div className="llm-trace-detail">
-                      <span className="llm-trace-detail-item">
-                        模型: {trace.model || '-'}
-                      </span>
-                      {trace.token_usage && trace.token_usage.total_tokens ? (
-                        <span className="llm-trace-detail-item">
-                          Token: {trace.token_usage.total_tokens}
-                        </span>
-                      ) : null}
-                      <span className="llm-trace-detail-item">
-                        耗时: {trace.latency_ms > 0 ? `${trace.latency_ms}ms` : '-'}
-                      </span>
-                    </div>
+              return (
+                <section
+                  className="llm-trace-group"
+                  data-pipeline={group.key}
+                  key={group.key}
+                >
+                  <div className="llm-trace-group-header">
+                    <span>{group.label}</span>
+                    <span>{invokedCount}/{group.nodes.length} 已调用</span>
                   </div>
-                );
-              })}
-            </div>
+                  <div className="llm-trace-node-list">
+                    {group.nodes.map((node) => {
+                      const trace = traceMap[node.key];
+                      const status = statusMeta(trace);
+                      const model = trace?.model === 'deterministic' ? '-' : trace?.model || '-';
+
+                      return (
+                        <div className="llm-trace-node" key={node.key}>
+                          <div className="llm-trace-node-title">
+                            <span className={`llm-trace-status-dot ${status.className}`} />
+                            <span className="llm-trace-node-label">{node.label}</span>
+                            <span className={`llm-trace-status ${status.className}`}>
+                              {status.label}
+                            </span>
+                          </div>
+                          <dl className="llm-trace-node-details">
+                            <div>
+                              <dt>模型</dt>
+                              <dd>{model}</dd>
+                            </div>
+                            <div>
+                              <dt>耗时</dt>
+                              <dd>{formatDuration(trace?.latency_ms || 0)}</dd>
+                            </div>
+                            <div>
+                              <dt>Token</dt>
+                              <dd>{trace?.token_usage?.total_tokens || '-'}</dd>
+                            </div>
+                          </dl>
+                          {trace?.error_type && (
+                            <div className="llm-trace-error">错误类型: {trace.error_type}</div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </section>
+              );
+            })}
           </div>
         </div>
       )}

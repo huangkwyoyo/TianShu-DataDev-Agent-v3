@@ -71,6 +71,8 @@ interface AppState {
   // Spark 单阶段触发的产物内容（供面板展示）
   sparkStageResult: { stage: string; result: SparkStageResult; status: string } | null;
 
+  // 持久化 SQL 代码（不被后续阶段覆盖）
+  sqlCode: string | null;
   // 持久化 COMPILER 阶段产物（不被后续阶段覆盖）
   compilerCode: { pyspark: string; standalone: string } | null;
   // 是否展示代码下载区
@@ -107,6 +109,7 @@ export default function App() {
     sparkVerifyResult: null,
     artifactsReady: false,
     sparkStageResult: null,
+    sqlCode: null,
     compilerCode: null,
     showCodeDownload: false,
     llmTraces: null,
@@ -135,6 +138,8 @@ export default function App() {
         planResult: null,
         executeResult: null,
         packageResult: null,
+        sqlCode: null,
+        compilerCode: null,
         sparkStageResult: null,
         activePanel: null,
       });
@@ -194,6 +199,8 @@ export default function App() {
         planResult: null,
         executeResult: null,
         packageResult: null,
+        sqlCode: null,
+        compilerCode: null,
         requestId: result.request_id,
         activePanel: 'parse',
         artifactsReady: false,  // parse 不产生 contract
@@ -214,6 +221,8 @@ export default function App() {
         planResult: result,
         executeResult: null,
         packageResult: null,
+        sqlCode: null,
+        compilerCode: null,
         requestId: result.request_id,
         activePanel: 'plan',
         artifactsReady: false,  // plan 不产生 contract
@@ -248,6 +257,8 @@ export default function App() {
           activePanel: 'sql' as Panel,
           llmTraces: (result as ExecuteRichResponse).llm_traces || null,
           artifactsReady,
+          // 持久化 SQL 代码（独立于 executeResult）
+          sqlCode: result.generated_sql || null,
           // 重置 Spark 状态——新的 execute 需要重新执行 Spark 阶段
           sparkStages: [],
           sparkVerifyResult: null,
@@ -276,6 +287,8 @@ export default function App() {
       isStreaming: true,
       streamError: null,
       sparkStageResult: null,
+      sqlCode: null,
+      compilerCode: null,
       showCodeDownload: false,
     });
 
@@ -324,10 +337,12 @@ export default function App() {
                     open_questions: [],
                   }
                 : null;
-              // 持久化 PySpark 代码（standalone 优先——完整可运行脚本）
+              // 分别持久化纯转换模块和确定性作业入口。
               const compilerCode = fr.pyspark_code || fr.standalone_pyspark
                 ? { pyspark: fr.pyspark_code || '', standalone: fr.standalone_pyspark || '' }
                 : prev.compilerCode;
+              // 持久化 SQL 代码（独立于 executeResult，不被后续阶段覆盖）
+              const sqlCode = fr.generated_sql?.trim() ? fr.generated_sql : null;
 
               // 异步验证 artifacts 是否就绪
               if (fr.request_id) {
@@ -358,9 +373,12 @@ export default function App() {
                     }
                   : prev.planResult,
                 executeResult,
+                sqlCode,
                 compilerCode,
                 // SQL 成功就展示代码（即使 Spark 失败也保留，标注由 Spark 阶段状态体现）
-                showCodeDownload: fr.sql_ok,
+                showCodeDownload: Boolean(
+                  sqlCode || compilerCode?.standalone || compilerCode?.pyspark
+                ),
                 sparkStages,
                 pipelineStages: sqlStages,
                 llmTraces: fr.llm_traces,
@@ -514,7 +532,7 @@ export default function App() {
       </header>
 
       <div className="app-body">
-        <main className={`app-main${state.executeResult?.generated_sql && !state.pipelineError ? ' layout-executed' : ''}`}>
+        <main className={`app-main${state.sqlCode && !state.pipelineError ? ' layout-executed' : ''}`}>
           {/* 工具栏——始终在编辑器上方，不会被内容挡住 */}
           <div className="toolbar">
             <span className="toolbar-label">SQL</span>
@@ -676,16 +694,19 @@ export default function App() {
                   <h3>Code</h3>
                 </div>
                 <div className="panel-body">
-                  {state.executeResult?.generated_sql ? (
+                  {state.sqlCode ? (
                     <div className="code-block-wrapper">
                       <div className="code-block-header">
                         <span className="code-block-title">SQL</span>
                         <div className="code-block-actions">
                           <button
                             className="btn-copy"
+                            type="button"
+                            title="复制 SQL"
+                            aria-label="复制 SQL"
                             onClick={async () => {
                               try {
-                                await navigator.clipboard.writeText(state.executeResult!.generated_sql);
+                                await navigator.clipboard.writeText(state.sqlCode!);
                                 const btn = document.activeElement as HTMLElement;
                                 btn.textContent = '✅';
                                 setTimeout(() => { btn.textContent = '📋'; }, 1800);
@@ -696,8 +717,11 @@ export default function App() {
                           </button>
                           <button
                             className="btn-download"
+                            type="button"
+                            title="下载 SQL"
+                            aria-label="下载 SQL"
                             onClick={() => {
-                              const blob = new Blob([state.executeResult!.generated_sql], { type: 'text/sql' });
+                              const blob = new Blob([state.sqlCode!], { type: 'text/sql' });
                               const url = URL.createObjectURL(blob);
                               const a = document.createElement('a');
                               a.href = url; a.download = 'query.sql';
@@ -710,23 +734,25 @@ export default function App() {
                           </button>
                         </div>
                       </div>
-                      <pre className="code-block"><code>{state.executeResult!.generated_sql}</code></pre>
+                      <pre className="code-block"><code>{state.sqlCode}</code></pre>
                     </div>
                   ) : (
-                    <p className="spark-result-note">SQL: not available</p>
+                    <p className="spark-result-note">SQL: run EXECUTE or RUN-ALL first</p>
                   )}
 
-                  {state.compilerCode?.standalone || state.compilerCode?.pyspark ? (
+                  {state.compilerCode?.pyspark ? (
                     <div className="code-block-wrapper">
                       <div className="code-block-header">
-                        <span className="code-block-title">PySpark</span>
+                        <span className="code-block-title">PySpark 转换模块 · transform.py</span>
                         <div className="code-block-actions">
                           <button
                             className="btn-copy"
+                            type="button"
+                            title="复制 PySpark Transform"
+                            aria-label="复制 PySpark Transform"
                             onClick={async () => {
                               try {
-                                const code = state.compilerCode!.standalone || state.compilerCode!.pyspark;
-                                await navigator.clipboard.writeText(code);
+                                await navigator.clipboard.writeText(state.compilerCode!.pyspark);
                                 const btn = document.activeElement as HTMLElement;
                                 btn.textContent = '✅';
                                 setTimeout(() => { btn.textContent = '📋'; }, 1800);
@@ -737,9 +763,57 @@ export default function App() {
                           </button>
                           <button
                             className="btn-download"
+                            type="button"
+                            title="下载 PySpark Transform"
+                            aria-label="下载 PySpark Transform"
                             onClick={() => {
-                              const code = state.compilerCode!.standalone || state.compilerCode!.pyspark;
-                              const blob = new Blob([code], { type: 'text/x-python' });
+                              const blob = new Blob([state.compilerCode!.pyspark], { type: 'text/x-python' });
+                              const url = URL.createObjectURL(blob);
+                              const a = document.createElement('a');
+                              a.href = url; a.download = 'transform.py';
+                              document.body.appendChild(a); a.click();
+                              document.body.removeChild(a);
+                              URL.revokeObjectURL(url);
+                            }}
+                          >
+                            ↓ .py
+                          </button>
+                        </div>
+                      </div>
+                      <pre className="code-block"><code>{state.compilerCode.pyspark}</code></pre>
+                    </div>
+                  ) : (
+                    <p className="spark-result-note">PySpark Transform: run COMPILER first</p>
+                  )}
+
+                  {state.compilerCode?.standalone && (
+                    <div className="code-block-wrapper">
+                      <div className="code-block-header">
+                        <span className="code-block-title">Spark 本地运行入口 · spark_job.py</span>
+                        <div className="code-block-actions">
+                          <button
+                            className="btn-copy"
+                            type="button"
+                            title="复制 Spark 本地运行入口"
+                            aria-label="复制 Spark 本地运行入口"
+                            onClick={async () => {
+                              try {
+                                await navigator.clipboard.writeText(state.compilerCode!.standalone);
+                                const btn = document.activeElement as HTMLElement;
+                                btn.textContent = '✅';
+                                setTimeout(() => { btn.textContent = '📋'; }, 1800);
+                              } catch { /* ignore */ }
+                            }}
+                          >
+                            📋
+                          </button>
+                          <button
+                            className="btn-download"
+                            type="button"
+                            title="下载 Spark 本地运行入口"
+                            aria-label="下载 Spark 本地运行入口"
+                            onClick={() => {
+                              const blob = new Blob([state.compilerCode!.standalone], { type: 'text/x-python' });
                               const url = URL.createObjectURL(blob);
                               const a = document.createElement('a');
                               a.href = url; a.download = 'spark_job.py';
@@ -752,18 +826,16 @@ export default function App() {
                           </button>
                         </div>
                       </div>
-                      <pre className="code-block"><code>{state.compilerCode!.standalone || state.compilerCode!.pyspark}</code></pre>
+                      <pre className="code-block"><code>{state.compilerCode.standalone}</code></pre>
                     </div>
-                  ) : (
-                    <p className="spark-result-note">PySpark: run COMPILER first</p>
                   )}
                 </div>
               </div>
             )}
 
-            {state.executeResult && state.executeResult.generated_sql && (
+            {state.sqlCode && state.executeResult && (
               <SqlDisplay
-                sql={state.executeResult.generated_sql}
+                sql={state.sqlCode}
                 sqlSha256={state.executeResult.sql_sha256}
                 compilerVersion={state.executeResult.compiler_version}
                 trace={state.executeResult.execution_trace}

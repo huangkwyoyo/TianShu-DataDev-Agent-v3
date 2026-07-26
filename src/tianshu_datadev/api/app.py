@@ -155,7 +155,10 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
             planning_adapter = adapter
             prompt_manager = PromptManager()
             spark_developer_service = SparkDeveloperService.from_provider_adapter(
-                adapter, prompt_manager, max_llm_retries=1
+                adapter,
+                prompt_manager,
+                max_llm_retries=2,
+                retry_backoff_sec=1.0,
             )
             logger.info("SparkDeveloperService 初始化成功——DEVELOPER 阶段将调用 DeepSeek API")
         except Exception as exc:

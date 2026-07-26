@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -25,12 +26,35 @@ from tianshu_datadev.spark.annotations import (
     AnnotationValidator,
 )
 from tianshu_datadev.spark.models import SparkPlan
+from tianshu_datadev.spark.step_ids import iter_plan_steps
 
 if TYPE_CHECKING:
     from tianshu_datadev.llm.adapters.base import ProviderAdapter
     from tianshu_datadev.prompts.manager import PromptManager
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_annotation_field_names(raw_output: dict) -> dict:
+    """兼容旧 Prompt 产出的 flags，其他额外字段仍由严格 Schema 拒绝。"""
+    annotations = raw_output.get("annotations")
+    if not isinstance(annotations, list):
+        return raw_output
+
+    for index, annotation in enumerate(annotations):
+        if not isinstance(annotation, dict) or "flags" not in annotation:
+            continue
+        legacy_flags = annotation["flags"]
+        if (
+            "review_flags" in annotation
+            and annotation["review_flags"] != legacy_flags
+        ):
+            raise ValueError(
+                f"annotations[{index}] 同时包含冲突的 flags 和 review_flags"
+            )
+        annotation["review_flags"] = legacy_flags
+        annotation.pop("flags")
+    return raw_output
 
 
 class SparkDeveloperService:
@@ -83,6 +107,7 @@ class SparkDeveloperService:
         adapter: "ProviderAdapter",
         prompt_manager: "PromptManager",
         max_llm_retries: int = 1,
+        retry_backoff_sec: float = 0.0,
     ) -> "SparkDeveloperService":
         """从既有 ProviderAdapter + PromptManager 创建实例。
 
@@ -150,10 +175,11 @@ class SparkDeveloperService:
             # 附加显式 step_id 指引——防止 LLM 从原始 JSON 推断错误 ID
             # （JSON 中 step_type 是枚举值 "read"，但 step_id 格式要求类名 "SparkReadStep_0"）
             step_id_lines = ["", "## Step ID 映射（必须严格使用以下 step_id）", ""]
-            for i, step in enumerate(spark_plan.steps):
-                step_type = type(step).__name__
-                step_id = f"{step_type}_{i}"
-                step_id_lines.append(f"Step {i} → step_id: {step_id}")
+            all_steps = list(iter_plan_steps(spark_plan))
+            for step_id, stage_label, step_index, _step in all_steps:
+                step_id_lines.append(
+                    f"Stage {stage_label} Step {step_index} → step_id: {step_id}"
+                )
             step_id_lines.append("")
             step_id_lines.append("重要：annotations 中每个元素的 step_id 必须与上述映射一致——")
             step_id_lines.append("使用上面列出的 step_id 值，不要自己推断或使用 JSON 中的 step_type 值。")
@@ -175,6 +201,7 @@ class SparkDeveloperService:
                     )
                     # 移除 adapter 附加的 _token_usage（不属于 Schema 字段）
                     raw_output.pop("_token_usage", None)
+                    raw_output = _normalize_annotation_field_names(raw_output)
                     return AnnotatedSparkPlan.model_validate(raw_output)
                 except Exception as exc:
                     last_error = exc
@@ -187,6 +214,8 @@ class SparkDeveloperService:
                             max_llm_retries + 1,
                             exc,
                         )
+                        if retry_backoff_sec > 0:
+                            time.sleep(retry_backoff_sec * (2 ** attempt))
                         continue
                     # 校验错误 / 其他异常——不重试
                     raise
@@ -235,13 +264,11 @@ class SparkDeveloperService:
         )
 
         # Step 2：确定性校验（含 warning 过滤）
-        valid_step_ids = {
-            f"{type(s).__name__}_{i}"
-            for i, s in enumerate(spark_plan.steps)
-        }
+        all_steps = list(iter_plan_steps(spark_plan))
+        valid_step_ids = {step_id for step_id, _, _, _ in all_steps}
         validation_result = self._validator.validate(
             annotated=annotated,
-            expected_step_count=len(spark_plan.steps),
+            expected_step_count=len(all_steps),
             valid_step_ids=valid_step_ids,
         )
 
@@ -307,17 +334,21 @@ class SparkDeveloperService:
         lines.append(f"  plan_id: {spark_plan.plan_id}")
         lines.append(f"  version: {spark_plan.version}")
         lines.append(f"  source_phase: {spark_plan.source_phase}")
-        lines.append(f"  步骤总数: {len(spark_plan.steps)}")
+        all_steps = list(iter_plan_steps(spark_plan))
+        lines.append(f"  步骤总数: {len(all_steps)}")
         lines.append("")
 
-        for i, step in enumerate(spark_plan.steps):
-            step_type = type(step).__name__
-            step_id = f"{step_type}_{i}"
+        for global_index, (step_id, stage_label, step_index, step) in enumerate(
+            all_steps
+        ):
             step_data = step.model_dump(mode="json", exclude_none=True)
             # 移除 step_type 常量（已在类名中体现）
             step_data.pop("step_type", None)
 
-            lines.append(f"Step {i} (step_id: {step_id}):")
+            lines.append(
+                f"Stage {stage_label} Step {step_index} "
+                f"(step_id: {step_id}, 全局索引: {global_index}):"
+            )
             # 列出关键字段（不包含 SQL 文本）
             for key, val in step_data.items():
                 if val is not None and val != "" and val != []:

@@ -84,6 +84,27 @@ from tianshu_datadev.spark.physical_verifier import PhysicalVerificationStatus
 logger = logging.getLogger(__name__)
 
 
+def _render_compiled_program_sql(compiled: ProgramCompiledSql) -> str:
+    """将多语句编译产物渲染为可审查的完整 SQL 脚本。"""
+    sections: list[str] = []
+    for index, statement in enumerate(compiled.statements):
+        statement_id = (
+            compiled.statement_order[index]
+            if index < len(compiled.statement_order)
+            else f"statement_{index + 1}"
+        )
+        sql = statement.sql.strip().rstrip(";")
+        sections.append(f"-- Statement {index + 1}: {statement_id}\n{sql};")
+
+    if compiled.cleanup_sql:
+        cleanup = "\n".join(
+            sql.strip().rstrip(";") + ";"
+            for sql in compiled.cleanup_sql
+        )
+        sections.append(f"-- Cleanup\n{cleanup}")
+    return "\n\n".join(sections)
+
+
 def _summarize_open_questions(
     questions: list[OpenQuestion],
 ) -> list[dict]:
@@ -582,7 +603,18 @@ class Pipeline:
             unresolved_before = _find_unresolved_derived_columns(spec)
             if unresolved_before:
                 _t0 = time.time()
-                spec, planner_questions = self._run_requirement_planner(spec, manifest)
+                try:
+                    spec, planner_questions = self._run_requirement_planner(spec, manifest)
+                except Exception as exc:
+                    self._record_trace(
+                        request_id,
+                        "requirement_planner",
+                        model=self._adapter.provider_name() if self._adapter else "deterministic",
+                        latency_ms=int((time.time() - _t0) * 1000),
+                        status="error",
+                        error_type=type(exc).__name__,
+                    )
+                    raise
                 extra_questions.extend(planner_questions)
                 self._record_trace(
                     request_id, "requirement_planner",
@@ -600,8 +632,19 @@ class Pipeline:
 
         # ── 2. SpecEnricher：完整 scope，后执行 ──
         _t0 = time.time()
-        spec = self._spec_enricher.apply_enrichment(spec, manifest)
-        # Pipeline 与 SpecEnricher 共享同一 adapter
+        try:
+            spec = self._spec_enricher.apply_enrichment(spec, manifest)
+        except Exception as exc:
+            self._record_trace(
+                request_id,
+                "spec_enricher",
+                model=self._adapter.provider_name() if self._adapter else "deterministic",
+                latency_ms=int((time.time() - _t0) * 1000),
+                status="error",
+                error_type=type(exc).__name__,
+            )
+            raise
+        # Pipeline 与 SpecEnricher 共享同一 adapter。
         _has_llm = self._adapter is not None
         self._record_trace(
             request_id, "spec_enricher",
@@ -668,13 +711,24 @@ class Pipeline:
         hypothesis = None
         if len(spec.input_tables) > 1:
             _t0 = time.time()
-            hypothesis, rel_questions = self._relationship_planner.plan(spec, manifest)
+            try:
+                hypothesis, rel_questions = self._relationship_planner.plan(spec, manifest)
+            except Exception as exc:
+                self._record_trace(
+                    request_id,
+                    "relationship_planner",
+                    model=self._adapter.provider_name() if self._adapter else "deterministic",
+                    latency_ms=int((time.time() - _t0) * 1000),
+                    status="error",
+                    error_type=type(exc).__name__,
+                )
+                raise
             extra_questions.extend(rel_questions)
             self._record_trace(
                 request_id, "relationship_planner",
                 model=self._adapter.provider_name() if self._adapter else "deterministic",
                 latency_ms=int((time.time() - _t0) * 1000),
-                status="valid",
+                status="valid" if self._adapter else "skipped",
             )
             # 交叉验证——指标推断 vs Join 推断一致性检查
             if hypothesis:
@@ -804,10 +858,21 @@ class Pipeline:
                             "请设置 DEEPSEEK_API_KEY 环境变量"
                         )
                     _t0 = time.time()
-                    proposals, extraction_artifact = self._label_extractor.extract(
-                        spec, label_candidates,
-                    )
                     _le_request_id = self._gen_request_id(spec)
+                    try:
+                        proposals, extraction_artifact = self._label_extractor.extract(
+                            spec, label_candidates,
+                        )
+                    except Exception as exc:
+                        self._record_trace(
+                            _le_request_id,
+                            "label_extractor",
+                            model="deepseek",
+                            latency_ms=int((time.time() - _t0) * 1000),
+                            status="error",
+                            error_type=type(exc).__name__,
+                        )
+                        raise
                     self._record_trace(
                         _le_request_id, "label_extractor",
                         model="deepseek",
@@ -1298,7 +1363,8 @@ class Pipeline:
             )
             snapshot_executor = DuckDBExecutor(
                 duckdb_path=self._duckdb_path,
-                memory_limit="1GB",
+                # Worker 总上限为 1.5GB，需为 Python、PyArrow 和序列化保留余量。
+                memory_limit="512MB",
                 threads=1,
                 max_temp_directory_size="4GB",
                 process_memory_limit_mb=1536,
@@ -2343,8 +2409,9 @@ class Pipeline:
                     "program_cleanup_error": program_cleanup_error,
                 })
 
-                # ComputeSteps 路径独立返回
-                return {
+                # ComputeSteps 路径独立返回。rich=True 时必须遵守与普通路径相同的
+                # generated_sql 契约，否则 Run-All 前端会在成功后丢失 SQL。
+                compute_result = {
                     "request_id": request_id,
                     "spec_id": spec.spec_id,
                     "plan_id": plan.plan_id,
@@ -2385,6 +2452,28 @@ class Pipeline:
                     ) if hasattr(package_manifest, "model_dump") else {},
                     "llm_traces": self._get_llm_traces(request_id),  # 新增——LLM 调用追踪
                 }
+                if rich:
+                    program_sql = _render_compiled_program_sql(
+                        program_artifact.compiled
+                    )
+                    compute_result.update({
+                        "generated_sql": program_sql,
+                        "sql_sha256": hashlib.sha256(
+                            program_sql.encode()
+                        ).hexdigest(),
+                        "compiler_version": program_artifact.compiler_version,
+                        "steps": [
+                            self._step_to_summary(step)
+                            for sql_plan in plans
+                            for step in sql_plan.steps
+                        ],
+                        "join_evidence": [
+                            evidence
+                            for sql_plan in plans
+                            for evidence in self._extract_join_evidence(sql_plan)
+                        ],
+                    })
+                return compute_result
 
             elif hypothesis and len(hypothesis.candidates) > 1:
                 # ── 多跳链路径 ──
@@ -2686,8 +2775,17 @@ class Pipeline:
             "pipeline_stages": [{"stage": s, "status": "ok"} for s in _run_all_stages],
         }
         if rich:
-            # 提取 SQL 文本——兼容 CompiledSql 对象和纯字符串
-            if hasattr(compiled_sql, "sql"):
+            # 多语句路径展示完整 SQL Program，不能只展示最后一条语句。
+            if program_artifact is not None:
+                program_sql = _render_compiled_program_sql(
+                    program_artifact.compiled
+                )
+                result["generated_sql"] = program_sql
+                result["sql_sha256"] = hashlib.sha256(
+                    program_sql.encode()
+                ).hexdigest()
+                result["compiler_version"] = program_artifact.compiler_version
+            elif hasattr(compiled_sql, "sql"):
                 result["generated_sql"] = compiled_sql.sql
                 result["sql_sha256"] = compiled_sql.sql_sha256
                 result["compiler_version"] = compiled_sql.compiler_version
@@ -2844,9 +2942,15 @@ class Pipeline:
                 # DEVELOPER 可选——失败标记 skipped 后继续
                 if stage == SparkPipelineStage.DEVELOPER:
                     if current_status == "failed":
+                        developer_errors = [
+                            error for error in current_errors
+                            if "[DEVELOPER]" in error
+                        ]
+                        if not developer_errors:
+                            developer_errors = ["LLM 标注调用失败"]
                         spark_stages.append({
                             "stage": stage_val, "status": "skipped",
-                            "errors": ["LLM 标注服务不可用，已跳过"],
+                            "errors": developer_errors,
                         })
                         continue
                     spark_stages.append({
@@ -2979,7 +3083,8 @@ class Pipeline:
 
                 request_id = sql_result.get("request_id")
                 sql_ok = sql_result.get("pipeline_error") is None
-                generated_sql = sql_result.get("generated_sql", "") if sql_ok else ""
+                # SQL 是编译产物；后续执行失败也不能把已生成代码清空。
+                generated_sql = sql_result.get("generated_sql", "")
 
                 # 提取 pipeline_stages 供 done 事件使用（TeeCollector 已在 run_all()
                 # 执行期间实时推送了所有 SQL 阶段事件到 event_queue）
@@ -3061,17 +3166,26 @@ class Pipeline:
                         # DEVELOPER 可选——失败标记 skipped 后继续
                         if stage == SparkPipelineStage.DEVELOPER:
                             if current_status == "failed":
+                                developer_errors = [
+                                    error for error in current_errors
+                                    if "[DEVELOPER]" in error
+                                ]
+                                if not developer_errors:
+                                    developer_errors = ["LLM 标注调用失败"]
+                                developer_message = _sanitize_stream_error(
+                                    developer_errors[0]
+                                )
                                 event_queue.put({
                                     "event": "stage",
                                     "pipeline": "spark",
                                     "stage": stage_val,
                                     "status": "skipped",
                                     "duration_ms": duration_ms,
-                                    "message": "LLM 标注服务不可用，已跳过",
+                                    "message": f"标注已跳过：{developer_message}",
                                 })
                                 spark_stages.append({
                                     "stage": stage_val, "status": "skipped",
-                                    "errors": ["LLM 标注服务不可用，已跳过"],
+                                    "errors": developer_errors,
                                 })
                                 continue
                             event_queue.put({
@@ -3275,10 +3389,11 @@ class Pipeline:
 
                 logger.info(
                     "run_all_full_stream done event: request_id=%s sql_ok=%s spark_ok=%s "
-                    "spec_result=%s steps=%d",
+                    "spec_result=%s steps=%d generated_sql_len=%d",
                     request_id, sql_ok, spark_ok,
                     "yes" if sql_result.get("spec_result") else "no",
                     len(sql_result.get("steps", [])),
+                    len(generated_sql),
                 )
                 event_queue.put({"event": "done", "result": full_result})
 
@@ -4505,6 +4620,12 @@ class Pipeline:
         """
         if self._spark_developer_service is None:
             context.stage_results["DEVELOPER"] = "SKIPPED"
+            self._record_trace(
+                context.request_id,
+                "spark_developer",
+                model="deterministic",
+                status="skipped",
+            )
             err_msg = "[DEVELOPER] SKIPPED: 未注入 SparkDeveloperService"
             if err_msg not in context.errors:
                 context.errors.append(err_msg)
@@ -4512,6 +4633,13 @@ class Pipeline:
 
         if context.spark_plan is None:
             context.stage_results["DEVELOPER"] = "SKIPPED"
+            self._record_trace(
+                context.request_id,
+                "spark_developer",
+                model="deterministic",
+                status="skipped",
+                error_type="DependencyMissing",
+            )
             err_msg = "[DEVELOPER] SKIPPED: 无 SparkPlan（MAPPER 未执行或失败）"
             if err_msg not in context.errors:
                 context.errors.append(err_msg)
@@ -4534,11 +4662,22 @@ class Pipeline:
             new_error = f"[DEVELOPER] 标注异常：{e}"
             if new_error not in context.errors:
                 context.errors.append(new_error)
+            logging.getLogger(__name__).warning(
+                "Spark DEVELOPER 标注失败，后续确定性阶段将继续: %s",
+                e,
+            )
+            self._record_trace(
+                context.request_id, "spark_developer",
+                model="deepseek",
+                latency_ms=int((time.time() - _dev_t0) * 1000),
+                status="error",
+                error_type=type(e).__name__,
+            )
 
     def _do_spark_compile(self, context: SparkStageContext) -> None:
         """执行 COMPILER 阶段——SparkPlan → PySpark DSL。"""
         from tianshu_datadev.spark.compiler import SparkCompiler
-        from tianshu_datadev.spark.models import SparkReadStep
+        from tianshu_datadev.spark.runner import collect_input_names, render_spark_job
 
         compiler = SparkCompiler()
 
@@ -4551,67 +4690,9 @@ class Pipeline:
         context.compile_result = result
         context.stage_results["COMPILER"] = "SUCCESS"
 
-        # ── 生成独立可执行脚本（wrapper 格式，含 SparkSession 引导）──
-        # ── Phase 8B: 使用 annotated_pyspark（含 LLM 业务注释）──
-        annotated_pyspark = result.annotated_pyspark
-        # 提取所有 ReadStep 的 source_name
-        input_names: list[str] = []
-        for step in context.spark_plan.steps:
-            if isinstance(step, SparkReadStep):
-                input_names.append(step.source_name)
-
-        # 构建 wrapper 脚本
-        wrapper_lines: list[str] = []
-        wrapper_lines.append("from pyspark.sql import SparkSession")
-        wrapper_lines.append("from pyspark.sql.functions import *")
-        wrapper_lines.append("")
-        wrapper_lines.append("")
-        wrapper_lines.append("# 以下 transform 函数由编译器自动生成")
-        wrapper_lines.append("# 数据源需根据实际路径修改")
-        wrapper_lines.append("")
-        # 嵌入 annotated_pyspark（含 LLM 业务注释的 transform 函数）
-        for line in annotated_pyspark.split("\n"):
-            wrapper_lines.append(line)
-        wrapper_lines.append("")
-        wrapper_lines.append("")
-        wrapper_lines.append('if __name__ == "__main__":')
-        wrapper_lines.append('    spark = SparkSession.builder.appName("tianshu_datadev") \\')
-        wrapper_lines.append('        .master("local[*]") \\')
-        wrapper_lines.append('        .config("spark.sql.shuffle.partitions", "4") \\')
-        wrapper_lines.append('        .getOrCreate()')
-        wrapper_lines.append("")
-        wrapper_lines.append("    # ======================")
-        wrapper_lines.append("    # 1. 加载数据")
-        wrapper_lines.append("    # ======================")
-        wrapper_lines.append("    inputs = {")
-        for i, name in enumerate(input_names):
-            comma = "," if i < len(input_names) - 1 else ""
-            wrapper_lines.append(f'        "{name}": spark.read.csv("data/{name}.csv", header=True){comma}')
-        wrapper_lines.append("    }")
-        wrapper_lines.append("")
-        wrapper_lines.append("    # ======================")
-        wrapper_lines.append("    # 2. 执行转换")
-        wrapper_lines.append("    # ======================")
-        wrapper_lines.append("    result = transform(inputs, params=None)")
-        wrapper_lines.append("")
-        # ── Phase 8B: 追加静态字段解读注释（仅注释块，不进可执行代码）──
-        if context.annotation_result and context.annotation_result.annotations:
-            last_ann = context.annotation_result.annotations[-1]
-            safe_detail = compiler.renderer.render_comment_text(last_ann.intent_detail)
-            wrapper_lines.append(f"    # 输出字段说明: {safe_detail}")
-        wrapper_lines.append("")
-        wrapper_lines.append("    # ======================")
-        wrapper_lines.append("    # 3. 输出结果")
-        wrapper_lines.append("    # ======================")
-        wrapper_lines.append('    print("=== 结果概要 ===")')
-        wrapper_lines.append("    result.printSchema()")
-        wrapper_lines.append('    print(f"行数: {result.count()}")')
-        wrapper_lines.append("    result.show(20, truncate=False)")
-        wrapper_lines.append("")
-        wrapper_lines.append('    print("=== 执行完毕 ===")')
-        wrapper_lines.append("    spark.stop()")
-
-        context.standalone_pyspark = "\n".join(wrapper_lines)
+        input_names = collect_input_names(context.spark_plan)
+        # Runner 是独立的确定性本地运行产物，不进入 Validator 或物理验证执行路径。
+        context.standalone_pyspark = render_spark_job(input_names)
         # ── 存储沙箱可执行代码（纯 transform 函数，供 PhysicalVerifier 传入 executor）──
         context.sandbox_transform_code = result.raw_pyspark
 
@@ -5311,7 +5392,7 @@ class SparkStageContext:
     request_id: str = ""  # 关联的 Pipeline 请求 ID，由 _get_or_create_spark_context 设置
     spark_plan: "SparkPlan | None" = None
     compile_result: "SparkCompileResult | None" = None
-    standalone_pyspark: str | None = None  # 独立可执行 PySpark 脚本（含 SparkSession 引导，仅人审 artifact）
+    standalone_pyspark: str | None = None  # 确定性本地 Runner，不进入验证执行路径
     sandbox_transform_code: str | None = None  # 沙箱可执行 PySpark 代码（纯 transform 函数，不含 spark.read）
     comparator_report: "PlanComparisonReport | None" = None
     # ── Phase 8: DEVELOPER 阶段产物缓存 ──

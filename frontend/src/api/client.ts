@@ -414,7 +414,7 @@ export interface SparkStageResult {
   plan_id?: string;
   message?: string;
   pyspark_code?: string;          // 编译器产的带注释 PySpark DSL 代码（transform 函数）
-  standalone_pyspark?: string;    // 独立可执行脚本（含 SparkSession 引导、spark.read.csv）
+  standalone_pyspark?: string;    // 确定性生成的 Spark 本地运行入口
   raw_hash?: string;
   is_valid?: boolean;
   status?: string;

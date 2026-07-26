@@ -561,3 +561,43 @@ class TestFullRunResponseSparkOk:
         assert result["spark_ok"] is False, (
             f"物理跳过时 spark_ok 应为 False，实际为 {result['spark_ok']}"
         )
+
+    @patch.object(Pipeline, "run_spark_stage")
+    @patch.object(Pipeline, "run_all")
+    def test_developer_skip_preserves_actual_error(
+        self, mock_run_all, mock_run_spark_stage,
+    ):
+        """标注失败不阻断，但响应必须保留真实故障原因。"""
+        mock_run_all.return_value = {
+            "request_id": "test-developer-error",
+            "pipeline_error": None,
+            "generated_sql": "SELECT 1",
+            "llm_traces": {},
+        }
+        stage_results = self._mock_stage_results(
+            comparator_status="LOGIC_EQUIVALENT",
+            physver_status="ok",
+        )
+        stage_results[1] = {
+            "status": "failed",
+            "result": {"type": "developer"},
+            "llm_traces": {},
+            "errors": [
+                "[DEVELOPER] 标注异常：LLM 网络错误：连接被对端关闭",
+                "[PHYSICAL_VERIFIER] 历史错误",
+            ],
+        }
+        mock_run_spark_stage.side_effect = stage_results
+
+        pipeline = Pipeline()
+        self._setup_context(pipeline, "test-developer-error")
+        result = pipeline.run_all_full("test markdown")
+
+        developer_stage = next(
+            stage for stage in result["spark_stages"]
+            if stage["stage"] == "DEVELOPER"
+        )
+        assert developer_stage["status"] == "skipped"
+        assert developer_stage["errors"] == [
+            "[DEVELOPER] 标注异常：LLM 网络错误：连接被对端关闭"
+        ]
