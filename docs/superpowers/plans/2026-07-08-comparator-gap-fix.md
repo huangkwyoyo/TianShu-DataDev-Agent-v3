@@ -1,5 +1,8 @@
 # COMPARATOR 机制 8 个缺陷修复——实施计划
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 修复 COMPARATOR 机制的 8 个覆盖缺口——步骤顺序、嵌套谓词、window 启用、scan 列集合、状态映射、未知类型上报、null_order、术语统一

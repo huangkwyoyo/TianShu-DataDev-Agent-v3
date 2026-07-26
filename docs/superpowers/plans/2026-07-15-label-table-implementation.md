@@ -1,5 +1,8 @@
 # label_table 类型支持——实施计划（v4-light 最终修订版）
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 跑通个人使用场景——自然语言业务过程 → LlmLabelExtractor(LLM) → Validator(v1 六项确定性检查) → CaseWhenDecl → SQL/Spark Compiler。生产路径使用 LlmLabelExtractor（复用 LLMGateway/PromptManager/ProviderAdapter），pytest 使用 FakeLLMAdapter。

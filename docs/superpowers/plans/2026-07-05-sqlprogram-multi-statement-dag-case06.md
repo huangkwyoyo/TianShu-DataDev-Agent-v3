@@ -1,5 +1,8 @@
 # SqlProgram 多语句 DAG 实施计划——解锁 NYC Case 06 跨域融合
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **目标：** 利用已有 SqlProgram 多语句 DAG 基础设施（Phase 3A 建成），通过 `_temp_*` 临时表串联多步独立聚合→Join→计算→标签，解锁 NYC Case 06 跨域安全合规画像。

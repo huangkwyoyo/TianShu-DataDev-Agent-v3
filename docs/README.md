@@ -19,6 +19,11 @@
 | CRE 双引擎验证？ | [`CRE_v2_设计文档_20260713_1745.md`](CRE_v2_设计文档_20260713_1745.md) |
 | DeveloperSpec 怎么写？ | [`examples/`](examples/) |
 | 工程术语表？ | [`datadev_engineering_glossary_20260629_1600.md`](datadev_engineering_glossary_20260629_1600.md) |
+| ComputeSteps Builder 双能力扩展？ | [`superpowers/specs/2026-07-24-compute-steps-builder-extension-design.md`](superpowers/specs/2026-07-24-compute-steps-builder-extension-design.md) |
+| RequirementPlanner 如何工作？ | [`superpowers/specs/2026-07-21-requirement-planner-design.md`](superpowers/specs/2026-07-21-requirement-planner-design.md) |
+| Label Table 统一管线设计？ | [`superpowers/specs/2026-07-22-label-table-unified-pipeline-design.md`](superpowers/specs/2026-07-22-label-table-unified-pipeline-design.md) |
+| SparkPlan 多分支 DAG 设计？ | [`superpowers/specs/2026-07-10-sparkplan-v2-design.md`](superpowers/specs/2026-07-10-sparkplan-v2-design.md) |
+| 覆盖率、优化 Pass、安全门禁？ | [`superpowers/specs/2026-07-08-comparator-gap-fix-design.md`](superpowers/specs/2026-07-08-comparator-gap-fix-design.md) + [`superpowers/specs/2026-07-09-left-join-safety-gate-v2-design.md`](superpowers/specs/2026-07-09-left-join-safety-gate-v2-design.md) |
 
 ---
 
@@ -75,6 +80,17 @@
 | `CRE_v2_设计文档_20260713_1745.md` | CRE v2 双引擎编码比较体系 |
 | `CRE_v3_设计文档_20260713_2000.md` | CRE v3 CDP 工程化 |
 | `diagnostic-monitor-analysis_20260715_1430.md` | 诊断监控方案分析 |
+| `superpowers/specs/2026-07-15-label-table-design.md` | label_table v1 类型完整管线设计（Parser → Extractor → Validator → Promotion → Builder → Compiler） |
+| `superpowers/specs/2026-07-21-requirement-planner-design.md` | RequirementPlanner v3.1 设计——TimeTransformExpr + UncertaintyEntry 路由 |
+| `superpowers/specs/2026-07-22-label-table-unified-pipeline-design.md` | Label Table 统一管线——所有 dataset_type 走统一管线，删除 label_scope.py |
+| `superpowers/specs/2026-07-24-compute-steps-builder-extension-design.md` | ComputeSteps Builder 双能力扩展——case_when+metrics 共存 + 混合源 Join + 两跳桥接 JOIN |
+| `superpowers/specs/2026-07-10-sparkplan-v2-design.md` | SparkPlan 多分支 DAG——branches + 编译器支持，typed_branches 替换 SqlRawExpression |
+| `superpowers/specs/2026-07-06-spark-comparator-closure-and-risks.md` | Spark Comparator 内容级对齐闭环报告与残留风险 |
+| `superpowers/specs/2026-07-10-full-pipeline-monitoring-design.md` | 全链路监控设计 |
+| `superpowers/specs/2026-07-09-left-join-safety-gate-v2-design.md` | LEFT JOIN 安全门禁 v2 设计 |
+| `superpowers/specs/2026-07-09-step-alias-human-friendly-design.md` | SparkPlan step alias 人性化命名设计 |
+| `superpowers/specs/2026-07-06-spark-stage-independent-and-llm-traces-design.md` | Spark 阶段独立执行 + LLM 追踪面板设计 |
+| `superpowers/specs/2026-07-07-spark-compiler-llm-annotation-injection-design.md` | Spark Compiler LLM 标注注入设计 |
 
 ### 📎 示例
 
@@ -97,6 +113,14 @@
 | `spec_enricher_validation_gap_fix_plan_20260701.md` | SpecEnricher 验证缺口已修复 |
 | `spec_schema_dag_extension_plan_20260701.md` | Schema DAG 扩展已实现 |
 | `企业落地场景与业界分析_20260626_1500.md` | 历史企业场景分析 |
+| `roadmap/`（全部 phase-*.md 文件） | Phase 0-8 路线图设计文档，全部 Phase 已完成 |
+| `risks/phase-6-8-known-risks.md` | Phase 6-8 历史风险登记（已复核），当前残留风险仅 Case05-Comparator |
+| `superpowers/plans/2026-07-05-phase-9*.md` | Phase 9B/9C 实施计划，已完成 |
+| `superpowers/plans/2026-07-05-r8-llm-production-verification.md` | R8 真实验证计划，已完成 |
+| `superpowers/plans/2026-07-15-label-table-implementation.md` | label_table 实施计划，已完成 |
+| `superpowers/plans/2026-07-21-requirement-planner-implementation.md` | RequirementPlanner 实施计划，已完成 |
+| `superpowers/plans/2026-07-22-label-table-unified-pipeline.md` | Label Table 统一管线实施计划，已完成 |
+| `superpowers/plans/2026-07-24-compute-steps-builder-extension.md` | ComputeSteps Builder 扩展实施计划，已完成 |
 
 ---
 
@@ -112,5 +136,7 @@
 ## 交叉引用
 
 - `docs/roadmap/`：各 Phase 实施路线图（Phase 0-8 全部完成，历史参考）
-- `docs/superpowers/`：完整设计（specs）+ 实施计划（plans）
-- `docs/risks/phase-6-8-known-risks.md`：**Phase 6-8 历史风险与验收证据**（已冻结），当前风险以 `current-state-and-verification-status.md` §3、§3.5 为准
+- `docs/superpowers/specs/`：各特性完整设计文档（含 Phase 9A-9C、label_table v1、RequirementPlanner v3.1、ComputeSteps Builder 扩展、SparkPlan v2、CRE v2-v3 等）
+- `docs/superpowers/plans/`：实施计划方案书
+- `docs/risks/phase-6-8-known-risks.md`：**Phase 6-8 历史风险与验收证据**（已复核），当前风险以 `current-state-and-verification-status.md` §3、§3.5 为准
+- `docs/current-state-and-verification-status.md`：**项目当前状态的唯一权威文档**

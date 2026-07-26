@@ -1,5 +1,8 @@
 # Spark-first Phase 6-8 实施计划
 
+> **实施状态**：✅ 已实施完成（2026-07）。此实施计划对应的 Phase 6-8 已全部实施，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 状态：待执行 | 日期：2026-07-03
 > 前置：设计文档 `2026-07-03-spark-first-phase-6-8-design.md` 已通过 CRCS 审查
 > 基线代码：Phase 5 完成，45 个测试通过，`src/tianshu_datadev/spark/` 含 models.py / mapper.py / plan_equivalence.py

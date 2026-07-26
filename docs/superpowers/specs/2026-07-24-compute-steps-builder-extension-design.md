@@ -1,5 +1,8 @@
 # ComputeSteps Builder 双能力扩展——C 类架构变更设计（修订版）
 
+> **实施状态**：✅ 已实施完成（2026-07）。实际实施新增了 spec 中未包含的两跳桥接 JOIN，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **分类**：C 类（架构风险）
 > **目标**：补齐 Builder 两个能力缺口——case_when + metrics 共存、上游步骤 + 物理表混合 Join——并修复两份多 Transform 案例的 YAML 格式和业务逻辑错误，使其通过 Parser→Validator→Builder→Contract→Spark 全链路验收。
 > **关联 Spec**：case04（双 Transform 事故风险评估）、case05（三 Transform 违章执法归因）

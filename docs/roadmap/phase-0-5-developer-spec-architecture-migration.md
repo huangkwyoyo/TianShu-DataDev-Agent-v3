@@ -1,5 +1,8 @@
 # Phase 0.5：DeveloperSpec-first 文档迁移与路线图统一
 
+> **Phase 状态**：✅ 已完成。本文档为历史设计记录，实际实施以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 状态：✅ 已完成（2026-06-26）
 > 下一阶段：Phase 1A — DeveloperSpec Parser + SourceManifest
 

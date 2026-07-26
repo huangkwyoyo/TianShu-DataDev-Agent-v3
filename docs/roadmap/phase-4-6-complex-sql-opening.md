@@ -1,5 +1,8 @@
 ﻿# Phase 4.6：复杂 SQL 模式渐进开放（多跳 Join + 子查询）
 
+> **Phase 状态**：✅ 已完成。本文档为历史设计记录，实际实施以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 状态：**已完成 ✅**（2026-07-02 核销——Step 1 + Step 2 全部实施并验证通过）
 > 前置依赖：Phase 3 Exit 满足全部退出条件 ✅ | Phase 4.5（内部交互验证口）✅
 > 关联文档：[[subquery-multihop-join-boundary_20260629_1500]] | [[03-sql-ir-and-compiler-plan]] §7.3 | [[AGENTS.md]] §2

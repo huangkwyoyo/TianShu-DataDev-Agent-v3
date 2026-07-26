@@ -1,5 +1,8 @@
 # 数据流式步骤别名——设计规格
 
+> **实施状态**：✅ 已实施完成（2026-07）。最小别名修复方案（`_alias_resolver`）已实现并部署，`_alias_generator` 已删除。实际实施与本文档存在细节差异，以 `docs/superpowers/specs/2026-07-11-sparkplan-minimal-alias-fix.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 版本：2026-07-09 | 状态：设计完成
 
 ## 问题

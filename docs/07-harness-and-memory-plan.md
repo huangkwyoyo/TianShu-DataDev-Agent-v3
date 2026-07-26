@@ -1,7 +1,11 @@
 # Phase 4 Harness + 回归 / 规则 / Schema 标注 — TianShu DataDev Agent v3
 
 > 文档版本：2026-07-13 更新版
-> 状态：Phase 4 已退出，Harness 七维门禁已落地，Phase 8 Spark 5 维度评测已完成。当前测试基线 2568 passed / 24 skipped / 10 预存失败。
+> 状态：Phase 4 已退出，Harness 七维门禁已落地，Phase 8 Spark 5 维度评测已完成。
+>
+> ⚠️ **本文档为历史设计计划，实际实施已偏离此计划。** 当前实际状态请参阅 `docs/current-state-and-verification-status.md`。
+> 重点差异：独立记忆系统（Engineering Memory）未实现——失败沉淀走 Harness 回归集、确定性规则、Schema/Contract 标注，不建设可运行时检索的 Memory。
+> 最后核对日期：2026-07-26
 
 ## 1. 当前状态
 

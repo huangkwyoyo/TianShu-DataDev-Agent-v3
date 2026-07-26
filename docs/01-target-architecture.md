@@ -1,6 +1,6 @@
 # 目标架构 — TianShu DataDev Agent v3
 
-> 文档版本：Phase 0.5 DeveloperSpec-first 架构校正版
+> 文档版本：Phase 0.5 DeveloperSpec-first 架构校正版 | 2026-07-26 更新——补充 ComputeStep+Builder 双能力、RatioExpr、ComputeStepValidator、StepOutputSchema、SparkPlan branches 多分支 DAG、RequirementPlanner v3.1、Snapshot 桥接、UPPER() JOIN 归一化
 
 ## 1. 架构原则
 
@@ -10,6 +10,8 @@
 4. SQL 与 Spark 共享 DataTransformContract 和冻结快照，不共享实现代码。
 5. Comparator 只证明样本一致性；人负责业务审查和上线决策。
 6. LangGraph 是薄编排层，业务节点是普通 Python 函数。
+7. ComputeStep 是高维计划单元——case_when 与 metrics 可在同一 step 共存，由 Builder 编译为 SqlBuildPlan step 链。RatioExpr 以封闭结构表达安全比率。
+8. SparkPlan 支持多分支 DAG——branches 字段将 ComputeSteps 编译为独立 DataFrame 分支，编译器按 branches → 主 steps 顺序执行。
 
 ## 2. 总体数据流
 
@@ -21,19 +23,31 @@ DeveloperSpec (.md 项目书，Markdown 正文 + YAML-like metadata block)
 ParsedDeveloperSpec
   → SourceManifest（表字段事实追踪：developer_spec / schema_registry / snapshot_profile）
   → RelationshipHypothesis（Join 推理：LLM 提候选 → Validator 证据定级 → 人工确认中低置信）
-  → SqlBuildPlan / SqlProgram（受控 SQL 构建计划，8 step 类型化 DAG）
-  → SQL Validator → Compiler（确定性渲染 + 优化 Pass）→ DuckDB Executor
-  → SQL Code Review Package（供程序员审查）
 
-[Spark-first v2.0]
-  → DataTransformContract（从已验证 SqlBuildPlan 确定性抽取，三级递进）
-  → SparkDeveloper（LLM 只做语义标注）→ SparkCompiler（确定性 PySpark DSL 生成）
+[统一管线 v2——所有 dataset_type 走同一流程]
+  → RequirementPlanner v3.1（LLM 推断维度/派生维度/指标/CASE WHEN/比率/不确定项，
+    执行顺序：Planner 先于 SpecEnricher，含 TimeTransformExpr 全链路）
+  → SpecEnricher（推断补充声明：计算指标、窗口指标、比率候选 RatioProposal）
+  → RatioProposalValidator（确定性校验）→ RatioPromotion（提升为正式 RatioDecl）
+  → ComputeStepValidator（五项确定性校验 + UNKNOWN 阻断）
+  → StepOutputSchema Compute（推导每步输出列类型与唯一键组）
+  → ComputeStep → Builder（case_when + metrics 可共存，混合源 Join）
+  → SqlBuildPlan / SqlProgram（受控 SQL 构建计划，10 step 类型化 DAG）
+  → SQL Validator → Compiler（确定性渲染 + UPPER() JOIN 归一化 + 优化 Pass）
+  → DuckDB Executor → SQL Code Review Package（供程序员审查）
+
+[Spark-first v2.0 + 多分支 DAG]
+  → DataTransformContract（从已验证 SqlBuildPlan 确定性抽取，三级递进，
+    新增 RatioExpr + TimeTransformExpr + 桥接模式）
+  → SparkDeveloper（LLM 只做语义标注）→ SparkCompiler（确定性 PySpark DSL 生成，
+       支持 branches 多分支 DAG）
   → Static Validator（AST 硬门禁）
   → 双链验证（PlanComparator：SqlBuildPlan vs SparkPlan + PhysicalVerifier）
   → 人工审查
 ```
 
 Snapshot Builder 必须在双引擎执行前完成。两个 Executor 只能读取同一个 snapshot_id。
+Snapshot Builder 支持桥接模式——当 Join 图不连通时，自动检测断裂路径并使用桥接表连接，确保一致性快照。
 
 ### 2.1 SourceManifest 与 SchemaRegistry 冲突策略
 
@@ -87,6 +101,11 @@ Join 推理是 SQL 生成中最易出错的环节。本架构将 Join 推理拆�
 
 归一化后的字段名用于匹配，但 **SqlBuildPlan 中保留原始字段名**——归一化仅用于推理和校验阶段。
 
+**字段值大小写归一化**（用于 JOIN 运行时）：
+- 已知大小写不一致的字段（如 `borough`）在 JOIN 条件中自动以 `UPPER()` 包裹两边。
+- 当前硬编码规则：crash_detail.borough（全大写）与 taxi_zone.borough（首字母大写）在 JOIN 时通过 UPPER() 归一化。
+- 未来可扩展为配置化的字段级大小写策略表，不依赖硬编码。
+
 ### 2.4 证据链路模板
 
 每个 Join 推理必须输出完整证据链，格式如下：
@@ -124,33 +143,36 @@ join_hypothesis:
 
 WEAK 等级的 Join 证据链可能只有一条 `field_name_similarity` 且 `edit_distance >= 1`——此时 action 为 `REJECT_BLOCKING`，Join 不进入 SqlBuildPlan。
 
-## 3. SQL IR：两层结构
+## 3. SQL IR：两层结构 + ComputeStep 高层计划单元
 
-旧架构的三层 IR（RequirementIR → SubIntent → SQLPlan）被替换为两层：
+旧架构的三层 IR（RequirementIR → SubIntent → SQLPlan）被替换为两层 + 高层 ComputeStep：
 
 | 层 | 作用 | 对应 Phase |
 |----|------|------------|
-| SqlBuildPlan | 单语句受控 SQL 构建计划，使用 8 种类型化 step 表达单条 SELECT 的完整语义 | Phase 1B |
+| ComputeStep | 高维计划单元——维度/指标/CASE WHEN/比率在同一 step 组织，case_when 与 metrics 可共存。经 ComputeStepValidator 校验和 StepOutputSchema 推导后，由 Builder 编译为 SqlBuildPlan step 链 | Phase 10+ |
+| SqlBuildPlan | 单语句受控 SQL 构建计划，使用 10 种类型化 step 表达单条 SELECT 的完整语义 | Phase 1B |
 | SqlProgram | 多语句 DAG，将多个 SqlBuildPlan 编排为有序执行单元，管理 _temp 中间表生命周期 | Phase 3A |
 
-两层之间不插入任何"LogicalPlan"中间层——SqlBuildPlan 已经是逻辑与物理的统一表达。
+SqlBuildPlan 与 SqlProgram 之间不插入任何"LogicalPlan"中间层——SqlBuildPlan 已经是逻辑与物理的统一表达。ComputeStep 是更高维度的计划单元，最终编译为 SqlBuildPlan。
 
 ### 3.1 SqlBuildPlan 最小 step 范围
 
-SqlBuildPlan 必须使用以下 8 种封闭类型化 step，不接受自由 SQL 片段：
+SqlBuildPlan 最终必须使用以下 10 种封闭类型化 step，不接受自由 SQL 片段：
 
 | Step | 说明 | 关键字段 |
 |------|------|----------|
 | `ScanStep` | 扫描表/视图 | `table_ref`、`required_columns`、`partition_filters`、`estimated_row_count` |
 | `FilterStep` | 行过滤 | `predicate: Predicate`（封闭 AST，非字符串） |
 | `JoinStep` | 受控关联 | `right_table_ref`、`join_type`、`join_keys`、`relationship_ref`、`cardinality_hint` |
-| `AggregateStep` | 分组聚合 | `group_keys`、`metrics: list[AggregateSpec]`、`having: Predicate | None` |
-| `ProjectStep` | 列投影 | `columns: list[ColumnRef | AliasExpr]` |
-| `CaseWhenStep` | 条件标签 | `cases: list[WhenBranch]`、`else_value`、`alias`（Phase 3B 开放） |
-| `SortStep` | 排序 | `order_by: list[SortSpec]`、`limit: int | None` |
-| `LimitStep` | 行数限制 | `limit: int`、`offset: int | None` |
+| `AggregateStep` | 分组聚合 | `group_keys`、`metrics: list[AggregateSpec]`、`having: Predicate \| None`、`time_transforms: list[TimeTransformExpr]` |
+| `ProjectStep` | 列投影 | `columns: list[ColumnRef \| AliasExpr]`——ratio_expr 在 AliasExpr 中表达 |
+| `CaseWhenStep` | 条件标签 | `cases: list[WhenBranch]`、`else_value`、`alias`、`evaluation_phase: pre_aggregate \| post_aggregate` |
+| `WindowStep` | 窗口函数 | `expressions: list[WindowExpr]`——9 种白名单窗口函数 |
+| `SortStep` | 排序 | `order_by: list[SortSpec]`、`limit: int \| None` |
+| `LimitStep` | 行数限制 | `limit: int`、`offset: int \| None` |
+| `SubqueryStep` | FROM 子查询 | `sql_build_plan: SqlBuildPlan`、`alias: str`，仅 FROM 子句派生表，深度 ≤ 2 |
 
-每个 step 的字段均为封闭类型化对象（`ColumnRef`、`Predicate`、`JoinSpec`、`AggregateSpec`、`SortSpec`、`Literal` 等）。任何 `where_sql`、`join_on: str`、`expression: str`、`raw_sql` 字段都属于越界。
+每个 step 的字段均为封闭类型化对象（`ColumnRef`、`Predicate`、`JoinSpec`、`AggregateSpec`、`SortSpec`、`Literal`、`RatioExpr`、`TimeTransformExpr` 等）。任何 `where_sql`、`join_on: str`、`expression: str`、`raw_sql` 字段都属于越界。
 
 ### 3.2 SqlProgram + _temp + DAG + 拓扑排序
 
@@ -199,8 +221,8 @@ DataTransformContract 是 SQL 侧向 Spark 侧传递的权威业务规格，从�
 | 级别 | 交付 Phase | 覆盖范围 | 内容 |
 |------|------------|----------|------|
 | **DataTransformContract-lite** | Phase 2 | 单语句 SqlBuildPlan | 输入表/字段、过滤、Join 关系、聚合定义、输出列和类型、排序、行限制 |
-| **DataTransformContract v1** | Phase 3 Exit | SqlProgram 多语句 DAG | lite 全部内容 + 多步依赖图 + _temp 中间表规格 + CASE 标签规则 + 窗口函数规格 + 受控写入方案 |
-| **Phase 5 消费 v1** | Phase 5 | 完整 v1 | SparkPlan IR 从 v1 确定性映射；v1 是 Spark 侧的唯一业务输入——SparkDeveloper 不读取 DeveloperSpec |
+| **DataTransformContract v1** | Phase 3 Exit → Phase 10+ 扩展 | SqlProgram 多语句 DAG | lite 全部内容 + 多步依赖图 + _temp 中间表规格 + CASE 标签规则 + 窗口函数规格 + 受控写入方案 + 比率表达式 ratio_expr + 时间变换 time_transforms |
+| **Phase 5 消费 v1** | Phase 5+ | 完整 v1 | SparkPlan IR 从 v1 确定性映射；v1 是 Spark 侧的唯一业务输入——SparkDeveloper 不读取 DeveloperSpec |
 
 ```text
 contract_id
@@ -213,7 +235,9 @@ aggregations[]                 # 聚合定义（函数、输入列、别名、di
 grouping_keys[]                # 分组键
 case_when_labels[]             # CASE 标签规则（Phase 3B，v1 新增）
 window_specs[]                 # 窗口函数规格（Phase 3B，v1 新增）
-output_columns[]               # 输出列名和类型
+ratio_exprs[]                  # 比率表达式（Phase 10+ 新增）：分子/分母/除零策略/乘数
+time_transforms[]              # 时间变换表达式（Phase 10+ 新增）：source_column/time_function/alias
+output_columns[]               # 输出列名和类型——ratio_expr 在 AliasExpr 中以子字段表达
 output_grain                   # 输出粒度
 write_spec                     # 写入方案（Phase 3C，v1 新增）：分区键、overwrite 范围、禁止操作列表
 business_keys[]                # 业务键（用于快照构建锚点）
@@ -253,7 +277,18 @@ Validator 对 DAG 执行拓扑排序，规则：
 - 同级节点按 `step_id` 字典序打破平局——保证相同 DAG 产生相同顺序。
 - 循环依赖被检测并拒绝（`CIRCULAR_DEPENDENCY`）。
 
-### 5.3 自动合并的边界
+### 5.3 SparkPlan 多分支 DAG 与 SqlProgram 的关系
+
+SparkPlan 支持多分支 DAG——`branches: dict[str, list[SparkStep]]` 字段将 ComputeSteps 编译为独立 DataFrame 分支：
+
+- 每个分支是一个完整的 Read→...→Aggregate 链，生成一个命名 DataFrame 变量。
+- 编译器先编译所有 branches（产生独立 DataFrame 变量），再编译主 steps——主 steps 可通过 JoinStep 引用分支输出。
+- 分支之间不存在 _temp 中间表——它们是 Spark 内存中的 DataFrame 变量，由 Spark 优化器管理。
+- 与 SqlProgram 的差异：SqlProgram steps 通过 _temp 表物化传递，串行执行；SparkPlan branches 在 Spark 执行计划中并行，无物化开销。
+
+此机制使多个 ComputeStep 的读取→过滤→聚合可以在同一个 SparkPlan 中并行执行，最后通过 Join 合并，无需 DAG 中间表。
+
+### 5.4 自动合并的边界
 
 当两个 step 输出相同粒度、兼容列且需要合并时，由 SqlProgram 显式插入一个 `union_step`（而非旧架构的隐式 MergePlan）：
 - 输出粒度不兼容 → 拒绝，进入 `HUMAN_REVIEW`。
@@ -261,12 +296,14 @@ Validator 对 DAG 执行拓扑排序，规则：
 - 列冲突无明确策略 → 拒绝。
 - 期望基数未声明 → 允许但记录 WARN。
 
-## 6. Artifact 优先的 Graph State
+## 6. Artifact 优先的 Graph State（⚠️ 规划中——当前未实现为代码级 TypedDict）
+
+> **状态**：以下 `GraphState` 是架构愿景中的概念模型，描述 LangGraph 编排层理想化的状态结构。当前实现中，Pipeline（`api/pipeline.py`）使用普通 Python 属性和 `_results` 字典管理状态，并未定义此 TypedDict 类。保留此节作为未来 LangGraph 编排升级的目标状态参考。
 
 LangGraph State 只保存小型结构化字段，语义更新为 DeveloperSpec-first 命名：
 
 ```python
-class GraphState(TypedDict):
+class GraphState(TypedDict):  # ⚠️ 规划中——当前代码中无此类
     request_id: str
     developer_spec_ref: str                     # DeveloperSpec artifact 引用
     parsed_developer_spec_ref: str | None       # ParsedDeveloperSpec artifact 引用
@@ -293,7 +330,7 @@ class GraphState(TypedDict):
 
 ## 7. 执行环境边界
 
-- Snapshot Builder 只读访问开发数据源。
+- Snapshot Builder 只读访问开发数据源。支持桥接模式——当 Join 图不连通时自动检测断裂路径并使用桥接表连接，确保关系一致快照。
 - DuckDB 与 Spark 在隔离环境读取 Parquet 快照。
 - EnvironmentManifest 固定引擎版本、时区、ANSI 模式、大小写、Decimal 和 NaN 策略。
 - SQL、Spark 代码和 LLM 生成的测试代码必须先静态验证再执行。
@@ -330,4 +367,4 @@ generated/review_packages/{request_id}/
 
 ---
 
-> Phase 0.5 DeveloperSpec-first 校正 | 2026-06-26 | Phase 1A 前置事实源
+> Phase 0.5 DeveloperSpec-first 校正 | 2026-07-26 更新 | Phase 10+ 已实现（ComputeStep+Builder 双能力、RatioExpr、ComputeStepValidator、StepOutputSchema、SparkPlan branches、RequirementPlanner v3.1、Snapshot 桥接、UPPER() JOIN 归一化）

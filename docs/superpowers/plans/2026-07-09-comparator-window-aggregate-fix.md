@@ -1,5 +1,8 @@
 # Comparator Window + Aggregate 修复计划
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) 或 superpowers:executing-plans 按任务逐步执行。步骤使用 `- [ ]` 跟踪进度。
 
 **目标:** 修复 Comparator 中 window 对比崩溃、漏检字段、order_by 顺序丢弃，以及 aggregate assert 生产崩溃

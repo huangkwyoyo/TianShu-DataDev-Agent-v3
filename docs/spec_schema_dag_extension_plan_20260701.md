@@ -1,5 +1,12 @@
 # Spec Schema 多步 DAG 计算扩展方案
 
+> **执行状态**：**部分执行**。已实施内容：
+> - **P0（多步聚合链）已执行**——ComputeStep 模型（StrictModel）、ParsedDeveloperSpec 新增 `compute_steps` 字段、`_build_from_compute_steps()` Builder 分支（含 Spec DAG 拓扑排序、SqlProgram 组装）
+> - **P0-2（多分支合流）未执行**——依赖 ComputeStep.source 支持多输入（list），尚未实现
+> - **P1-3（Top-N per group）未执行**——依赖 FilterStep 支持过滤窗口函数结果
+> - **P1-4（跨粒度指标依赖）未执行**——属于 P0-2 子集
+> - Compiler / Validator / PerfValidator 未修改
+
 ## 一、CRCS 分类
 
 **B 类 — DESIGN-REVIEW（设计方案评审）**

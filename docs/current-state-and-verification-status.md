@@ -1,7 +1,7 @@
 # 项目当前状态与验证进度 — TianShu DataDev Agent v3
 
-> 文档版本：2026-07-17 label_table v1 完成 + 测试统计口径修正 + 运行环境说明
-> 最后更新：2026-07-17
+> 文档版本：2026-07-26 ComputeSteps 双能力扩展 + RatioExpr 全链路 + Label Table 统一管线 + RequirementPlanner v3.1 + SparkPlan 多分支 DAG + Snapshot 桥接 + 前端增强
+> 最后更新：2026-07-26
 > 本文是项目当前实施状态的**唯一权威文档**。各 Phase 设计文档（docs/00-09、docs/roadmap/）描述的是目标设计，实际建成状态以本文为准。
 
 ## 1. Phase 进度矩阵
@@ -19,7 +19,7 @@
 | 6A | scan/filter/project/sort/limit | ✅ | ✅ | ✅ | 编译 + Validator 全错误码 |
 | 6B | aggregate/join/case_when | ✅ | ✅ | ✅ | 编译扩展 |
 | 6C | window + 帧边界 | ✅ | ✅ | ✅ | 含 RepairPlanner |
-| 7A | 逻辑链路 + Snapshot | ✅ | ✅ | ✅ | PlanComparator 9 种 step |
+| 7A | 逻辑链路 + Snapshot | ✅ | ✅ | ✅ | PlanComparator 累计 9 种 step（含 Phase 7C 窗口合并） |
 | 7B | 物理链路——双引擎验证 | ✅ | ✅ | ✅ | 11/11 真实 Spark 通过 |
 | 7C | 物理链路扩展 + 安全加固 | ✅ | ✅ | ✅ | 窗口双引擎 + SQL 加固 |
 | 8 | 编排硬化 + Harness | ✅ | ✅ | ✅ | Orchestrator + Review Package + 5 维度 |
@@ -30,18 +30,26 @@
 | 9C-R16 | table_paths 环境配置补齐 | ✅ | ✅ | ✅ | R16 消除，CSV fixture 自动发现，2026-07-05 |
 | 9C-R16b | table_paths 边界硬化 | ✅ | ✅ | ✅ | None/{} 语义区分 + E2E 模式开关，2026-07-05 |
 | 9B-P1 | provenance.yml 显式断言 | ✅ | ✅ | ✅ | snapshot_manifest_hash 测试覆盖矩阵补全，2026-07-05 |
-| 9A4-NYC | 真实业务样本——NYC 案例 01-06 | ✅ | ✅ | 🟡 | Case 01-06 SQL+Spark 双链 LOGIC_EQUIVALENT；Case 05 窗口函数 NOT_COVERED |
+| 9A4-NYC | 真实业务样本——NYC 案例 01-06 | ✅ | ✅ | 🟡 | Case 01-06 SQL+Spark 双链 LOGIC_EQUIVALENT；Case 05 窗口函数帧边界规范化差异 |
 | 10-Case06 | SqlProgram 多语句 DAG——NYC Case 06 | ✅ | ✅ | ✅ | **2026-07-06 闭环**："三层剥离" |
 | 10-ContentAlign | Spark Comparator 内容级对齐 | ✅ | ✅ | ✅ | **2026-07-06 完成**：8 commits |
 | CRE Phase 2 | CRE shadow 最终准入硬化 | ✅ | ✅ | ✅ | **2026-07-13 物理验证可用** |
 | label_table v1 | 标签表类型完整管线 | ✅ | ✅ | ✅ | **2026-07-16 完成**：Parser → Extractor → Validator → Promotion → Builder(CaseWhenStep) → Compiler。8 commits，90 个测试全绿。详见 `docs/superpowers/specs/2026-07-15-label-table-design.md` |
+| RatioExpr 全链路 | 聚合后比率表达式——RatioExpr/RatioProposal/RatioDecl + Validator + Promotion | ✅ | ✅ | ✅ | **2026-07-23 完成**：2 commits。数据模型层→SpecEnricher→Compiler→Contract→Spark 全链路贯通 |
+| Label Table 统一管线 | 所有 dataset_type 走统一管线，不再跳过 Planner/Enricher | ✅ | ✅ | ✅ | **2026-07-22 完成**：删除 label_scope.py + 重复门禁 + _prepare_spec_for_planning。UncertaintyEntry 路由 + 合并 + 冲突检测，11+10 个测试全绿 |
+| RequirementPlanner v3.1 | TimeTransformExpr 全链路 + UncertaintyEntry 路由 | ✅ | ✅ | ✅ | **2026-07-21 完成**：TimeTransformExpr 数据模型→SQL Compiler→Contract→Builder→Spark 全链路。RequirementPlanner 核心组件 + ProposalValidator(V1-V13) + ProposalPromotion |
+| ComputeSteps Builder 双能力扩展 | case_when+metrics 共存 + 混合源 Join + 两跳桥接 JOIN | ✅ | ✅ | ✅ | **2026-07-24 完成**：10 commits。ComputeStepValidator(五项校验+UNKNOWN阻断) + StepOutputSchema + 删除 case_when 守卫 + 猜键/CROSS JOIN + 12 项表驱动单元测试 + E2E 测试。全量回归验证通过 v3 |
+| SparkPlan 多分支 DAG | branches + 编译器支持 | ✅ | ✅ | ✅ | **2026-07-24 完成**：SparkPlan branches 字段 + 编译器多分支编译为独立 DataFrame + CaseWhenDecl.typed_branches 替换 SqlRawExpression（typed_branches 属于 CaseWhenDecl 模型，非 SparkPlan 字段） |
+| Snapshot 桥接 | 不连通 Join 图支持 + compute_steps 两跳桥接 JOIN | ✅ | ✅ | ✅ | **2026-07-26 完成**：`_build_bridge_join_plan` + `_find_bridge_candidates` + `_find_bridge_confluence_keys`。SnapShot 锚表时间过滤 + 空快照门禁 |
+| 前端增强 | LLM 追踪面板 + SQL 前端持久化 + 物理验证展示 | ✅ | ✅ | ✅ | **2026-07-24/26 完成**：LlmTracePanel 前端组件 + 横向指示灯布局 + Run-All 面板三层兜底 + 物理验证对比摘要 + 双引擎对比结论展示 |
 
-### 测试基线（2026-07-17 采集）
+### 测试基线（2026-07-26 待重新采集）
 
 **采集口径**：
-- `pytest --collect-only`：**2818 tests collected**
-- 全量执行需要 `--run-slow` + PySpark 环境（SparkSession 启动约 30-60s，部分测试有 180s 超时）
-- 非 Spark/非 Harness 子集：**1629 passed / 6 skipped / 2 xfailed**（50s）
+- 近两周（2026-07-17 至 2026-07-26）新增大量代码：ComputeSteps Builder 双能力扩展、RatioExpr 全链路、Label Table 统一管线、RequirementPlanner v3.1、SparkPlan 多分支 DAG、Snapshot 桥接、前端增强。
+- **测试计数暂未重新采集**——大量新增 E2E 和集成测试后，`pytest --collect-only` 计数已不再准确。
+- 前次基线（2026-07-17）：`pytest --collect-only` 为 **2818 tests collected**
+- 非 Spark/非 Harness 子集：前次基线 **1629 passed / 6 skipped / 2 xfailed**（50s）
 - ruff/tsc/build：零告警
 
 **Spark 测试状态**（需 `--run-slow`）：
@@ -127,8 +135,12 @@ DeveloperSpec (.md 项目书)
     │   → 进入下游 SQL/Spark 管线
     │
     ├─ SQL 管线（确定性，生产可用）
-    │   Pipeline.run_all() → Parser → SourceManifest → SqlBuildPlan(含CaseWhenStep) → Compiler → DuckDB
+    │   Pipeline.run_all() → RequirementPlanner v3.1 → SpecEnricher（RatioExpr注入） → RelationshipPlanner
+    │   → SourceManifest → ComputeStepValidator（五项校验+UNKNOWN阻断）
+    │   → SqlBuildPlan（含CaseWhenStep/RatioExpr/桥接JOIN） → Compiler → DuckDB
     │       │
+    │       ├─ StepOutputSchema（独立类型与唯一键元数据）
+    │       ├─ _build_bridge_join_plan（两跳桥接 JOIN）
     │       └─ export_artifacts() → PipelineArtifactBundle
     │           ├─ sql_build_plan（真实 SqlBuildPlan）
     │           └─ data_transform_contract
@@ -136,36 +148,43 @@ DeveloperSpec (.md 项目书)
     │               └─ adapt_lite_to_v1() → DataTransformContractV1
     │
     └─ Spark 管线（确定性，生产级验证）
-        DataTransformContractV1 → Mapper → SparkPlan → Compiler → Validator
+        DataTransformContractV1 → Mapper → SparkPlan（含 branches 多分支 DAG） → Compiler → Validator
                                         │                      │
                                         ├── PlanComparator.compare()        ← 单 plan 路径（SqlBuildPlan）
                                         ├── PlanComparator.compare_program() ← 多语句 DAG 路径（SqlProgram）
                                         │       └─ 三层剥离：_temp_* 过滤 + grain-aware merge + target_grain 过滤
                                         ├── PhysicalVerifier                ← 双引擎物理对比
                                         ├── Orchestrator                    ← 6 阶段编排
-                                        └── Harness 5 维度                  ← 评测框架
-                                                  │
-                                                  └─ SparkReviewBuilder.build()
-                                                         │
-                                                         └─ SparkReviewPackage
-                                                            ├─ provenance（完整溯源链）
-                                                            ├─ stage_results（6 阶段结果）
-                                                            ├─ comparator_status（对比器状态）
-                                                            └─ review_ready ★ REVIEW_READY 判定
+                                        ├── Harness 5 维度                  ← 评测框架
+                                        ├── Snapshot Builder                ← 不可变数据快照创建与管理
+                                        ├── SparkReviewBuilder.build()      ← 后端审查包构建
+                                        │       └─ SparkReviewPackage
+                                        │          ├─ provenance（完整溯源链）
+                                        │          ├─ stage_results（6 阶段结果）
+                                        │          ├─ comparator_status（对比器状态）
+                                        │          └─ review_ready ★ REVIEW_READY 判定
+                                        └── Run-All 面板 + LLM 追踪面板     ← 前端可观测性
 ```
 
 ## 5. 下一步方向
 
 1. ~~Case 06 Spark 双链 LOGIC_EQUIVALENT~~ → **✅ 已完成（2026-07-06）**
 2. ~~CRE shadow 最终准入硬化~~ → **✅ 已完成（2026-07-13）**
-3. **CRE 门禁切换（非阻断后续事项）**：
+3. ~~Label Table 统一管线~~ → **✅ 已完成（2026-07-22）**
+4. ~~RatioExpr 全链路~~ → **✅ 已完成（2026-07-23）**
+5. ~~ComputeSteps Builder 双能力扩展~~ → **✅ 已完成（2026-07-24）**
+6. ~~SparkPlan 多分支 DAG~~ → **✅ 已完成（2026-07-24）**
+7. ~~Snapshot 桥接 + 前端增强~~ → **✅ 已完成（2026-07-26）**
+8. **测试基线重采集**——大量新代码新增后，需要重新运行全量测试并记录新的基线
+9. **CRE 门禁切换（非阻断后续事项）**：
    - Golden Registry 为空——需业务方注册已知差异样本
    - NULL strategy 始终 UNKNOWN——仅进入 HUMAN_REVIEW
    - 门禁切换需 Owner 批准
-4. **Case 05 Window 规范化差异**——Spark 与 DuckDB 的 ROW_NUMBER 窗口帧边界默认行为存在规范化差异，非代码 bug。**C 类保守阻断**：需人工确认语义等价后再解除阻断
-5. **CASE WHEN condition 等价比较**——当前设计为 UNSUPPORTED，**按需建设，非当前优先级**。condition 是业务语义核心，人工审核是当前通道
-6. **`_temp_` 前缀检测统一**（R-CA-2，**低优先级维护债**）
-7. **生产环境 LLM 验证**——R8 脚本就绪，待 API key 配置后执行
+10. **Case 05 Window 规范化差异**——Spark 与 DuckDB 的 ROW_NUMBER 窗口帧边界默认行为存在规范化差异，非代码 bug。**C 类保守阻断**：需人工确认语义等价后再解除阻断
+11. **CASE WHEN condition 等价比较**——当前设计为 UNSUPPORTED，**按需建设，非当前优先级**。condition 是业务语义核心，人工审核是当前通道
+12. **`_temp_` 前缀检测统一**（R-CA-2，**低优先级维护债**）——已部分修复（Contract 提取器消除 _temp_ 表引用泄漏），但统一检测机制仍未实现
+13. **生产环境 LLM 验证**——R8 脚本就绪，待 API key 配置后执行
+14. **物理验证溢出降级后精度验证**——引擎内 count + 键对齐抽样对比替代 NOT_EXECUTED，需确认抽样精度足够
 
 ## 6. 关键文档索引
 
@@ -182,6 +201,9 @@ DeveloperSpec (.md 项目书)
 | `docs/case_when条件对比边界说明_20260717_0908.md` | CASE WHEN condition UNSUPPORTED 取舍记录 |
 | `docs/datadev_engineering_glossary_20260629_1600.md` | 工程术语表 |
 | `docs/superpowers/specs/2026-07-15-label-table-design.md` | label_table v1 完整设计 |
+| `docs/superpowers/specs/2026-07-21-requirement-planner-design.md` | RequirementPlanner v3.1 设计文档 |
+| `docs/superpowers/specs/2026-07-22-label-table-unified-pipeline-design.md` | Label Table 统一管线设计文档 |
+| `docs/superpowers/specs/2026-07-24-compute-steps-builder-extension-design.md` | ComputeSteps Builder 双能力扩展设计 |
 | `docs/superpowers/specs/` | Spark-first Phase 6-8 完整设计 |
 | `docs/superpowers/plans/README.md` | 方案书索引与执行链路 |
 | `docs/examples/` | DeveloperSpec 示例（汇总表/标签表/多步骤加工） |

@@ -1,5 +1,8 @@
 # Run-All 实时进度可见性——NDJSON 流式实现
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Run-All 执行期间前端实时展示 SQL + Spark 双管线阶段进度和错误信息，消除黑盒体验。

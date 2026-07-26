@@ -1,5 +1,8 @@
 # Case06 B 类功能收口——compute_ratios / risk_label / 拓扑对齐 实施方案
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 补齐 Case06（区域安全合规画像 7 步 DAG）的 B 类功能遗留——使 compute_ratios（比率计算）和 risk_label（CASE WHEN）正确执行，并使 Spark Comparator 产出 LOGIC_EQUIVALENT 严格断言。

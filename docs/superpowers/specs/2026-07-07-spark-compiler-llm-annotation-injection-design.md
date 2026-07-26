@@ -1,5 +1,8 @@
 # Spark Compiler LLM 注释注入设计文档
 
+> **实施状态**：✅ 已实施完成（2026-07）。annotated_pyspark 已接入，LLM 语义标注注入 SparkCompiler 产出，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > Phase 8B — 将 LLM 语义标注（intent_detail / operation_summary）注入 SparkCompiler 产出的 standalone PySpark 脚本中
 
 ## 1. 问题描述

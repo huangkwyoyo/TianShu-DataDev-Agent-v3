@@ -1,5 +1,8 @@
 # Label Table 统一管线——设计方案
 
+> **实施状态**：✅ 已实施完成（2026-07）。删除单表门禁，所有 dataset_type 统一管线，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **状态**：修订中（第三版——基于现有代码事实校准）
 > **日期**：2026-07-22
 > **触发**：label_table v1 单表门禁拒绝三表 JOIN 场景——`label_table v1 仅支持单表——当前 spec 包含 3 张表: ['fc', 'dd', 'tz']`

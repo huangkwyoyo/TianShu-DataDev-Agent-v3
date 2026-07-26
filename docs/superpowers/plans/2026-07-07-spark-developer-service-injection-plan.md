@@ -1,5 +1,8 @@
 # SparkDeveloperService 注入 Implementation Plan
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 将 `SparkDeveloperService`（LLM 语义标注）接入 Pipeline 单阶段 `/spark/develop` 路径，使前端点击「标注」按钮后调用 DeepSeek API 产出 `AnnotatedSparkPlan` 并展示在前端面板。

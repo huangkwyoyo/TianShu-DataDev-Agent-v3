@@ -1,5 +1,8 @@
 # Phase 3B：CaseWhenStep + WindowExpr（标签与窗口函数）
 
+> **Phase 状态**：✅ 已完成。本文档为历史设计记录，实际实施以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 状态：**已完成 ✅**（2026-06-29 核销）
 > 前置依赖：Phase 3A 退出条件全部满足 ✅
 
@@ -161,4 +164,4 @@ git diff --check
 
 ---
 
-> Phase 3B | **已完成** | 枚举值自动检测已实现（Phase 3B.1） | 1123 全量通过
+> Phase 3B | **已完成** | 枚举值自动检测已架构实现但未集成（Phase 3B.1 ⚠️） | 1123 全量通过

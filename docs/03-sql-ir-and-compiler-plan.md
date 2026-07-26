@@ -1,6 +1,9 @@
 ﻿# SQL IR 和编译器计划 — TianShu DataDev Agent v3
 
-> 文档版本：Phase 0.5 DeveloperSpec-first 架构校正版 | 实施状态：Phase 1B/1C 已完成。当前项目状态见 `docs/current-state-and-verification-status.md`
+> 文档版本：Phase 0.5 DeveloperSpec-first 架构校正版 | 实施状态：Phase 1B/1C 已完成。
+>
+> ⚠️ **本文档为历史设计计划，实际实施已偏离此计划。** 当前实际状态请参阅 `docs/current-state-and-verification-status.md`。
+> 最后核对日期：2026-07-26
 
 ## 1. 目标
 

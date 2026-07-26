@@ -1,5 +1,8 @@
 # 物理验证后代码展示与下载 实施计划
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **执行方式**：inline 执行（单会话），使用 systematic-debugging 排查问题。
 
 **目标**：物理验证成功后，展示 SQL 和 PySpark 代码，每个代码框上方有下载按钮（.sql / .py）。

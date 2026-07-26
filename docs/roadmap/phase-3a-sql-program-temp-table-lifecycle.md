@@ -1,5 +1,8 @@
 # Phase 3A：SqlProgram + _temp 中间表生命周期
 
+> **Phase 状态**：✅ 已完成。本文档为历史设计记录，实际实施以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 状态：**已完成 ✅**（2026-06-29 核销）
 > 前置依赖：Phase 2 退出条件全部满足 ✅
 

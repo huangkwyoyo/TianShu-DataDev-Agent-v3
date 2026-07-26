@@ -1,5 +1,8 @@
 # 全流程运行监控——设计规格书 v2
 
+> **实施状态**：✅ 已实施完成（2026-07）。6 批监控模块已实现：Models/Sanitizer → RunLogCollector → Middleware → SQL/Spark 管线埋点 → ResourceSampler → 人类可读日志。
+> 最后核对日期：2026-07-26
+
 > **状态**：Owner 已确认方案（含第二轮 7 项补丁），待转入 writing-plans
 > **CRCS 审查**：2×B 类 + 2×C 类 + 1×A 类 + 第二轮 7 项全部采纳推荐方案
 

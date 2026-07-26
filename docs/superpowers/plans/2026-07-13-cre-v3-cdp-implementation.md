@@ -1,5 +1,8 @@
 # CRE v3 CDP 摘要路径实施计划（修订版）
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** 实现 CDP v1 摘要协议全链路——模型+校验 → 手工黄金向量 → Python oracle → 双引擎字段探针 → 双引擎 builder + 引擎侧集成 → 三方属性测试+性能基准 → Engine-side Shadow → 接管结论 → 清理过渡设计。

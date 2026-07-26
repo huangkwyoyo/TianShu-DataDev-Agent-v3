@@ -1,5 +1,8 @@
 # label_table 类型支持——完整设计书（修订版 v2）
 
+> **实施状态**：⚠️ 部分实施/被后续方案取代。label_table v1 基础设计已实施（Parser → Extractor → Validator → Promotion → CaseWhenStep），但后续被统一管线方案（`docs/superpowers/specs/2026-07-22-label-table-unified-pipeline-design.md`）取代其设计路径。
+> 最后核对日期：2026-07-26
+
 > **状态**：设计阶段，待审批。**不执行。**
 >
 > 修订记录：

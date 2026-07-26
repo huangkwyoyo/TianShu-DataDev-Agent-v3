@@ -1,5 +1,8 @@
 # COMPARATOR 审查缺陷优化计划
 
+> **实施状态**：✅ 已实施完成（2026-07）。CR-01/CR-02 + IM-01~IM-05 已修复，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 版本：2026-07-08 | 基于审查报告 2026-07-08-comparator-gap-fix-design.md 修复后的二次审查
 > 当前测试基线：583 passed / 11 skipped / 0 failed（全量），plan_comparator 专项 55 passed
 

@@ -1,5 +1,11 @@
 # SpecEnricher LLM 输出校验缺口修复计划
 
+> **执行状态**：**已执行**。修复内容：
+> 1. JSON Schema `window_function.enum` 修正：SUM→SUM_OVER, AVG→AVG_OVER, 新增 NTILE/COUNT_OVER
+> 2. 旧名兼容映射层（"SUM"→"SUM_OVER", "AVG"→"AVG_OVER"）
+> 3. expression 安全校验（禁止 SQL 注入字符）
+> 4. 测试覆盖：`test_spec_enricher_llm.py`、`test_relationship_planner_llm.py`
+
 ## 一、CRCS 分类
 
 ### 窗口函数白名单校验：B 类 — DESIGN-REVIEW

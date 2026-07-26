@@ -1,5 +1,8 @@
 # Phase 4A：LLM Gateway + Prompt 版本管理
 
+> **Phase 状态**：✅ 已完成。本文档为历史设计记录，实际实施以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 状态：**Phase 4A 退出——全部 5/5 条件满足 ✅**（2026-06-29 更新）
 > 前置依赖：Phase 3C 退出 ✅ + HarnessReport(phase="phase-3-exit") ✅（已生成——GO）
 >

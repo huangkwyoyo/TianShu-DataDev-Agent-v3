@@ -1,5 +1,8 @@
 # RequirementPlanner v3.1 实施计划
 
+> **执行状态**：✅ 全部执行完成。`RequirementPlanner` 类已实现（`src/tianshu_datadev/planning/requirement_planner.py`），本计划中 6 阶段 16 个任务均有对应 git 提交，TimeTransformExpr 全链路（SQL/Spark/Contract/Comparator）已贯通。详见 `docs/current-state-and-verification-status.md` RatioExpr 行。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 实现 RequirementPlanner 组件——从自然语言业务描述生成结构化维度/派生维度/指标/CASE WHEN 声明，含 TimeTransformExpr 全链路（SQL/Spark/Contract/Comparator）。

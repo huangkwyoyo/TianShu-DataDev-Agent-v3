@@ -1,5 +1,8 @@
 # COMPARATOR 机制 CRCS v2.0 修复计划（修订版 v2）
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task.
 
 **Goal:** 修复 COMPARATOR 机制中 3 个 C 类验证边界缺陷和 1 个 B 类逻辑缺陷，补全测试矩阵以证明"不再误判等价"。

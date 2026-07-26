@@ -1,5 +1,8 @@
 # COMPARATOR 机制 8 个缺陷修复——设计方案
 
+> **实施状态**：✅ 已实施完成（2026-07）。COMPARATOR 8 个缺陷已修复，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 文档版本：2026-07-08 | 基于系统性调试 Phase 1-3 的根因分析 + 3 轮方案审查
 
 ## 背景

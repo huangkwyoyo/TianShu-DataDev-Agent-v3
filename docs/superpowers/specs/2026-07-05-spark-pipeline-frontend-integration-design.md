@@ -1,5 +1,8 @@
 # Spark 管线前端集成——PipelineStageIndicator 双管线展示
 
+> **实施状态**：✅ 已实施完成（2026-07）。Phase 9A5/9B 实施完成，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 日期：2026-07-05 | 状态：已完成（Phase 9A5/9B 实施）
 > 基于 brainstorming 会话形成——3 轮澄清 + 用户审批通过
 

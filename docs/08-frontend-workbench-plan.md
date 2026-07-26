@@ -1,6 +1,10 @@
 # 内部交互验证口计划 — TianShu DataDev Agent v3
 
-> 文档版本：Phase 0.5 DeveloperSpec-first 架构校正版 | 实施状态：Phase 4.5 已完成。当前项目状态见 `docs/current-state-and-verification-status.md`
+> 文档版本：Phase 0.5 DeveloperSpec-first 架构校正版 | 实施状态：Phase 4.5 已完成。
+>
+> ⚠️ **本文档为历史设计计划，实际实施已偏离此计划。** 当前实际状态请参阅 `docs/current-state-and-verification-status.md`。
+> 重点差异：前端实际实现采用 VS Code / terminal 风格暗色主题，与本文描述的交互验证口设计有较大偏离。当前前端由 `frontend/` 目录下的 Svelte 应用实现，可通过 `./dev-reload.sh` 启动查看。
+> 最后核对日期：2026-07-26
 
 ## 1. 定位
 

@@ -1,8 +1,12 @@
 # C2 文档收口 + C3/C4 前置澄清与执行方案
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+> **说明**：本方案定义的 C3/C4 点亮路径已在后续 Phase 9A、Case 06 B 类收口、Final Hardening 中被陆续执行。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**日期：** 2026-07-04 | **状态：** 方案中
+**日期：** 2026-07-04 | **状态：** ✅ 已完成
 
 **目标：** 收口 C2 后遗留的文档表述问题，明确 C3/C4 每项前置条件的满足状态，输出可执行的 C3/C4 点亮计划或阻塞报告。
 

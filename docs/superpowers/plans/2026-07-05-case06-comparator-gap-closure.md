@@ -1,5 +1,8 @@
 # Case06 SqlProgram 多语句 DAG Spark Comparator 缺口收口——实施计划
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 补齐 Case06（SqlProgram 7 步 DAG）的 Spark Comparator 双链验证，建立 `TestNYCCase06SparkDualChain` 测试类，明确 xfail 转正与保留策略。

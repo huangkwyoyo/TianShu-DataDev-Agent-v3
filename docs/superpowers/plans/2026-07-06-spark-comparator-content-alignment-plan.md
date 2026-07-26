@@ -1,5 +1,8 @@
 # Spark 双链 Comparator 内容级对齐——实施计划
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 消除 SQL DAG 扁平化 vs Spark Mapper 之间的 scan/join/aggregate 内容级差异，使 Case 06 `compare_program()` 判定 `LOGIC_EQUIVALENT`

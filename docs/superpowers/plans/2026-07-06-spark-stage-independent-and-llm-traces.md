@@ -1,5 +1,8 @@
 # Spark 阶段独立触发 + LLM 调用追踪 — 实施计划
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 让 6 个 Spark 管线阶段可在 SQL 编译执行后独立手动触发，并在前端展示 LLM 调用追踪信息（节点名、Token、延迟）。

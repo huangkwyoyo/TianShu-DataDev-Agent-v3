@@ -6,6 +6,9 @@ phase: Phase 8 — Spark 管线 DEVELOPER 阶段 LLM 语义标注注入
 reviewers: [huangkwyoyo]
 ---
 
+> **实施状态**：✅ 已实施完成（2026-07）。Pipeline 已接收 SparkDeveloperService，`_do_spark_develop` 改为真实调用，LLM 语义标注已接入。
+> 最后核对日期：2026-07-26
+
 # SparkDeveloperService 注入设计文档
 
 ## 1. 本轮执行的阶段
