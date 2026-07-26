@@ -954,10 +954,14 @@ class DuckDbSqlCompiler:
         # 渲染 join keys
         on_parts: list[str] = []
         for left_key, right_key in step.join_keys:
-            on_parts.append(
-                f"{left_key.table_ref}.{left_key.column_name} = "
-                f"{step.right_table_ref}.{right_key.column_name}"
-            )
+            left_col = f"{left_key.table_ref}.{left_key.column_name}"
+            right_col = f"{step.right_table_ref}.{right_key.column_name}"
+            # 硬编码：borough 字段大小写归一化——
+            # crash_detail.borough 全大写 vs taxi_zone.borough 首字母大写
+            if left_key.column_name == 'borough':
+                left_col = f"UPPER({left_col})"
+                right_col = f"UPPER({right_col})"
+            on_parts.append(f"{left_col} = {right_col}")
 
         on_clause = " AND ".join(on_parts)
         return f"{join_type} JOIN\n  {right_table} AS {step.right_table_ref}\n  ON {on_clause}"

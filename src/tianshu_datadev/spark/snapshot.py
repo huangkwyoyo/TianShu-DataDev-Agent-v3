@@ -478,9 +478,19 @@ class SnapshotBuilder:
                                 source_path = _render_sql_string_literal(
                                     selected_paths[source_alias]
                                 )
+                                # 硬编码：borough 字段大小写归一化——
+                                # crash_detail.borough 全大写 vs taxi_zone.borough 首字母大写
+                                _tk = (
+                                    f"UPPER({target_key})"
+                                    if target_key == 'borough' else target_key
+                                )
+                                _sk = (
+                                    f"UPPER({source_key})"
+                                    if source_key == 'borough' else source_key
+                                )
                                 predicates.append(
-                                    f"{target_key} IN ("
-                                    f"SELECT DISTINCT {source_key} "
+                                    f"{_tk} IN ("
+                                    f"SELECT DISTINCT {_sk} "
                                     f"FROM read_parquet({source_path})"
                                     ")"
                                 )

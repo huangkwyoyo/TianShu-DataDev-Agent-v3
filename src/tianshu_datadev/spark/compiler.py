@@ -631,18 +631,35 @@ class SparkCompiler:
         )
         how = self.renderer.render_join_type(step.join_type)
         if step.left_key == step.right_key:
-            # using-column Join 会把同名联结键合并为一个输出列，避免后续
-            # 聚合或投影以裸列名引用时触发 Spark AMBIGUOUS_REFERENCE。
-            join_key = self.renderer.validate_identifier(
-                step.left_key, "JoinStep.join_key",
-            )
-            raw = (
-                f'{out_alias} = {left}.join('
-                f'{right}, on="{join_key}", how={how})'
-            )
+            if step.left_key == 'borough':
+                # borough 大小写归一化：改用表达式 JOIN 而非 using-column JOIN——
+                # crash_detail.borough 全大写 vs taxi_zone.borough 首字母大写
+                left_key_ref = self.renderer.render_join_key(left, left_col)
+                right_key_ref = self.renderer.render_join_key(right, right_col)
+                condition = (
+                    f"F.upper({left_key_ref}) == F.upper({right_key_ref})"
+                )
+                raw = (
+                    f"{out_alias} = {left}.join("
+                    f"{right}, on={condition}, how={how})"
+                )
+            else:
+                # using-column Join 会把同名联结键合并为一个输出列，避免后续
+                # 聚合或投影以裸列名引用时触发 Spark AMBIGUOUS_REFERENCE。
+                join_key = self.renderer.validate_identifier(
+                    step.left_key, "JoinStep.join_key",
+                )
+                raw = (
+                    f'{out_alias} = {left}.join('
+                    f'{right}, on="{join_key}", how={how})'
+                )
         else:
             left_key_ref = self.renderer.render_join_key(left, left_col)
             right_key_ref = self.renderer.render_join_key(right, right_col)
+            # borough 大小写归一化——处理左右键不同名但涉及 borough 的场景
+            if step.left_key == 'borough' or step.right_key == 'borough':
+                left_key_ref = f"F.upper({left_key_ref})"
+                right_key_ref = f"F.upper({right_key_ref})"
             condition = f"{left_key_ref} == {right_key_ref}"
             raw = f"{out_alias} = {left}.join({right}, on={condition}, how={how})"
 
