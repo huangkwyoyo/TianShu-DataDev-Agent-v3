@@ -1,5 +1,9 @@
 # C2 ProviderAdapter 接入实施方案
 
+> **执行状态**：✅ 已执行完毕（通过方案 A 合并）。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+> **说明**：本方案被 `05-c2-llm-boundary-consolidation.md`（方案 A 完全合并）替代——最终实现删除了 Spark 侧重复文件，复用既有 LLM 基础设施，而非新建 Adapter。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **目标：** 完成 LLM ProviderAdapter 接入，使 `SparkDeveloperService.annotate()` 可调用真实 LLM 产出 `AnnotatedSparkPlan`，并通过 `AnnotationValidator` 校验。

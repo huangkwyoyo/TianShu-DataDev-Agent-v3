@@ -1,5 +1,8 @@
 # Spark-first Phase 6-8 完整设计方案
 
+> **实施状态**：✅ 已实施完成（2026-07）。Phase 6-8 全部实施通过，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 状态：已完成（Phase 6-8 全部实施通过）| 日期：2026-07-03
 > 前置：Phase 5（SparkPlan IR + mapper.py + plan_equivalence.py）已完成，45 个测试通过
 

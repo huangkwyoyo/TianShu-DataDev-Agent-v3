@@ -1,5 +1,8 @@
 # 快照 inputs key 别名对齐修复实施计划（方案 A）
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** REQUIRED SUB-SKILL: 用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务执行本计划。步骤用 checkbox（`- [ ]`）跟踪。
 
 **Goal:** 修复快照 Parquet 文件命名（物理名）与 PySpark 代码 `inputs[...]` key（别名）不一致导致的 KeyError 崩溃——让快照的 `SnapshotFile.source_name` 承载别名（inputs key），executor prologue 通过 manifest 侧车索引按别名装载 inputs。

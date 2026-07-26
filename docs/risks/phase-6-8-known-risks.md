@@ -1,10 +1,12 @@
 # Phase 6-8 已知风险登记
 
-> **文档属性**：历史阶段验收记录，冻结于 2026-07-13。
+> **文档属性**：历史阶段验收记录，冻结于 2026-07-13，2026-07-26 再次复核。
 > 本文保留 Phase 6-8 验收时点的风险判断和实施证据，不再作为当前风险清单。文中的"剩余风险"和"处置建议"可能已被后续实现消除。当前有效状态、残留风险与能力边界以 `docs/current-state-and-verification-status.md` §3、§3.5 为准。
 >
-> 日期：2026-07-06 | 最后更新：2026-07-13 CRE v2.3 最终准入硬化完成
-> 状态：C1-C4 全部点亮，Case 06 内容级对齐完成（8 commits），CRE v2.3 shadow 硬化完成（8 项要求），2568 passed / 24 skipped / 10 预存失败 / 2 xfailed (total backend)
+> **2026-07-26 复核更新**：Phase 9A-9C 已全部完成，C4 桥接级风险已消除（Harness 自动驱动器 + 真实业务样本验收通过），9A1-9A3/9A5 全部完成，R5-R11 仅 R9 保留保守阻断。仅 Case05-Comparator（窗口函数 ROW_NUMBER 帧边界规范化差异）仍为有效未消除风险。
+>
+> 日期：2026-07-06 | 最后更新：2026-07-26（复核更新 Phase 9A-9C 完成状态）
+> 状态：C1-C4 全部点亮，Case 06 内容级对齐完成（8 commits），CRE v2.3 shadow 硬化完成（8 项要求），2568 passed / 24 skipped / 10 预存失败 / 2 xfailed (total backend)。Phase 9A1-9A5 + 9B + 9C 全部完成。
 
 ---
 
@@ -150,23 +152,18 @@
 
 ---
 
-## Case05-Comparator: 窗口函数 Comparator NOT_COVERED 🟡
+## Case05-Comparator: 窗口函数 ROW_NUMBER 帧边界规范化差异 🟡
 
 - **风险等级**：C（功能缺口——不影响核心平台，仅影响 Case 05 的双链等价判定）
 - **发现时间**：2026-07-05 全局收尾审计
 - **影响范围**：`tests/api/test_nyc_business_case.py::TestNYCCase05SparkDualChain`
 - **问题描述**：
-  - Case 05（INNER JOIN + ROW_NUMBER 窗口函数）的 Spark Comparator 使用**宽松断言**
-  - 断言为 `!= LOGIC_MISMATCH`（排除逻辑矛盾），而非严格的 `== LOGIC_EQUIVALENT`
-  - 接受 `HUMAN_REVIEW_REQUIRED` 作为通过状态
-  - 根因：`PlanComparator` 对 `WindowStep`（ROW_NUMBER）的对比规则尚未实现等价判定
-  - Case 01-04 的断言均为严格 `== LOGIC_EQUIVALENT`——Case 05 是唯一的宽松断言案例
-- **对比证据**（2026-07-05）：
-  - Case 01-04：`assert state.comparator_report.status == ComparisonStatus.LOGIC_EQUIVALENT` ✅
-  - Case 05：`assert state.comparator_report.status != ComparisonStatus.LOGIC_MISMATCH` ⚠️
-  - Case 05：`assert state.overall_status.value in {..., "HUMAN_REVIEW_REQUIRED"}` ⚠️
-- **处置建议**：后续 Phase 实现 WindowStep 的 Comparator 等价判定规则，将 Case 05 升级为严格断言
-- **状态**：🟡 NOT_COVERED——窗口函数 Comparator 规则待完善
+  - Case 05（INNER JOIN + ROW_NUMBER 窗口函数）的 PlanComparator 中 window 已从 `_NOT_YET_COVERED_TYPES` 移至 `_PHASE_7B_ENABLED_TYPES`（commit `47ef75a`，2026-07-08，`plan_comparator.py:134`）
+  - 当前对比结果为 HUMAN_REVIEW_REQUIRED，可被 REVIEW_READY 判定接受
+  - 根因：Spark 的 ROW_NUMBER 窗口帧边界默认行为与 DuckDB 存在规范化差异，非 NOT_COVERED
+  - 可能触发 LOGIC_MISMATCH，而非因对比规则缺失导致 NOT_COVERED
+- **处置建议**：非 NOT_COVERED 问题。窗口帧边界在 DuckDB/Spark 间存在规范化差异，可能触发 LOGIC_MISMATCH。需人工确认语义等价后再解除阻断。
+- **状态**：🟡 窗口帧边界规范化差异——ROW_NUMBER 可对比但存在引擎行为差异
 
 ---
 
@@ -193,7 +190,7 @@
   4. Contract 提取器：`extract_v1()` 过滤 `_temp_*` scan + join（对称守卫）
 - **剩余风险**（非阻塞）：
   - R-CA-1（C）：`target_grain` 过滤是 Case 06 特化，不是通用业务真理——多输出粒度场景需扩展
-  - R-CA-3（中高 B）：Builder 缺 join——独立排查 builder join 生成逻辑
+  - R-CA-3（中高 B→已降至低/非阻断）：Builder 缺 join——**2026-07-24 更新**：ComputeSteps Builder 双能力扩展（混合源 Join + 两跳桥接 JOIN）已覆盖，见风险矩阵当前状态
   - R-CA-2（B）：`_temp_` 前缀检测逻辑两处不一致——建议提取共享谓词
 - **处置建议**：Case 06 闭环达成，合并就绪。剩余风险登记为后续独立 Phase。闭环报告：`docs/superpowers/specs/2026-07-06-spark-comparator-closure-and-risks.md`
 - **状态**：✅ 已消除——Case 06 Spark 双链 LOGIC_EQUIVALENT 达成，1 xfail 转正，659 passed / 11 skipped（spark+artifacts+api）
@@ -207,18 +204,21 @@
 | C1 | 已消除 | — | — | 2026-07-04 点亮（11/11 真实 Spark 通过） |
 | C2 | 已消除 | — | — | 2026-07-04 架构收口 + 循环导入修复（PromptManager 可直接导入） |
 | C3 | 已消除 | — | — | 2026-07-04 点亮（桥接生产化 + Orchestrator 集成） |
-| C4 | B-D4 桥接级已点亮 | 否 | 否 | D4 桥接级已点亮——完整 SQL Pipeline 生产级验证待后续 Phase |
+| **C4** | **已消除** | — | — | **2026-07-26 消除**——Phase 9A 完成：Harness 自动驱动器 + 真实业务样本（NYC 01-06）验收通过。桥接级 -> 生产级升级完成 |
 | R3 | 已消除 | — | — | 2026-07-04 已修复 |
 | R4 | 已消除 | — | — | — |
-| Case05-Comp | C | 否 | 否 | 窗口函数 Comparator NOT_COVERED——待后续 Phase 升级为严格断言 |
+| ~~Case05-Comp~~ | **已合并至 R9** | — | — | 与 R9 为同一根因（ROW_NUMBER 帧边界规范化差异），保留 R9 为权威条目。2026-07-26 去重合并 |
 | Case06-Comp | 已消除 | — | — | **2026-07-06 消除**："三层剥离"使 Case 06 达到 LOGIC_EQUIVALENT，xfail 转正 |
-| R-CA-1 | **C** | 否 | 否 | `target_grain` 过滤是 Case 06 特化——不可误解为通用业务真理，多输出粒度场景需扩展 |
-| R-CA-3 | **中高（B）** | 否 | 否 | Builder 缺 join——B 类设计修复项，下一轮迭代优先处理 |
-| R-CA-2 | B | 否 | 否 | `_temp_` 前缀检测逻辑两处不一致——建议提取共享谓词 |
-| 9A1 | B-低风险 | 否 | 否 | 2026-07-05 已完成——PipelineArtifactBundle + export_artifacts() 就绪 |
-| 9A2 | B-低风险 | 否 | 否 | 2026-07-05 已完成——桥接函数标记 deprecated + 真实 SqlBuildPlan 驱动 COMPARATOR |
-| 9A3 | B-低风险 | 否 | 否 | 2026-07-05 已完成——Lite→V1 适配层 + Harness 自动驱动器 |
-| 9A5 | B-低风险 | 否 | 否 | 2026-07-05 已完成——ReviewPackage 增强 + REVIEW_READY 判定 + 端到端闭环验证 |
+| R-CA-1 | **低（非阻断）** | 否 | 否 | `target_grain` 过滤是 Case 06 特化——ComputeSteps Builder 双能力扩展 + Snapshot 桥接已缓解多输出粒度场景 |
+| R-CA-3 | **低（非阻断）** | 否 | 否 | Builder 缺 join——ComputeSteps Builder 双能力扩展（混合源 Join + 两跳桥接 JOIN）已覆盖 |
+| R-CA-2 | **低（非阻断）** | 否 | 否 | `_temp_` 前缀检测逻辑两处不一致——建议提取共享谓词，非阻断 |
+| 9A1 | 已消除 | — | — | 2026-07-05 已完成——PipelineArtifactBundle + export_artifacts() 就绪 |
+| 9A2 | 已消除 | — | — | 2026-07-05 已完成——桥接函数标记 deprecated + 真实 SqlBuildPlan 驱动 COMPARATOR |
+| 9A3 | 已消除 | — | — | 2026-07-05 已完成——Lite→V1 适配层 + Harness 自动驱动器 |
+| 9A5 | 已消除 | — | — | 2026-07-05 已完成——ReviewPackage 增强 + REVIEW_READY 判定 + 端到端闭环验证 |
+| **9B** | **已消除** | — | — | **2026-07-05 完成**——前端回归 + 可观测性，R11 消除 |
+| **9C** | **已消除** | — | — | **2026-07-05 完成**——DOM E2E 交互测试 6/6 Playwright 通过，R16/R16b 消除 |
+| **R9** | **C（保守阻断）** | 否 | 否 | Case 05 Window 规范化差异——Spark ROW_NUMBER 窗口帧边界默认行为与 DuckDB 存在规范化差异，非代码 bug，需人工确认 |
 
 ---
 ## Phase 9A3: Harness 自动驱动器 + Lite→V1 适配收口 ✅ 已完成

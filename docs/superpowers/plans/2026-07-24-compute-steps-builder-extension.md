@@ -1,5 +1,8 @@
 # ComputeSteps Builder 双能力扩展——实施计划（第三次修订版）
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** 执行此计划需使用 `superpowers:executing-plans`。步骤使用 checkbox (`- [ ]`) 语法跟踪。
 > **执行模式**：Inline Execution，顺序：Schema → Validator → Pipeline → Builder → Contract → SparkPlan → Fixtures → 单元测试 → E2E → 回归
 

@@ -1,5 +1,8 @@
 # Phase 4B：PerfValidator + Compiler Pass
 
+> **Phase 状态**：✅ 已完成。本文档为历史设计记录，实际实施以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 状态：**已完成 ✅**（2026-07-02 核销——代码已全部落地，文档补更新）
 > 前置依赖：Phase 4A 退出（真实 LLM 结构化输出可测量）✅
 

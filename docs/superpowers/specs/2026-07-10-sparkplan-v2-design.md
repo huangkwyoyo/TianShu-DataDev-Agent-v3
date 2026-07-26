@@ -1,5 +1,8 @@
 # SparkPlan v2 架构设计 **[SUPERSEDED]**
 
+> **实施状态**：⚠️ 完整架构被否决，未按本文实施。实际实施采用最小别名修复方案（`docs/superpowers/specs/2026-07-11-sparkplan-minimal-alias-fix.md`）。本文档保留仅供历史参考。
+> 最后核对日期：2026-07-26
+
 > **此文档已被 `2026-07-11-sparkplan-minimal-alias-fix.md` 取代。**
 > v2 完整架构被否决——实际实施的是最小别名修复方案。
 > 保留此文档仅供历史参考。

@@ -1,6 +1,9 @@
 # 复用与迁移地图 — TianShu DataDev Agent v3
 
 > 文档版本：Phase 0.5 DeveloperSpec-first 架构校正版
+>
+> ⚠️ **本文档为历史设计计划，实际实施已偏离此计划。** 本文描述的迁移工作（Phase 1A-8）已全部完成，保留作为历史设计参考和教训总结。当前实际状态请参阅 `docs/current-state-and-verification-status.md`。
+> 最后核对日期：2026-07-26
 
 ## 1. 目标
 

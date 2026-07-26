@@ -1,5 +1,8 @@
 # MetricFilterDecl Filter 全链路传播修复
 
+> **执行状态**：✅ 全部执行完成。`MetricFilterDecl` 模型已定义（`src/tianshu_datadev/developer_spec/models.py`），数据流 5 个断点（Contract 模型 + Spark 模型 + 提取器 + Mapper + Compiler）已全部打通，Spark 编译生成 `F.when(cond, val)` 条件聚合表达式。详见 `docs/current-state-and-verification-status.md` ComputeSteps 行。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task.
 
 **Goal:** 修复 `AggregateSpec.filter` (MetricFilterDecl) 在 Contract 提取边界丢失，导致 Spark 生成的聚合代码缺少 FILTER 条件，物理验证 RESULT_MISMATCH。

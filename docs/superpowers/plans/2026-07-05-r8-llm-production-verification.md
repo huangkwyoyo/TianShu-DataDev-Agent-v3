@@ -1,5 +1,8 @@
 # R8：LLM 生产环境 API key 配置 + 持续验证链路——实施计划
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 为 LLM Gateway 的真实 Provider（DeepSeek/Anthropic）配置安全的手动验证链路——在不污染默认 pytest（FakeAdapter）的前提下，提供一条显式开关控制的真实 LLM 端到端验证路径。

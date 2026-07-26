@@ -1,5 +1,8 @@
 # Phase 6：受控 PySpark DSL 生成
 
+> **Phase 状态**：✅ 已完成。本文档为历史设计记录，实际实施以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 状态：**已完成 ✅**（2026-07-04） | 设计文档：`docs/superpowers/specs/2026-07-03-spark-first-phase-6-8-design.md` | 当前项目状态见 `docs/current-state-and-verification-status.md`
 > 实施计划：`docs/superpowers/specs/2026-07-03-spark-first-phase-6-8-implementation-plan.md`
 > 前置依赖：Phase 5 SparkPlan IR + mapper.py 确定性映射 ✅

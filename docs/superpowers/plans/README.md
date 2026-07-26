@@ -1,6 +1,6 @@
 # 方案书索引
 
-> 最后更新：2026-07-17 | 当前阶段：Phase 9A-9C + label_table v1 完成
+> 最后更新：2026-07-26 | 当前阶段：持续迭代——ComputeSteps Builder 双能力扩展完成
 >
 > 所有已完成的计划保留为历史参考，最新状态以 `docs/current-state-and-verification-status.md` 为准。
 
@@ -72,6 +72,11 @@ Phase 6-8 骨架验收                   业务集成前置准备               
 | `2026-07-14-code-download-buttons.md` | 代码下载按钮 | ✅ |
 | `2026-07-14-run-all-progress-streaming.md` | Run-All 流式进度 | ✅ |
 | `2026-07-15-label-table-implementation.md` | label_table v1 完整管线 | ✅ |
+| `2026-07-17-case-when-physver-whitelist.md` | CASE WHEN condition UNSUPPORTED 物理验证白名单 | ✅ |
+| `2026-07-21-requirement-planner-implementation.md` | RequirementPlanner v3.1 组件 | ✅ 全部执行完成——RequirementPlanner v3.1 类已实现，TimeTransformExpr 全链路已贯通 |
+| `2026-07-22-metric-filter-propagation.md` | MetricFilterDecl 全链路传播修复 | ✅ 全部执行完成——MetricFilterDecl 模型已定义，5 个代码层全链路贯通（含 Spark 编译层） |
+| `2026-07-22-label-table-unified-pipeline.md` | LabelTable 统一管线 | ✅ 全部执行完成——_prepare_labels() 已合入 Pipeline，label_scope.py 已删除，所有 dataset_type 共享统一管线 |
+| `2026-07-24-compute-steps-builder-extension.md` | ComputeSteps Builder 双能力扩展 v3 | ✅ |
 
 ### 已归档
 
@@ -92,3 +97,7 @@ Phase 6-8 骨架验收                   业务集成前置准备               
 | 2026-07-13 | CRE shadow 物理验证可用 | 三条 Pipeline 证据通过 |
 | 2026-07-14 | Run-All 流式进度 + 代码下载按钮 | 前端体验改进 |
 | **2026-07-16** | **label_table v1 管线完成** | **Parser→Extractor→Validator→Promotion→Builder→Compiler 全链路，90 测试全绿** |
+| 2026-07-17 | CASE WHEN condition UNSUPPORTED 白名单 | 物理验证白名单实现，C 类风险登记 |
+| 2026-07-21 | RequirementPlanner v3.1 全部执行完成 | 类已实现，TimeTransformExpr 全链路已贯通（全部执行完成） |
+| 2026-07-22 | MetricFilterDecl 全链路贯通 | 模型已定义，5 个代码层全链路贯通（含 Spark 编译层）（全部执行完成） |
+| 2026-07-24 | ComputeSteps Builder 双能力扩展 v3 | 全量回归通过——12 项表驱动单元测试 + E2E 真实执行 |

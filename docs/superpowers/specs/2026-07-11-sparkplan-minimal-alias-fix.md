@@ -1,5 +1,8 @@
 # SparkPlan 最小别名修复（Spark-only）
 
+> **实施状态**：✅ 已实施完成（2026-07）。`_alias_resolver` 已实现，`_alias_generator` 已删除，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 消除 mapper/compiler/test 三套别名状态机冗余，将别名解析统一到单一 `_alias_resolver`。
 > **范围：仅 Spark Compiler。SQL Compiler 不在本次范围内。**
 

@@ -1,5 +1,8 @@
 # Phase 4D：Harness 七维门禁 + SQL-first v1.0 HarnessVerdict 门禁
 
+> **Phase 状态**：✅ 已完成。本文档为历史设计记录，实际实施以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 状态：已实施（Phase 4D 补全——D4/D5/D7 stub 消除，全部 7 维真实判决）✅
 > 前置依赖：Phase 4C 退出（攻击向量和语义错误注入全部拦截）✅
 

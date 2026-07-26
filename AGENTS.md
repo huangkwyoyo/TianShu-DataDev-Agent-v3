@@ -8,21 +8,28 @@ TianShu DataDev Agent v3 是 AI 辅助数据开发工具。它接收程序员编
 
 系统不自动上线、不写生产库、不生成生产数据。人是最终代码审查者和上线决策者。
 
-当前阶段：`Phase 9A-9C + label_table v1 完成。C1-C4 已消除，label_table v1 已交付`。项目状态详见 `docs/current-state-and-verification-status.md`（Phase 进度矩阵、业务集成验证状态、测试基线、残留风险、下一步方向）。
+当前阶段：`Phase 9A-9C + label_table v1 + ComputeSteps Builder 双能力扩展 + RatioExpr 全链路 + RequirementPlanner v3.1 完成`。C1-C4 已消除，label_table v1 已交付，RatioExpr 全链路贯通（RatioProposal → RatioDecl → RatioExpr → Compiler → Contract → Spark），ComputeStep 中 case_when 与 metrics 可共存，SparkPlan 支持多分支 DAG。项目状态详见 `docs/current-state-and-verification-status.md`（Phase 进度矩阵、业务集成验证状态、测试基线、残留风险、下一步方向）。
 
 ## 2. SQL Generation Boundary
 
 - 输入是 DeveloperSpec（Markdown 正文 + YAML-like metadata block），经 Parser 确定性解析为 ParsedDeveloperSpec。
-- LLM 只输出严格的 ParsedDeveloperSpec、RelationshipHypothesis、SqlBuildPlan 和 SqlProgram。
+- LLM 只输出严格的 ParsedDeveloperSpec、RelationshipHypothesis、SqlBuildPlan、SqlProgram、ComputeStep 及相关声明（维度、指标、CASE WHEN 规则、比率表达式 RatioProposal 等）。
 - SqlBuildPlan 必须使用封闭类型的 ScanStep、FilterStep、JoinStep、AggregateStep、ProjectStep、CaseWhenStep、WindowStep、SortStep、LimitStep、SubqueryStep（共 10 种）。
-  - WindowStep：窗口函数白名单限定 8 种（ROW_NUMBER、RANK、DENSE_RANK、LAG、LEAD、SUM/AVG/COUNT OVER），超出白名单的窗口函数由 Validator 拒绝。
+  - WindowStep：窗口函数白名单限定 9 种（ROW_NUMBER、RANK、DENSE_RANK、NTILE、LAG、LEAD、SUM/AVG/COUNT OVER），超出白名单的窗口函数由 Validator 拒绝。
   - SubqueryStep：仅 FROM 子句派生表子查询，深度 ≤ 2；不支持 WHERE 关联子查询、SELECT 标量子查询。
+- ComputeStep 是比 SqlBuildPlan 更高层的计划单元——一个 ComputeStep 可同时包含 case_when（条件标签）和 metrics（聚合指标），二者不再互斥。Builder 将 ComputeStep 编译为 SqlBuildPlan step 链。
+- RatioExpr 是仅允许两个已命名依赖做安全除法的受控比率表达式，全链路经过 RatioProposal → RatioProposalValidator → RatioDecl → RatioExpr → Compiler → Contract → Spark。禁止携带自由 SQL 表达式文本。
+- 所有字段引用必须通过 SafeIdentifier——拒绝携带表前缀的列名（如 `cd.crash_id`），点号在 Parser 层（1 处）和 sql_build_plan.py Builder 层（6 处）自动剥离，确保 column_name 始终为纯列名。
+（注意：SafeIdentifier 本身是拒绝性验证函数——正则 ^[A-Za-z_][A-Za-z0-9_]*$ 直接拒绝含点号的字符串。实际的点号剥离在传入 SafeIdentifier 字段之前由调用方代码在 7+ 个位置手动执行，SafeIdentifier 不做自动剥离）
 - 禁止 `where_sql`、`join_on: str`、`expression: str`、`raw_sql` 及其他自由 SQL 片段。
 - SQL 只能由 Python 确定性编译器生成。
 - SQL 修复只能生成新 SqlBuildPlan，禁止直接修改 SQL 文本。
 - 表、字段和 Join 必须来自 SourceManifest；optional SchemaRegistry 只补充缺失信息，禁止静默覆盖 DeveloperSpec 中程序员已声明的值——冲突时输出 SOURCE_CONFLICT。
 - 不支持的表达式必须拒绝或进入 `HUMAN_REVIEW`，不能使用字符串逃生口。
 - Join 推理遵循三层分工：LLM 提候选 → Validator 确定性定级（STRONG/MEDIUM/WEAK/NONE）→ 人工确认中低置信。WEAK/NONE 硬门禁——不得进入 SqlBuildPlan 的 JoinSpec。
+- ComputeStepValidator 在 Builder 前执行五项确定性校验（符号解析、类型兼容、基数安全、显式 JoinDecl、evaluation_phase 已确定），不调 LLM。UNKNOWN 类型的字段禁止参与 Join。
+- 每个 ComputeStep 有对应的 StepOutputSchema——记录输出列的类型映射与唯一键组，供下游步骤校验和 Builder 推导使用。UNKNOWN 类型不设默认值。
+- UPPER() 归一化：在 JOIN 条件中，`borough` 等已知大小写不一致的字段自动以 UPPER() 包裹两边，消除大小写不匹配导致的 Join 失败。
 - 性能门禁由确定性 PerfValidator 执行——硬规则（REJECT）阻断流水线，软规则（WARN）记录到 ExecutionTrace。LLM 不做性能决策。
 - SQL 编译器在渲染前运行轻量优化 pass（列裁剪、谓词规范化、无用排序消除、常量折叠），优化必须是幂等的——相同 SqlBuildPlan 两次编译产生相同 SQL 和哈希。
 
@@ -54,6 +61,8 @@ def transform(
 - SparkReviewer 输出 ReviewFinding 和 OptimizationDirective，不直接替换最终代码。
 - SparkTester 输出 TestPlan 和测试代码，不参与业务实现，也不能宣布测试通过。
 
+SparkPlan 支持多分支 DAG——branches 字段将 ComputeSteps 编译为独立 DataFrame 分支，每个分支独立运行 Read→...→Aggregate 链，最终在 JoinStep 中引用分支输出。编译器按 branches → 主 steps 顺序执行。
+
 ## 4. Execution Boundary
 
 - Snapshot Builder 只读访问开发数据源。
@@ -64,19 +73,33 @@ def transform(
 - Agent 环境不包含生产凭据和生产写权限。
 - EnvironmentManifest 必须记录引擎版本、时区、ANSI、大小写、Decimal、NULL 和 NaN 策略。
 
-## 5. Validation Boundary
+## 5. 验证状态
 
-LLM 不能决定验证通过。确定性 Comparator 产生以下精确状态：
+LLM 不能决定验证通过。确定性校验模块包括：
+
+- **ComputeStepValidator**：五项确定性校验（符号解析、类型兼容、基数安全、显式 JoinDecl、evaluation_phase 已确定），UNKNOWN 类型阻断 Join。在 Builder 前执行，返回 OpenQuestion 列表，不参与 assurance level 判定。
+- **Static Validator**：AST call-chain 硬门禁（8 种错误码 E601-E608），默认拒绝。
+- **PlanComparator**（逻辑结构对比）：确定性比较 SqlBuildPlan 与 SparkPlan 结构等价，产生以下精确状态：
 
 | 状态 | 含义 |
 |------|------|
-| `NOT_EXECUTED` | 至少一个必需执行没有结果 |
-| `RUNTIME_PASS` | 单引擎在当前快照运行成功 |
-| `DIFFERENT` | 必需比较维度不一致 |
-| `UNSUPPORTED_SEMANTICS` | 当前兼容策略不能证明等价 |
-| `CONSISTENT_SAMPLE` | 当前快照和比较维度一致 |
-| `REVIEW_READY` | 材料完整，可进入人工代码审查 |
-| `HUMAN_REVIEW` | 自动化无法安全继续 |
+| `LOGIC_EQUIVALENT` | SQL ↔ Spark 结构完全等价 |
+| `LOGIC_MISMATCH` | 存在结构不等价的 step |
+| `LOGIC_UNSUPPORTED` | 对比规则不支持该 step 类型（如 subquery） |
+| `NOT_COVERED` | 本 Phase 未覆盖对比的 step 类型（后续 Phase 会覆盖） |
+| `NOT_EXECUTED` | 逻辑链路尚未执行 |
+
+- **PhysicalVerifier**（双引擎结果对比）：确定性比较 SQL 与 Spark 执行结果，产生以下精确状态：
+
+| 状态 | 含义 |
+|------|------|
+| `RESULT_CONSISTENT` | 双引擎结果一致（最佳结论） |
+| `SAMPLED_CONSISTENT` | 溢出降级验证通过——行数一致 + 键对齐抽样一致 |
+| `RESULT_MISMATCH` | 双引擎结果不一致 |
+| `NOT_EXECUTED` | 尚未执行物理验证 |
+| `HUMAN_REVIEW` | 自动判定无法得出确定结论 |
+| `UNSUPPORTED_SEMANTICS` | step 类型不在物理验证范围内 |
+| `EXECUTION_ERROR` | 任一引擎执行失败 |
 
 禁止使用泛化 `PASS` 表示业务正确、全量一致、生产性能或上线批准。
 
@@ -114,7 +137,8 @@ LLM 不能决定验证通过。确定性 Comparator 产生以下精确状态：
 ## 8. Data Contracts
 
 - Phase 1 运行时契约使用严格 Pydantic 模型或等价 JSON Schema，拒绝额外字段。
-- DataTransformContract 是 SQL/Spark 共同业务规格，从已验证 SqlBuildPlan 确定性抽取，不包含实现代码。三级递进：lite（Phase 2 单语句）→ v1（Phase 3 Exit，+SqlProgram DAG +窗口 +CASE +受控写入）→ Phase 5 消费 v1。
+- DataTransformContract 是 SQL/Spark 共同业务规格，从已验证 SqlBuildPlan 确定性抽取，不包含实现代码。三级递进：lite（Phase 2 单语句）→ v1（Phase 3 Exit，+SqlProgram DAG +窗口 +CASE +受控写入 +RatioExpr）→ Phase 5 消费 v1。
+- RatioExpr 以封闭结构表达比率计算（分子/分母/除零策略/乘数），全链路经过 RatioProposal → RatioProposalValidator → RatioDecl → RatioExpr → Compiler → Contract → Spark。RatioExpr 在 Contract 中以 `ratio_expr` 字段独立存在，不在 `output_columns` 中揉合。
 - SqlProgram 多语句合并使用 DAG 依赖和确定性拓扑排序，不引入 CTE 嵌套作用域。
 - Code Review Package 记录事实源、代码、Prompt、模型、快照、环境和 Comparator 版本哈希。
 

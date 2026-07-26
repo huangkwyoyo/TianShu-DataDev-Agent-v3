@@ -1,5 +1,8 @@
 # DeveloperSpec 示例一：汇总表/宽表
 
+> **当前 Parser 版本**：v4（2026-07-26）——本示例的 YAML 格式与当前 `ParsedDeveloperSpec` Parser 兼容。
+> 校验要点：`output_columns`、`source_tables`（含 `key_columns` + `business_columns`）、`target_grain` 均被正确解析。
+>
 > 来源：主规划书附录 A.1
 > 场景：按日期和区域统计活跃用户数、订单金额，计算金额降序排名
 
@@ -76,11 +79,17 @@ spec:
       description: 订单总金额 SUM(order_amount)
     - name: amount_rank
       type: int
-      description: 金额降序排名 ROW_NUMBER
+      description: 按金额降序的区域排名
+      window_hint:
+        metric_name: amount_rank
+        window_function: ROW_NUMBER
+        input_column: total_order_amount
+        partition_by:
+          - stat_date
+        order_by:
+          - "total_order_amount DESC"
+        alias: amount_rank
 
-  write_strategy:
-    type: partition_overwrite
-    partition_format: yyyyMMdd
 ---
 
 # 用户区域日度汇总表

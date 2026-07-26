@@ -1,5 +1,8 @@
 ﻿# Phase 3 Exit HarnessReport
 
+> **Phase 状态**：✅ 已完成。本文档为历史设计记录，实际实施以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **报告 ID**：`hr_15af40bf5bae`
 > **Phase**：`phase-3-exit`
 > **总判决**：`GO`
@@ -135,7 +138,7 @@ Pipeline E2E 测试: 2 个 (test_pipeline_e2e.py)
 - Phase 2: ✅ 已完成
 - Phase 3A: ✅ 已完成
 - Phase 3B: ✅ 已完成
-- Phase 3B.1（枚举自动检测）: ✅ 已完成
+- Phase 3B.1（枚举自动检测）: ⚠️ 架构已实现但未集成——EnumProfiler 代码完整（487 行），但未接入生产流水线、无单元测试
 - Phase 3C: ⚠️ 实施中（5/6——本报告补齐第 6 项）
 - Phase 4A: 🔄 基础设施就绪（2/5，阻塞于本报告）
 - Phase 4B: ⏳ 待实施

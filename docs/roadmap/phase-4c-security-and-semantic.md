@@ -1,5 +1,8 @@
 # Phase 4C：安全与语义评测
 
+> **Phase 状态**：✅ 已完成。本文档为历史设计记录，实际实施以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 状态：已实施（Phase 4C 补全——5/5 语义可检测，0 known gaps）✅
 > 前置依赖：Phase 4B 退出（15 条 PERF 规则就位 + Compiler Pass 幂等）
 

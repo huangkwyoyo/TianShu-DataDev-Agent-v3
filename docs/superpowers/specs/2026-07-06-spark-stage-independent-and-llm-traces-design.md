@@ -1,5 +1,8 @@
 # Spark 阶段独立触发 + LLM 调用追踪 — 前端交互增强设计
 
+> **实施状态**：✅ 已实施完成（2026-07）。Spark 6 阶段独立按钮、LLM 追踪面板已实现，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 设计日期：2026-07-06 | 状态：已确认，待实施
 > 目标：让 spark_first 阶段可在 sql_first 的 execute-rich 成功后手动触发，同时为展示 LLM 调用信息预留 llm_traces 字段。
 

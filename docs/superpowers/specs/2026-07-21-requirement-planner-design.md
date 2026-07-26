@@ -1,5 +1,8 @@
 # RequirementPlanner 设计文档 v3.1
 
+> **实施状态**：✅ 已实施完成（2026-07）。实际实施增加了 UncertaintyEntry 路由，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 状态：待评审。未经批准不得开始编码。
 >
 > v3.1 修订：执行顺序反转（Planner 先于 SpecEnricher，禁止事后清空字段）/

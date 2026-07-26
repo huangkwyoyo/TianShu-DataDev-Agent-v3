@@ -1,5 +1,9 @@
 # 物理验证诊断监控引擎——可行性、意义与边界分析
 
+> **最后核对日期**：2026-07-26
+> **实施状态**：分析报告——尚未实施 `PhysVerDiagnosticEngine`。现有诊断功能（`_diag_physver_*` 文件写入、CRE/CDP Shadow）已在 PhysicalVerifier 中实现，但硬编码路径、无条件写入、Decimal 序列化等已知问题（见 §二）尚未修复。
+> **准确性**：仍准确——四项问题（硬编码路径、无条件写入、Decimal 序列化失败、无轮转清理）至今未处理。
+
 > 分析日期：2026-07-15
 > 分析依据：`/superpowers:brainstorming` 指令，针对之前讨论的 `PhysVerDiagnosticEngine` 方案
 

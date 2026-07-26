@@ -1,5 +1,8 @@
 # Spark 双链 Comparator 内容级对齐——设计文档
 
+> **实施状态**：✅ 已实施完成（2026-07）。Case 06 闭环，SQL+Spark 双链 LOGIC_EQUIVALENT，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 状态：设计确认 | 日期：2026-07-06
 > 目标：消除 SQL DAG 扁平化 vs Spark Mapper 之间的 scan/join/aggregate 内容级差异，使 Case 06 达到 LOGIC_EQUIVALENT
 

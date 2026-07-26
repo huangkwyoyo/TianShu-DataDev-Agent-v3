@@ -1,5 +1,7 @@
 # TianShu DataDev Agent v3 工程术语表
 
+> **最后更新**：2026-07-26 | **更新内容**：新增 9 个术语（RatioExpr、ComputeStepValidator、StepOutputSchema、桥接 JOIN、UncertaintyEntry、SparkPlan branches、Label Table 统一管线、UPPER 归一化、LLM 追踪面板），更新缩写速查表。
+
 本文解释本项目当前阶段的常见工程术语。每个术语按九件事说明：
 
 1. **术语名称**：一句话解释
@@ -355,7 +357,9 @@ SqlBuildPlan 实例：含 `plan_id`、`steps: list[StepNode]`、`source_manifest
 
 **是什么**
 
-SqlBuildPlanValidator 是编译前的最后一道结构安全门禁。它接收 SqlBuildPlan + SourceManifest + RelationshipHypothesis，执行确定性检查：空步骤拒绝、表引用校验、字段引用校验、Join key 类型兼容、WEAK/NONE Join 门禁、枚举值校验（Phase 1C）、时间过滤校验（大表必须有时间条件）、LIMIT 存在性（无聚合明细查询）、**子查询递归校验（V-010a~e 含嵌套 SqlBuildPlan 的五项规则）**。返回 passed: bool + questions: list[OpenQuestion]。
+SqlBuildPlanValidator 是编译前的最后一道结构安全门禁。它接收 SqlBuildPlan + SourceManifest + RelationshipHypothesis，执行确定性检查：空步骤拒绝、不支持步骤类型阻断、多跳 Join 校验（V-009a~d）、表引用/字段引用校验、Join key 类型兼容、WEAK/NONE Join 门禁、枚举值校验（Phase 1C）、时间过滤校验（大表必须有时间条件）、LIMIT 存在性（无聚合明细查询）、**窗口函数校验（白名单 + Frame 合法性）**、**窗口函数位置校验**、**粒度完整性校验**、**聚合类型声明对比/聚合后投影校验**、**子查询递归校验（V-010a~e 含嵌套 SqlBuildPlan 的五项规则）**。返回 passed: bool + questions: list[OpenQuestion]。
+
+> **注**：Phase 4.6 后 Validator 已扩展至 15 项检查（`validator.py` 代码注释明确标注"15 项检查"），包括：空步骤拒绝、不支持步骤类型阻断、多跳 Join 校验（V-009a~d）、表引用/字段引用校验、Join key 类型兼容、WEAK/NONE Join 门禁、枚举值校验、时间过滤校验、明细查询 LIMIT 校验、窗口函数校验（白名单 + Frame 合法性）、窗口函数位置校验、粒度完整性校验、聚合类型声明对比/聚合后投影校验、子查询递归校验（V-010a~e）。
 
 **解决什么问题**
 
@@ -363,7 +367,7 @@ SqlBuildPlanValidator 是编译前的最后一道结构安全门禁。它接收 
 
 **在当前项目中的位置**
 
-- `src/tianshu_datadev/sql/validator.py:38` — SqlBuildPlanValidator
+- `src/tianshu_datadev/sql/validator.py:53` — SqlBuildPlanValidator
 
 **输入是什么**
 
@@ -3289,7 +3293,381 @@ v3.1 反转为：`RequirementPlanner → SpecEnricher(full) → unresolved检查
 
 ---
 
-## 63. 项目缩写速查
+## 77. RatioExpr（比值表达式）
+
+**一句话解释**：比值表达式——分子/分母均为已计算聚合的别名引用，编译为 `CASE WHEN denominator IS NULL OR denominator = 0 THEN NULL ELSE CAST(numerator AS DOUBLE) / CAST(denominator AS DOUBLE) END`。
+
+**是什么**
+
+RatioExpr 是一种特殊的聚合方式，用于计算两个聚合指标的比值。它不直接对应 SQL 的单个聚合函数，而是由 Compiler 渲染为 CASE WHEN + CAST 的组合表达式。分子和分母各自是已计算聚合的别名引用（SafeIdentifier），RatioExpr 在编译时按别名引用组合它们。
+
+**解决什么问题**
+
+双引擎（DuckDB/Spark）下除法语义需要统一：分母为零时不抛异常（返回 NULL），分子/分母类型统一为 DOUBLE 避免整数除法截断。RatioExpr 通过 `CASE WHEN denominator IS NULL OR denominator = 0 THEN NULL` 处理除零异常，通过显式 CAST 确保类型一致。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/planning/models.py` — RatioExpr 模型定义
+- `src/tianshu_datadev/sql/compiler.py` — DuckDB 侧渲染 `/` 表达式
+- `src/tianshu_datadev/spark/models.py` — Spark 侧 RatioExpr 模型
+- `src/tianshu_datadev/spark/mapper.py` — Contract→Spark 映射
+- `src/tianshu_datadev/artifacts/models.py` — Contract 侧序列化
+- `src/tianshu_datadev/artifacts/contract_extractor.py` — Contract 抽取
+
+**输入是什么**
+
+分子聚合别名（SafeIdentifier）+ 分母聚合别名（SafeIdentifier）。
+
+**输出是什么**
+
+编译后 SQL 表达式：`CASE WHEN denominator IS NULL OR denominator = 0 THEN NULL ELSE CAST(numerator AS DOUBLE) / CAST(denominator AS DOUBLE) END`。当 multiplier=100 时，输出外层包裹乘法：`CASE WHEN ... END * 100`。
+
+**出错会导致什么风险**
+
+如果 RatioExpr 的分子/分母别名引用被反转，将产生语义错误的比值。如果 CASE WHEN 分母保护缺失（直接在 SQL 中写 `/` 而无分母保护），除零错误会中断整个查询。
+
+**简单例子**
+
+退货率计算：分子别名 `total_return_amount`，分母别名 `total_amount` → 编译为 `CASE WHEN _ratio_base.total_amount IS NULL OR _ratio_base.total_amount = 0 THEN NULL ELSE CAST(_ratio_base.total_return_amount AS DOUBLE) / CAST(_ratio_base.total_amount AS DOUBLE) END AS return_rate`。
+
+**Owner 审查时应该问什么**
+
+1. "RatioExpr 是否同时支持 DuckDB 和 Spark 方言？分别在何处编译？"
+2. "除零返回 NULL 是设计决策——在什么场景下应该抛异常而不是返回 NULL？"
+
+---
+
+## 78. ComputeStepValidator（确定性校验器）
+
+**一句话解释**：在 Builder 之前执行的 5 项确定性检查——确保 ComputeStep 声明合法后 Builder 才进行编译。
+
+**是什么**
+
+ComputeStepValidator 是 ComputeSteps 路径的专用校验器，在 `_build_from_compute_steps()` 被调用前执行。5 项检查全部为确定性代码，不依赖 LLM：
+1. **符号解析**——Join 键在对应的上游输出或 SourceManifest 中存在（列存在性 + JOIN 键有效性的统一入口）
+2. **类型兼容**——left_key 与 right_key 字段类型兼容，UNKNOWN 类型直接阻断
+3. **Join 基数安全**——单列 Join 仅由完全匹配的单列唯一键组放行
+4. **显式 JoinDecl**——合流步骤（多 source）必须有显式 JoinDecl，不允许隐式推断
+5. **evaluation_phase 已确定**——所有 CaseWhenDecl 的 evaluation_phase 必须为 pre_aggregate 或 post_aggregate，不可为 None
+
+**解决什么问题**
+
+ComputeSteps 路径的中间步骤产出列在编译时才动态确定（不同于源表字段在 SourceManifest 中预注册）。如果没有独立校验器，列引用错误只能在编译时暴露（如 `Column not found` SQL 错误），诊断成本高。ComputeStepValidator 在"编译前"捕获这些错误，输出结构化的 OpenQuestion。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/planning/compute_step_validator.py` — ComputeStepValidator 实现
+- `src/tianshu_datadev/planning/step_output_schema.py` — 依赖 StepOutputSchema 获取列信息
+- `src/tianshu_datadev/api/pipeline.py` — Pipeline 中调用入口
+
+**输入是什么**
+
+ParsedDeveloperSpec（含 compute_steps 字段）+ SourceManifest + 可选 StepOutputSchema 缓存。
+
+**输出是什么**
+
+`(passed: bool, questions: list[OpenQuestion])`。
+
+**出错会导致什么风险**
+
+如果列存在性校验漏检了一个假引用，Builder 会在编译阶段报错（SQL 编译时暴露）——风险可控。如果类型兼容性漏检（如字符串列上做 SUM），Compiler 可能生成不兼容类型转换。
+
+**简单例子**
+
+step 中引用 `input_column: daily_amount`，但该步的 source 步骤未产出名为 daily_amount 的列 → ComputeStepValidator 阻断并生成 OpenQuestion("列 daily_amount 在 source step 中不可用")。
+
+**Owner 审查时应该问什么**
+
+1. "ComputeStepValidator 的 5 项检查与现有的 SqlBuildPlanValidator 的 8 项检查是否有重叠？"
+2. "中间步骤的列元数据（StepOutputSchema）是如何构建和维护的？"
+
+---
+
+## 79. StepOutputSchema（步骤输出模式）
+
+**一句话解释**：记录每个 ComputeStep 的输出列名和类型，供下游步骤查找可用列。
+
+**是什么**
+
+StepOutputSchema 是一个轻量元数据模型。它为每个 ComputeStep 的 `output_alias` 记录一组 `(column_name, column_type)` 对。当步骤 A 引用步骤 B 的产出列时，StepOutputSchema 提供"B 步骤在运行后会产出哪些列"的信息。由 ComputeStepValidator 使用，也用于 Builder 中的列引用解析。
+
+**解决什么问题**
+
+传统 SqlBuildPlan 中所有列引用在 SourceManifest 中注册（源表字段）。ComputeSteps 路径中中间步骤的产出列是动态确定的——Step 定义时说"我要产出 XX 列"，但下游步骤在编译前需要知道"XX 列的可用性和类型"。StepOutputSchema 在这个"编译前但需要列信息"的间隙中提供服务。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/planning/step_output_schema.py` — StepOutputSchema 定义与构建
+- `src/tianshu_datadev/planning/compute_step_validator.py` — 校验时使用
+- `src/tianshu_datadev/api/pipeline.py` — Pipeline 中构建
+
+**输入是什么**
+
+ParsedDeveloperSpec（含 compute_steps 列表）+ 源表列声明。
+
+**输出是什么**
+
+`dict[str, StepOutputInfo]`——每个 ComputeStep 的 output_alias 到一个 StepOutputInfo（列名列表 + 类型字典）的映射。
+
+**出错会导致什么风险**
+
+如果 StepOutputSchema 构建错误（如漏掉步骤产出的某列），下游步骤引用该列时 ComputeStepValidator 会误判为"列不存在"——产生假阳性阻断。如果类型推断错误，Validator 类型兼容性检查可能误报。
+
+**简单例子**
+
+step `daily` 有 `metrics: [metric_name: daily_amount, aggregation: SUM, input_column: amount]` 和 `group_by: [stat_date]` → StepOutputSchema["_daily"] = {"daily_amount": "decimal", "stat_date": "date"}。
+
+**Owner 审查时应该问什么**
+
+1. "StepOutputSchema 中的列类型是从哪里推断的？直接透传源表类型还是做类型推断？"
+2. "当同一个 column_name 在多个 step 中出现时（如 stat_date），StepOutputSchema 如何处理类型冲突？"
+
+---
+
+## 80. 桥接 JOIN（两跳 JOIN 自动检测）
+
+**一句话解释**：当源表与上游输出无直接列名匹配时，通过中间桥接表实现间接 JOIN。
+
+**是什么**
+
+桥接 JOIN 是一种自动 JOIN 推断策略。当表 A 与表 B 没有直接可匹配的列名（如 A.order_id vs B.order_key），但各自与中间表 C 有匹配时（A ↔ C ↔ B），系统自动推导两跳桥接。第一阶段仅支持 1 跳桥接（A ↔ C ↔ B），后续可扩展多跳。
+
+**解决什么问题**
+
+现实数据仓库中，事实表与维表有时没有直接外键关系——需要通过中间关联表间接建立连接。桥接 JOIN 基于命名约定自动发现 FK 候选关系（如 target 表有 key_column X，source 表有列名以 _X 结尾则视为潜在 FK），避免程序员手动声明完整的 Join 链。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/planning/sql_build_plan.py` — `_find_bridge_join()` 相关逻辑
+- `src/tianshu_datadev/planning/sql_program.py` — 桥接场景的 SqlProgram 组装
+
+**输入是什么**
+
+SourceManifest（含 foreign_keys）+ RelationshipHypothesis（已有 Join 候选）。
+
+**输出是什么**
+
+额外的 JoinCandidate（通过桥接表发现的间接 Join 关系）。
+
+**出错会导致什么风险**
+
+如果桥接 JOIN 发现错误的间接关系（如通过无关联的"公共字段"误判），可能生成语义错误的 SQL——需要 RelationshipHypothesis 的 evidence_level 门禁二次确认。过度桥接（如 3 跳以上）产生复杂且不可预测的 Join 路径。
+
+**简单例子**
+
+表 `order_fact` 有 `order_id`，表 `store_dim` 有 `store_id`——两者无直接匹配。但中间表 `order_store_bridge` 同时有 `order_id` 和 `store_id` → 桥接 JOIN：`order_fact JOIN order_store_bridge USING(order_id) JOIN store_dim USING(store_id)`。
+
+**Owner 审查时应该问什么**
+
+1. "桥接 JOIN 是否限制最大跳数？当前是否仅支持 1 跳？"
+2. "桥接 JOIN 发现的关系是否需要 evidence_level 评审，还是自动加入？"
+
+---
+
+## 81. UncertaintyEntry（不确定性条目）
+
+**一句话解释**：RequirementPlanner 产出中标记低置信度推断的结构，含 output_column/output_kind 路由字段。
+
+**是什么**
+
+UncertaintyEntry 是 RequirementPlanner（需求规划器）产生的一种特殊条目。当 Planner 对某个派生列或指标的来源、口径、粒度不够确定时（如"字段名模糊需要人工确认"），不静默猜测，而是生成 UncertaintyEntry 记录到 `planner_output.uncertain_entries`。每个条目包含 `output_column`（路由到哪列）和 `output_kind`（路由类型——LABEL/METRIC/DERIVED_DIMENSION/UNKNOWN）两个关键路由字段。
+
+**解决什么问题**
+
+传统 LLM 推断倾向于"猜测一个答案"，不告知不确定性——如果猜错，诊断极其困难。UncertaintyEntry 采用"不确定就标记"策略：不猜测、不静默丢弃、不阻断整条管线。标记项进入 EnrichedSpec 后可触发 HUMAN_REVIEW，也可在后续阶段由人工确认覆盖。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/developer_spec/models.py` — UncertaintyEntry 模型定义
+- `src/tianshu_datadev/planning/requirement_planner.py` — Planner 产出
+- `src/tianshu_datadev/api/pipeline.py` — `_enrich_and_plan()` 中的路由处理
+
+**输入是什么**
+
+RequirementPlanner 的 LLM 响应中标记为不确定的条目。
+
+**输出是什么**
+
+`UncertaintyEntry(output_column: str | None, output_kind: Literal["LABEL", "METRIC", "DERIVED_DIMENSION", "UNKNOWN"])` 列表。
+
+**出错会导致什么风险**
+
+如果 UncertaintyEntry 的 `output_kind` 路由错误（如维度条目路由到 metric），下游 SpecEnricher 会在错误桶中查找，可能掩盖真正的字段来源问题。如果所有不确定条目都触发 HUMAN_REVIEW，planner 的 uncertainty 阈值设置不当会导致过多人工干预。
+
+**简单例子**
+
+Planner 解析到字段名 `"status"`——不确定它是订单状态、用户状态还是支付状态 → 生成 UncertaintyEntry(field_ref="status", output_column="status", output_kind="DERIVED_DIMENSION")。
+
+**Owner 审查时应该问什么**
+
+1. "UncertaintyEntry 触发 HUMAN_REVIEW 后，人工确认的流程是什么？"
+2. "RequirementPlanner 的不确定性判断标准是什么？哪些线索触发标记？"
+
+---
+
+## 82. SparkPlan branches（多分支 DAG）
+
+**一句话解释**：SparkPlan 支持多个独立计算分支，每个分支可独立编译和执行。
+
+**是什么**
+
+SparkPlan branches 是 Spark 侧 IR 的 DAG 扩展。传统 SparkPlan 是一个线性变换链（transform chain），branches 模型允许 SparkPlan 包含多个独立的分支（branch），每个分支有自己的 transform 链。分支间通过 `branch_name` 标识，最终通过合流步骤（join/union）合并。每个分支可单独编译和执行。
+
+**解决什么问题**
+
+多步聚合链（SQL 管线的 SqlProgram）映射到 Spark 侧时，如果 SparkPlan 仍然是线性结构，无法表达"先独立计算 A 和 B，再合并 A+B 结果"的语义。branches 模型使 SparkPlan 的表达能力等价于 SqlProgram 的 DAG 依赖图。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/spark/models.py` — SparkPlanBranch / BranchTransform / BranchMerge 模型
+- `src/tianshu_datadev/spark/mapper.py` — Contract→SparkPlan 映射（含 branches 拆分）
+- `src/tianshu_datadev/spark/compiler.py` — branches 编译
+- `src/tianshu_datadev/spark/plan_comparator.py` — branches 等价对比
+
+**输入是什么**
+
+DataTransformContract（含 step_dag）+ SourceManifest。
+
+**输出是什么**
+
+SparkPlan 实例：含 `branches: list[SparkPlanBranch]`，每个 branch 含独立 transform 链 + 合流指令。
+
+**出错会导致什么风险**
+
+如果 branch 间的依赖顺序错误（如合并步骤在依赖分支未完成前执行），生成错误的 PySpark 代码。如果 PlanComparator 不支持 branches 比较，多分支场景的 SQL↔Spark 等价判定会跳过或误判。
+
+**简单例子**
+
+SqlProgram 2 步（先聚合 A，再聚合 B，最后 Join A+B）→ SparkPlan 分解为 3 个 branch：branch_A（聚合 A 的 transform 链）、branch_B（聚合 B 的 transform 链）、branch_merge（Join 两个中间 DataFrame）。
+
+**Owner 审查时应该问什么**
+
+1. "branches 模型中的分支间数据依赖如何表达？是否支持任意 DAG 拓扑？"
+2. "PlanComparator 如何比较 SQL 的 SqlProgram 与 Spark 的 branches？"
+
+---
+
+## 83. Label Table 统一管线
+
+**一句话解释**：所有 dataset_type（label_table/aggregate_table 等）共享同一 Pipeline 入口——删除 label_table 单表门禁。
+
+**是什么**
+
+Phase 9A+ 之前的 label_table 有独立入口（单独的 label_table 管线分支），aggregate_table 走另一条路。统一管线设计删除了 label_table 专用门禁，让所有 dataset_type 都经过相同的 `Pipeline.execute()` / `Pipeline.run_all()` 入口。系统内部根据 `dataset_type` 路由到不同处理路径（SqlBuildPlan 分支或 Label 分支），但对外呈现统一接口。
+
+**解决什么问题**
+
+开发者（程序员）不需要理解系统内部有多少条管线——只需要知道"提交 DeveloperSpec，系统自动选择最佳路径"。减少意外行为（如 label_table 的独立入口在新版本中表现不一致）。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/api/pipeline.py` — Pipeline 主干
+- `src/tianshu_datadev/developer_spec/parser.py` — dataset_type 识别
+- `src/tianshu_datadev/planning/sql_build_plan.py` — Builder 分支
+- `src/tianshu_datadev/llm/gateway.py` — LLM 入口统一
+
+**输入是什么**
+
+DeveloperSpec 文本（含 dataset_type 声明）。
+
+**输出是什么**
+
+统一 ExecuteResponse / RunAllResponse——不区分入口来源。
+
+**出错会导致什么风险**
+
+如果 label_table 和 aggregate_table 在内部路径切换时共享资源（如 _temp 表命名空间、_results 字典），可能发生命名冲突。如果 label_table 管线的特殊验证规则（如 LabelRuleValidator）在统一入口中被遗漏，安全门禁被绕过。
+
+**Owner 审查时应该问什么**
+
+1. "统一管线后，label_table 的 LabelRuleValidator 是否在所有入口下都被调用？"
+2. "不同 dataset_type 之间的 _temp 命名空间是否隔离？"
+
+---
+
+## 84. UPPER 归一化（JOIN 键自动大小写归一化）
+
+**一句话解释**：当前仅在 borough 字段上应用 UPPER() 包裹解决大小写不一致问题，可扩展为配置驱动的通用机制。
+
+**是什么**
+
+UPPER 归一化是 SQL 和 Spark 双引擎 JOIN 键比较时的一项硬编码预处理——在 JOIN 键 `key == 'borough'` 时在 JOIN 条件中添加 UPPER 函数统一大小写。SQL Compiler（`sql/compiler.py`）和 Spark Compiler/Snapshot（`spark/compiler.py`、`spark/snapshot.py`）均有相同逻辑。当前适用于 SQL 和 Spark 双管线中的 borough 字段（如 collision 表 borough 全大写 vs taxi_zone 表 borough 首字母大写），未来可扩展为配置驱动的通用机制。
+
+**解决什么问题**
+
+现实数据仓库中，同一含义的字段在不同表中可能因建表约定不同存在大小写差异（尤其是手工导入的 CSV 源）。如果没有大小写归一化，`a.borough = b.borough` 可能因为 'manhattan' ≠ 'Manhattan' 丢失匹配行。UPPER 归一化在不修改原始数据的前提下解决这个匹配问题。
+
+**在当前项目中的位置**
+
+- `src/tianshu_datadev/sql/compiler.py` — SQL 侧 JOIN 渲染（borough UPPER 硬编码）
+- `src/tianshu_datadev/spark/snapshot.py` — Spark 侧 snapshot JOIN 检查
+- `src/tianshu_datadev/spark/compiler.py` — Spark 侧 JOIN 渲染
+
+**输入是什么**
+
+两表的 JOIN 键列名和值。
+
+**输出是什么**
+
+JOIN 条件中添加 UPPER 函数后的 SQL/Spark 表达式。
+
+**出错会导致什么风险**
+
+当前硬编码的 borough 专用 UPPER 修复缺乏通用性——如果其他字段也出现大小写不一致问题，需要修改代码才能支持。如果未来扩展到其他字段，需评估 UPPER 导致索引失效的风险（某些引擎对 UPPER(column) 不做索引扫描）。
+
+**简单例子**
+
+`collision` 表的 `borough` 列存储 "manhattan"，`borough_lookup` 表的 `borough_name` 列存储 "Manhattan" → Spark 侧检测到 `key == 'borough'` 后，JOIN 条件变为 `F.upper(F.col("collision.borough")) == F.upper(F.col("borough_lookup.borough_name"))`。
+
+**Owner 审查时应该问什么**
+
+1. "UPPER 归一化是全局开启还是可配置？哪些场景需要关闭？"
+2. "Unicode 字符的 UPPER 在不同语言下是否一致？中文/德文是否有问题？"
+
+---
+
+## 85. LLM 追踪面板（前端横向指示灯布局）
+
+**一句话解释**：前端横向指示灯布局——显示每个 LLM 调用节点的状态（成功/失败/跳过/进行中）。
+
+**是什么**
+
+LLM 追踪面板（LlmTracePanel）是一个前端 React 组件，位于流水线执行页面右上角。它以横向排列的指示灯形式展示每个 LLM 调用节点的执行状态。每个指示灯对应一个 LLM 调用节点（如 RequirementPlanner、SpecEnricher 等），颜色标识状态：绿色（成功）、红色（失败）、灰色（跳过）、蓝色脉冲（进行中）。点击指示灯可展开详情（调用链、消耗 Token 数、耗时）。
+
+**解决什么问题**
+
+在 Pipeline 执行过程中（尤其是 run_all_full_stream SSE 模式），用户需要实时了解"系统在做什么、哪个阶段、是否出错"。LLM 追踪面板将后端 `pipeline_stages` 的状态映射为前端可视化的指示灯序列，消除"长时间等待无反馈"的焦虑。
+
+**在当前项目中的位置**
+
+- `frontend/src/components/LlmTracePanel.tsx` — 组件实现
+- `frontend/src/components/LlmTracePanel.css` — 样式
+- `frontend/src/App.tsx` — 集成位置
+
+**输入是什么**
+
+`pipeline_stages`（来自后端响应，含各阶段名称、状态、开始/完成时间）。
+
+**输出是什么**
+
+前端渲染：横向指示灯行（点击可展开详情）。
+
+**出错会导致什么风险**
+
+如果后端返回的 stage 名称与前端预期的枚举不一致，面板可能显示"未知阶段"或布局错乱。如果 SSE 流式推送的 stage 顺序与前端预期不符，指示灯可能乱序显示。
+
+**简单例子**
+
+Pipeline 执行中，`LlmTracePanel` 显示：`[RequirementPlanner] ✅ → [SpecEnricher] ⏳ → [RelationshipPlanner] ⬜`——表示 Planner 已完成（成功），Enricher 正在执行，RelationshipPlanner 尚未开始。
+
+**Owner 审查时应该问什么**
+
+1. "后端推送 stage 状态变化时，前端以 SSE 事件驱动还是轮询？过渡状态的处理策略是什么？"
+2. "指示灯面板在移动端/窄屏上的布局策略是什么？超过 10 个指示灯时如何处理？"
+
+---
+
+## 86. 项目缩写速查
 
 | 缩写 | 全称 | 含义 |
 |------|------|------|
@@ -3360,15 +3738,22 @@ v3.1 反转为：`RequirementPlanner → SpecEnricher(full) → unresolved检查
 | **STT** | SparkTimeTransformExpr | Spark 侧时间变换模型 |
 | **CW** | CaseWhenRule/CaseWhenBranch | CASE WHEN 规则/分支模型——v3.1 Planner 产出 |
 | **DDD** | DerivedDimensionDecl | 派生维度声明——source_column + time_function → alias |
+| **RE** | RatioExpr | 比值表达式——CAST/ NULLIF 编译 |
+| **CSV** | ComputeStepValidator | ComputeStep 确定性校验器——5 项检查 |
+| **SOS** | StepOutputSchema | 步骤输出模式——列名/类型元数据 |
+| **BJ** | 桥接 JOIN | 两跳 JOIN 自动桥接检测 |
+| **UE** | UncertaintyEntry | 低置信度推断标记（含路由字段） |
+| **BR** | SparkPlan branches | 多分支 DAG——独立编译执行 |
+| **LTU** | Label Table 统一管线 | 所有 dataset_type 共享入口 |
+| **UCN** | UPPER 归一化 | JOIN 键自动 UPPER 大小写统一 |
+| **LLP** | LLM 追踪面板 | 前端横向指示灯 |
 
 ---
 
-> 本文基于项目代码基线（2026-07-21）更新，覆盖 82 个核心工程术语。相比 v2026-07-03 更新内容：
-> - §7 SqlBuildPlan：更新为 10 种 Step（新增 SubqueryStep，Phase 4.6）
-> - §8 SqlBuildPlanValidator：新增子查询递归校验（V-010a~e）
-> - §17 Pipeline：重写为双管线架构（SQL 管线 + Spark 6 阶段）+ Label 分支 + run_all_full() + v3.1 执行顺序反转
-> - 新增 §64-78：LabelPredicateNode 体系、LabelDomain 双层模型、LabelRuleValidator v1、Promotion、LlmLabelExtractor、PhysicalVerifier、PhysicalVerificationReport、CRE Shadow、物理验证白名单、Snapshot Builder、ProcessGuard/SQL Executor Worker、RequirementPlanner、Proposal 三件套、TimeTransformExpr/DerivedGroupKey、执行顺序反转 共 19 个新条目
-> - 缩写表新增 31 个缩写
+> 本文基于项目代码基线（2026-07-26）更新，覆盖 **91 个核心工程术语**。相比 v2026-07-21 更新内容：
+> - 新增 §77-85：RatioExpr、ComputeStepValidator、StepOutputSchema、桥接 JOIN、UncertaintyEntry、SparkPlan branches、Label Table 统一管线、UPPER 归一化、LLM 追踪面板 共 **9 个新条目**
+> - 缩写表新增 9 个缩写
+> - §2 CRE 相关文档更新：CRE v2 标记为已归档，CRE v3 标记为部分实施
 > 
 > 每个术语遵循"九件事"说明格式：名称→是什么→解决什么问题→项目位置→输入→输出→风险→例子→审查问题。
 > 参考：[[AGENTS.md]] | [[03-sql-ir-and-compiler-plan]] | [[01-target-architecture]] | [[2026-07-15-label-table-design]] | [[CRE_v2_设计文档_20260713_1745]] | [[case_when条件对比边界说明_20260717_0908]] | [[2026-07-21-requirement-planner-design]]

@@ -1,5 +1,9 @@
 # LLM 输出解析器 Fixture 补充计划
 
+> **执行状态**：**已执行**（2026-07-01 起陆续实施）。fixture 文件已创建于 `tests/fixtures/llm_responses/` 目录，覆盖 RelationshipPlanner 和 SpecEnricher 的 LLM 输出解析路径。测试已在 `test_relationship_planner_llm.py` 和 `test_spec_enricher_llm.py` 中实施。
+> 
+> **额外发现**：执行 Fixture 补充过程中暴露了 JSON Schema 与系统枚举命名不一致（SUM/AVG 缺少 _OVER 后缀，NTILE/COUNT_OVER 缺失），该问题在 [spec_enricher_validation_gap_fix_plan](spec_enricher_validation_gap_fix_plan_20260701.md) 中规划并修复。
+
 ## 一、CRCS 分类
 
 **B 类 — DESIGN-REVIEW（需设计确认）**

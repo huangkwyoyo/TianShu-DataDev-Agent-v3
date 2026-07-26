@@ -1,5 +1,8 @@
 # dev-reload——git pull 后自动重启前后端服务 — 实施计划
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 提供 `./dev-reload.sh` 一键脚本，使 Agent 在 `git pull` / `git checkout` 后可靠地重启前后端开发服务器，确保最新代码生效。

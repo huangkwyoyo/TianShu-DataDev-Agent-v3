@@ -1,5 +1,8 @@
 # CASE WHEN condition UNSUPPORTED 物理验证白名单实施计划
 
+> **执行状态**：✅ 已执行完毕。实际实施细节可能与本文档存在差异，以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > **C 类架构风险** — 设计已批准，实施中不新增状态枚举、验证 API、前端组件
 > **设计文档**: `docs/case_when物理验证白名单设计_20260717_0918.md`
 

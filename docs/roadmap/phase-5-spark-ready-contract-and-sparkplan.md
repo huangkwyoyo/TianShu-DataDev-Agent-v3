@@ -1,5 +1,8 @@
 # Phase 5：SparkPlan IR + DataTransformContractV1 确定性映射
 
+> **Phase 状态**：✅ 已完成。本文档为历史设计记录，实际实施以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 状态：**已完成 ✅（2026-06-29）**
 > 前置依赖：Phase 4.6 退出 ✅ | Phase 4.5 内部验证口 ✅ | Harness 七维门禁 ✅
 

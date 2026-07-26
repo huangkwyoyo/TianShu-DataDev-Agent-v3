@@ -1,5 +1,8 @@
 # DeveloperSpec 示例二：标签表
 
+> **当前 Parser 版本**：v4（2026-07-26）——本示例的 YAML 格式与当前 `ParsedDeveloperSpec` Parser 兼容。
+> 注意：`label_rules` 由 SpecEnricher 进行 LLM 丰富化后填充，本示例仅作格式参考。
+>
 > 来源：主规划书附录 A.2
 > 场景：基于用户近90天行为生成价值等级标签和活跃度标签
 
@@ -54,14 +57,48 @@ spec:
       type: int
       description: 近30天活跃天数（有任意行为的天数）
 
+  # label_rules 由 SpecEnricher 从 source_tables + output_columns 丰富化后填充，
+  # 此处仅作格式展示。使用 typed_branches 类型化条件节点格式（因 sql_build_plan
+  # 仅处理 typed_branches），并指定 evaluation_phase 为 post_aggregate
+  #（因引用聚合后字段 total_amount）。
   label_rules:
-    - field: value_level
-      source_fields: [order_amount]
-      logic: CASE WHEN 分段
-    - field: activity_score
-      source_fields: [behavior_time]
-      logic: COUNT(DISTINCT date(behavior_time)) WHERE behavior_time >= date_sub(current_date, 30)
+    - output_column: value_level
+      evaluation_phase: post_aggregate
+      typed_branches:
+        - condition:
+            node_type: COMPARE
+            left: total_amount
+            op: ">="
+            right:
+              node_type: LITERAL
+              value: "10000"
+              data_type: string
+          then_label: "high"
+        - condition:
+            node_type: COMPARE
+            left: total_amount
+            op: ">="
+            right:
+              node_type: LITERAL
+              value: "1000"
+              data_type: string
+          then_label: "mid"
+        - condition:
+            node_type: COMPARE
+            left: total_amount
+            op: ">"
+            right:
+              node_type: LITERAL
+              value: "0"
+              data_type: string
+          then_label: "low"
+      else_value: "inactive"
 ---
+
+> 说明：`activity_score`（近30天活跃天数）在 `output_columns` 中声明，其计算逻辑
+> （`COUNT(DISTINCT date(behavior_time))`）在加工步骤第2步中定义。该字段为常规聚合指标，
+> 不属于 `label_rules` 的范围（`label_rules` 仅处理 `value_level` 的 CASE WHEN 分段），
+> 也无需在 `metrics` 中单独声明。
 
 # 用户行为标签表
 

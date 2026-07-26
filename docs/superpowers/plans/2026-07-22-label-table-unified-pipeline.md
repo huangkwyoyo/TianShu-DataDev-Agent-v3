@@ -1,5 +1,8 @@
 # Label Table 统一管线——实施计划
 
+> **执行状态**：✅ 全部执行完成。`_prepare_labels()` 已合入 Pipeline（`src/tianshu_datadev/api/pipeline.py`），`label_scope.py` 已删除，所有 dataset_type 共享统一管线（Planner/Enricher/Builder）。Planner marking → LabelExtractor 兜底规则（I1 修正）已落地。详见 `docs/current-state-and-verification-status.md` Label Table 统一管线行。
+> 最后核对日期：2026-07-26
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 将 label_table 从独立 Planner 分支统一到标准管线──删除 v1 单表门禁，所有 dataset_type 共享 Planner/Enricher 管线，LabelExtractor 仅兜底处理 Planner 标记 LABEL + unresolved + Planner 未生成 case_when_rules 的列。

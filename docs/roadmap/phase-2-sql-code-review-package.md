@@ -1,5 +1,8 @@
 # Phase 2：SQL Code Review Package v1 + DataTransformContract-lite
 
+> **Phase 状态**：✅ 已完成。本文档为历史设计记录，实际实施以 `docs/current-state-and-verification-status.md` 为准。
+> 最后核对日期：2026-07-26
+
 > 状态：**已完成 ✅**（2026-06-29 核销，见 Phase 3 Exit Report）
 > 前置依赖：Phase 1C 退出条件全部满足 ✅
 
