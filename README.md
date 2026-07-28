@@ -1,127 +1,162 @@
 # TianShu DataDev Agent v3
 
-AI 辅助数据开发工具：接收程序员编写的半自然语言 + 半结构化 DeveloperSpec 项目书，生成 SQL、测试、验证材料和 Code Review Package。最终目标覆盖受控 PySpark DSL 和 SQL/Spark 双链验证。
+AI 辅助数据开发工具。接收程序员编写的半自然语言 + 半结构化 DeveloperSpec 项目书，经 **确定性管线 + LLM 增强** 生成 SQL、PySpark DSL、双链验证报告和 Code Review Package。
 
-最终产物是代码和审查材料，不是生产数据。系统不自动上线、不写生产库。
+> **最终产物是代码和审查材料，不是生产数据。系统不自动上线、不写生产库。**
+
+---
+
+## 快速开始
+
+```bash
+pip install -e ".[dev]"
+./dev-reload.sh          # 启动前后端（详见下方"开发命令"）
+# 浏览器打开 http://127.0.0.1:5173
+```
+
+---
 
 ## 当前状态
 
-- 当前阶段：**Phase 9A-9C + label_table v1 完成**——C1-C4 已消除，label_table v1 管线已交付，前端 E2E 6/6 通过。
-- Phase 0–4.6（SQL 链路）全部退出——含 DeveloperSpec Parser、SqlBuildPlan、Validator、Compiler、Executor、Code Review Package、Harness 七维门禁、复杂 SQL（多跳 Join + 子查询）。
-- **Phase 6–9 已完成**——受控 PySpark DSL（10 种 step）、SQL/Spark 双链验证（逻辑+物理）、编排硬化 + Harness 5 维度评测、前端回归 + 可观测性、DOM E2E 交互测试已全部实现并回归通过。
-- **label_table v1 已完成（2026-07-16）**——Parser→LlmLabelExtractor→Validator→Promotion→Builder(CaseWhenStep)→Compiler 全链路，90 测试全绿。
-- 项目当前状态详见 **`docs/current-state-and-verification-status.md`**（Phase 进度矩阵、业务集成验证状态、测试基线、残留风险、下一步方向）。
-- 文档入口详见 **`docs/README.md`**。
+**Capability Complete** — SQL→PySpark 全量 10 种 step 双链验证已贯通，管线已合入 `main`。
 
-### 路线图状态
+| 维度 | 状态 |
+| --- | :---: |
+| SQL 管线（Parse→Plan→Validate→Compile→Execute） | ✅ |
+| PySpark DSL（10 种封闭 step 类型：scan/filter/project/aggregate/join/case_when/window/sort/limit/subquery） | ✅ |
+| SQL/Spark 逻辑等价对比（PlanComparator，含窗口合并、多分支、Snapshot 桥接） | ✅ |
+| 物理双引擎验证（DuckDB ↔ Spark，含浮点容差 + CRE 编码比较体系） | ✅ |
+| label_table v1 完整管线（Parser→LlmLabelExtractor→Validator→Promotion→Builder CaseWhenStep→Compiler） | ✅ |
+| RatioExpr 全链路（RatioProposal→Validator→Decl→Expr→Compiler→Contract→Spark） | ✅ |
+| RequirementPlanner v3.1（TimeTransformExpr + UncertaintyEntry 路由） | ✅ |
+| ComputeSteps Builder 双能力扩展（case_when+metrics 共存 + 混合源 Join + 两跳桥接） | ✅ |
+| SparkPlan 多分支 DAG（branches + typed_branches 替换 SqlRawExpression） | ✅ |
+| Snapshot 桥接 + 前端增强（LLM 追踪、物理验证对比、Run-All 面板三层兜底） | ✅ |
+| NYC 业务案例 01-06 全量 SQL+Spark LOGIC_EQUIVALENT 验证 | ✅ |
+| C1-C4 业务集成风险已全部消除 | ✅ |
 
-Phase 6-8 的 roadmap 文件已从占位更新为设计摘要，完整设计见 `docs/superpowers/specs/`。
+> **详细进度矩阵、测试基线、残留风险 → `docs/current-state-and-verification-status.md`**
 
-| Phase | 文件 | 状态 |
-|-------|------|------|
-| 5 | `phase-5-spark-ready-contract-and-sparkplan.md` | ✅ 已完成（2026-06-29） |
-| 6 | `phase-6-controlled-pyspark-dsl.md` | ✅ 已完成（2026-07-04） |
-| 7 | `phase-7-sql-spark-cross-validation.md` | ✅ 已完成（2026-07-04） |
-| 8 | `phase-8-spark-first-orchestration-hardening.md` | ✅ 已完成（2026-07-04） |
-| C1-C4 | `docs/risks/phase-6-8-known-risks.md` | ✅ Phase 6-8 历史验收记录——已冻结，当前风险以 current-state §3/§3.5 为准 |
+---
 
-**实施状态**：Phase 0-9 已完成。C1-C4 业务集成全部点亮，前端 E2E 6/6 通过。详见 `docs/current-state-and-verification-status.md`。
+## 架构
 
-## 目标流程
+### 数据流
 
 ```text
-DeveloperSpec (.md 项目书，Markdown 正文 + YAML-like metadata block)
-→ ParsedDeveloperSpec（系统结构化理解 + open_questions，含 label_table 类型识别）
-→ SourceManifest（表字段事实追踪，optional SchemaRegistry 补充）
-→ RelationshipHypothesis（Join 推理 + 证据定级：强/中/弱/无）
-→ [label_table 分支] LlmLabelExtractor → LabelRuleValidator → Promotion → Builder 追加 CaseWhenStep
-→ SqlBuildPlan / SqlProgram（受控 SQL 构建计划，10 step 类型化 DAG）
-→ SQL Validator → Compiler（确定性渲染）→ DuckDB Executor
-→ SQL Code Review Package（供程序员审查）
-
-[Spark-first v2.0]
-→ DataTransformContract（从已验证 SqlBuildPlan 确定性抽取）
-→ mapper.py → baseline SparkPlan（确定性，唯一结构路径）
-→ SparkDeveloper（LLM 只做标注，不增删改 step）
-→ SparkCompiler（确定性 PySpark DSL 生成）+ SparkCodeRenderer（安全渲染）
-→ Static Validator（AST 硬门禁）
-→ SQL/Spark 双链验证（PlanComparator + PhysicalVerifier）
+DeveloperSpec (.md 项目书，Markdown + YAML metadata)
+  │
+  ▼
+ParsedDeveloperSpec（确定性 Parser → 结构化理解）
+  │  ├─ RequirementPlanner（LLM：补充维度/指标/CASE WHEN）
+  │  ├─ SpecEnricher（LLM：比率表达式、窗口帧边界）
+  │  └─ LabelExtractor（label_table 类型：标签规则提取 + 校验 + 提升）
+  ▼
+SqlBuildPlan / SqlProgram（10 种封闭 step 类型 DAG）
+  │  └─ ComputeStepValidator（符号解析、类型兼容、基数安全）
+  ▼
+┌─ SQL Validator → Compiler → Executor → SQL Code Review Package
+│     （确定性渲染，禁止 raw_sql / where_sql / expression: str）
+│
+└─ Spark（从头路径）
+      │
+      ├─ DataTransformContract（从已验证 SqlBuildPlan 确定性抽取）
+      ├─ mapper.py → baseline SparkPlan（确定性，唯一结构路径）
+      ├─ SparkDeveloper（LLM 只做语义标注，不增删改 step）
+      ├─ SparkCompiler + Renderer（确定性生成 PySpark DSL）
+      ├─ Validator（AST call-chain 硬门禁）
+      └─ SQL/Spark 双链验证
+           ├─ 逻辑等价（PlanComparator：SqlBuildPlan ↔ SparkPlan）
+           └─ 物理一致（PhysicalVerifier：DuckDB ↔ PySpark 同一快照）
 ```
 
-## 关键边界
+### 关键原则
 
-### SQL
+| 原则 | 说明 |
+|--- | ---|
+| **LLM 不生成 SQL/代码** | LLM 只输出结构化声明（ParsedDeveloperSpec、SqlBuildPlan、SparkPlan 标注）。代码由 Python 确定性编译器生成。 |
+| **封闭 step 类型** | SqlBuildPlan：10 种封闭类型；SparkPlan：scan/filter/project/aggregate/join/case_when/window/sort/limit。禁止 `raw_sql`、`expression: str` 逃生口。 |
+| **双链验证** | 逻辑（PlanComparator 结构等价）+ 物理（DuckDB+Spark 同一快照双引擎执行对比）。状态使用 `LOGIC_EQUIVALENT` / `RESULT_CONSISTENT` / `NOT_EXECUTED` / `HUMAN_REVIEW`。 |
+| **依赖确定性** | 表/字段/Join 必须来自 SourceManifest；SchemaRegistry 只补充不覆盖；冲突 → SOURCE_CONFLICT。 |
+| **编排薄层** | LangGraph 只做编排/分支/checkpoint/重试，不接触模型、不构造 Prompt、不解析 LLM 自由文本。 |
 
-- LLM 不生成 SQL 文本或 SQL 片段。
-- LLM 只输出严格类型化 SqlBuildPlan（10 种封闭 step 类型）。
-- Python 编译器确定性生成 SQL；相同 SqlBuildPlan 两次编译产生相同 SQL 和哈希。
-- 禁止 `raw_sql`、`where_sql`、`join_on: str`、`expression: str`。
-- 表、字段和 Join 必须来自 SourceManifest；SchemaRegistry 只补充不覆盖——冲突输出 SOURCE_CONFLICT。
+---
 
-### PySpark
-
-PySpark 只能以受控纯转换函数形式生成：
-
-```python
-def transform(inputs: Mapping[str, DataFrame], params: TransformParams) -> DataFrame:
-    ...
-```
-
-代码只读取注入的 `inputs`，禁止自行读取数据（`spark.read`、`spark.table`）、Action、写入、UDF、网络、文件系统和动态执行。
-
-**生成链路**：`mapper.py` 是唯一 Contract → SparkPlan 结构生成路径。SparkDeveloper（LLM）只做语义标注，不增删改 step、不直接输出代码。Compiler 确定性生成 PySpark DSL，所有代码片段通过 Renderer 封闭枚举/白名单渲染。Validator 做 AST call-chain 硬门禁。
-
-SparkDeveloper / SparkCompiler / SparkPlan 生成链路只读 DataTransformContractV1 和 baseline SparkPlan；Phase 7 验证层可读取 SqlBuildPlan 的结构化 artifact 用于对比，但不得把 SQL 文本提供给 SparkDeveloper 或 SparkCompiler。
-
-### 验证
-
-SQL 与 Spark 读取同一个关系一致冻结快照（SnapshotManifest）。逻辑链路（PlanComparator：SqlBuildPlan ↔ SparkPlan 结构等价对比）和物理链路（PhysicalVerifier：同一快照上 DuckDB + Spark 双引擎执行结果对比）双链验证。状态使用 `LOGIC_EQUIVALENT` / `RESULT_CONSISTENT` / `NOT_EXECUTED` / `HUMAN_REVIEW`，禁止泛化 "PASS"。未覆盖 step 类型必须明确标记 `NOT_EXECUTED`。
-
-### LangGraph
-
-编排层负责编排、分支、checkpoint、重试和人工中断。SparkOrchestrator 不直接访问模型、不构造 Prompt、不解析 LLM 自由文本——只调用已封装的 SparkDeveloperService。业务逻辑是普通 Python 服务；Graph State 只保存 artifact 引用、哈希、状态和摘要。
-
-### Memory 边界
-
-本项目不建设独立 Engineering Memory。失败案例沉淀进入 Harness 回归集、确定性 Validator / Compiler / Optimizer 规则、SchemaRegistry / Contract 显式标注和 Prompt/Harness 版本化评测记录。运行时路由、规划与生成不读取长期 Memory。事实源只有 SourceManifest / SchemaRegistry / Contract。
-
-## 规划文档
-
-核心文档入口：
-
-- **`docs/README.md`** — 文档索引与分类入口（推荐从此开始）
-- `docs/current-state-and-verification-status.md` — 当前实施状态（唯一权威）
-- `AGENTS.md` — 项目宪法
-- `docs/00-product-charter.md` 至 `docs/09-test-strategy.md` — 架构与设计参考
-- `docs/superpowers/specs/` — 各特性完整设计文档
-- `docs/superpowers/plans/` — 方案书索引
-- `docs/examples/` — DeveloperSpec 示例（汇总表/标签表/多步骤加工）
-
-## 目录
+## 目录结构
 
 ```text
 src/tianshu_datadev/
-├── developer_spec/   # DeveloperSpec Parser、ParsedDeveloperSpec、SourceManifest
-├── planning/         # RelationshipHypothesis、SqlBuildPlan、SqlProgram
-├── sql/              # SQL Validator、确定性 Compiler、PerfContract
-├── spark/            # SparkDeveloper、Static Validator、SparkReviewer
-├── execution/        # 快照、DuckDB 和 Spark 隔离执行
-├── validation/       # 规范化、Comparator、PlanEquivalence
-├── orchestration/    # LangGraph 薄编排层
-├── artifacts/        # Code Review Package
-└── llm/              # LLM Gateway、Prompt 版本管理
+├── developer_spec/     # Parser、ParsedDeveloperSpec、SourceManifest
+├── planning/           # RelationshipHypothesis、SqlBuildPlan、SqlProgram
+│   ├── requirement_planner.py   # v3.1：LLM 基础声明生成
+│   ├── spec_enricher.py         # 窗口帧/比率/标签增强
+│   └── sql_build_plan.py        # Builder（含 CaseWhenStep、ComputeSteps）
+├── labels/             # LabelExtractor、Validator、Promotion（label_table 类型）
+├── sql/                # Validator、确定性 Compiler
+├── spark/              # mapper、Developer（LLM 标注）、Compiler、Validator、Reviewer
+├── execution/          # 快照、DuckDB/Spark 隔离执行
+├── validation/         # PlanComparator、PhysicalVerifier、CRE
+├── orchestration/      # LangGraph 薄编排层
+├── artifacts/          # Code Review Package、Contract Extractor
+└── llm/                # LLM Gateway、Prompt 版本管理、调用追踪
+
+frontend/src/
+├── App.tsx             # 主应用状态机 & 面板布局
+├── api/client.ts       # API 客户端 + NDJSON 流式消费
+└── components/         # SpecEditor、ParsePreview、PlanStepsPanel、SqlDisplay、
+                        # LlmTracePanel、RunProgressPanel、SparkStageButtons 等
 ```
+
+---
+
+## 文档
+
+| 入口 | 说明 |
+|--- | ---|
+| **`docs/README.md`** | 文档索引与分类入口（推荐从这里开始） |
+| **`docs/current-state-and-verification-status.md`** | 当前实施状态的唯一权威文档 |
+| **`AGENTS.md`** | 项目宪法——所有 Agent 必须遵守 |
+| `docs/00-product-charter.md` ~ `docs/09-test-strategy.md` | 架构与设计参考 |
+| `docs/superpowers/specs/` | 各特性完整设计文档 |
+| `docs/superpowers/plans/` | 方案书索引 |
+| `docs/examples/` | DeveloperSpec 示例（汇总表/标签表/多步骤加工） |
+
+---
 
 ## 开发命令
 
-```powershell
+```bash
+# ── 安装 ──
 pip install -e ".[dev]"
-python -m pytest tests -q
-python -m ruff check .
+
+# ── 重启服务（Windows Git Bash 下唯一入口）──
+./dev-reload.sh               # 前后端全重启
+./dev-reload.sh --backend     # 仅后端
+./dev-reload.sh --frontend    # 仅前端
+
+# ── 测试 ──
+python -m pytest tests/ -q    # 非 Spark/非 Harness 子集
+python -m pytest tests/ --run-slow   # 含 Spark（需 PySpark）
+
+# ── 代码检查 ──
+ruff check src/ tests/
+npx tsc --noEmit              # TypeScript 类型检查
+
+# ── 前端单独 ──
+cd frontend && npm run dev    # 开发模式（Vite HMR）
 ```
 
-## 已知质量状态
+---
 
-- pytest：2818 collected（2026-07-17 基线）。非 Spark/非 Harness 子集：1629 passed / 6 skipped / 2 xfailed。Spark 全量需 `--run-slow` + PySpark。
-- ruff/tsc/build：零告警。
-- 详情见 `docs/current-state-and-verification-status.md`。
+## 测试基线
+
+> 数据口径：2026-07-26（近两周新增大量测试：ComputeSteps 扩展、RatioExpr、RequirementPlanner v3.1、集成测试等，测试计数持续增长）。
+
+- Ruff / tsc / build：**零告警**
+- 详见 `docs/current-state-and-verification-status.md` §1
+
+---
+
+## 许可
+
+MIT License
