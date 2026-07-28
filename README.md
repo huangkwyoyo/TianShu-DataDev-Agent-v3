@@ -73,7 +73,7 @@ SqlBuildPlan / SqlProgram（10 种封闭 step 类型 DAG）
 ### 关键原则
 
 | 原则 | 说明 |
-|--- | ---|
+| --- | --- |
 | **LLM 不生成 SQL/代码** | LLM 只输出结构化声明（ParsedDeveloperSpec、SqlBuildPlan、SparkPlan 标注）。代码由 Python 确定性编译器生成。 |
 | **封闭 step 类型** | SqlBuildPlan：10 种封闭类型；SparkPlan：scan/filter/project/aggregate/join/case_when/window/sort/limit。禁止 `raw_sql`、`expression: str` 逃生口。 |
 | **双链验证** | 逻辑（PlanComparator 结构等价）+ 物理（DuckDB+Spark 同一快照双引擎执行对比）。状态使用 `LOGIC_EQUIVALENT` / `RESULT_CONSISTENT` / `NOT_EXECUTED` / `HUMAN_REVIEW`。 |
@@ -112,7 +112,7 @@ frontend/src/
 ## 文档
 
 | 入口 | 说明 |
-|--- | ---|
+| --- | --- |
 | **`docs/README.md`** | 文档索引与分类入口（推荐从这里开始） |
 | **`docs/current-state-and-verification-status.md`** | 当前实施状态的唯一权威文档 |
 | **`AGENTS.md`** | 项目宪法——所有 Agent 必须遵守 |
