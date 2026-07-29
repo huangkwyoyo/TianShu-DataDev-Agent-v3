@@ -18,6 +18,23 @@ TianShu DataDev Agent 解决"从中文业务需求到可信数据代码"之间�
 
 ---
 
+### 数据库简介
+
+**TianShu（天枢）** 是基于 DuckDB 的 NYC（纽约市）城市交通数据仓库。数据全部来自 NYC 开放数据——TLC 出租车行程（Yellow/Green/FHV/HV）、停车罚单、交通事故、TIF 支付和司机申请，共 16 张原始表。
+
+| 项目 | 说明 |
+|------|------|
+| 数据库引擎 | DuckDB（嵌入式分析引擎，单文件运行） |
+| Gold 层规模 | 6 张事实表 + 4 张 G3 汇总表 + 6 张维表 |
+| 核心数据量 | fact_trips ~8,032 万行，fact_parking_violations ~958 万行，fact_crashes ~166 万行 |
+| 业务域 | 出行（traffic）、违章（violation）、安全（safety）、供给（supply）、资产（asset）、空间（spatial） |
+| 注册指标 | 10 个：行程量、车费收入、小费、行驶距离、罚单数量、标准罚款、事故/死亡/受伤人数、TIF 支付金额 |
+| 查询约束 | 只读连接，LLM 不直接访问数据库，优先 G3 汇总表，按需降级 G2 事实表 |
+
+本项目的 6 个真实业务案例（NYC Case 01-06）及测试用 Parquet 快照均来自 TianShu 数仓。Agent 将 TianShu 的表结构和业务指标作为验证代码生成正确性的基准数据源，但 Agent 本身不绑定 NYC 数据集——任何符合 SourceManifest 规范的 Parquet 表均可接入。
+
+---
+
 ## 2. 项目目标
 
 1. **半结构化输入 → 可信代码**：程序员用自然语言 + 表格描述业务逻辑，系统生成经双引擎验证的生产级 SQL 和 PySpark
